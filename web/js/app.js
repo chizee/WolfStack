@@ -21505,7 +21505,8 @@ async function loadAiAlerts() {
 }
 
 async function testAiConnection() {
-    // First save settings so the backend has the latest keys
+    // Save current settings first so the backend tests against what
+    // the user just typed in the form.
     var config = {
         provider: (document.getElementById('ai-provider') || {}).value || 'claude',
         claude_api_key: (document.getElementById('ai-claude-key') || {}).value || '',
@@ -21524,27 +21525,83 @@ async function testAiConnection() {
         smtp_tls: (document.getElementById('ai-smtp-tls') || {}).value || 'starttls',
         check_interval_minutes: parseInt((document.getElementById('ai-check-interval') || {}).value) || 60,
     };
+
+    // Show an in-progress modal IMMEDIATELY so the operator knows
+    // something is happening — KO4BSR's report was that they got
+    // nothing for 30+ seconds before the failure modal appeared.
+    var dlg = document.createElement('div');
+    dlg.id = 'ai-test-modal';
+    dlg.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.55);z-index:10000;display:flex;align-items:center;justify-content:center;font-family:inherit;';
+    dlg.innerHTML = `
+        <div style="background:var(--bg-card,#1e2028);border:1px solid var(--border-color,#2d2f3a);border-radius:12px;padding:24px;width:480px;max-width:90vw;box-shadow:0 12px 40px rgba(0,0,0,0.6);">
+            <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px;">
+                <div id="ai-test-spinner" style="width:18px;height:18px;border:2px solid rgba(255,255,255,0.18);border-top-color:#3b82f6;border-radius:50%;animation:ai-test-spin 0.8s linear infinite;"></div>
+                <div id="ai-test-title" style="font-size:15px;font-weight:600;color:var(--text-primary);">Testing AI connection…</div>
+            </div>
+            <div id="ai-test-step" style="font-size:13px;color:var(--text-secondary);line-height:1.5;">Saving settings…</div>
+            <div id="ai-test-detail" style="margin-top:14px;font-size:12px;color:var(--text-muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;word-break:break-all;"></div>
+            <div style="text-align:right;margin-top:18px;">
+                <button id="ai-test-close" class="btn btn-sm" style="display:none;">Close</button>
+            </div>
+        </div>
+        <style>@keyframes ai-test-spin{to{transform:rotate(360deg);}}</style>
+    `;
+    document.body.appendChild(dlg);
+
+    var stepEl = dlg.querySelector('#ai-test-step');
+    var titleEl = dlg.querySelector('#ai-test-title');
+    var detailEl = dlg.querySelector('#ai-test-detail');
+    var spinnerEl = dlg.querySelector('#ai-test-spinner');
+    var closeBtn = dlg.querySelector('#ai-test-close');
+    var finish = function(ok, title, body) {
+        spinnerEl.style.display = 'none';
+        titleEl.textContent = title;
+        titleEl.style.color = ok ? '#22c55e' : '#ef4444';
+        stepEl.style.display = 'none';
+        detailEl.textContent = body;
+        closeBtn.style.display = '';
+        closeBtn.onclick = function() { dlg.remove(); };
+    };
+
     try {
-        // Save first
         await fetch('/api/ai/config', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(config)
         });
-        // Now test
-        var resp = await fetch('/api/ai/chat', {
+
+        stepEl.textContent = 'Sending a 150-byte ping to ' + (config.provider === 'local' ? config.local_url : config.provider) + '…';
+
+        var resp = await fetch('/api/ai/test-connection', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ message: 'Say "Hello! AI Agent is working." in one short sentence.' })
         });
         var data = await resp.json();
-        if (data.error) {
-            showModal('AI Error: ' + data.error);
+
+        if (data.ok) {
+            finish(true, '✅ AI connection successful',
+                'Provider: ' + (data.provider || '?')
+                + '\nModel:    ' + (data.model || '?')
+                + '\nURL:      ' + (data.url || '?')
+                + '\nElapsed:  ' + (data.elapsed_ms || 0) + ' ms'
+                + '\nReply:    ' + (data.reply || '').slice(0, 200)
+            );
         } else {
-            showModal('✅ AI responded: ' + (data.response || '').substring(0, 200));
+            var stageMap = {
+                config:  'Configuration error',
+                request: 'Request failed',
+                timeout: 'Request timed out',
+            };
+            finish(false, '❌ ' + (stageMap[data.stage] || 'Test failed'),
+                'Provider: ' + (data.provider || '?')
+                + '\nModel:    ' + (data.model || '?')
+                + '\nURL:      ' + (data.url || '?')
+                + '\nElapsed:  ' + (data.elapsed_ms || 0) + ' ms'
+                + '\n\n' + (data.error || 'No error message returned')
+            );
         }
     } catch (e) {
-        showModal('Connection failed: ' + e.message);
+        finish(false, '❌ Test failed', 'Browser-side error: ' + (e.message || String(e)));
     }
 }
 

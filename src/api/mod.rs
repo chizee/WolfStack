@@ -7752,6 +7752,86 @@ pub async fn ai_test_email(
     }
 }
 
+/// POST /api/ai/test-connection — lightweight reachability probe for
+/// the configured AI provider. Sends a tiny chat completion (no tools,
+/// max_tokens=8, "ping") with a 15s outer timeout and 5s connect
+/// timeout. Returns timing breakdown + structured error so the
+/// "Test Connection" UI can show what actually failed.
+///
+/// Distinct from /api/ai/chat — that path loads the full system
+/// prompt and 8 tool schemas (~13 KB request body), which is enough
+/// to trip path-MTU black holes on misconfigured LANs. KO4BSR's
+/// reproduction. The test endpoint sends ~150 bytes so the URL/auth
+/// path is exercised without the body-size dependency.
+pub async fn ai_test_connection(
+    req: HttpRequest, state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+
+    let config = state.ai_agent.config.lock().unwrap().clone();
+    if !config.is_configured() {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "ok": false,
+            "stage": "config",
+            "error": "AI not configured — set provider/key in Settings → AI Agent",
+        }));
+    }
+
+    let provider = config.provider.clone();
+    let url_for_log = match provider.as_str() {
+        "local" => config.local_url.clone(),
+        "openai" => "https://api.openai.com/v1".to_string(),
+        "openrouter" => "https://openrouter.ai/api/v1".to_string(),
+        "gemini" => format!("https://generativelanguage.googleapis.com/.../{}:generateContent", config.model),
+        _ => "https://api.anthropic.com/v1/messages".to_string(),
+    };
+
+    let started = std::time::Instant::now();
+    // Reuse simple_chat — it picks the right provider call. The system
+    // prompt and history we pass are intentionally minimal so the
+    // request body stays small (~150 bytes for local, similar for
+    // hosted providers).
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        crate::ai::simple_chat(&config, "You are a connectivity test. Reply with the single word: OK", &[], "ping"),
+    ).await;
+    let elapsed_ms = started.elapsed().as_millis();
+
+    match result {
+        Ok(Ok(reply)) => HttpResponse::Ok().json(serde_json::json!({
+            "ok": true,
+            "provider": provider,
+            "url": url_for_log,
+            "model": config.model,
+            "elapsed_ms": elapsed_ms,
+            "reply": reply.chars().take(200).collect::<String>(),
+        })),
+        Ok(Err(e)) => HttpResponse::Ok().json(serde_json::json!({
+            "ok": false,
+            "stage": "request",
+            "provider": provider,
+            "url": url_for_log,
+            "model": config.model,
+            "elapsed_ms": elapsed_ms,
+            "error": e,
+        })),
+        Err(_) => HttpResponse::Ok().json(serde_json::json!({
+            "ok": false,
+            "stage": "timeout",
+            "provider": provider,
+            "url": url_for_log,
+            "model": config.model,
+            "elapsed_ms": elapsed_ms,
+            "error": format!(
+                "Test request did not complete within 15 seconds. \
+                 The host may be unreachable, blocked by a firewall, or behind a path-MTU black hole. \
+                 Try `curl -v {}` from this machine to diagnose.",
+                url_for_log
+            ),
+        })),
+    }
+}
+
 /// GET /api/ai/suppress?p=<phrase>&t=<token> — one-click suppress
 /// from an alert email. Session-free: the HMAC token is the auth.
 /// Adds the phrase to accepted_risks and returns a minimal HTML page
@@ -21890,6 +21970,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/ai/action/exec", web::post().to(ai_action_exec))
         .route("/api/ai/config/sync", web::post().to(ai_sync_config))
         .route("/api/ai/test-email", web::post().to(ai_test_email))
+        .route("/api/ai/test-connection", web::post().to(ai_test_connection))
         .route("/api/ai/suppress", web::get().to(ai_suppress_link))
         .route("/api/ai/accepted-risks", web::get().to(ai_accepted_risks_get))
         .route("/api/ai/accepted-risks", web::post().to(ai_accepted_risks_save))
