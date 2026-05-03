@@ -17658,15 +17658,27 @@ pub async fn predictive_proposal_command(
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let (id, idx) = path.into_inner();
 
-    let store = match state.predictive_proposals.read() {
-        Ok(g) => g,
-        Err(e) => e.into_inner(),
+    // 1. Try local store.
+    let local_p: Option<crate::predictive::Proposal> = {
+        let store = state.predictive_proposals.read()
+            .unwrap_or_else(|e| e.into_inner());
+        store.get(&id).cloned()
     };
-    let Some(p) = store.get(&id) else {
-        return HttpResponse::NotFound().json(serde_json::json!({
-            "error": "proposal not found",
-        }));
+
+    // 2. If not local, fan out to online peers — the Inbox aggregates
+    //    proposals from every cluster node, so the operator can click
+    //    Run on a finding that lives on a peer. The local store on
+    //    THIS node won't have it; fetch via X-WolfStack-Secret.
+    let p = match local_p {
+        Some(p) => p,
+        None => match fetch_proposal_from_peers(&id, &state).await {
+            Some(p) => p,
+            None => return HttpResponse::NotFound().json(serde_json::json!({
+                "error": "proposal not found",
+            })),
+        },
     };
+
     let cmds = match &p.remediation {
         crate::predictive::RemediationPlan::Manual { commands, .. } => commands,
         _ => return HttpResponse::BadRequest().json(serde_json::json!({
@@ -17685,13 +17697,14 @@ pub async fn predictive_proposal_command(
     // postgres; `lxc:web` → lxc-attach; `vm:opnsense:...` → VM
     // serial console; everything else → host shell on the node the
     // finding lives on.
-    let (console_type, console_name) = resolve_console_target(p);
+    let (console_type, console_name) = resolve_console_target(&p);
 
     // Cross-node: if the finding is on a peer (scope.node_id !=
-    // this server's node_id), surface the peer's locally-assigned
-    // cluster-key id so console.html can use the existing
-    // remote-console proxy. Console.html accepts both peer.id and
-    // peer.self_id via `cluster.get_node`'s fallback scan.
+    // this server's node_id), surface the peer's id so console.html
+    // can use the existing remote-console proxy. `cluster.get_node`
+    // accepts both the locally-assigned cluster key and the peer's
+    // self_id, so passing scope.node_id (the self_id stamped by the
+    // originating analyzer) resolves correctly on either path.
     let remote_node_id: Option<String> = if p.scope.node_id != state.node_id {
         Some(p.scope.node_id.clone())
     } else {
@@ -17705,6 +17718,42 @@ pub async fn predictive_proposal_command(
         "remote_node_id": remote_node_id,
         "title": p.title,
     }))
+}
+
+/// Look for a proposal on every online wolfstack peer. Returns the
+/// first 200 response. Used as a fallback in `predictive_proposal_command`
+/// when the proposal id isn't in this node's local store — i.e. the
+/// finding lives on a peer and the operator clicked Run from the
+/// aggregated cluster Inbox.
+async fn fetch_proposal_from_peers(
+    id: &str,
+    state: &web::Data<AppState>,
+) -> Option<crate::predictive::Proposal> {
+    let peers: Vec<_> = state.cluster.get_all_nodes()
+        .into_iter()
+        .filter(|n| !n.is_self && n.node_type == "wolfstack" && n.online)
+        .collect();
+    if peers.is_empty() { return None; }
+
+    let secret = state.cluster_secret.clone();
+    let client = &*API_HTTP_CLIENT;
+    let path = format!("/api/proposals/{}", urlencoding::encode(id));
+
+    for peer in peers {
+        for url in build_node_urls(&peer.address, peer.port, &path) {
+            let res = client.get(&url)
+                .timeout(std::time::Duration::from_secs(5))
+                .header("X-WolfStack-Secret", &secret)
+                .send()
+                .await;
+            let Ok(resp) = res else { continue };
+            if !resp.status().is_success() { let _ = resp.bytes().await; continue; }
+            if let Ok(p) = resp.json::<crate::predictive::Proposal>().await {
+                return Some(p);
+            }
+        }
+    }
+    None
 }
 
 /// Map a proposal's `scope.resource_id` to a `(console_type,
