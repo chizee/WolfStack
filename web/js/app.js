@@ -48320,19 +48320,39 @@ function predTermOpen(proposalId, meta) {
     if (closeBtn) closeBtn.style.display = '';
 }
 
-/// Pin #page-inbox's pixel height to .main-content's clientHeight,
-/// re-syncing on window resize and on layout shifts inside
-/// .main-content (sidebar collapse, theme switch, task-log toggle).
-/// Without this, percentage heights inside #page-inbox don't resolve
-/// because .main-content uses min-height/max-height, not height.
+/// Pin #page-inbox's pixel height to the actual space available
+/// inside `.main-content` BELOW the sticky top-bar (and any other
+/// preceding sibling), re-syncing on window resize and on layout
+/// shifts inside `.main-content` (sidebar collapse, theme switch,
+/// task-log toggle).
+///
+/// Why measure dynamically: `.main-content` uses min-height /
+/// max-height (not height), so percentage heights on children
+/// resolve to `auto`. AND its first child is `<header class="top-bar">`,
+/// which is in normal flow — naive `clientHeight` includes that
+/// header's footprint, so sizing #page-inbox to clientHeight pushes
+/// the terminal pane below the viewport bottom by the header's
+/// height. Computing the remaining space relative to inbox's actual
+/// top edge handles both issues at once and adapts to theme tweaks
+/// of the top-bar.
 function predictiveSetupHeightSync(inbox) {
     const main = document.querySelector('.main-content');
     if (!main) return;
     const apply = () => {
-        // clientHeight excludes scrollbars/borders, which is what
-        // we want — we're sizing INTO the visible area.
-        const h = main.clientHeight;
-        if (h > 0) inbox.style.height = h + 'px';
+        // Reset any previous height so we measure inbox's natural
+        // top position (its top is determined by what's above it,
+        // not by its own height — but resetting first eliminates
+        // any cached value affecting subsequent measurements).
+        inbox.style.height = '';
+        const mainRect  = main.getBoundingClientRect();
+        const inboxRect = inbox.getBoundingClientRect();
+        // Distance from inbox's top to main's content bottom.
+        // main.clientHeight excludes any horizontal scrollbar but
+        // not borders; mainRect.top + clientHeight is the bottom
+        // edge of the content area.
+        const inboxTopWithinMain = inboxRect.top - mainRect.top;
+        const h = Math.max(200, main.clientHeight - inboxTopWithinMain);
+        inbox.style.height = h + 'px';
     };
     apply();
     // Re-apply on a future paint to catch the case where this fires
