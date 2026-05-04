@@ -47722,54 +47722,62 @@ function renderPredictiveInbox() {
                         <button class="btn btn-sm" onclick="predictiveRunNow()" id="predictive-run-now">🔄 Run analyzer now</button>
                     </div>
                 </div>
-                <div class="predictive-split" style="display:grid;grid-template-columns:minmax(0,1fr) minmax(0,560px);gap:16px;align-items:start;">
-                    <div id="predictive-list" style="min-width:0;">
+                <div class="predictive-split" style="display:grid;grid-template-columns:minmax(0,1fr) minmax(0,560px);gap:16px;align-items:stretch;height:calc(100vh - 200px);min-height:480px;">
+                    <div id="predictive-list" style="min-width:0;overflow-y:auto;padding-right:6px;">
                         <div style="color:var(--text-muted);padding:40px;text-align:center;">Loading…</div>
                     </div>
-                    <div id="predictive-terminal-pane" style="position:sticky;top:16px;background:var(--bg-card,#1e2028);border:1px solid var(--border,#2d2f3a);border-radius:10px;overflow:hidden;display:flex;flex-direction:column;height:calc(100vh - 160px);min-height:400px;">
-                        <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid var(--border,#2d2f3a);background:var(--bg-secondary,#16181f);">
-                            <div style="display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600;">
-                                <span style="font-size:16px;">💻</span>
-                                <span id="predictive-term-status" style="color:var(--text-muted);">No active terminal</span>
+                    <div id="predictive-terminal-pane" style="background:var(--bg-card,#1e2028);border:1px solid var(--border,#2d2f3a);border-radius:10px;overflow:hidden;display:flex;flex-direction:column;min-height:0;">
+                        <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid var(--border,#2d2f3a);background:var(--bg-secondary,#16181f);flex-shrink:0;">
+                            <div style="display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600;min-width:0;">
+                                <span id="predictive-term-spinner" style="display:none;width:14px;height:14px;border:2px solid rgba(96,165,250,0.25);border-top-color:#60a5fa;border-radius:50%;animation:predTermSpin 0.7s linear infinite;flex-shrink:0;"></span>
+                                <span id="predictive-term-icon" style="font-size:16px;flex-shrink:0;">💻</span>
+                                <span id="predictive-term-status" style="color:var(--text-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">No active terminal</span>
                             </div>
-                            <button class="btn btn-sm" onclick="predTermClose()" id="predictive-term-close" style="display:none;font-size:11px;padding:2px 8px;">✕ Close</button>
+                            <button class="btn btn-sm" onclick="predTermClose()" id="predictive-term-close" style="display:none;font-size:11px;padding:2px 8px;flex-shrink:0;">✕ Close</button>
                         </div>
-                        <div id="predictive-term-container" style="flex:1;background:#0a0a0a;padding:8px;overflow:hidden;">
+                        <div id="predictive-term-container" style="flex:1;background:#0a0a0a;padding:8px;overflow:hidden;min-height:0;">
                             <div style="color:var(--text-muted);padding:24px;text-align:center;font-size:13px;line-height:1.6;">
-                                Click <strong>▶ Run</strong> on a remediation command to open a terminal here.<br>
-                                <span style="font-size:11px;opacity:0.7;">Multiple commands from the same proposal share the session — no more 3-popup workflows.</span>
+                                Click <strong>▶ Run</strong> or <strong>💻 Open terminal</strong> on a proposal.<br>
+                                <span style="font-size:11px;opacity:0.7;">Multiple commands on the same proposal share the session — no more 3-popup workflows.</span>
                             </div>
                         </div>
                     </div>
                 </div>
                 <style>
-                    /* Tablet / small laptop — stack to a single column.
-                       The terminal becomes a fixed-height pane below
-                       the list; sticky positioning is dropped because
-                       sticky inside a stacked layout glues it to the
-                       top of its now-vertical sibling and hides
-                       proposals behind it. */
-                    @media (max-width: 1100px) {
-                        .predictive-split { grid-template-columns: 1fr !important; }
-                        #predictive-terminal-pane { position: static !important; height: 380px !important; }
+                    @keyframes predTermSpin {
+                        from { transform: rotate(0deg); }
+                        to   { transform: rotate(360deg); }
                     }
-                    /* Phone — tighten outer padding so the proposal
-                       cards aren't pinched, give the terminal a bit
-                       less height so the user can still see at least
-                       one proposal above it without scrolling. */
+                    /* Tablet / small laptop — stack to one column. The
+                       fixed split-grid height becomes a sum of the
+                       list's max-height and the terminal's height so
+                       neither overlaps the other. */
+                    @media (max-width: 1100px) {
+                        .predictive-split {
+                            grid-template-columns: 1fr !important;
+                            height: auto !important;
+                        }
+                        #predictive-list {
+                            max-height: 60vh;
+                        }
+                        #predictive-terminal-pane { height: 380px !important; }
+                    }
+                    /* Phone — tighter outer padding, shorter terminal
+                       so at least one proposal stays visible above it
+                       without scrolling. */
                     @media (max-width: 640px) {
                         .predictive-shell { padding: 12px !important; }
-                        #predictive-terminal-pane { height: 300px !important; }
                         .predictive-split { gap: 12px !important; }
+                        #predictive-list { max-height: 55vh; }
+                        #predictive-terminal-pane { height: 300px !important; }
                         /* xterm uses fixed font sizing — drop one
-                           notch on phones so a typical 80-col line
-                           doesn't horizontally overflow the pane. */
+                           notch on phones so an 80-col line fits the
+                           pane width. */
                         #predictive-term-container .xterm,
                         #predictive-term-container .xterm-viewport,
                         #predictive-term-container .xterm-screen { font-size: 11px !important; }
                     }
-                    /* Touch-target sizing for the Close button on
-                       coarse pointers. */
+                    /* Touch-target sizing for the Close button. */
                     @media (pointer: coarse) {
                         #predictive-term-close { min-height: 36px; min-width: 60px; }
                     }
@@ -48180,13 +48188,14 @@ async function predictiveRunCmd(proposalId, cmdIdx) {
         return;
     }
 
-    // Different proposal already running → confirm before tearing
-    // down. Avoids killing an in-progress session by accident.
+    // Different proposal already running → just switch. A toast is
+    // less interruptive than a modal for what's a non-destructive
+    // action (the previous shell only had non-destructive commands
+    // run in it; the operator can re-open it via Run on its proposal
+    // again).
     if (predTermState.proposalId && predTermState.proposalId !== proposalId) {
-        const ok = await confirmModal(
-            'Switch the embedded terminal to a different proposal? The current shell will be closed.'
-        );
-        if (!ok) return;
+        const where = meta.node_hostname || meta.console_name || 'target';
+        showToast(`Switching terminal to ${where}`, 'info', 1800);
     }
 
     predTermClose();
@@ -48229,10 +48238,21 @@ function predTermOpen(proposalId, meta) {
         ? `${protocol}//${window.location.host}/ws/remote-console/${encodeURIComponent(meta.remote_node_id)}/${encodeURIComponent(meta.console_type)}/${encodeURIComponent(meta.console_name)}`
         : `${protocol}//${window.location.host}/ws/console/${encodeURIComponent(meta.console_type)}/${encodeURIComponent(meta.console_name)}`;
 
-    term.writeln(`\x1b[90m● Connecting to ${meta.console_type} on ${meta.console_name}…\x1b[0m`);
+    // Show the spinner (and hide the static 💻 icon) while the WS
+    // negotiates — for a remote-console hop through the cluster
+    // proxy this can take a noticeable second on a slow link.
+    const spinner = document.getElementById('predictive-term-spinner');
+    const icon    = document.getElementById('predictive-term-icon');
+    if (spinner) spinner.style.display = '';
+    if (icon)    icon.style.display    = 'none';
+
+    const where = meta.node_hostname || meta.console_name;
+    term.writeln(`\x1b[90m● Connecting to ${meta.console_type} on ${where}…\x1b[0m`);
     const ws = new WebSocket(wsUrl);
     ws.binaryType = 'arraybuffer';
     ws.onopen = () => {
+        if (spinner) spinner.style.display = 'none';
+        if (icon)    icon.style.display    = '';
         term.writeln('\x1b[32m● Connected\x1b[0m');
         // Auto-run the requested remediation command if one was
         // supplied. Empty meta.command (e.g. from the "Open terminal"
@@ -48250,9 +48270,13 @@ function predTermOpen(proposalId, meta) {
         else term.write(new Uint8Array(event.data));
     };
     ws.onclose = () => {
+        if (spinner) spinner.style.display = 'none';
+        if (icon)    icon.style.display    = '';
         term.writeln('\r\n\x1b[31m● Disconnected\x1b[0m');
     };
     ws.onerror = () => {
+        if (spinner) spinner.style.display = 'none';
+        if (icon)    icon.style.display    = '';
         term.writeln('\r\n\x1b[31m● Connection error — check the target node is online and try again.\x1b[0m');
     };
     term.onData(d => { if (ws.readyState === WebSocket.OPEN) ws.send(d); });
@@ -48269,8 +48293,13 @@ function predTermOpen(proposalId, meta) {
 
     const status = document.getElementById('predictive-term-status');
     if (status) {
-        const where = isRemote ? `peer ${meta.console_name}` : meta.console_name;
-        status.textContent = `${meta.title || 'proposal'} → ${where}`;
+        // Prefer the friendly hostname the backend looked up; fall
+        // back to console_name only if it's missing (older WolfStack
+        // peer that doesn't yet return node_hostname).
+        const host = meta.node_hostname || meta.console_name;
+        const ctx  = meta.console_type === 'host' ? host
+                  : `${meta.console_type}: ${meta.console_name} on ${host}`;
+        status.textContent = `${meta.title || 'proposal'} → ${ctx}`;
         status.style.color = '';
     }
     const closeBtn = document.getElementById('predictive-term-close');
@@ -48311,10 +48340,8 @@ async function predictiveOpenTerm(proposalId) {
         return;
     }
     if (predTermState.proposalId && predTermState.proposalId !== proposalId) {
-        const ok = await confirmModal(
-            'Switch the embedded terminal to this proposal\'s target? The current shell will be closed.'
-        );
-        if (!ok) return;
+        const where = meta.node_hostname || meta.console_name || 'target';
+        showToast(`Switching terminal to ${where}`, 'info', 1800);
     }
     predTermClose();
     // Empty `command` so predTermOpen doesn't auto-send anything.
@@ -48343,6 +48370,10 @@ function predTermClose() {
         status.textContent = 'No active terminal';
         status.style.color = 'var(--text-muted)';
     }
+    const spinner = document.getElementById('predictive-term-spinner');
+    const icon    = document.getElementById('predictive-term-icon');
+    if (spinner) spinner.style.display = 'none';
+    if (icon)    icon.style.display    = '';
     const closeBtn = document.getElementById('predictive-term-close');
     if (closeBtn) closeBtn.style.display = 'none';
     const container = document.getElementById('predictive-term-container');

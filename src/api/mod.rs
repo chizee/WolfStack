@@ -17999,13 +17999,40 @@ pub async fn predictive_proposal_command(
         None
     };
 
+    // Friendly hostname for the UI — `console_name` for `host`
+    // targets is the literal string "host" (the resolver returns
+    // it that way so the WS path is `/ws/console/host/host`), not
+    // a hostname the operator would recognise. Look up the actual
+    // node and prefer its hostname; fall back to the node id only
+    // if cluster state hasn't seen the node yet.
+    let node_hostname = resolve_node_hostname(&state, &p.scope.node_id);
+
     HttpResponse::Ok().json(serde_json::json!({
         "command": command,
         "console_type": console_type,
         "console_name": console_name,
         "remote_node_id": remote_node_id,
+        "node_hostname": node_hostname,
         "title": p.title,
     }))
+}
+
+/// Resolve a proposal's `scope.node_id` to a human-readable hostname
+/// for status displays. Tries the cluster's node table first, then
+/// falls back to the local node's own hostname when the id matches
+/// `state.node_id` (covers the case where this node hasn't been
+/// surfaced via `get_node` yet — e.g. very early in startup).
+/// Returns `node_id` verbatim only as a last resort.
+fn resolve_node_hostname(state: &web::Data<AppState>, node_id: &str) -> String {
+    if let Some(n) = state.cluster.get_node(node_id) {
+        if !n.hostname.is_empty() { return n.hostname; }
+    }
+    if node_id == state.node_id {
+        if let Some(n) = state.cluster.get_all_nodes().into_iter().find(|n| n.is_self) {
+            if !n.hostname.is_empty() { return n.hostname; }
+        }
+    }
+    node_id.to_string()
 }
 
 /// GET /api/proposals/{id}/console-target — return just the
@@ -18047,11 +18074,13 @@ pub async fn predictive_proposal_console_target(
     } else {
         None
     };
+    let node_hostname = resolve_node_hostname(&state, &p.scope.node_id);
 
     HttpResponse::Ok().json(serde_json::json!({
         "console_type": console_type,
         "console_name": console_name,
         "remote_node_id": remote_node_id,
+        "node_hostname": node_hostname,
         "title": p.title,
     }))
 }
