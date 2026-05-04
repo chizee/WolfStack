@@ -22002,6 +22002,11 @@ pub async fn gateways_delete(req: HttpRequest, state: web::Data<AppState>, path:
             tracing::warn!(target: "wolfstack::gateway", "save after delete failed: {}", e);
         }
     }
+    // After delete persists, prune any tdbsam users that no
+    // remaining gateway still references. Must run AFTER save —
+    // reconcile_managed_users reads gateways.json from disk to
+    // compute the active-users set.
+    crate::gateway::samba::reconcile_managed_users();
     invalidate_gateway_cluster_cache(&state);
     push_to_peers(&state).await;
     HttpResponse::Ok().json(serde_json::json!({ "deleted": id }))
@@ -22797,6 +22802,9 @@ async fn apply_and_persist(state: &web::Data<AppState>, g: crate::gateway::Gatew
         }
     };
     invalidate_gateway_cluster_cache(state);
+    // Post-persist orphan-user prune — must run after the new
+    // gateway is on disk so the active-users set is current.
+    crate::gateway::samba::reconcile_managed_users();
     push_to_peers(state).await;
     let s = state.gateways.read().unwrap_or_else(|e| e.into_inner());
     HttpResponse::Ok().json(gateway_to_json(&stored, &s))

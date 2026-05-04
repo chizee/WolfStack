@@ -265,6 +265,7 @@ pub fn parse_mdstat(content: &str, backend_label: &str) -> Vec<Array> {
                 }
                 if t.contains("recovery") { state_refined = "recovering".into(); }
                 else if t.contains("check") { state_refined = "checking".into(); }
+                else if t.contains("reshape") { state_refined = "reshaping".into(); }
                 else if t.contains("resync") { state_refined = "resyncing".into(); }
             }
             lines.next();
@@ -828,6 +829,30 @@ mod tests {
         let arrays = parse_mdstat(sample, "mdadm");
         assert_eq!(arrays[0].disks.len(), 2);
         assert_eq!(arrays[0].disks[0].device, "/dev/nvme0n1p1");
+    }
+
+    #[test]
+    fn parse_mdstat_reshape_in_progress_maps_to_reshaping_state() {
+        // Reshape is a real mdadm state (e.g. RAID5 → RAID6 grow).
+        // Must map to "reshaping" not the catch-all "resyncing".
+        let sample = "md0 : active raid5 sda1[0] sdb1[1] sdc1[2] sdd1[3]\n      \
+            5860528128 blocks super 1.2 level 5, 64k chunk, algorithm 2 [4/4] [UUUU]\n      \
+            [==>..................]  reshape = 11.4% (333912448/2930264064) finish=156.4min speed=276544K/sec\n\n";
+        let arrays = parse_mdstat(sample, "mdadm");
+        assert_eq!(arrays[0].state, "reshaping");
+        assert_eq!(arrays[0].sync_progress, Some(11));
+    }
+
+    #[test]
+    fn parse_mdstat_auto_read_only_annotation() {
+        // Kernel marks newly-assembled arrays as `(auto-read-only)`
+        // until first write. Must skip the parens flag and pick raid1
+        // as the level.
+        let sample = "md0 : active (auto-read-only) raid1 sda1[0] sdb1[1]\n      \
+            1953382464 blocks super 1.2 [2/2] [UU]\n\n";
+        let arrays = parse_mdstat(sample, "mdadm");
+        assert_eq!(arrays[0].level, "raid1");
+        assert_eq!(arrays[0].disks.len(), 2);
     }
 
     #[test]

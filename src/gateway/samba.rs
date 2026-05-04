@@ -359,9 +359,10 @@ fn reload_smbd() -> Result<(), SambaError> {
 }
 
 /// Ensure UNIX users exist for every SMB user named in the auth
-/// config. Passwords are NOT set here — the operator sets them via
-/// the dedicated /users/{name}/password endpoint, which pipes
-/// plaintext straight into smbpasswd (never persisted by WolfStack).
+/// config, AND record them as wolfstack-managed (so the post-persist
+/// orphan prune knows they're ours to delete later when no gateway
+/// still references them). Passwords are NOT set here — the operator
+/// sets them via the dedicated /users/{name}/password endpoint.
 fn apply_users(auth: &AuthConfig) -> Result<(), SambaError> {
     let users = match auth {
         AuthConfig::Users { users, .. } => users.clone(),
@@ -375,8 +376,67 @@ fn apply_users(auth: &AuthConfig) -> Result<(), SambaError> {
     }
     for u in &users {
         ensure_unix_user(&u.username)?;
+        wolfstack_managed_users_record(&u.username);
     }
     Ok(())
+}
+
+/// Public reconciliation entry-point — called by the API layer
+/// AFTER every gateway mutation has been persisted to disk. Reads
+/// the on-disk gateway store to compute the active user set, then
+/// removes any wolfstack-managed user that no gateway still
+/// references. Operator's pre-existing Samba users (never recorded
+/// in /var/lib/samba/wolfstack-managed-users) are left alone.
+///
+/// Called from api/mod.rs::apply_and_persist + the delete handler.
+/// Errors are logged, not propagated — the gateway config is
+/// persisted successfully, and a failed prune is a recoverable
+/// cleanup miss, not a correctness failure.
+pub fn reconcile_managed_users() {
+    if super::sources::which_helper("pdbedit").is_none() {
+        return; // can't prune without pdbedit.
+    }
+    let store = super::GatewayStore::load();
+    let mut active: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for g in store.gateways.values() {
+        if let AuthConfig::Users { users, .. } = &g.auth {
+            for u in users {
+                active.insert(u.username.clone());
+            }
+        }
+    }
+    for username in wolfstack_managed_users_load() {
+        if active.contains(&username) { continue; }
+        let _ = Command::new("pdbedit").args(["-x", "-u", &username]).status();
+        // We DON'T call `userdel` — the UNIX account may legitimately
+        // be in use elsewhere. Operator can clean it up if they want.
+        wolfstack_managed_users_remove(&username);
+    }
+}
+
+const MANAGED_USERS_PATH: &str = "/var/lib/samba/wolfstack-managed-users";
+
+fn wolfstack_managed_users_load() -> Vec<String> {
+    std::fs::read_to_string(MANAGED_USERS_PATH).ok()
+        .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+        .unwrap_or_default()
+}
+
+fn wolfstack_managed_users_record(username: &str) {
+    let mut set = wolfstack_managed_users_load();
+    if !set.iter().any(|u| u == username) {
+        set.push(username.to_string());
+        if let Some(parent) = std::path::Path::new(MANAGED_USERS_PATH).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(MANAGED_USERS_PATH, set.join("\n"));
+    }
+}
+
+fn wolfstack_managed_users_remove(username: &str) {
+    let mut set = wolfstack_managed_users_load();
+    set.retain(|u| u != username);
+    let _ = std::fs::write(MANAGED_USERS_PATH, set.join("\n"));
 }
 
 /// Set a user's SMB password. Plaintext is piped directly into
