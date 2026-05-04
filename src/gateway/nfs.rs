@@ -25,6 +25,7 @@ use super::{AuthConfig, Gateway, NfsVersion, Protocol};
 const EXPORTS_DIR: &str = "/etc/exports.d";
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum NfsError {
     NotInstalled { install_command: String, install_package: String },
     WriteFailed(String),

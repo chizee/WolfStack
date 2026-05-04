@@ -117,13 +117,16 @@ pub enum VmExportProto { Smb, Nfs, Iscsi }
 /// Mount lifecycle errors. The variants matter because the API
 /// surfaces them (`error_type`) so the UI can suggest a fix —
 /// "missing samba package", "bad credentials", "host unreachable".
+/// `install_command` and `install_package` are read by the JSON
+/// serialiser when this enum is surfaced over the API; the compiler
+/// can't see that, hence the dead-code allow.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum SourceError {
     Unsupported(&'static str),
     MissingTool { tool: String, install_command: String, install_package: String },
     MountFailed(String),
     PathInvalid(String),
-    Timeout,
     Io(std::io::Error),
 }
 
@@ -136,7 +139,6 @@ impl std::fmt::Display for SourceError {
             }
             SourceError::MountFailed(s) => write!(f, "mount failed: {}", s),
             SourceError::PathInvalid(s) => write!(f, "invalid path: {}", s),
-            SourceError::Timeout => write!(f, "operation timed out"),
             SourceError::Io(e) => write!(f, "io error: {}", e),
         }
     }
@@ -144,6 +146,35 @@ impl std::fmt::Display for SourceError {
 
 impl From<std::io::Error> for SourceError {
     fn from(e: std::io::Error) -> Self { SourceError::Io(e) }
+}
+
+/// Reject any subpath that contains `..` segments or absolute-path
+/// shenanigans. Centralised so every source validator gets the same
+/// rule. The orchestrator also re-checks at mount time as
+/// defence-in-depth — this validate-time check just makes the error
+/// happen at the right place (config save, not mount).
+fn reject_path_traversal(label: &str, subpath: Option<&String>) -> Result<(), String> {
+    let Some(sp) = subpath.filter(|s| !s.is_empty()) else { return Ok(()); };
+    if sp.contains('\0') {
+        return Err(format!("{} subpath contains a null byte", label));
+    }
+    for component in std::path::Path::new(sp.as_str()).components() {
+        use std::path::Component;
+        match component {
+            Component::ParentDir => return Err(format!(
+                "{} subpath must not contain '..' segments", label
+            )),
+            Component::RootDir | Component::Prefix(_) => {
+                // Root prefixes are stripped at mount time but rejecting
+                // them here makes the operator's intent explicit.
+                return Err(format!(
+                    "{} subpath must be relative (no leading '/' or drive prefix)", label
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Validate a Source. Returns the first concrete problem; the gateway
@@ -166,25 +197,29 @@ pub fn validate(s: &Source) -> Result<(), String> {
                 }
             }
         }
-        Source::WolfDisk { volume_id, .. } => {
+        Source::WolfDisk { volume_id, subpath } => {
             if volume_id.trim().is_empty() {
                 return Err("wolfdisk source requires volume_id".into());
             }
+            reject_path_traversal("wolfdisk", subpath.as_ref())?;
         }
-        Source::CephFs { cluster_id, fs_name, .. } => {
+        Source::CephFs { cluster_id, fs_name, subpath } => {
             if cluster_id.trim().is_empty() || fs_name.trim().is_empty() {
                 return Err("cephfs source requires cluster_id and fs_name".into());
             }
+            reject_path_traversal("cephfs", subpath.as_ref())?;
         }
-        Source::Smb { server, share, .. } => {
+        Source::Smb { server, share, subpath, .. } => {
             if server.trim().is_empty() || share.trim().is_empty() {
                 return Err("smb source requires server and share".into());
             }
+            reject_path_traversal("smb", subpath.as_ref())?;
         }
-        Source::Nfs { server, export, .. } => {
+        Source::Nfs { server, export, subpath, .. } => {
             if server.trim().is_empty() || export.trim().is_empty() {
                 return Err("nfs source requires server and export".into());
             }
+            reject_path_traversal("nfs", subpath.as_ref())?;
         }
         // v1.1+ stubs — config-valid but mount returns Unsupported
         Source::Sshfs { .. } | Source::S3Rclone { .. } | Source::ContainerVol { .. }
@@ -236,17 +271,10 @@ pub fn mount(gateway_id: &str, idx: usize, source: &Source) -> Result<PathBuf, S
             // We bind a sub-mount from there so unmounting our gateway
             // doesn't disturb the underlying volume mount.
             let wolfdisk_root = wolfdisk_volume_path(volume_id)?;
-            let target = match subpath {
-                Some(sp) => wolfdisk_root.join(sp.trim_start_matches('/')),
-                None => wolfdisk_root,
+            let target = match subpath.as_deref() {
+                Some(sp) if !sp.is_empty() => safe_join(&wolfdisk_root, sp)?,
+                _ => wolfdisk_root,
             };
-            if !target.exists() {
-                return Err(SourceError::PathInvalid(format!(
-                    "wolfdisk volume '{}' subpath '{}' does not exist",
-                    volume_id,
-                    subpath.as_deref().unwrap_or("/")
-                )));
-            }
             if !is_mounted(&mount_dir) {
                 run_mount(&["mount", "--bind", &target.to_string_lossy(), &mount_dir.to_string_lossy()])?;
             }
@@ -299,13 +327,7 @@ pub fn mount(gateway_id: &str, idx: usize, source: &Source) -> Result<PathBuf, S
             // points only at that subtree — cleanest way to honour
             // subpath without re-mounting CIFS for every change.
             if let Some(sp) = subpath.as_deref().filter(|s| !s.is_empty()) {
-                let target = mount_dir.join(sp.trim_start_matches('/'));
-                if !target.exists() {
-                    return Err(SourceError::PathInvalid(format!(
-                        "smb subpath '{}' does not exist on the share",
-                        sp
-                    )));
-                }
+                let target = safe_join(&mount_dir, sp)?;
                 Ok(target)
             } else {
                 Ok(mount_dir)
@@ -326,7 +348,7 @@ pub fn mount(gateway_id: &str, idx: usize, source: &Source) -> Result<PathBuf, S
                 ])?;
             }
             if let Some(sp) = subpath.as_deref().filter(|s| !s.is_empty()) {
-                Ok(mount_dir.join(sp.trim_start_matches('/')))
+                safe_join(&mount_dir, sp)
             } else {
                 Ok(mount_dir)
             }
@@ -353,9 +375,44 @@ pub fn unmount(gateway_id: &str, idx: usize, _source: &Source) -> Result<(), Sou
 }
 
 /// Cheap health check — does the mount root still respond to stat?
+#[allow(dead_code)]
 pub fn health_check(gateway_id: &str, idx: usize) -> bool {
     let p = source_mount_path(gateway_id, idx);
     std::fs::metadata(&p).is_ok()
+}
+
+/// Safely join `subpath` to `base`, refusing any result that escapes
+/// `base` after canonicalisation. Defence-in-depth — `validate()`
+/// already rejects `..` segments at config-save time, but this catches
+/// symlink tricks (a user-controlled subpath that happens to traverse
+/// a symlink in the source pointing outside the mount root). Returns
+/// `PathInvalid` on any escape.
+pub fn safe_join(base: &Path, subpath: &str) -> Result<PathBuf, SourceError> {
+    let trimmed = subpath.trim_start_matches('/');
+    if trimmed.is_empty() {
+        return Ok(base.to_path_buf());
+    }
+    // Reject ".." early — even though validate() blocked it, an older
+    // config file might have slipped through.
+    for component in std::path::Path::new(trimmed).components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err(SourceError::PathInvalid(format!(
+                "subpath '{}' contains a '..' segment", subpath
+            )));
+        }
+    }
+    let candidate = base.join(trimmed);
+    // Canonicalise both sides so symlink traversal can't escape.
+    let base_real = base.canonicalize()
+        .map_err(|e| SourceError::PathInvalid(format!("base '{}' canonicalise failed: {}", base.display(), e)))?;
+    let cand_real = candidate.canonicalize()
+        .map_err(|e| SourceError::PathInvalid(format!("subpath '{}' does not resolve under '{}': {}", subpath, base.display(), e)))?;
+    if !cand_real.starts_with(&base_real) {
+        return Err(SourceError::PathInvalid(format!(
+            "subpath '{}' escapes the source mount root", subpath
+        )));
+    }
+    Ok(cand_real)
 }
 
 // ─── Helpers ───
@@ -541,6 +598,7 @@ fn ceph_mon_addrs() -> Result<String, SourceError> {
 
 /// Surfaces the source list to the wizard. Each source describes
 /// itself for the "discover sources" picker.
+#[allow(dead_code)]
 pub fn describe(s: &Source) -> serde_json::Value {
     use Source::*;
     match s {
@@ -568,5 +626,94 @@ pub fn describe(s: &Source) -> serde_json::Value {
             "type": "unsupported",
             "label": "Unsupported (reserved for a future release)",
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmpdir() -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("wolfstack-gw-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn safe_join_accepts_legit_subpath() {
+        let base = tmpdir();
+        std::fs::create_dir_all(base.join("ok")).unwrap();
+        let result = safe_join(&base, "ok").expect("legit subpath");
+        assert!(result.starts_with(&base.canonicalize().unwrap()));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn safe_join_rejects_double_dot_traversal() {
+        let base = tmpdir();
+        let r = safe_join(&base, "../etc");
+        assert!(r.is_err(), "expected escape rejection");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn safe_join_rejects_symlink_escape() {
+        // Symlink trick: a directory inside the base that points outside.
+        // safe_join's canonicalize step must catch this.
+        let base = tmpdir();
+        let outside = std::env::temp_dir().join(format!("wolfstack-gw-outside-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let inside_link = base.join("escape");
+        let _ = std::os::unix::fs::symlink(&outside, &inside_link);
+
+        let r = safe_join(&base, "escape");
+        assert!(r.is_err(), "symlink-out should be rejected, got {:?}", r);
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn safe_join_strips_leading_slash() {
+        let base = tmpdir();
+        std::fs::create_dir_all(base.join("ok")).unwrap();
+        // "/ok" should be treated as relative "ok", not as "/ok"
+        // (which would escape the base on canonicalize).
+        let r = safe_join(&base, "/ok").expect("leading slash should be trimmed");
+        assert!(r.starts_with(&base.canonicalize().unwrap()));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn validate_smb_subpath_traversal() {
+        let bad = Source::Smb {
+            server: "x".into(), share: "y".into(),
+            subpath: Some("../escape".into()),
+            username: None, password: None, domain: None, options: None,
+        };
+        assert!(validate(&bad).is_err());
+    }
+
+    #[test]
+    fn validate_local_path_must_be_absolute() {
+        let s = Source::Local { node_id: "n".into(), path: "relative/path".into() };
+        let err = validate(&s).unwrap_err();
+        assert!(err.contains("absolute"), "{}", err);
+    }
+
+    #[test]
+    fn validate_rejects_v1_1_source_types() {
+        // Sshfs / S3Rclone / etc are config-modeled but their mount path
+        // returns Unsupported. Validate rejects them at config-save time
+        // so operators get a clear "future release" error rather than
+        // a cryptic mount failure.
+        let cases = [
+            Source::Sshfs { user: "u".into(), host: "h".into(), path: "/p".into(), port: None, key_id: None },
+            Source::S3Rclone { remote_id: "r".into(), bucket: "b".into(), prefix: None },
+            Source::Rbd { cluster_id: "c".into(), pool: "p".into(), image: "i".into(), fs: "ext4".into() },
+        ];
+        for s in cases {
+            assert!(validate(&s).is_err(), "should reject {:?}", s);
+        }
     }
 }

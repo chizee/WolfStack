@@ -48637,7 +48637,7 @@ function gwOpenWizard() {
         auth_mode: 'anonymous',
         anon_writable: false,
         users: [],
-        options: { readonly: false, guest_ok: true, time_machine: false, recycle_bin: false, allow_hosts: [] },
+        options: { readonly: false, guest_ok: true, time_machine: false, recycle_bin: false, allow_hosts: [], smb_workgroup: 'WORKGROUP' },
     };
     gwRenderWizard();
 }
@@ -48855,6 +48855,11 @@ function gwWizardStep3() {
         <input class="form-control" style="width:100%;" placeholder="Allowed CIDRs (comma-separated). Empty = anyone on the LAN."
             value="${escapeAttr((d.options.allow_hosts || []).join(', '))}"
             oninput="_gwWizardData.options.allow_hosts=this.value.split(',').map(s=>s.trim()).filter(Boolean);">
+
+        <h4 style="margin:14px 0 8px;">SMB workgroup</h4>
+        <input class="form-control" style="width:100%;" placeholder="WORKGROUP" value="${escapeAttr(d.options.smb_workgroup || 'WORKGROUP')}"
+            oninput="_gwWizardData.options.smb_workgroup=this.value || 'WORKGROUP';">
+        <small style="color:var(--text-muted);font-size:11px;display:block;margin-top:2px;">Default WORKGROUP. Override for AD-joined or non-default home networks. Applies cluster-wide on the [global] section.</small>
 
         <h4 style="margin:14px 0 8px;">Summary</h4>
         <div style="background:var(--bg-secondary);padding:12px 14px;border-radius:8px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.6;">
@@ -49084,16 +49089,58 @@ async function gwSetPasswordPrompt(gatewayId, username) {
     } catch (e) { showToast('Set password failed: ' + (e.message || String(e)), 'error'); }
 }
 
-// Lightweight modal helpers — fall back to native prompt/confirm if
-// the dashboard doesn't already expose them.
+// Modal helpers. Always use the dashboard's built-in styled modals
+// (showConfirm / showPrompt). For password input we build a small
+// type=password variant inline so the plaintext never appears
+// on-screen — showPrompt is type=text only.
 async function confirmModal(msg) {
     if (typeof window.showConfirm === 'function') return window.showConfirm(msg);
     return new Promise(resolve => resolve(window.confirm(msg)));
 }
 async function promptModal(label, initial, opts) {
-    if (typeof window.showPrompt === 'function') return window.showPrompt(label, initial, opts);
-    const v = window.prompt(label, initial || '');
-    return v;
+    if (opts && opts.type === 'password') return passwordPrompt(label);
+    if (typeof window.showPrompt === 'function') return window.showPrompt(label, '', initial || '');
+    return window.prompt(label, initial || '');
+}
+function passwordPrompt(label) {
+    return new Promise(resolve => {
+        const overlay = document.createElement('div');
+        overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);z-index:100001;display:flex;align-items:center;justify-content:center;';
+        const modal = document.createElement('div');
+        modal.style.cssText = 'background:var(--bg-card,#1e2028);border:1px solid var(--border-color,#2d2f3a);border-radius:12px;padding:24px 28px;max-width:440px;width:90%;box-shadow:0 20px 60px rgba(0,0,0,0.5);color:var(--text-primary,#e4e4e7);font-family:inherit;';
+        const h = document.createElement('div');
+        h.style.cssText = 'font-size:15px;font-weight:600;margin-bottom:14px;color:var(--accent-light,#60a5fa);';
+        h.textContent = label;
+        const input = document.createElement('input');
+        input.type = 'password';
+        input.className = 'form-control';
+        input.style.cssText = 'width:100%;box-sizing:border-box;';
+        input.autocomplete = 'new-password';
+        const hint = document.createElement('small');
+        hint.style.cssText = 'display:block;color:var(--text-muted,#a1a1aa);font-size:11px;margin-top:8px;line-height:1.5;';
+        hint.textContent = 'Plaintext is sent once over your authenticated session and piped straight into smbpasswd. WolfStack never persists it.';
+        const btnWrap = document.createElement('div');
+        btnWrap.style.cssText = 'margin-top:16px;display:flex;justify-content:flex-end;gap:8px;';
+        const cancelBtn = document.createElement('button');
+        cancelBtn.className = 'btn btn-sm';
+        cancelBtn.textContent = 'Cancel';
+        const okBtn = document.createElement('button');
+        okBtn.className = 'btn btn-sm btn-primary';
+        okBtn.textContent = 'Set password';
+        cancelBtn.onclick = () => { overlay.remove(); resolve(null); };
+        okBtn.onclick = () => { overlay.remove(); resolve(input.value); };
+        input.onkeydown = (e) => { if (e.key === 'Enter') { overlay.remove(); resolve(input.value); } };
+        overlay.onclick = (e) => { if (e.target === overlay) { overlay.remove(); resolve(null); } };
+        btnWrap.appendChild(cancelBtn);
+        btnWrap.appendChild(okBtn);
+        modal.appendChild(h);
+        modal.appendChild(input);
+        modal.appendChild(hint);
+        modal.appendChild(btnWrap);
+        overlay.appendChild(modal);
+        document.body.appendChild(overlay);
+        input.focus();
+    });
 }
 
 window.gwLoad = gwLoad;
@@ -49214,10 +49261,20 @@ async function gwFedSubmit() {
             return;
         }
         document.getElementById('gw-fed-add').remove();
-        showToast('Cluster connected: ' + name, 'success');
-        // Probe immediately so the operator sees ✓/✗ before they wait
-        // for the next round of cluster aggregation.
-        await fetch(`/api/federations/${encodeURIComponent(d.id)}/test`, { method: 'POST' });
+        // Probe immediately and surface the result before reload — the
+        // operator gets ✓/✗ feedback in the same flow rather than
+        // having to click "Test" themselves to see if it worked.
+        try {
+            const t = await fetch(`/api/federations/${encodeURIComponent(d.id)}/test`, { method: 'POST' });
+            const tr = await t.json();
+            if (tr.ok) {
+                showToast(`✓ ${name} connected (${tr.elapsed_ms}ms)`, 'success');
+            } else {
+                showToast(`⚠ ${name} added but probe failed: ${tr.error || 'unknown'}`, 'error', 6500);
+            }
+        } catch (probeErr) {
+            showToast(`Added ${name}; probe failed: ${probeErr.message || probeErr}`, 'error');
+        }
         await gwLoad();
     } catch (e) { showToast('Add failed: ' + (e.message || String(e)), 'error'); }
 }

@@ -21916,7 +21916,9 @@ pub async fn gateways_get(req: HttpRequest, state: web::Data<AppState>, path: we
     }
 }
 
-/// POST /api/gateways — create.
+/// POST /api/gateways — create. The current node becomes the owner
+/// (`origin_node_id`); every other peer holds the config but does
+/// not serve it.
 pub async fn gateways_create(req: HttpRequest, state: web::Data<AppState>, body: web::Json<GatewayCreateRequest>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let body = body.into_inner();
@@ -21928,6 +21930,7 @@ pub async fn gateways_create(req: HttpRequest, state: web::Data<AppState>, body:
         mode: body.mode,
         protocols: body.protocols,
         sources: body.sources,
+        origin_node_id: state.node_id.clone(),
         serve_nodes: body.serve_nodes,
         auth: body.auth,
         policy: crate::gateway::ModePolicy::Single,
@@ -21939,6 +21942,7 @@ pub async fn gateways_create(req: HttpRequest, state: web::Data<AppState>, body:
     if let Err(errs) = crate::gateway::validate(&g) {
         return HttpResponse::BadRequest().json(serde_json::json!({ "errors": errs }));
     }
+    gateway_audit(&state, "info", "Share created", &format!("'{}' on {}", g.name, state.node_id));
     apply_and_persist(&state, g, &id).await
 }
 
@@ -21946,15 +21950,8 @@ pub async fn gateways_create(req: HttpRequest, state: web::Data<AppState>, body:
 pub async fn gateways_update(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>, body: web::Json<GatewayCreateRequest>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let id = path.into_inner();
+    let existing = match require_owner(&state, &id) { Ok(g) => g, Err(r) => return r };
     let body = body.into_inner();
-    // Carry over created_at + disabled — caller can't change those here.
-    let (created_at, disabled) = {
-        let s = state.gateways.read().unwrap_or_else(|e| e.into_inner());
-        match s.get(&id) {
-            Some(existing) => (existing.created_at.clone(), existing.disabled),
-            None => return HttpResponse::NotFound().json(serde_json::json!({ "error": "gateway not found" })),
-        }
-    };
     let g = crate::gateway::Gateway {
         id: id.clone(),
         name: body.name,
@@ -21962,17 +21959,19 @@ pub async fn gateways_update(req: HttpRequest, state: web::Data<AppState>, path:
         mode: body.mode,
         protocols: body.protocols,
         sources: body.sources,
+        origin_node_id: existing.origin_node_id.clone(),
         serve_nodes: body.serve_nodes,
         auth: body.auth,
         policy: crate::gateway::ModePolicy::Single,
         options: body.options,
-        created_at,
+        created_at: existing.created_at.clone(),
         updated_at: String::new(),
-        disabled,
+        disabled: existing.disabled,
     };
     if let Err(errs) = crate::gateway::validate(&g) {
         return HttpResponse::BadRequest().json(serde_json::json!({ "errors": errs }));
     }
+    gateway_audit(&state, "info", "Share updated", &format!("'{}'", g.name));
     apply_and_persist(&state, g, &id).await
 }
 
@@ -21980,6 +21979,7 @@ pub async fn gateways_update(req: HttpRequest, state: web::Data<AppState>, path:
 pub async fn gateways_delete(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let id = path.into_inner();
+    if let Err(r) = require_owner(&state, &id) { return r; }
     let removed = {
         let mut s = state.gateways.write().unwrap_or_else(|e| e.into_inner());
         s.remove(&id)
@@ -21988,6 +21988,7 @@ pub async fn gateways_delete(req: HttpRequest, state: web::Data<AppState>, path:
         Some(g) => g,
         None => return HttpResponse::NotFound().json(serde_json::json!({ "error": "gateway not found" })),
     };
+    gateway_audit(&state, "warning", "Share deleted", &format!("'{}'", g.name));
     crate::gateway::orchestrator::teardown(&g);
     {
         let s = state.gateways.read().unwrap_or_else(|e| e.into_inner());
@@ -22005,10 +22006,7 @@ pub async fn gateways_delete(req: HttpRequest, state: web::Data<AppState>, path:
 pub async fn gateways_reload(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let id = path.into_inner();
-    let g = {
-        let s = state.gateways.read().unwrap_or_else(|e| e.into_inner());
-        match s.get(&id) { Some(g) => g.clone(), None => return HttpResponse::NotFound().json(serde_json::json!({ "error": "gateway not found" })) }
-    };
+    let g = match require_owner(&state, &id) { Ok(g) => g, Err(r) => return r };
     match crate::gateway::orchestrator::apply(&g) {
         Ok(rt) => {
             let mut s = state.gateways.write().unwrap_or_else(|e| e.into_inner());
@@ -22024,6 +22022,7 @@ pub async fn gateways_reload(req: HttpRequest, state: web::Data<AppState>, path:
 pub async fn gateways_disable(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let id = path.into_inner();
+    if let Err(r) = require_owner(&state, &id) { return r; }
     let g = {
         let mut s = state.gateways.write().unwrap_or_else(|e| e.into_inner());
         match s.gateways.get_mut(&id) {
@@ -22031,6 +22030,7 @@ pub async fn gateways_disable(req: HttpRequest, state: web::Data<AppState>, path
             None => return HttpResponse::NotFound().json(serde_json::json!({ "error": "gateway not found" })),
         }
     };
+    gateway_audit(&state, "info", "Share disabled", &format!("'{}'", g.name));
     crate::gateway::orchestrator::teardown(&g);
     {
         let s = state.gateways.read().unwrap_or_else(|e| e.into_inner());
@@ -22044,6 +22044,7 @@ pub async fn gateways_disable(req: HttpRequest, state: web::Data<AppState>, path
 pub async fn gateways_enable(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let id = path.into_inner();
+    if let Err(r) = require_owner(&state, &id) { return r; }
     let g = {
         let mut s = state.gateways.write().unwrap_or_else(|e| e.into_inner());
         match s.gateways.get_mut(&id) {
@@ -22051,6 +22052,7 @@ pub async fn gateways_enable(req: HttpRequest, state: web::Data<AppState>, path:
             None => return HttpResponse::NotFound().json(serde_json::json!({ "error": "gateway not found" })),
         }
     };
+    gateway_audit(&state, "info", "Share enabled", &format!("'{}'", g.name));
     match crate::gateway::orchestrator::apply(&g) {
         Ok(rt) => {
             let mut s = state.gateways.write().unwrap_or_else(|e| e.into_inner());
@@ -22077,24 +22079,22 @@ pub async fn gateways_set_password(
 ) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let (id, username) = path.into_inner();
+    let g = match require_owner(&state, &id) { Ok(g) => g, Err(r) => return r };
     let body = body.into_inner();
     if body.password.is_empty() {
         return HttpResponse::BadRequest().json(serde_json::json!({ "error": "password is empty" }));
     }
-    // Check the gateway exists and has this user defined.
-    {
-        let s = state.gateways.read().unwrap_or_else(|e| e.into_inner());
-        let g = match s.get(&id) { Some(g) => g, None => return HttpResponse::NotFound().json(serde_json::json!({ "error": "gateway not found" })) };
-        let configured = match &g.auth {
-            crate::gateway::AuthConfig::Users { users, .. } => users.iter().any(|u| u.username == username),
-            _ => false,
-        };
-        if !configured {
-            return HttpResponse::BadRequest().json(serde_json::json!({
-                "error": "user is not in this gateway's auth list — add them first via PUT /api/gateways/{id}"
-            }));
-        }
+    // Check the gateway has this user defined.
+    let configured = match &g.auth {
+        crate::gateway::AuthConfig::Users { users, .. } => users.iter().any(|u| u.username == username),
+        _ => false,
+    };
+    if !configured {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "user is not in this gateway's auth list — add them first via PUT /api/gateways/{id}"
+        }));
     }
+    gateway_audit(&state, "info", "Share password set", &format!("user '{}' on share '{}'", username, g.name));
     match crate::gateway::samba::set_user_password(&username, &body.password) {
         Ok(()) => HttpResponse::Ok().json(serde_json::json!({ "ok": true })),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e.to_string() })),
@@ -22125,13 +22125,20 @@ pub async fn gateways_discover_sources(req: HttpRequest, state: web::Data<AppSta
             }
         }
     }
-    // CephFS filesystems — call the existing ceph status helper.
+    // CephFS filesystems — call `ceph fs ls`. Wrapped in a 5-second
+    // timeout because if `ceph` is installed but no cluster is
+    // configured (or monitors are unreachable), the command blocks
+    // for ~30s waiting for quorum, which would freeze the wizard.
     let ceph = crate::ceph::get_cluster_status();
     if let Some(cluster_id) = serde_json::to_value(&ceph).ok()
         .and_then(|v| v.get("cluster_id").and_then(|x| x.as_str()).map(|s| s.to_string()))
     {
-        // The existing module exposes filesystems via `ceph fs ls`.
-        if let Ok(out) = std::process::Command::new("ceph").args(["fs", "ls", "--format=json"]).output() {
+        let ceph_result = tokio::task::spawn_blocking(|| {
+            std::process::Command::new("timeout")
+                .args(["5", "ceph", "fs", "ls", "--format=json"])
+                .output()
+        }).await;
+        if let Ok(Ok(out)) = ceph_result {
             if out.status.success() {
                 if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
                     if let Some(arr) = v.as_array() {
@@ -22448,6 +22455,54 @@ pub async fn gateways_sync(req: HttpRequest, state: web::Data<AppState>, body: w
 }
 
 // ─── Gateway internals ───
+
+/// Append a gateway audit entry to the shared alert_log. Surfaced in
+/// the Tasks panel so operators see who created/edited/deleted what.
+fn gateway_audit(state: &web::Data<AppState>, severity: &str, title: &str, detail: &str) {
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string();
+    let hostname = state.cluster.get_all_nodes().into_iter()
+        .find(|n| n.is_self).map(|n| n.hostname).unwrap_or_default();
+    let cluster = state.cluster.get_self_cluster_name();
+    let mut log = state.alert_log.write().unwrap_or_else(|e| e.into_inner());
+    let id = log.last().map(|e| e.id + 1).unwrap_or(1);
+    log.push(AlertLogEntry {
+        id,
+        timestamp: now,
+        severity: severity.into(),
+        title: title.into(),
+        detail: detail.into(),
+        hostname,
+        cluster,
+    });
+    while log.len() > 200 {
+        log.remove(0);
+    }
+}
+
+/// Verify the local node owns the gateway. Returns 409 with a clear
+/// "open the originating cluster" message otherwise — only the owner
+/// node serves the SMB/NFS daemons, so a remote mutation here would
+/// lie about taking effect.
+fn require_owner<'a>(
+    state: &web::Data<AppState>,
+    id: &str,
+) -> Result<crate::gateway::Gateway, HttpResponse> {
+    let s = state.gateways.read().unwrap_or_else(|e| e.into_inner());
+    let Some(g) = s.get(id).cloned() else {
+        return Err(HttpResponse::NotFound().json(serde_json::json!({ "error": "gateway not found" })));
+    };
+    if g.origin_node_id != state.node_id && !g.origin_node_id.is_empty() {
+        return Err(HttpResponse::Conflict().json(serde_json::json!({
+            "error": format!(
+                "this share is served from node '{}'. Open that node's dashboard to manage it — \
+                 v1.0 single-node-serve doesn't support cross-node mutation.",
+                g.origin_node_id
+            ),
+            "origin_node_id": g.origin_node_id,
+        })));
+    }
+    Ok(g)
+}
 
 async fn apply_and_persist(state: &web::Data<AppState>, g: crate::gateway::Gateway, id: &str) -> HttpResponse {
     // Apply first — if mounting/daemon-config fails, don't persist

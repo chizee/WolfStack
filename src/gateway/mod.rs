@@ -55,8 +55,18 @@ pub struct Gateway {
     pub mode: GatewayMode,
     pub protocols: Vec<Protocol>,
     pub sources: Vec<Source>,
-    /// node_ids (self_ids) that should run the share daemons. Empty
-    /// = serve from the operator's current node only.
+    /// `node_id` (self_id) of the WolfStack node that owns this
+    /// gateway — the only node that runs the SMB/NFS daemons for
+    /// it in v1.0. Stamped at create time and never changed without
+    /// an explicit migrate-share API call (post-v1.0). Cluster sync
+    /// distributes the config to every peer for visibility, but only
+    /// `origin_node_id` actually applies it; peers ignore.
+    #[serde(default)]
+    pub origin_node_id: String,
+    /// Reserved for v2.0 — multi-node serve. v1.0 honours
+    /// `origin_node_id` only; non-empty `serve_nodes` is rejected by
+    /// validate() so operators get a clear "v2.0 feature" error
+    /// rather than silently-wrong behaviour.
     #[serde(default)]
     pub serve_nodes: Vec<String>,
     pub auth: AuthConfig,
@@ -163,11 +173,20 @@ pub struct UserGrant {
     pub writable: bool,
 }
 // Passwords are NEVER stored in `gateways.json`. The API sets a user's
-// password by piping plaintext directly into `smbpasswd`/`pdbedit`
-// (which holds it in Samba's tdbsam at /var/lib/samba/private/passdb.tdb,
-// 0600 root-only). Multi-node password replication is a v2.0 concern
-// (CTDB shared pdb backend); single-node v1.0 leaves passwords on
-// the serve node alone — same trust boundary as any traditional NAS.
+// password by piping plaintext directly into `smbpasswd` (which holds
+// it in Samba's tdbsam at /var/lib/samba/private/passdb.tdb, 0600
+// root-only). The username list IS replicated across the cluster (so
+// every node's `gateways.json` agrees on who's allowed) but the
+// password is per-node.
+//
+// v1.0 IMPLICATION: only the gateway's `origin_node_id` actually
+// serves the share, so passwords only need to live there. The
+// orchestrator's startup re-apply skips peers (see
+// `reconcile_on_startup`), and mutating endpoints reject calls on
+// non-owner nodes (see `require_owner`). When v2.0 multi-node serve
+// lands, password replication becomes a real concern — handled either
+// via CTDB's shared pdb backend, or a privileged push-to-peers call
+// triggered from the password-set endpoint.
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct GatewayOptions {
@@ -194,7 +213,15 @@ pub struct GatewayOptions {
     pub case_sensitive: Option<bool>,
     #[serde(default)]
     pub max_connections: Option<u32>,
+    /// SMB workgroup advertised in the [global] section. Defaults to
+    /// `WORKGROUP` (the de-facto Windows default) so out-of-the-box
+    /// LAN browsing just works. Override per-cluster for AD-joined
+    /// or non-default home networks.
+    #[serde(default = "default_workgroup")]
+    pub smb_workgroup: String,
 }
+
+fn default_workgroup() -> String { "WORKGROUP".to_string() }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(rename_all = "snake_case")]
@@ -340,6 +367,13 @@ pub fn validate(g: &Gateway) -> Result<(), Vec<String>> {
     if g.sources.is_empty() {
         errs.push("at least one source is required".into());
     }
+    if !g.serve_nodes.is_empty() {
+        errs.push(
+            "`serve_nodes` is reserved for a future release (v2.0 multi-node serve). \
+             Leave empty in v1.0; the gateway runs on whichever node you create it from."
+                .into(),
+        );
+    }
     match g.mode {
         GatewayMode::Single => {
             if g.sources.len() != 1 {
@@ -417,18 +451,257 @@ pub fn snapshot_for_sync(store: &GatewayStore) -> Vec<Gateway> {
     store.gateways.values().cloned().collect()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sources::Source;
+
+    fn ok_gateway(name: &str) -> Gateway {
+        Gateway {
+            id: "g1".into(),
+            name: name.into(),
+            cluster: String::new(),
+            mode: GatewayMode::Single,
+            protocols: vec![Protocol::Smb],
+            sources: vec![Source::Local { node_id: "node-a".into(), path: "/srv/data".into() }],
+            origin_node_id: "node-a".into(),
+            serve_nodes: vec![],
+            auth: AuthConfig::Anonymous { writable: false },
+            policy: ModePolicy::Single,
+            options: GatewayOptions::default(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            disabled: false,
+        }
+    }
+
+    #[test]
+    fn validate_accepts_minimum_valid_gateway() {
+        let g = ok_gateway("ops");
+        assert!(validate(&g).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_empty_name() {
+        let mut g = ok_gateway("ops");
+        g.name = "".into();
+        let errs = validate(&g).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("name is required")), "errs: {:?}", errs);
+    }
+
+    #[test]
+    fn validate_rejects_share_name_with_special_chars() {
+        // Samba section header must be a clean identifier; bracket
+        // injection or quoting would break the smb.conf parser.
+        for bad in ["ops share", "ops]bad", "../etc", "foo\nbar", "$ipc$"] {
+            let mut g = ok_gateway(bad);
+            assert!(validate(&g).is_err(), "should reject name: {:?}", bad);
+            g.name = bad.into();
+        }
+    }
+
+    #[test]
+    fn validate_rejects_empty_protocols() {
+        let mut g = ok_gateway("ops");
+        g.protocols.clear();
+        assert!(validate(&g).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_or_multiple_sources_in_single_mode() {
+        let mut g = ok_gateway("ops");
+        g.sources.clear();
+        let errs = validate(&g).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("at least one source")), "{:?}", errs);
+
+        let mut g2 = ok_gateway("ops");
+        g2.sources.push(Source::Local { node_id: "node-a".into(), path: "/other".into() });
+        let errs2 = validate(&g2).unwrap_err();
+        assert!(errs2.iter().any(|e| e.contains("single mode requires exactly one source")), "{:?}", errs2);
+    }
+
+    #[test]
+    fn validate_rejects_non_single_modes_in_v1_0() {
+        for mode in [GatewayMode::Failover, GatewayMode::Aggregate, GatewayMode::Sharded] {
+            let mut g = ok_gateway("ops");
+            g.mode = mode.clone();
+            let errs = validate(&g).unwrap_err();
+            assert!(errs.iter().any(|e| e.contains("reserved for a future release")),
+                "mode {:?} should be rejected, got {:?}", mode, errs);
+        }
+    }
+
+    #[test]
+    fn validate_rejects_non_empty_serve_nodes_in_v1_0() {
+        // serve_nodes is reserved for v2.0 multi-node serve. v1.0 must
+        // refuse it cleanly, otherwise operators get silent
+        // "I set this but it's ignored" behaviour.
+        let mut g = ok_gateway("ops");
+        g.serve_nodes = vec!["node-b".into()];
+        let errs = validate(&g).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("serve_nodes")), "{:?}", errs);
+    }
+
+    #[test]
+    fn validate_rejects_users_auth_with_no_users() {
+        let mut g = ok_gateway("ops");
+        g.auth = AuthConfig::Users { users: vec![], default_writable: true };
+        let errs = validate(&g).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("at least one user")), "{:?}", errs);
+    }
+
+    #[test]
+    fn validate_rejects_path_traversal_in_subpath() {
+        // Three forms of path-traversal at config-save time. The
+        // runtime safe_join provides a second line of defence (symlink
+        // tricks); this test pins the validator's behaviour.
+        let mut g = ok_gateway("ops");
+        g.sources = vec![Source::Smb {
+            server: "10.0.0.1".into(),
+            share: "media".into(),
+            subpath: Some("../etc".into()),
+            username: None, password: None, domain: None, options: None,
+        }];
+        let errs = validate(&g).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("..") || e.contains("traversal")
+                || e.contains("not contain")), "expected traversal rejection, got {:?}", errs);
+
+        g.sources = vec![Source::Smb {
+            server: "10.0.0.1".into(),
+            share: "media".into(),
+            subpath: Some("/absolute".into()),
+            username: None, password: None, domain: None, options: None,
+        }];
+        assert!(validate(&g).is_err(), "absolute subpath should be rejected");
+
+        g.sources = vec![Source::Nfs {
+            server: "10.0.0.1".into(),
+            export: "/mnt".into(),
+            subpath: Some("ok/../../escape".into()),
+            options: None,
+        }];
+        assert!(validate(&g).is_err(), "nested .. should be rejected");
+    }
+
+    #[test]
+    fn validate_rejects_local_path_under_system_dirs() {
+        for bad in ["/etc/wolfstack", "/proc/1", "/sys", "/dev/null", "/boot/efi"] {
+            let mut g = ok_gateway("ops");
+            g.sources = vec![Source::Local { node_id: "node-a".into(), path: bad.into() }];
+            assert!(validate(&g).is_err(), "should reject system path: {}", bad);
+        }
+    }
+
+    #[test]
+    fn performance_tier_picks_worst_source() {
+        let local = Source::Local { node_id: "n".into(), path: "/srv".into() };
+        let smb = Source::Smb {
+            server: "x".into(), share: "y".into(), subpath: None,
+            username: None, password: None, domain: None, options: None,
+        };
+        let s3 = Source::S3Rclone { remote_id: "r".into(), bucket: "b".into(), prefix: None };
+
+        let mut g = ok_gateway("ops");
+        g.sources = vec![local.clone()];
+        assert_eq!(performance_tier(&g), "fast");
+        g.sources = vec![smb.clone()];
+        assert_eq!(performance_tier(&g), "ok");
+        g.sources = vec![s3.clone()];
+        assert_eq!(performance_tier(&g), "cold");
+        // Mixed → worst tier wins (so operators can't accidentally
+        // mark a cold-backed gateway as fast).
+        g.sources = vec![local, s3];
+        assert_eq!(performance_tier(&g), "cold");
+    }
+
+    #[test]
+    fn merge_from_peer_uses_most_recent_updated_at() {
+        let mut store = GatewayStore::default();
+
+        let mut older = ok_gateway("ops");
+        older.updated_at = "2026-01-01T00:00:00Z".into();
+        store.upsert(older);
+
+        let mut newer = ok_gateway("ops");
+        newer.updated_at = "2026-06-01T00:00:00Z".into();
+        newer.options.readonly = true; // distinguishing change
+
+        let changed = store.merge_from_peer(vec![newer]);
+        assert!(changed);
+        let stored = store.get("g1").unwrap();
+        assert_eq!(stored.updated_at, "2026-06-01T00:00:00Z");
+        assert!(stored.options.readonly, "newer payload should win");
+    }
+
+    #[test]
+    fn merge_from_peer_ignores_older_updates() {
+        // Last-write-wins must be strict — a peer that comes back
+        // online with a STALE config shouldn't overwrite this node's
+        // newer state.
+        let mut store = GatewayStore::default();
+        let mut newer = ok_gateway("ops");
+        newer.updated_at = "2026-06-01T00:00:00Z".into();
+        newer.options.readonly = true;
+        store.upsert(newer);
+
+        let mut older = ok_gateway("ops");
+        older.updated_at = "2026-01-01T00:00:00Z".into();
+        older.options.readonly = false;
+
+        let changed = store.merge_from_peer(vec![older]);
+        assert!(!changed, "older payload must not overwrite newer");
+        assert!(store.get("g1").unwrap().options.readonly);
+    }
+
+    #[test]
+    fn upsert_stamps_updated_at_and_creates_created_at() {
+        let mut store = GatewayStore::default();
+        let g = ok_gateway("ops");
+        let stored = store.upsert(g);
+        assert!(!stored.created_at.is_empty(), "created_at should be stamped");
+        assert!(!stored.updated_at.is_empty(), "updated_at should be stamped");
+        // Second upsert preserves created_at, advances updated_at.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let mut g2 = stored.clone();
+        g2.options.readonly = true;
+        let stored2 = store.upsert(g2);
+        assert_eq!(stored.created_at, stored2.created_at, "created_at must not change on update");
+        assert!(stored2.updated_at >= stored.updated_at);
+    }
+
+    #[test]
+    fn resolve_tier_via_validator_consistency() {
+        // resolve_tier in compat::mod.rs is for licence tiers (different
+        // module). Here we pin the gateway equivalent: performance_tier
+        // must be deterministic for the same input.
+        let g = ok_gateway("ops");
+        assert_eq!(performance_tier(&g), performance_tier(&g));
+    }
+}
+
 /// Reconcile on-disk daemon configuration with the current gateway
-/// store. Removes orphaned Samba snippets, NFS exports, and per-gateway
-/// mount roots whose ID is no longer in `gateways.json`.
+/// store. Removes:
 ///
-/// Called once on startup. Catches three classes of leak:
-///   * a previous create that wrote a Samba snippet but failed before
-///     the gateway was persisted (fixed by apply-then-teardown, but
-///     this catches any historical leftovers);
-///   * a peer-pushed delete that arrived while this node was offline;
-///   * an operator who hand-edited `gateways.json` and removed a row.
-pub fn reconcile_on_startup(store: &GatewayStore) {
-    let known: std::collections::HashSet<String> = store.gateways.keys().cloned().collect();
+///   1. Orphaned Samba snippets / NFS exports / mount trees whose ID
+///      isn't in `gateways.json` (failed creates from before the
+///      apply-then-teardown landed, or a peer-pushed delete that
+///      arrived while this node was offline).
+///   2. Snippets/exports for gateways owned by *another* node — only
+///      the owner serves in v1.0. Pre-v22.9 multi-node clusters where
+///      every peer applied every gateway leave stale serving state on
+///      non-owner peers; this purges it.
+///
+/// Called once on startup with the local `node_id` so we can tell
+/// whether each known gateway is "ours to serve" or "a peer's".
+pub fn reconcile_on_startup(store: &GatewayStore, local_node_id: &str) {
+    // Set of IDs that this node should leave configs in place for —
+    // i.e. the gateways this node owns. Peer-owned gateways are still
+    // "known" but their configs must be purged from this node.
+    let owned: std::collections::HashSet<String> = store.gateways.values()
+        .filter(|g| g.origin_node_id.is_empty() || g.origin_node_id == local_node_id)
+        .map(|g| g.id.clone())
+        .collect();
+    let known = &owned;
 
     // Samba snippets — match by filename stem.
     let snippets_dir = std::path::Path::new("/etc/samba/wolfstack-gateways.d");
@@ -501,12 +774,17 @@ pub fn reconcile_on_startup(store: &GatewayStore) {
 
 /// Same content as `samba::render_aggregator` but without recursion
 /// into the gateway store (we already hold the snapshot).
-fn rebuild_aggregator_for_reconcile(_store: &GatewayStore) -> String {
+fn rebuild_aggregator_for_reconcile(store: &GatewayStore) -> String {
+    let workgroup = store.gateways.values()
+        .find(|g| g.protocols.contains(&Protocol::Smb)
+            && !g.options.smb_workgroup.trim().is_empty())
+        .map(|g| g.options.smb_workgroup.trim().to_string())
+        .unwrap_or_else(|| "WORKGROUP".to_string());
     let mut out = String::new();
     out.push_str("# Auto-generated by WolfStack — do not edit\n");
     out.push_str("# Per-gateway snippets live in /etc/samba/wolfstack-gateways.d/*.conf\n\n");
     out.push_str("[global]\n");
-    out.push_str("    workgroup = WORKGROUP\n");
+    out.push_str(&format!("    workgroup = {}\n", workgroup));
     out.push_str("    server string = WolfStack Gateway %h\n");
     out.push_str("    server role = standalone server\n");
     out.push_str("    log file = /var/log/samba/log.%m\n");

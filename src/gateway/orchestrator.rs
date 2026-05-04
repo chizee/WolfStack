@@ -53,17 +53,15 @@ pub fn apply(g: &Gateway) -> Result<GatewayRuntime, ApplyError> {
     let share = sources::share_path(&g.id);
     std::fs::create_dir_all(&share)?;
 
-    let mut active_index = 0usize;
+    let active_index;
     let mut last_error: Option<String> = None;
 
     match g.mode {
         GatewayMode::Single => {
             // Mount source 0 and bind it to share/.
             let s = &g.sources[0];
-            let mounted = sources::mount(&g.id, 0, s).map_err(|e| {
-                last_error = Some(e.to_string());
-                ApplyError::Source("source-0".into(), e)
-            })?;
+            let mounted = sources::mount(&g.id, 0, s)
+                .map_err(|e| ApplyError::Source("source-0".into(), e))?;
             // share/ is a bind-mount of the resolved source path so
             // Samba/NFS see a stable path that survives source-mount
             // reconfigs.
@@ -78,9 +76,6 @@ pub fn apply(g: &Gateway) -> Result<GatewayRuntime, ApplyError> {
     // Daemon configs.
     if g.protocols.contains(&Protocol::Smb) {
         if let Err(e) = samba::write_gateway_snippet(g, &share) {
-            // SMB failure is recoverable — capture but allow NFS to
-            // still try. We bubble up the first error encountered.
-            last_error = Some(e.to_string());
             return Err(ApplyError::Samba(e));
         }
     } else {
@@ -139,6 +134,7 @@ pub fn teardown(g: &Gateway) {
 }
 
 /// Run a quick health check and update the runtime row.
+#[allow(dead_code)]
 pub fn health_check(g: &Gateway, rt: &mut GatewayRuntime) {
     rt.last_health_check_unix = now_unix();
     if g.disabled {

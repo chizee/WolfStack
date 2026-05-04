@@ -447,18 +447,55 @@ async fn main() -> std::io::Result<()> {
         // and re-apply every persisted gateway. Mounts and daemon
         // configs may have been wiped by a reboot; this brings them
         // back without operator action.
+        //
+        // KNOWN restart-window: this runs as an async task spawned
+        // alongside the HTTP listener, so during the first few seconds
+        // after start-up the API will report each gateway with a
+        // "not running" runtime row before the apply loop completes.
+        // The reconciler purges orphans before the loop runs so we
+        // never serve stale state — just briefly report it as
+        // not-yet-applied. Acceptable trade-off vs. blocking the API
+        // listener on a potentially slow mount sequence (NFS sources
+        // can stall for tens of seconds on a missing server).
         {
             let store = app_state.gateways.clone();
+            let node_id_for_apply = node_id.clone();
             tokio::spawn(async move {
                 {
                     let s = store.read().unwrap_or_else(|e| e.into_inner());
-                    crate::gateway::reconcile_on_startup(&s);
+                    crate::gateway::reconcile_on_startup(&s, &node_id_for_apply);
                 }
                 let snapshot: Vec<crate::gateway::Gateway> = {
                     let s = store.read().unwrap_or_else(|e| e.into_inner());
                     s.gateways.values().cloned().collect()
                 };
+                let me = node_id_for_apply.clone();
                 for g in snapshot {
+                    // Only the owner node serves a gateway in v1.0.
+                    // Peers hold the config (so the cluster panel can
+                    // surface it) but don't write Samba snippets or
+                    // mount sources locally — that would mean two
+                    // hosts serving the same share name with diverged
+                    // tdbsam state.
+                    let owner = if g.origin_node_id.is_empty() {
+                        // Pre-v22.9 configs that pre-dated the field
+                        // get retroactively assigned to whichever node
+                        // first re-applies them. This mirrors the
+                        // "first node that boots is the owner" model
+                        // and is fine because pre-v22.9 there was only
+                        // one node anyway.
+                        true
+                    } else {
+                        g.origin_node_id == me
+                    };
+                    if !owner {
+                        tracing::debug!(
+                            target: "wolfstack::gateway",
+                            "skipping startup apply for '{}' — owned by '{}'",
+                            g.name, g.origin_node_id
+                        );
+                        continue;
+                    }
                     match crate::gateway::orchestrator::apply(&g) {
                         Ok(rt) => {
                             let mut s = store.write().unwrap_or_else(|e| e.into_inner());

@@ -185,3 +185,95 @@ pub async fn fetch_json(c: &FederatedCluster, path: &str) -> Result<serde_json::
     }
     resp.json::<serde_json::Value>().await.map_err(|e| format!("invalid JSON: {}", e))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ok_entry() -> FederatedCluster {
+        FederatedCluster {
+            id: String::new(),
+            name: "Main".into(),
+            base_url: "https://wolfstack.example.com:8553".into(),
+            api_key: "wsk_xxx".into(),
+            insecure_tls: false,
+            created_at: String::new(),
+            last_ok_unix: 0,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn validate_accepts_minimum_valid_entry() {
+        assert!(validate(&ok_entry()).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_empty_name() {
+        let mut e = ok_entry(); e.name = "".into();
+        assert!(validate(&e).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_non_http_base_url() {
+        for bad in ["wolfstack.example.com:8553", "ftp://x", "/relative", ""] {
+            let mut e = ok_entry();
+            e.base_url = bad.into();
+            assert!(validate(&e).is_err(), "should reject base_url: {:?}", bad);
+        }
+    }
+
+    #[test]
+    fn validate_rejects_missing_api_key() {
+        let mut e = ok_entry(); e.api_key = "".into();
+        assert!(validate(&e).is_err());
+    }
+
+    #[test]
+    fn upsert_assigns_id_and_trims_trailing_slash() {
+        let mut store = FederationStore::default();
+        let mut e = ok_entry();
+        e.base_url = "https://example.com:8553/".into(); // trailing slash
+        let stored = store.upsert(e);
+        assert!(!stored.id.is_empty(), "upsert should assign a uuid");
+        assert_eq!(stored.base_url, "https://example.com:8553");
+        assert!(!stored.created_at.is_empty());
+    }
+
+    #[test]
+    fn upsert_with_existing_id_updates_in_place() {
+        let mut store = FederationStore::default();
+        let mut e = ok_entry();
+        let stored = store.upsert(e.clone());
+        let id = stored.id.clone();
+
+        e.id = id.clone();
+        e.name = "Renamed".into();
+        let updated = store.upsert(e);
+        assert_eq!(updated.id, id);
+        assert_eq!(store.clusters.len(), 1, "must update in place, not append");
+        assert_eq!(store.clusters[0].name, "Renamed");
+    }
+
+    #[test]
+    fn redacted_strips_api_key() {
+        let mut store = FederationStore::default();
+        store.upsert(ok_entry());
+        let v = store.redacted();
+        let arr = v.as_array().unwrap();
+        let first = &arr[0];
+        assert!(first.get("api_key").is_none(), "api_key must NEVER be in the redacted JSON");
+        assert_eq!(first.get("api_key_set").and_then(|x| x.as_bool()), Some(true));
+        // base_url, name etc still present
+        assert!(first.get("base_url").is_some());
+        assert!(first.get("name").is_some());
+    }
+
+    #[test]
+    fn remove_returns_false_for_unknown_id() {
+        let mut store = FederationStore::default();
+        store.upsert(ok_entry());
+        assert!(!store.remove("does-not-exist"));
+        assert_eq!(store.clusters.len(), 1);
+    }
+}
