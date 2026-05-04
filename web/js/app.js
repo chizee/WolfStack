@@ -32562,11 +32562,16 @@ async function showMonitorDetails(monitorId) {
         </div>`;
     }).join('') || '<div style="color:var(--text-muted); padding:12px;">No recent checks</div>';
 
+    // CSS exposes `.modal-overlay` (fixed-position centering layer)
+    // and `.modal` (inner card). Earlier this code set `class="modal
+    // active"` on the outer div and `class="modal-content"` on the
+    // inner — neither of which is a positioning class — so the dialog
+    // flowed inline and rendered left-aligned under the sidebar.
     const modal = document.createElement('div');
-    modal.className = 'modal active';
+    modal.className = 'modal-overlay active';
     modal.id = 'sp-monitor-details-modal';
     modal.innerHTML = `
-        <div class="modal-content" style="max-width:600px;">
+        <div class="modal" style="max-width:600px;">
             <div class="modal-header">
                 <h3 style="display:flex; align-items:center; gap:10px;">
                     <span style="width:12px; height:12px; border-radius:50%; background:${colors[st]};"></span>
@@ -33071,25 +33076,40 @@ async function loadContainersForMonitor() {
         return nodeCluster === spCurrentCluster && n.online;
     });
 
+    // /api/nodes/{id}/proxy/... rejects self-targeted calls (returns
+    // 400 "Use local API for self node"), so for the local node we
+    // hit /api/containers/* directly. Without this the local node's
+    // containers never appear in the dropdown — on single-node
+    // installs the picker was completely empty.
+    const containerUrl = (node, suffix) =>
+        node.is_self ? `/api/containers/${suffix}` : `/api/nodes/${node.id}/proxy/containers/${suffix}`;
+
+    // The /api/containers/* endpoints return ContainerInfo (name, state
+    // both lowercase). The previous code read Docker-API-shaped fields
+    // (c.Names, c.State, c.Id) which don't exist on this endpoint —
+    // the `||` fallbacks rescued `name`, but `state` always came out
+    // as the long Docker status string ("Up 5 minutes") rather than
+    // "running" / "stopped". That broke the green/red dot in the
+    // dropdown options.
     for (const node of clusterNodes) {
         try {
-            const dockerRes = await fetch(`/api/nodes/${node.id}/proxy/containers/docker`);
+            const dockerRes = await fetch(containerUrl(node, 'docker'));
             if (dockerRes.ok) {
                 const containers = await dockerRes.json();
                 containers.forEach(c => {
                     spAvailableContainers.push({
-                        name: c.Names?.[0]?.replace(/^\//, '') || c.name || c.Id?.slice(0, 12),
+                        name: c.name || c.Names?.[0]?.replace(/^\//, '') || c.id?.slice(0, 12),
                         runtime: 'docker',
                         node: node.hostname,
                         node_id: node.id,
-                        state: c.State || c.status
+                        state: c.state || c.State || c.status
                     });
                 });
             }
         } catch (e) { }
 
         try {
-            const lxcRes = await fetch(`/api/nodes/${node.id}/proxy/containers/lxc`);
+            const lxcRes = await fetch(containerUrl(node, 'lxc'));
             if (lxcRes.ok) {
                 const containers = await lxcRes.json();
                 containers.forEach(c => {
