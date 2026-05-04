@@ -2083,16 +2083,17 @@
             </div>
         </div>
 
-        <!-- ═══ Shares (WolfStack Gateway) Page ═══ -->
+        <!-- ═══ Shares (WolfStack Gateway) Page — per-node ═══ -->
         <div id="page-shares" class="page-view" style="display:none;">
             <div class="card" style="margin-bottom:16px;">
                 <div class="card-body" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;">
                     <div>
                         <h2 style="margin:0;display:flex;align-items:center;gap:10px;">
-                            <span style="font-size:28px;">📂</span>Shares
+                            <span style="font-size:28px;">📂</span>Shares on this node
                         </h2>
                         <p style="margin:6px 0 0;color:var(--text-muted);font-size:13px;">
-                            Universal SMB/NFS gateway. Point a share at any storage WolfStack can reach — local dirs, WolfDisk, CephFS, peer NAS shares — and re-export it to your LAN clients.
+                            Re-export anything this node can reach — host paths, Docker volumes, LXC mountpoints,
+                            VM disk dirs, WolfDisk, CephFS, or remote SMB/NFS — as an SMB or NFS share to your LAN.
                         </p>
                     </div>
                     <div style="display:flex;gap:8px;align-items:center;">
@@ -2102,12 +2103,6 @@
                 </div>
             </div>
             <div id="gw-daemon-status" style="margin-bottom:12px;"></div>
-            <details style="margin-bottom:14px;">
-                <summary style="cursor:pointer;font-size:13px;font-weight:600;padding:6px 4px;">
-                    🌐 Connected clusters <span id="gw-fed-count" style="font-size:11px;color:var(--text-muted);font-weight:400;"></span>
-                </summary>
-                <div id="gw-fed-section" style="margin-top:10px;"></div>
-            </details>
             <div id="gw-list" style="display:flex;flex-direction:column;gap:10px;">
                 <div style="color:var(--text-muted);text-align:center;padding:30px;">Loading shares…</div>
             </div>

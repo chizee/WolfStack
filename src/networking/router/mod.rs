@@ -1746,6 +1746,150 @@ pub fn parse_kernel_route_gateway_for_diagnostics(raw: &str) -> Option<String> {
     parse_route_gateway(raw)
 }
 
+/// One kernel routing-table entry that *might* be a WolfStack route.
+/// Used by orphan detection.
+#[derive(Debug, Clone, Serialize)]
+pub struct KernelRouteEntry {
+    pub cidr: String,
+    pub gateway: String,
+    pub iface: String,
+    pub raw: String,
+}
+
+/// Scan the kernel routing table for routes via the WolfNet interface
+/// (or via a gateway in the WolfNet subnet) and return entries that
+/// are NOT in the supplied configured-route set. These are "orphans"
+/// — Klas's report (2026-05-04 13:50): "There is no way to remove an
+/// orphaned subnet route".
+///
+/// How orphans happen:
+///   * A route was installed by an older WolfStack version that didn't
+///     remove it on subsequent config changes.
+///   * The config replicated to a peer mid-edit and a later remove
+///     never reached this node.
+///   * An operator manually `ip route add`-ed something and forgot.
+///   * A route was applied here but the config row was deleted via a
+///     different node; the propagation arrived AFTER the apply path
+///     ran on this node.
+///
+/// Match keys: (cidr, gateway). A configured route with the same
+/// (cidr, gateway) cancels out the kernel entry from the orphan list.
+/// Disabled routes and routes whose `node_id` doesn't match this node
+/// still cancel — the operator turning a route off shouldn't surface
+/// it as an orphan; if it's still in the kernel that's the apply
+/// path's bug, not an orphan.
+pub fn list_orphan_subnet_routes(configured: &[SubnetRoute]) -> Vec<KernelRouteEntry> {
+    let wn_iface = crate::networking::detect_wolfnet_iface()
+        .unwrap_or_else(|| "wolfnet0".into());
+
+    let configured_set: std::collections::HashSet<(String, String)> = configured.iter()
+        .map(|r| (r.subnet_cidr.trim().to_string(), r.gateway.trim().to_string()))
+        .collect();
+
+    let raw = match read_kernel_route_table() {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut orphans: Vec<KernelRouteEntry> = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() { continue; }
+
+        // First whitespace-separated token is the destination — either
+        // "default" or "<cidr>". We only care about CIDR-shaped dests
+        // because WolfStack subnet routes always have a /N.
+        let mut tokens = line.split_whitespace();
+        let cidr = match tokens.next() {
+            Some("default") => continue,
+            Some(t) if t.contains('/') => t.to_string(),
+            _ => continue,
+        };
+
+        let mut gw: Option<String> = None;
+        let mut iface: Option<String> = None;
+        let mut iter = tokens;
+        while let Some(t) = iter.next() {
+            match t {
+                "via" => gw = iter.next().map(|s| s.to_string()),
+                "dev" => iface = iter.next().map(|s| s.to_string()),
+                _ => {}
+            }
+        }
+
+        // Only consider routes that go through wolfnet — anything else
+        // isn't WolfStack's concern.
+        let is_wolfnet_route = iface.as_deref() == Some(wn_iface.as_str());
+        if !is_wolfnet_route { continue; }
+
+        let gw = match gw {
+            Some(g) => g,
+            None => continue, // dev-only route (no via) — not an orphan we'd touch
+        };
+
+        // Cancel against config.
+        if configured_set.contains(&(cidr.clone(), gw.clone())) { continue; }
+
+        orphans.push(KernelRouteEntry {
+            cidr,
+            gateway: gw,
+            iface: iface.unwrap_or_default(),
+            raw: line.to_string(),
+        });
+    }
+    orphans
+}
+
+/// Force-remove a kernel route by `ip route del <cidr> via <gateway>`.
+/// Used by the orphan-cleanup endpoint. Verifies the kernel route
+/// matches what the caller asked for before deleting — if a different
+/// gateway has taken over since the orphan was listed, refuse the
+/// delete and let the operator see the conflict.
+pub fn remove_orphan_kernel_route(cidr: &str, expected_gateway: &str) -> Result<(), String> {
+    use std::process::Command;
+
+    // Sanity-check the inputs — they came from operator input via the
+    // API, even if filtered through `list_orphan_subnet_routes`.
+    // Reject anything that isn't a plain CIDR / IPv4.
+    if !cidr.contains('/') {
+        return Err(format!("not a CIDR: {}", cidr));
+    }
+    if expected_gateway.parse::<std::net::Ipv4Addr>().is_err() {
+        return Err(format!("not an IPv4 gateway: {}", expected_gateway));
+    }
+
+    // Re-read the current kernel route — refuse if it doesn't match
+    // the expected gateway. Same defence as remove_subnet_route uses
+    // for the configured-route path; we won't blindly delete a route
+    // whose gateway has been replaced under us.
+    match read_kernel_route_gateway(cidr) {
+        Ok(None) => return Ok(()), // already gone, idempotent
+        Ok(Some(gw)) if gw != expected_gateway => {
+            return Err(format!(
+                "kernel route for {} currently uses gateway {} (expected {}); refusing to delete to avoid breaking another tool's route",
+                cidr, gw, expected_gateway
+            ));
+        }
+        Ok(Some(_)) => {}
+        Err(e) => return Err(format!("could not read kernel state for {}: {}", cidr, e)),
+    }
+
+    let out = Command::new("ip")
+        .args(["route", "del", cidr])
+        .output()
+        .map_err(|e| format!("ip route del: {}", e))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        // "No such process" is the kernel saying the route is already
+        // gone — idempotent success.
+        if stderr.contains("No such process") || stderr.contains("does not exist") {
+            return Ok(());
+        }
+        return Err(format!("ip route del {} failed: {}", cidr, stderr));
+    }
+    Ok(())
+}
+
 /// Extract the `via <gw>` from the first non-empty line of an `ip route
 /// show` capture. Returns None when the format is not our simple `<dest>
 /// via <ip> ...` shape (dev-only, blackhole, multipath).

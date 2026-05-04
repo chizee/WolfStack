@@ -1659,7 +1659,7 @@ function selectView(page) {
     document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
     document.querySelector(`.nav-item[data-page="${page}"]`)?.classList.add('active');
 
-    const titles = { datacenter: 'Datacenter', settings: 'Settings', docs: 'Help & Documentation', appstore: 'App Store', issues: 'Issues', inbox: 'Predictive Inbox', 'global-wolfnet': 'Global View', kubernetes: 'WolfKube', topology: '3D Server Room', wolfflow: 'WolfFlow', wolfagents: 'WolfAgents', 'cluster-browser': 'Cluster Browser', databases: 'Databases', 'control-panel': 'Control Panel', shares: 'Shares', array: 'Storage Array' };
+    const titles = { datacenter: 'Datacenter', settings: 'Settings', docs: 'Help & Documentation', appstore: 'App Store', issues: 'Issues', inbox: 'Predictive Inbox', 'global-wolfnet': 'Global View', kubernetes: 'WolfKube', topology: '3D Server Room', wolfflow: 'WolfFlow', wolfagents: 'WolfAgents', 'cluster-browser': 'Cluster Browser', databases: 'Databases', 'control-panel': 'Control Panel', array: 'Storage Array' };
     document.getElementById('page-title').textContent = titles[page] || page;
 
     if (page === 'datacenter') {
@@ -1703,8 +1703,6 @@ function selectView(page) {
         dbLoadConnections();
     } else if (page === 'control-panel') {
         cpInit();
-    } else if (page === 'shares') {
-        gwLoad();
     } else if (page === 'array') {
         arrayLoad();
     }
@@ -1744,6 +1742,7 @@ function selectServerView(nodeId, view) {
         secrets: 'Secrets',
         lxc: 'LXC',
         storage: 'Storage',
+        shares: 'Shares',
         files: 'File Manager',
         networking: 'Networking',
         wolfnet: 'WolfNet',
@@ -1778,7 +1777,7 @@ function selectServerView(nodeId, view) {
 
     // Load data for the view
     // Show a modern loading overlay for views that fetch data asynchronously
-    const asyncViews = ['components', 'services', 'containers', 'compose', 'secrets', 'lxc', 'vms', 'storage', 'networking', 'backups', 'wolfnet', 'certificates', 'cron', 'pve-resources', 'mysql-editor', 'security', 'ceph', 'wolfkube', 'wolfram'];
+    const asyncViews = ['components', 'services', 'containers', 'compose', 'secrets', 'lxc', 'vms', 'storage', 'shares', 'networking', 'backups', 'wolfnet', 'certificates', 'cron', 'pve-resources', 'mysql-editor', 'security', 'ceph', 'wolfkube', 'wolfram'];
     if (asyncViews.includes(view) && el) {
         // Clear table bodies to prevent stale data showing
         el.querySelectorAll('tbody').forEach(tb => { tb.innerHTML = ''; });
@@ -1836,6 +1835,7 @@ function selectServerView(nodeId, view) {
     }
     if (view === 'vms') loadVms().finally(() => hidePageLoadingOverlay(el));
     if (view === 'storage') Promise.all([loadStorageProviders(), loadStorageMounts(), loadZfsStatus(), loadDiskInfo()]).finally(() => hidePageLoadingOverlay(el));
+    if (view === 'shares') gwLoad().finally(() => hidePageLoadingOverlay(el));
     if (view === 'syslogs') { loadSystemLogs(); hidePageLoadingOverlay(el); }
     if (view === 'files') { if (!window._skipFileReset) { containerFileMode = null; currentFilePath = '/'; } window._skipFileReset = false; loadFiles().finally(() => hidePageLoadingOverlay(el)); }
     if (view === 'networking') loadNetworking().finally(() => hidePageLoadingOverlay(el));
@@ -2003,6 +2003,9 @@ function buildServerTree(nodes) {
                         </a>
                         <a class="nav-item server-child-item" data-node="${node.id}" data-view="services" onclick="selectServerView('${node.id}', 'services')">
                             <span class="icon">⚡</span> Services
+                        </a>
+                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="shares" onclick="selectServerView('${node.id}', 'shares')">
+                            <span class="icon">📂</span> Shares
                         </a>
                         <a class="nav-item server-child-item" data-node="${node.id}" data-view="storage" onclick="selectServerView('${node.id}', 'storage')">
                             <span class="icon">💾</span> Storage
@@ -48470,21 +48473,22 @@ async function gwLoad() {
     const list = document.getElementById('gw-list');
     if (list) list.innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:30px;">Loading shares…</div>';
 
+    // Per-node — Shares is scoped to currentNodeId. apiUrl() proxies
+    // to the right node automatically, so /api/gateways always returns
+    // shares belonging to the node we're viewing. No cluster fan-out
+    // here: cross-cluster discovery belongs in WolfRun, not Shares.
     try {
-        // /api/gateways/cluster aggregates THIS cluster (every node)
-        // AND every federated remote cluster — one round-trip surfaces
-        // every share from every connected site.
-        const [statusR, clusterR, fedR] = await Promise.all([
-            fetch('/api/gateways/status'),
-            fetch('/api/gateways/cluster'),
-            fetch('/api/federations'),
+        const [statusR, listR] = await Promise.all([
+            fetch(apiUrl('/api/gateways/status')),
+            fetch(apiUrl('/api/gateways')),
         ]);
         if (statusR.ok) _gwState.status = await statusR.json();
-        if (clusterR.ok) {
-            const data = await clusterR.json();
-            _gwState.gateways = data.gateways || [];
+        if (listR.ok) {
+            const data = await listR.json();
+            // /api/gateways returns a bare array, /api/gateways/cluster
+            // returns { gateways: [...] }. Handle both.
+            _gwState.gateways = Array.isArray(data) ? data : (data.gateways || []);
         }
-        if (fedR.ok) _gwState.federations = await fedR.json();
     } catch (e) {
         if (list) list.innerHTML = `<div style="color:var(--danger,#ef4444);padding:20px;">Failed to load: ${escapeHtml(e.message || String(e))}</div>`;
         _gwState.loading = false;
@@ -48492,7 +48496,6 @@ async function gwLoad() {
     }
     _gwState.loading = false;
     gwRender();
-    gwRenderFederationSection();
 }
 
 function gwRender() {
@@ -48501,30 +48504,44 @@ function gwRender() {
     if (!list) return;
 
     // Daemon-status banner — flag missing samba/nfs-kernel-server so
-    // operators get a clear "install this" prompt instead of cryptic
-    // errors when they try to create a share.
+    // operators get a clear "install this" prompt with a one-click
+    // install button that opens an inline terminal showing live
+    // package-manager output.
     if (statusBox) {
         const s = _gwState.status || {};
-        const lines = [];
+        const cards = [];
         if (!s.smb || !s.smb.installed) {
-            lines.push(`<span style="color:#f59e0b;">⚠️ Samba is not installed on this node</span> — <code>apt-get install -y samba</code> (required for SMB shares)`);
+            cards.push(`<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+                <span style="color:#f59e0b;">⚠️ Samba is not installed on this node</span>
+                <span style="font-size:11px;color:var(--text-muted);">SMB shares need <code>samba</code>.</span>
+                <button class="btn btn-sm btn-primary" onclick="gwInstallDaemon('samba')">📦 Install Samba</button>
+            </div>`);
         } else if (!s.smb.running) {
-            lines.push(`<span style="color:#f59e0b;">⚠️ smbd is not running</span> — <code>systemctl start smbd</code>`);
+            cards.push(`<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+                <span style="color:#f59e0b;">⚠️ smbd is not running</span>
+                <span style="font-size:11px;color:var(--text-muted);"><code>systemctl start smbd</code></span>
+            </div>`);
         }
         if (!s.nfs || !s.nfs.installed) {
-            lines.push(`<span style="color:var(--text-muted);">ℹ️ NFS server is not installed</span> — <code>apt-get install -y nfs-kernel-server</code> (only needed for NFS shares)`);
+            cards.push(`<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+                <span style="color:var(--text-muted);">ℹ️ NFS server is not installed</span>
+                <span style="font-size:11px;color:var(--text-muted);">Only needed for NFS shares.</span>
+                <button class="btn btn-sm" onclick="gwInstallDaemon('nfs')">📦 Install NFS server</button>
+            </div>`);
         }
-        statusBox.innerHTML = lines.length === 0 ? '' :
-            `<div class="card"><div class="card-body" style="padding:10px 14px;font-size:12px;display:flex;flex-direction:column;gap:4px;">${lines.join('')}</div></div>`;
+        statusBox.innerHTML = cards.length === 0 ? '' :
+            `<div class="card"><div class="card-body" style="padding:12px 14px;font-size:12px;display:flex;flex-direction:column;gap:8px;">${cards.join('')}</div></div>`;
     }
 
     if (!_gwState.gateways || _gwState.gateways.length === 0) {
         list.innerHTML = `
             <div class="card"><div class="card-body" style="text-align:center;padding:40px 20px;">
                 <div style="font-size:48px;line-height:1;margin-bottom:12px;">📂</div>
-                <h3 style="margin:0 0 8px;">No shares yet</h3>
+                <h3 style="margin:0 0 8px;">No shares on this node yet</h3>
                 <p style="color:var(--text-muted);max-width:520px;margin:0 auto 18px;">
-                    Create a share to expose any storage WolfStack can reach as an SMB or NFS network share to your LAN.
+                    Create a share to expose any storage on this node — local dirs, Docker volumes,
+                    LXC mountpoints, VM disk dirs, WolfDisk volumes, or CephFS — as an SMB or NFS
+                    network share to your LAN.
                 </p>
                 <button class="btn btn-primary" onclick="gwOpenWizard()">+ New Share</button>
             </div></div>
@@ -48532,22 +48549,8 @@ function gwRender() {
         return;
     }
 
-    // Group by origin cluster so multi-cluster control panels still
-    // group cleanly.
-    const groups = new Map();
-    for (const g of _gwState.gateways) {
-        const key = (g.origin_cluster && g.origin_cluster.length > 0) ? g.origin_cluster
-                  : (g.cluster && g.cluster.length > 0) ? g.cluster
-                  : 'WolfStack';
-        if (!groups.has(key)) groups.set(key, []);
-        groups.get(key).push(g);
-    }
-
     let html = '';
-    for (const [groupName, gws] of groups) {
-        html += `<div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-muted);margin:8px 4px -2px;">${escapeHtml(groupName)}</div>`;
-        for (const g of gws) html += gwRenderRow(g);
-    }
+    for (const g of _gwState.gateways) html += gwRenderRow(g);
     list.innerHTML = html;
 }
 
@@ -48568,34 +48571,10 @@ function gwStatusBadge(g) {
 function gwRenderRow(g) {
     const protos = (g.protocols || []).map(p => `<span style="display:inline-block;padding:1px 7px;border-radius:4px;font-size:10px;font-weight:700;background:rgba(59,130,246,0.15);color:#3b82f6;border:1px solid rgba(59,130,246,0.3);">${escapeHtml(p.toUpperCase())}</span>`).join(' ');
     const sourceLabel = (g.sources && g.sources[0]) ? gwSourceLabel(g.sources[0]) : '(no source)';
-    // Three placement origins: same-node, peer-in-this-cluster, federated remote cluster.
-    const fed = g.federated === true;
-    const remote = fed
-        ? `<span style="font-size:10px;color:#3b82f6;">🌐 ${escapeHtml(g.origin_federation_name || 'federated')}${g.origin_hostname ? ' / ' + escapeHtml(g.origin_hostname) : ''}</span>`
-        : g.origin_self === false
-            ? `<span style="font-size:10px;color:var(--text-muted);">on ${escapeHtml(g.origin_hostname || g.origin_node_id || 'peer')}</span>`
-            : '';
     const sessions = g.runtime && g.runtime.active_sessions ? `${g.runtime.active_sessions} sessions` : '';
     const safeId = escapeAttr(g.id);
-    const remoteAttr = g.origin_node_id ? `,'${escapeAttr(g.origin_node_id)}'` : '';
-    // Federation-error placeholder rows render slightly differently —
-    // no protocols, just the failure reason.
-    if (g.federation_error) {
-        return `
-            <div class="card" style="border-left:3px solid #ef4444;">
-                <div class="card-body" style="display:flex;align-items:center;gap:14px;padding:14px 18px;">
-                    <div style="font-size:24px;">🌐</div>
-                    <div style="flex:1;min-width:0;">
-                        <div><strong style="font-size:14px;color:#ef4444;">${escapeHtml(g.name)}</strong></div>
-                        <div style="font-size:11px;color:var(--text-muted);margin-top:2px;">${escapeHtml(g.federation_error)}</div>
-                    </div>
-                    <button class="btn btn-sm" onclick="gwFedTest('${escapeAttr(g.origin_federation_id)}')">Retry</button>
-                </div>
-            </div>
-        `;
-    }
     return `
-        <div class="card" style="cursor:pointer;${fed ? 'border-left:3px solid #3b82f6;' : ''}" onclick="gwOpenDetail('${safeId}'${remoteAttr})">
+        <div class="card" style="cursor:pointer;" onclick="gwOpenDetail('${safeId}')">
             <div class="card-body" style="display:flex;align-items:center;gap:14px;padding:14px 18px;">
                 <div style="font-size:24px;">📂</div>
                 <div style="flex:1;min-width:0;">
@@ -48603,7 +48582,6 @@ function gwRenderRow(g) {
                         <strong style="font-size:14px;">${escapeHtml(g.name)}</strong>
                         ${protos}
                         ${gwTierBadge(g.performance_tier)}
-                        ${remote}
                     </div>
                     <div style="font-size:12px;color:var(--text-muted);margin-top:4px;display:flex;gap:14px;flex-wrap:wrap;">
                         <span>↳ ${escapeHtml(sourceLabel)}</span>
@@ -48727,7 +48705,7 @@ async function gwRenderWizard() {
 async function gwWizardStep1() {
     let discovered = { sources: [] };
     try {
-        const r = await fetch('/api/gateways/sources/discover');
+        const r = await fetch(apiUrl('/api/gateways/sources/discover'));
         if (r.ok) discovered = await r.json();
     } catch (_) {}
     // Stash structured source dicts so the picker handler can adopt
@@ -48735,9 +48713,42 @@ async function gwWizardStep1() {
     // break the moment we changed the label format.
     window._gwDiscoveredSources = discovered.sources || [];
     const d = _gwWizardData;
-    const opts = (discovered.sources || []).map((_, i) =>
-        `<option value="${i}">${escapeHtml((discovered.sources || [])[i].label || '(unlabelled)')}</option>`
-    ).join('');
+
+    // Group sources by category so the dropdown isn't a wall of text
+    // when a node has lots of Docker volumes / LXC containers / VMs.
+    // Bucket by label prefix — backend gives stable, human-readable
+    // labels we can match without coupling the frontend to source
+    // type names.
+    const list = discovered.sources || [];
+    const buckets = {
+        'Host paths':     [],
+        'Docker volumes': [],
+        'LXC containers': [],
+        'VM disk dirs':   [],
+        'WolfDisk':       [],
+        'CephFS':         [],
+        'Other':          [],
+    };
+    list.forEach((s, i) => {
+        const label = s.label || '(unlabelled)';
+        let bucket;
+        if (label.startsWith('Docker volume:'))      bucket = 'Docker volumes';
+        else if (label.startsWith('LXC rootfs:'))    bucket = 'LXC containers';
+        else if (label.startsWith('PVE VM ') || label.startsWith('libvirt VM')) bucket = 'VM disk dirs';
+        else if (label.startsWith('WolfDisk volume:')) bucket = 'WolfDisk';
+        else if (label.startsWith('CephFS:'))        bucket = 'CephFS';
+        else if (label.startsWith('Local directory')) bucket = 'Host paths';
+        else                                          bucket = 'Other';
+        buckets[bucket].push({ idx: i, label });
+    });
+    const optgroups = Object.entries(buckets)
+        .filter(([, items]) => items.length > 0)
+        .map(([name, items]) =>
+            `<optgroup label="${escapeHtml(name)}">` +
+            items.map(it => `<option value="${it.idx}">${escapeHtml(it.label)}</option>`).join('') +
+            `</optgroup>`
+        ).join('');
+
     return `
         <label style="display:block;font-size:12px;font-weight:600;margin-bottom:4px;">Share name</label>
         <input id="gw-w-name" class="form-control" style="width:100%;margin-bottom:14px;"
@@ -48750,7 +48761,7 @@ async function gwWizardStep1() {
         <label style="display:block;font-size:12px;font-weight:600;margin-bottom:4px;">Source</label>
         <select id="gw-w-source-pick" class="form-control" style="width:100%;margin-bottom:10px;" onchange="gwWizardSourcePick(this)">
             <option value="">— pick a discovered source, or use a custom one below —</option>
-            ${opts}
+            ${optgroups}
         </select>
 
         <details style="margin-bottom:8px;" ${d.source.type === 'local' || d.source.type === 'smb' || d.source.type === 'nfs' ? 'open' : ''}>
@@ -48945,7 +48956,7 @@ async function gwWizardSubmit() {
     const url = isEdit ? `/api/gateways/${encodeURIComponent(_gwWizardEditId)}` : '/api/gateways';
     const method = isEdit ? 'PUT' : 'POST';
     try {
-        const r = await fetch(url, {
+        const r = await fetch(apiUrl(url), {
             method,
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body),
@@ -48974,45 +48985,23 @@ async function gwWizardSubmit() {
 
 // ─── Detail panel ───
 
-async function gwOpenDetail(id, originNodeId) {
-    // Cross-cluster: if originNodeId differs from this node, fetch
-    // through the peer-proxy. v1.0 ships local-only detail; cross-cluster
-    // shares are read-only in the list (still visible via the cluster
-    // panel) and clicking opens an info dialog explaining you need to
-    // manage them from the originating cluster.
-    const local = _gwState.gateways.find(g => g.id === id && g.origin_self !== false);
-    if (!local) {
-        const remote = _gwState.gateways.find(g => g.id === id);
-        if (remote && remote.federated) {
-            showModal(
-                `<div style="font-size:13px;line-height:1.6;">
-                    This share lives on the federated cluster <strong>${escapeHtml(remote.origin_federation_name || 'remote')}</strong>
-                    (<code>${escapeHtml(remote.origin_federation_url || '')}</code>).<br><br>
-                    Federated shares are <strong>read-only from this dashboard</strong>. To edit, open
-                    <a href="${escapeAttr(remote.origin_federation_url || '#')}" target="_blank" rel="noopener">the remote cluster's dashboard</a>
-                    and use its Shares page directly. Cross-cluster edit is a v2 feature.
-                </div>`,
-                'Federated share — read-only here'
-            );
-        } else {
-            showModal(
-                `<div style="font-size:13px;line-height:1.6;">
-                    This share lives on <strong>${escapeHtml((remote && remote.origin_hostname) || 'a peer node')}</strong>
-                    (cluster <strong>${escapeHtml((remote && remote.origin_cluster) || 'unknown')}</strong>).
-                    Open that node's dashboard to edit — peer-edit-from-anywhere is a v2 feature.
-                </div>`,
-                'Remote share'
-            );
-        }
+async function gwOpenDetail(id) {
+    const g = _gwState.gateways.find(x => x.id === id);
+    if (!g) {
+        showToast('Share not found — it may have been removed; refreshing.', 'warning');
+        await gwLoad();
         return;
     }
-    const g = local;
     const m = document.createElement('div');
     m.id = 'gw-detail';
     m.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.55);z-index:10000;display:flex;align-items:center;justify-content:center;';
     document.body.appendChild(m);
     const protos = (g.protocols || []).join('+').toUpperCase();
-    const ip = window.location.hostname;
+    // Connect commands target the node hosting the share, not the
+    // dashboard — for remote nodes we'd otherwise tell users to mount
+    // from the wrong host.
+    const _node = (typeof allNodes !== 'undefined') ? allNodes.find(n => n.id === currentNodeId) : null;
+    const ip = (_node && _node.address) ? _node.address : window.location.hostname;
     const userBlock = (g.auth && g.auth.mode === 'users') ? `
         <h4 style="margin:14px 0 6px;">Users</h4>
         <div style="display:flex;flex-direction:column;gap:6px;">
@@ -49073,18 +49062,15 @@ async function gwOpenDetail(id, originNodeId) {
 }
 
 function gwEditFrom(id) {
-    const g = _gwState.gateways.find(x => x.id === id && x.origin_self !== false);
-    if (!g) {
-        showToast("Can only edit shares owned by this node", 'error');
-        return;
-    }
+    const g = _gwState.gateways.find(x => x.id === id);
+    if (!g) { showToast('Share not found', 'error'); return; }
     document.getElementById('gw-detail')?.remove();
     gwOpenEdit(g);
 }
 
 async function gwReload(id) {
     try {
-        const r = await fetch(`/api/gateways/${encodeURIComponent(id)}/reload`, { method: 'POST' });
+        const r = await fetch(apiUrl(`/api/gateways/${encodeURIComponent(id)}/reload`), { method: 'POST' });
         const d = await r.json();
         if (!r.ok) { showToast('Reload failed: ' + (d.error || r.statusText), 'error'); return; }
         showToast('Reloaded', 'success');
@@ -49096,7 +49082,7 @@ async function gwReload(id) {
 async function gwDisable(id) {
     if (!await confirmModal('Disable this share? Clients will be disconnected. Configuration is kept.')) return;
     try {
-        const r = await fetch(`/api/gateways/${encodeURIComponent(id)}/disable`, { method: 'POST' });
+        const r = await fetch(apiUrl(`/api/gateways/${encodeURIComponent(id)}/disable`), { method: 'POST' });
         if (!r.ok) { const d = await r.json().catch(()=>({})); showToast('Disable failed: ' + (d.error || r.statusText), 'error'); return; }
         showToast('Disabled', 'success');
         document.getElementById('gw-detail')?.remove();
@@ -49106,7 +49092,7 @@ async function gwDisable(id) {
 
 async function gwEnable(id) {
     try {
-        const r = await fetch(`/api/gateways/${encodeURIComponent(id)}/enable`, { method: 'POST' });
+        const r = await fetch(apiUrl(`/api/gateways/${encodeURIComponent(id)}/enable`), { method: 'POST' });
         if (!r.ok) { const d = await r.json().catch(()=>({})); showToast('Enable failed: ' + (d.error || r.statusText), 'error'); return; }
         showToast('Enabled', 'success');
         document.getElementById('gw-detail')?.remove();
@@ -49117,7 +49103,7 @@ async function gwEnable(id) {
 async function gwDelete(id, name) {
     if (!await confirmModal(`Delete share "${name}"? Clients will lose access. The underlying data is NOT deleted — only the gateway config and mounts are removed.`)) return;
     try {
-        const r = await fetch(`/api/gateways/${encodeURIComponent(id)}`, { method: 'DELETE' });
+        const r = await fetch(apiUrl(`/api/gateways/${encodeURIComponent(id)}`), { method: 'DELETE' });
         if (!r.ok) { const d = await r.json().catch(()=>({})); showToast('Delete failed: ' + (d.error || r.statusText), 'error'); return; }
         showToast('Deleted', 'success');
         document.getElementById('gw-detail')?.remove();
@@ -49129,7 +49115,7 @@ async function gwSetPasswordPrompt(gatewayId, username) {
     const pw = await promptModal(`Set password for "${username}"`, '', { type: 'password' });
     if (!pw) return;
     try {
-        const r = await fetch(`/api/gateways/${encodeURIComponent(gatewayId)}/users/${encodeURIComponent(username)}/password`, {
+        const r = await fetch(apiUrl(`/api/gateways/${encodeURIComponent(gatewayId)}/users/${encodeURIComponent(username)}/password`), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ password: pw }),
@@ -49224,6 +49210,33 @@ function passwordPrompt(label) {
     });
 }
 
+// Install Samba or the NFS server on the current node by opening an
+// inline terminal that runs the package manager live. Once the
+// terminal closes, we re-poll daemon status so the install banner
+// disappears without the operator hitting refresh.
+async function gwInstallDaemon(component) {
+    if (component !== 'samba' && component !== 'nfs') {
+        showToast('Unknown daemon: ' + component, 'error');
+        return;
+    }
+    const node = (typeof allNodes !== 'undefined') ? allNodes.find(n => n.id === currentNodeId) : null;
+    const hostname = node ? node.hostname : 'this node';
+    // 'install' console type expects the component as the "name" param
+    // and routes through /ws/remote-console/{nodeId}/install/{component}
+    // automatically when currentNodeId points at a non-self peer.
+    // Switch to the per-node terminal view first so the inline terminal
+    // container exists in the DOM.
+    selectServerView(currentNodeId, 'terminal');
+    // The terminal view-switch above clears the container; defer one
+    // tick so the new container is in place before we open the install
+    // session, otherwise openInlineTerminal writes into the old DOM.
+    setTimeout(() => {
+        openInlineTerminal('install', component);
+        showToast(`Installing ${component} on ${hostname} — watch the terminal for progress. Re-open Shares when done.`, 'info', 6000);
+    }, 50);
+}
+
+window.gwInstallDaemon = gwInstallDaemon;
 window.gwLoad = gwLoad;
 window.gwOpenWizard = gwOpenWizard;
 window.gwOpenEdit = gwOpenEdit;
@@ -49516,7 +49529,10 @@ function arrayRowHtml(a) {
     }
     const isLocal = a.origin_self !== false;
     const isFederated = !!a.federated;
-    const sched = isLocal ? (_arrayState.config.schedules || []).find(s => s.array === a.name) : null;
+    // Ceph entries are read-only from this UI — start/stop/parity
+    // are mdadm/NoNRAID specific. Ceph cluster mgmt has its own page.
+    const isCeph = a.backend === 'ceph';
+    const sched = (isLocal && !isCeph) ? (_arrayState.config.schedules || []).find(s => s.array === a.name) : null;
     const sync = (a.sync_progress != null)
         ? `<div style="margin-top:6px;height:6px;background:rgba(59,130,246,0.15);border-radius:3px;overflow:hidden;">
                 <div style="width:${a.sync_progress}%;height:100%;background:#3b82f6;"></div>
@@ -49568,8 +49584,12 @@ function arrayRowHtml(a) {
                     </thead>
                     <tbody>${disksHtml}</tbody>
                 </table>
+                ${isCeph ? `<div style="margin-top:8px;font-size:11px;color:var(--text-muted);">${escapeHtml(a.ceph_health_detail || '')} · v${escapeHtml(a.ceph_version || '?')}</div>` : ''}
                 <div style="margin-top:12px;display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
-                    ${isLocal
+                    ${isCeph
+                        ? `<a class="btn btn-sm" href="wolfstack-ceph.php" style="text-decoration:none;">Open Ceph manager →</a>
+                           <span style="font-size:11px;color:var(--text-muted);">Cluster-managed; mutating ops live in the Ceph page</span>`
+                        : isLocal
                         ? `${a.state === 'stopped'
                                 ? `<button class="btn btn-sm" onclick="arrayStart('${escapeAttr(a.name)}')">▶ Start</button>`
                                 : `<button class="btn btn-sm" onclick="arrayStop('${escapeAttr(a.name)}')">⏸ Stop</button>`}

@@ -4822,13 +4822,78 @@ pub async fn diagnostics_subnet_routes(req: HttpRequest, state: S) -> HttpRespon
         .ok()
         .map(|s| s.trim().to_string());
 
+    // ─── Orphan detection ───
+    //
+    // Klas (2026-05-04): "There is no way to remove an orphaned subnet
+    // route". The diagnostics endpoint above only iterates CONFIGURED
+    // routes — kernel entries that go via the WolfNet interface but
+    // aren't in the config silently fall off the page, with no UI
+    // surface to remove them. Surface them here so the frontend can
+    // render an "Orphaned routes" section with a one-click remove.
+    let orphans = super::list_orphan_subnet_routes(&routes);
+
     HttpResponse::Ok().json(serde_json::json!({
         "node_id": self_id,
         "routes": entries,
+        "orphans": orphans,
         "ip_route_dump": ip_route_dump,
         "ip_route_error": ip_route_error,
         "ip_forward": ip_forward,
     }))
+}
+
+/// POST /api/router/subnet-routes/orphan/remove — force-delete a
+/// kernel subnet route that has no matching config row. Body:
+/// `{ "cidr": "10.0.0.0/24", "gateway": "10.10.0.5" }`.
+///
+/// Verifies the kernel currently has a route for `cidr` whose gateway
+/// matches `gateway` before deleting — if they've diverged since the
+/// operator clicked Remove, we refuse rather than blindly remove a
+/// route some other tool installed.
+#[derive(serde::Deserialize)]
+pub struct RemoveOrphanRouteRequest {
+    pub cidr: String,
+    pub gateway: String,
+}
+
+pub async fn remove_orphan_subnet_route(
+    req: HttpRequest,
+    state: S,
+    body: web::Json<RemoveOrphanRouteRequest>,
+) -> HttpResponse {
+    auth_or_return!(req, state);
+    let body = body.into_inner();
+
+    // Cross-check against the live config: if the operator-supplied
+    // (cidr, gateway) pair somehow IS in the config now (race vs
+    // edits since they loaded the diagnostics page), refuse the
+    // orphan-remove and tell them to use the regular delete-route
+    // endpoint instead — we don't want to silently bypass the
+    // config-aware code path.
+    {
+        let cfg = state.router.config.read().unwrap();
+        let matched = cfg.subnet_routes.iter().any(|r|
+            r.subnet_cidr.trim() == body.cidr.trim()
+            && r.gateway.trim() == body.gateway.trim()
+        );
+        if matched {
+            return HttpResponse::Conflict().json(serde_json::json!({
+                "ok": false,
+                "error": "This route exists in the configuration — use the regular Delete button on the route, not the orphan cleanup. (The orphan-remove path is only for kernel entries with no matching config row.)"
+            }));
+        }
+    }
+
+    match super::remove_orphan_kernel_route(&body.cidr, &body.gateway) {
+        Ok(()) => HttpResponse::Ok().json(serde_json::json!({
+            "ok": true,
+            "removed": { "cidr": body.cidr, "gateway": body.gateway }
+        })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "ok": false,
+            "error": e
+        })),
+    }
 }
 
 // ─── LAN Health ───
@@ -5746,11 +5811,12 @@ pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
         .route("/api/router/proxies/{id}",     web::put().to(update_proxy))
         .route("/api/router/proxies/{id}",     web::delete().to(delete_proxy))
         .route("/api/router/proxy-backends",   web::get().to(list_proxy_backends))
-        .route("/api/router/subnet-routes",             web::get().to(list_subnet_routes))
-        .route("/api/router/subnet-routes",             web::post().to(create_subnet_route))
-        .route("/api/router/subnet-routes/diagnostics", web::get().to(diagnostics_subnet_routes))
-        .route("/api/router/subnet-routes/{id}",        web::put().to(update_subnet_route))
-        .route("/api/router/subnet-routes/{id}",        web::delete().to(delete_subnet_route));
+        .route("/api/router/subnet-routes",                 web::get().to(list_subnet_routes))
+        .route("/api/router/subnet-routes",                 web::post().to(create_subnet_route))
+        .route("/api/router/subnet-routes/diagnostics",     web::get().to(diagnostics_subnet_routes))
+        .route("/api/router/subnet-routes/orphan/remove",   web::post().to(remove_orphan_subnet_route))
+        .route("/api/router/subnet-routes/{id}",            web::put().to(update_subnet_route))
+        .route("/api/router/subnet-routes/{id}",            web::delete().to(delete_subnet_route));
 }
 
 /// GET /api/router/host-dns — detect what's holding port 53 on this

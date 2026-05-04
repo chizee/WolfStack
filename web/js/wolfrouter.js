@@ -8024,6 +8024,67 @@
             `);
         }
 
+        // ─── Orphaned KERNEL routes (klas, 2026-05-04) ───
+        //
+        // Each per-node response carries an `orphans` array — kernel
+        // routes via the WolfNet interface that don't match ANY
+        // configured route. These are unreachable via the regular
+        // route list (the config has nothing to delete) so we render
+        // a dedicated section with a one-click "Remove from kernel"
+        // action that calls /api/router/subnet-routes/orphan/remove
+        // on the originating node.
+        const kernelOrphans = []; // { nodeId, nodeName, cidr, gateway, iface, raw }
+        for (const r of results) {
+            if (r.error) continue;
+            const data = r.data || {};
+            const responderId = data.node_id || r.node?.node_id || '';
+            const responderName = topoNodeName(responderId) || responderId || 'this node';
+            for (const o of (data.orphans || [])) {
+                kernelOrphans.push({
+                    nodeId: responderId,
+                    nodeName: responderName,
+                    cidr: o.cidr,
+                    gateway: o.gateway,
+                    iface: o.iface,
+                    raw: o.raw,
+                });
+            }
+        }
+        if (kernelOrphans.length) {
+            parts.push(`
+                <div style="margin-bottom:14px; padding:14px; background:rgba(234,179,8,0.10); border:1px solid rgba(234,179,8,0.45); border-radius:8px; color:var(--text);">
+                    <div style="font-weight:600; font-size:13px; color:#fde047; margin-bottom:6px;">⚠ Found ${kernelOrphans.length} kernel route${kernelOrphans.length === 1 ? '' : 's'} with no matching configuration row</div>
+                    <div style="font-size:12px; color:var(--text-muted); line-height:1.6;">
+                        These routes go via the WolfNet interface but aren't in WolfStack's subnet-route list. They were likely installed by an older WolfStack version and never cleaned up, or by a manual <code>ip route add</code>. Click <strong>Remove from kernel</strong> to drop the entry — WolfStack will refuse if the kernel's gateway has changed since this scan, so it can't accidentally undo another tool's route.
+                    </div>
+                    <table style="width:100%; margin-top:10px; border-collapse:collapse; font-size:12px;">
+                        <thead>
+                            <tr style="text-align:left; color:var(--text-muted); font-size:11px;">
+                                <th style="padding:6px 8px; border-bottom:1px solid var(--border);">Node</th>
+                                <th style="padding:6px 8px; border-bottom:1px solid var(--border);">Destination</th>
+                                <th style="padding:6px 8px; border-bottom:1px solid var(--border);">Gateway</th>
+                                <th style="padding:6px 8px; border-bottom:1px solid var(--border);">Interface</th>
+                                <th style="padding:6px 8px; border-bottom:1px solid var(--border);"></th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${kernelOrphans.map((o, idx) => `
+                                <tr>
+                                    <td style="padding:6px 8px; border-bottom:1px solid var(--border);">${escHtml(o.nodeName)}</td>
+                                    <td style="padding:6px 8px; border-bottom:1px solid var(--border); font-family:monospace;">${escHtml(o.cidr)}</td>
+                                    <td style="padding:6px 8px; border-bottom:1px solid var(--border); font-family:monospace;">${escHtml(o.gateway)}</td>
+                                    <td style="padding:6px 8px; border-bottom:1px solid var(--border); font-family:monospace;">${escHtml(o.iface || '?')}</td>
+                                    <td style="padding:6px 8px; border-bottom:1px solid var(--border);">
+                                        <button class="btn btn-sm" data-orphan-idx="${idx}" onclick="wrRemoveOrphanRoute('${escHtml(o.nodeId)}','${escHtml(o.cidr)}','${escHtml(o.gateway)}', this)">🗑 Remove from kernel</button>
+                                    </td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                </div>
+            `);
+        }
+
         if (routeIndex.size === 0 && nodeErrors.length === 0) {
             parts.push(`<div style="padding:10px 12px; color:var(--text-muted); font-size:12px;">No subnet routes configured.</div>`);
         }
@@ -8142,11 +8203,45 @@
         return n ? n.node_name : '';
     }
 
+    /// Remove a kernel route that has no matching configuration row.
+    /// Calls /api/router/subnet-routes/orphan/remove on the originating
+    /// node (the one whose diagnostics surfaced the orphan). The
+    /// backend re-validates the (cidr, gateway) pair against the
+    /// kernel and refuses if anything's changed since the operator
+    /// clicked, so the worst-case is "Refuse — kernel state changed,
+    /// re-run diagnostics".
+    async function wrRemoveOrphanRoute(nodeId, cidr, gateway, btn) {
+        if (!confirm(`Remove kernel route ${cidr} via ${gateway} from this node?\n\nThis runs \`ip route del ${cidr}\` on the host. WolfStack will refuse if the kernel's gateway has changed since the scan, so it can't accidentally delete a route managed by something else.`)) {
+            return;
+        }
+        if (btn) { btn.disabled = true; btn.textContent = '⏳ Removing…'; }
+        try {
+            const url = await wrNodeUrl(nodeId, '/api/router/subnet-routes/orphan/remove');
+            const resp = await fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ cidr, gateway }),
+            });
+            const j = await resp.json().catch(() => ({}));
+            if (!resp.ok || j.ok === false) {
+                if (btn) { btn.disabled = false; btn.textContent = '🗑 Remove from kernel'; }
+                alert('Could not remove orphan route:\n\n' + (j.error || `HTTP ${resp.status}`));
+                return;
+            }
+            // Re-run diagnostics so the page reflects post-delete state.
+            await wrRunSubnetRouteDiagnostics();
+        } catch (e) {
+            if (btn) { btn.disabled = false; btn.textContent = '🗑 Remove from kernel'; }
+            alert('Could not remove orphan route: ' + ((e && e.message) || String(e)));
+        }
+    }
+
     // Expose subnet route functions
     window.wrShowSubnetRouteEditor = wrShowSubnetRouteEditor;
     window.wrEditSubnetRoute = wrEditSubnetRoute;
     window.wrDeleteSubnetRoute = wrDeleteSubnetRoute;
     window.wrToggleSubnetRoute = wrToggleSubnetRoute;
     window.wrRunSubnetRouteDiagnostics = wrRunSubnetRouteDiagnostics;
+    window.wrRemoveOrphanRoute = wrRemoveOrphanRoute;
 
 })();

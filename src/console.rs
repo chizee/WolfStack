@@ -243,6 +243,8 @@ async fn console_session(
                 "mariadb" => "__inline_mariadb__",
                 "postgresql" => "__inline_postgresql__",
                 "certbot" => "__inline_certbot__",
+                "samba" => "__inline_samba__",
+                "nfs" => "__inline_nfs__",
                 _ => {
                     let _ = session.text(format!("\r\n\x1b[31mUnknown component: {}\x1b[0m\r\n", component)).await;
                     let _ = session.close(None).await;
@@ -299,11 +301,44 @@ async fn console_session(
                 fi && \
                 systemctl enable --now postgresql; \
                 else echo 'Unsupported package manager' && exit 1; fi";
+            // Samba — install + auto-enable smbd. Cross-distro: apt
+            // (Debian/Ubuntu/Pi), dnf (Fedora/RHEL), zypper (SUSE),
+            // pacman (Arch). The service unit name is `smbd` on
+            // Debian-family and `smb` on Red Hat/SUSE/Arch — try both
+            // so the same component works everywhere.
+            let samba_inline = "if command -v apt-get >/dev/null 2>&1; then \
+                apt-get update -qq && apt-get install -y samba; \
+                elif command -v dnf >/dev/null 2>&1; then \
+                dnf install -y samba; \
+                elif command -v zypper >/dev/null 2>&1; then \
+                zypper install -y samba; \
+                elif command -v pacman >/dev/null 2>&1; then \
+                pacman -S --noconfirm samba; \
+                else echo 'Unsupported package manager' && exit 1; fi && \
+                (systemctl enable --now smbd 2>/dev/null || systemctl enable --now smb 2>/dev/null) && \
+                echo 'Samba installed and smbd enabled.'";
+            // NFS server — same deal. Debian/Ubuntu use
+            // nfs-kernel-server (service: nfs-server or nfs-kernel-server
+            // depending on version), Red Hat uses nfs-utils (service:
+            // nfs-server), Arch uses nfs-utils (service: nfs-server).
+            let nfs_inline = "if command -v apt-get >/dev/null 2>&1; then \
+                apt-get update -qq && apt-get install -y nfs-kernel-server; \
+                elif command -v dnf >/dev/null 2>&1; then \
+                dnf install -y nfs-utils; \
+                elif command -v zypper >/dev/null 2>&1; then \
+                zypper install -y nfs-kernel-server; \
+                elif command -v pacman >/dev/null 2>&1; then \
+                pacman -S --noconfirm nfs-utils; \
+                else echo 'Unsupported package manager' && exit 1; fi && \
+                (systemctl enable --now nfs-server 2>/dev/null || systemctl enable --now nfs-kernel-server 2>/dev/null) && \
+                echo 'NFS server installed and enabled.'";
             let inline_script = match install_script {
                 "__inline_mariadb__" => Some(mariadb_inline),
                 "__inline_postgresql__" => Some(postgresql_inline),
                 "__inline_certbot__" => Some(certbot_inline),
                 "__inline_wolfproxy__" => Some(wolfproxy_inline),
+                "__inline_samba__" => Some(samba_inline),
+                "__inline_nfs__" => Some(nfs_inline),
                 _ => None,
             };
             let is_inline = inline_script.is_some();

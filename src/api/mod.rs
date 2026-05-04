@@ -17420,16 +17420,22 @@ pub async fn system_install_package(
 
 /// GET /api/proposals — inbox view (Pending + active Snoozed),
 /// sorted Critical→Info, then most-recently-updated first.
+///
+/// Acked findings are filtered out at read time. Without this the
+/// "Ack as intentional" button only stops *future* analyser runs
+/// from re-creating the proposal; the existing Pending row would
+/// stay visible forever (Piranha bug, 2026-05-04).
 pub async fn predictive_proposals_list(
     req: HttpRequest,
     state: web::Data<AppState>,
 ) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
-    let store = match state.predictive_proposals.read() {
-        Ok(g) => g,
-        Err(e) => e.into_inner(),
-    };
-    let inbox: Vec<&crate::predictive::Proposal> = store.inbox();
+    let acks = state.predictive_acks.read().unwrap_or_else(|e| e.into_inner()).clone();
+    let store = state.predictive_proposals.read().unwrap_or_else(|e| e.into_inner());
+    let inbox: Vec<crate::predictive::Proposal> = store.inbox().into_iter()
+        .filter(|p| !acks.suppresses(&p.finding_type, &p.scope))
+        .cloned()
+        .collect();
     HttpResponse::Ok().json(inbox)
 }
 
@@ -17486,11 +17492,18 @@ async fn build_cluster_response(
         ClusterProposalsResponse, NodeAggregateStatus, sort_proposals,
     };
 
-    // Self proposals — clone out under a brief read lock.
+    // Self proposals — clone out under a brief read lock. Filter
+    // against the local ack store so already-acked findings stay
+    // hidden when the operator re-opens the inbox (Piranha bug —
+    // ack only stopped *future* analyser runs from re-creating).
+    let acks = state.predictive_acks.read().unwrap_or_else(|e| e.into_inner()).clone();
     let self_proposals: Vec<crate::predictive::Proposal> = {
         let store = state.predictive_proposals.read()
             .unwrap_or_else(|e| e.into_inner());
-        store.inbox().into_iter().cloned().collect()
+        store.inbox().into_iter()
+            .filter(|p| !acks.suppresses(&p.finding_type, &p.scope))
+            .cloned()
+            .collect()
     };
 
     // Self status — for the nodes list. We always responded to
@@ -17551,7 +17564,10 @@ async fn build_cluster_response(
     for (id, hostname, cluster_name, h) in handles {
         match h.await {
             Ok(Ok(proposals)) => {
-                all_proposals.extend(proposals);
+                all_proposals.extend(
+                    proposals.into_iter()
+                        .filter(|p| !acks.suppresses(&p.finding_type, &p.scope))
+                );
                 node_status.push(NodeAggregateStatus {
                     node_id: id, hostname, is_self: false,
                     responded: true, error: None, cluster_name,
@@ -22180,6 +22196,82 @@ pub async fn gateways_discover_sources(req: HttpRequest, state: web::Data<AppSta
             }
         }
     }
+    // Docker named volumes — each named volume has its data directory
+    // at `/var/lib/docker/volumes/<name>/_data`. Surface them as
+    // `Local` sources so they can be re-exported without needing a
+    // v1.1 ContainerVol implementation. We scan the directory rather
+    // than going through the Docker socket so this works even if the
+    // Docker daemon is paused/down.
+    let docker_vol_root = std::path::Path::new("/var/lib/docker/volumes");
+    if let Ok(rd) = std::fs::read_dir(docker_vol_root) {
+        for e in rd.flatten() {
+            if let Some(name) = e.file_name().to_str() {
+                // Skip metadata.db and other non-volume entries —
+                // every real named volume has a `_data` subdir.
+                let data = e.path().join("_data");
+                if !data.is_dir() { continue; }
+                entries.push(serde_json::json!({
+                    "type": "local",
+                    "node_id": node_id,
+                    "path": data.to_string_lossy(),
+                    "label": format!("Docker volume: {}", name),
+                }));
+            }
+        }
+    }
+
+    // LXC containers — surface each container's rootfs (so the
+    // operator can re-export, say, the `/home` inside an LXC). Walks
+    // every registered LXC storage path, not just the default, so
+    // multi-pool installs are covered.
+    for base in crate::containers::lxc_storage_paths() {
+        let base_path = std::path::Path::new(&base);
+        if let Ok(rd) = std::fs::read_dir(base_path) {
+            for e in rd.flatten() {
+                let Some(name) = e.file_name().to_str().map(|s| s.to_string()) else { continue };
+                let rootfs = e.path().join("rootfs");
+                if !rootfs.is_dir() { continue; }
+                entries.push(serde_json::json!({
+                    "type": "local",
+                    "node_id": node_id,
+                    "path": rootfs.to_string_lossy(),
+                    "label": format!("LXC rootfs: {} ({})", name, base),
+                }));
+            }
+        }
+    }
+
+    // VM disk image directories — Proxmox keeps per-VM dirs under
+    // `/var/lib/vz/images/<vmid>` and libvirt under
+    // `/var/lib/libvirt/images`. Useful when an operator wants to
+    // share a VM's disk dir read-only for migration / inspection.
+    for vm_root in ["/var/lib/vz/images", "/var/lib/libvirt/images"] {
+        let p = std::path::Path::new(vm_root);
+        if !p.is_dir() { continue; }
+        // The libvirt root is one flat directory of .qcow2/.img files;
+        // surface it directly. The PVE root is a tree of <vmid>/<files>;
+        // surface each VMID subdir.
+        if vm_root.ends_with("libvirt/images") {
+            entries.push(serde_json::json!({
+                "type": "local",
+                "node_id": node_id,
+                "path": vm_root,
+                "label": format!("libvirt VM images ({})", vm_root),
+            }));
+        } else if let Ok(rd) = std::fs::read_dir(p) {
+            for e in rd.flatten() {
+                let Some(vmid) = e.file_name().to_str().map(|s| s.to_string()) else { continue };
+                if !e.path().is_dir() { continue; }
+                entries.push(serde_json::json!({
+                    "type": "local",
+                    "node_id": node_id,
+                    "path": e.path().to_string_lossy(),
+                    "label": format!("PVE VM {} images ({})", vmid, vm_root),
+                }));
+            }
+        }
+    }
+
     // Always include "Local directory" as a free-form source — UI
     // surfaces a path field.
     entries.push(serde_json::json!({
@@ -22490,6 +22582,69 @@ fn invalidate_array_cluster_cache(state: &web::Data<AppState>) {
     *cache = None;
 }
 
+/// Convert a CephClusterStatus into the same array-shaped entry the
+/// Storage Array UI already understands. OSDs surface as `disks`,
+/// health maps to `state` (HEALTH_OK→clean, HEALTH_WARN→degraded,
+/// HEALTH_ERR→unhealthy / unreachable). Cluster-level used / total
+/// bytes drive the capacity badge. Deduped across peers by fsid —
+/// every node in a Ceph cluster sees the same fsid, so first
+/// observation wins.
+fn ceph_to_array_entry(
+    ceph: &crate::ceph::CephClusterStatus,
+    node_id: &str,
+    hostname: &str,
+    cluster_label: &str,
+    origin_self: bool,
+    seen_fsids: &mut std::collections::HashSet<String>,
+) -> Option<serde_json::Value> {
+    if ceph.fsid.is_empty() {
+        // No Ceph configured on this node, or status read failed.
+        return None;
+    }
+    if !seen_fsids.insert(ceph.fsid.clone()) {
+        return None; // Already surfaced via another node.
+    }
+    let state = match ceph.health {
+        crate::ceph::CephHealthStatus::Ok      => "clean",
+        crate::ceph::CephHealthStatus::Warn    => "degraded",
+        crate::ceph::CephHealthStatus::Error   => "degraded",
+        crate::ceph::CephHealthStatus::Unknown => "unknown",
+    };
+    let disks: Vec<serde_json::Value> = ceph.osds.iter().map(|o| {
+        let dstate = if o.up && o.in_cluster { "in_sync" }
+            else if !o.up { "faulty" }
+            else { "spare" };
+        serde_json::json!({
+            "device": format!("osd.{}", o.id),
+            "role": "data",
+            "state": dstate,
+            "size_bytes": o.size_bytes,
+            "used_bytes": o.used_bytes,
+            "smart_status": "unknown",
+            "model": if o.host.is_empty() { None } else { Some(o.host.clone()) },
+            "serial": serde_json::Value::Null,
+            "temperature_c": serde_json::Value::Null,
+        })
+    }).collect();
+    Some(serde_json::json!({
+        "name": format!("ceph/{}", &ceph.fsid[..ceph.fsid.len().min(8)]),
+        "level": format!("ceph ({} osds, {} pools)", ceph.osds.len(), ceph.pools.len()),
+        "state": state,
+        "sync_progress": serde_json::Value::Null,
+        "sync_speed_kbs": serde_json::Value::Null,
+        "disks": disks,
+        "size_bytes": ceph.total_bytes,
+        "used_bytes": ceph.used_bytes,
+        "backend": "ceph",
+        "ceph_health_detail": ceph.health_detail,
+        "ceph_version": ceph.ceph_version,
+        "origin_node_id": node_id,
+        "origin_hostname": hostname,
+        "origin_cluster": cluster_label,
+        "origin_self": origin_self,
+    }))
+}
+
 pub async fn array_cluster(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
 
@@ -22507,7 +22662,10 @@ pub async fn array_cluster(req: HttpRequest, state: web::Data<AppState>) -> Http
         }
     }
 
-    // Self.
+    // Self — both mdadm/NoNRAID arrays AND any Ceph cluster this
+    // node is attached to. Ceph is its own distributed beast; we
+    // surface it as an "array-shaped" entry so the page covers
+    // every storage system the operator manages.
     let self_arrays = tokio::task::spawn_blocking(crate::array::list_arrays).await.unwrap_or_default();
     let self_backend = match crate::array::detect_backend() {
         crate::array::Backend::Mdadm => "mdadm",
@@ -22529,9 +22687,20 @@ pub async fn array_cluster(req: HttpRequest, state: web::Data<AppState>) -> Http
         }
         v
     }).collect();
+    // Ceph — dedupe by fsid since multiple nodes in a cluster all
+    // see the same Ceph cluster. First-occurrence wins.
+    let mut seen_ceph_fsids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let self_ceph = tokio::task::spawn_blocking(crate::ceph::get_cluster_status).await.ok();
+    if let Some(ceph) = self_ceph {
+        if let Some(entry) = ceph_to_array_entry(&ceph, &self_node_id, &self_hostname, &self_cluster, true, &mut seen_ceph_fsids) {
+            all.push(entry);
+        }
+    }
 
-    // Peers — only online wolfstack nodes that aren't ourselves.
-    // Proxmox-typed nodes don't run our array module so we skip them.
+    // Peers — every online wolfstack node that isn't us. We also
+    // fan out to each peer's `/api/ceph/status` so Ceph clusters
+    // attached to peer nodes surface in the panel even if THIS
+    // node isn't itself attached to that Ceph cluster.
     let peers: Vec<_> = nodes_snapshot.into_iter()
         .filter(|n| !n.is_self && n.node_type == "wolfstack" && n.online)
         .collect();
@@ -22539,43 +22708,70 @@ pub async fn array_cluster(req: HttpRequest, state: web::Data<AppState>) -> Http
     let client = &*API_HTTP_CLIENT;
     let mut handles = Vec::new();
     for peer in &peers {
-        let urls = build_node_urls(&peer.address, peer.port, "/api/array");
+        let array_urls = build_node_urls(&peer.address, peer.port, "/api/array");
+        let ceph_urls  = build_node_urls(&peer.address, peer.port, "/api/ceph/status");
         let secret = secret.clone();
         let peer_id = peer.self_id.clone().unwrap_or_else(|| peer.id.clone());
         let peer_host = peer.hostname.clone();
         let cluster_label = peer.cluster_name.clone().unwrap_or_default();
         let h = tokio::spawn(async move {
-            for url in urls {
-                let res = client.get(&url)
-                    .timeout(std::time::Duration::from_secs(8))
-                    .header("X-WolfStack-Secret", &secret)
-                    .send().await;
-                if let Ok(resp) = res {
-                    if resp.status().is_success() {
-                        if let Ok(v) = resp.json::<serde_json::Value>().await {
-                            return Some((peer_id, peer_host, cluster_label, v));
+            // Both calls in parallel for this peer.
+            let array_fut = async {
+                for url in &array_urls {
+                    if let Ok(resp) = client.get(url)
+                        .timeout(std::time::Duration::from_secs(8))
+                        .header("X-WolfStack-Secret", &secret).send().await
+                    {
+                        if resp.status().is_success() {
+                            if let Ok(v) = resp.json::<serde_json::Value>().await { return Some(v); }
                         }
                     }
                 }
-            }
-            None
+                None
+            };
+            let ceph_fut = async {
+                for url in &ceph_urls {
+                    if let Ok(resp) = client.get(url)
+                        .timeout(std::time::Duration::from_secs(8))
+                        .header("X-WolfStack-Secret", &secret).send().await
+                    {
+                        if resp.status().is_success() {
+                            if let Ok(v) = resp.json::<serde_json::Value>().await { return Some(v); }
+                        }
+                    }
+                }
+                None
+            };
+            let (array_v, ceph_v) = tokio::join!(array_fut, ceph_fut);
+            (peer_id, peer_host, cluster_label, array_v, ceph_v)
         });
         handles.push(h);
     }
     for h in handles {
-        if let Ok(Some((pid, host, cluster, v))) = h.await {
-            let backend = v.get("backend").and_then(|x| x.as_str()).unwrap_or("mdadm").to_string();
-            if let Some(arrays) = v.get("arrays").and_then(|x| x.as_array()) {
-                for entry in arrays {
-                    let mut e = entry.clone();
-                    if let Some(obj) = e.as_object_mut() {
-                        obj.insert("origin_node_id".into(), serde_json::json!(pid));
-                        obj.insert("origin_hostname".into(), serde_json::json!(host));
-                        obj.insert("origin_cluster".into(), serde_json::json!(cluster));
-                        obj.insert("origin_self".into(), serde_json::json!(false));
-                        obj.insert("backend".into(), serde_json::json!(backend));
+        if let Ok((pid, host, cluster, array_v, ceph_v)) = h.await {
+            // mdadm / NoNRAID arrays from this peer
+            if let Some(v) = array_v {
+                let backend = v.get("backend").and_then(|x| x.as_str()).unwrap_or("mdadm").to_string();
+                if let Some(arrays) = v.get("arrays").and_then(|x| x.as_array()) {
+                    for entry in arrays {
+                        let mut e = entry.clone();
+                        if let Some(obj) = e.as_object_mut() {
+                            obj.insert("origin_node_id".into(), serde_json::json!(pid));
+                            obj.insert("origin_hostname".into(), serde_json::json!(host));
+                            obj.insert("origin_cluster".into(), serde_json::json!(cluster));
+                            obj.insert("origin_self".into(), serde_json::json!(false));
+                            obj.insert("backend".into(), serde_json::json!(backend));
+                        }
+                        all.push(e);
                     }
-                    all.push(e);
+                }
+            }
+            // Ceph status from this peer (deduped by fsid across all peers).
+            if let Some(v) = ceph_v {
+                if let Ok(ceph) = serde_json::from_value::<crate::ceph::CephClusterStatus>(v) {
+                    if let Some(entry) = ceph_to_array_entry(&ceph, &pid, &host, &cluster, false, &mut seen_ceph_fsids) {
+                        all.push(entry);
+                    }
                 }
             }
         }
