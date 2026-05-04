@@ -1647,6 +1647,11 @@ function configuratorApiUrl(path) {
 // ─── Page Navigation ───
 function selectView(page) {
     closeSidebarMobile();
+    // Close the embedded inbox terminal when leaving the inbox so the
+    // WebSocket and xterm don't stay live in a hidden pane.
+    if (currentPage === 'inbox' && page !== 'inbox' && typeof predTermClose === 'function') {
+        try { predTermClose(); } catch (_) {}
+    }
     currentPage = page;
     currentNodeId = null;
     try { updateClusterPill(); } catch (_) {}
@@ -1716,6 +1721,10 @@ function selectView(page) {
 
 function selectServerView(nodeId, view) {
     closeSidebarMobile();
+    // Close the embedded inbox terminal when leaving the inbox.
+    if (currentPage === 'inbox' && view !== 'inbox' && typeof predTermClose === 'function') {
+        try { predTermClose(); } catch (_) {}
+    }
     if (nodeId !== currentNodeId) _physicalInterfacesCache = null; // reset NIC cache on node switch
     currentNodeId = nodeId;
     currentPage = view;
@@ -47692,8 +47701,14 @@ function renderPredictiveInbox() {
     const container = document.getElementById('page-inbox');
     if (!container) return;
     if (!container.querySelector('.predictive-shell')) {
+        // Two-column layout: left = proposals list, right = embedded
+        // terminal. Replaces the per-command popup-window terminal so
+        // a proposal with three non-destructive commands runs all
+        // three in the same shell instead of spawning three windows.
+        // The split collapses to one column under 1100px for laptop
+        // screens (terminal becomes a sticky panel below the list).
         container.innerHTML = `
-            <div class="predictive-shell" style="padding:20px 24px;max-width:1100px;margin:0 auto;">
+            <div class="predictive-shell" style="padding:20px 24px;max-width:1600px;margin:0 auto;">
                 <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:18px;gap:16px;flex-wrap:wrap;">
                     <div style="flex:1;min-width:280px;">
                         <h2 style="margin:0 0 6px 0;font-size:22px;color:var(--text-primary);">🔮 Predictive Inbox</h2>
@@ -47707,9 +47722,58 @@ function renderPredictiveInbox() {
                         <button class="btn btn-sm" onclick="predictiveRunNow()" id="predictive-run-now">🔄 Run analyzer now</button>
                     </div>
                 </div>
-                <div id="predictive-list">
-                    <div style="color:var(--text-muted);padding:40px;text-align:center;">Loading…</div>
+                <div class="predictive-split" style="display:grid;grid-template-columns:minmax(0,1fr) minmax(0,560px);gap:16px;align-items:start;">
+                    <div id="predictive-list" style="min-width:0;">
+                        <div style="color:var(--text-muted);padding:40px;text-align:center;">Loading…</div>
+                    </div>
+                    <div id="predictive-terminal-pane" style="position:sticky;top:16px;background:var(--bg-card,#1e2028);border:1px solid var(--border,#2d2f3a);border-radius:10px;overflow:hidden;display:flex;flex-direction:column;height:calc(100vh - 160px);min-height:400px;">
+                        <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid var(--border,#2d2f3a);background:var(--bg-secondary,#16181f);">
+                            <div style="display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600;">
+                                <span style="font-size:16px;">💻</span>
+                                <span id="predictive-term-status" style="color:var(--text-muted);">No active terminal</span>
+                            </div>
+                            <button class="btn btn-sm" onclick="predTermClose()" id="predictive-term-close" style="display:none;font-size:11px;padding:2px 8px;">✕ Close</button>
+                        </div>
+                        <div id="predictive-term-container" style="flex:1;background:#0a0a0a;padding:8px;overflow:hidden;">
+                            <div style="color:var(--text-muted);padding:24px;text-align:center;font-size:13px;line-height:1.6;">
+                                Click <strong>▶ Run</strong> on a remediation command to open a terminal here.<br>
+                                <span style="font-size:11px;opacity:0.7;">Multiple commands from the same proposal share the session — no more 3-popup workflows.</span>
+                            </div>
+                        </div>
+                    </div>
                 </div>
+                <style>
+                    /* Tablet / small laptop — stack to a single column.
+                       The terminal becomes a fixed-height pane below
+                       the list; sticky positioning is dropped because
+                       sticky inside a stacked layout glues it to the
+                       top of its now-vertical sibling and hides
+                       proposals behind it. */
+                    @media (max-width: 1100px) {
+                        .predictive-split { grid-template-columns: 1fr !important; }
+                        #predictive-terminal-pane { position: static !important; height: 380px !important; }
+                    }
+                    /* Phone — tighten outer padding so the proposal
+                       cards aren't pinched, give the terminal a bit
+                       less height so the user can still see at least
+                       one proposal above it without scrolling. */
+                    @media (max-width: 640px) {
+                        .predictive-shell { padding: 12px !important; }
+                        #predictive-terminal-pane { height: 300px !important; }
+                        .predictive-split { gap: 12px !important; }
+                        /* xterm uses fixed font sizing — drop one
+                           notch on phones so a typical 80-col line
+                           doesn't horizontally overflow the pane. */
+                        #predictive-term-container .xterm,
+                        #predictive-term-container .xterm-viewport,
+                        #predictive-term-container .xterm-screen { font-size: 11px !important; }
+                    }
+                    /* Touch-target sizing for the Close button on
+                       coarse pointers. */
+                    @media (pointer: coarse) {
+                        #predictive-term-close { min-height: 36px; min-width: 60px; }
+                    }
+                </style>
                 <details style="margin-top:24px;background:rgba(96,165,250,0.05);border:1px solid rgba(96,165,250,0.2);border-radius:8px;padding:0;">
                     <summary style="padding:10px 14px;cursor:pointer;font-size:12px;color:#60a5fa;font-weight:600;">ℹ How this works</summary>
                     <div style="padding:0 14px 12px 14px;font-size:12px;color:var(--text-secondary);line-height:1.55;">
@@ -48017,6 +48081,7 @@ function predictiveCardHtml(p) {
             ${remediation}
             <div style="display:flex;gap:8px;flex-wrap:wrap;">
                 <button class="btn btn-sm btn-primary" onclick="predictiveApprove('${escapeAttr(p.id)}')">✓ Mark applied</button>
+                <button class="btn btn-sm" onclick="predictiveOpenTerm('${escapeAttr(p.id)}')" title="Open an interactive shell on this proposal's target — host, container, or VM">💻 Open terminal</button>
                 <button class="btn btn-sm" onclick="predictiveSnoozeMenu('${escapeAttr(p.id)}', this)">⏰ Snooze</button>
                 <button class="btn btn-sm" onclick="predictiveDismiss('${escapeAttr(p.id)}')">✗ Dismiss</button>
                 <button class="btn btn-sm" onclick="predictiveAck('${escapeAttr(p.finding_type)}', '${escapeAttr(p.scope.node_id)}', '${escapeAttr(p.scope.resource_id || '')}')">🛡 Ack as intentional</button>
@@ -48053,33 +48118,241 @@ function predictiveRemediationHtml(r, proposalId) {
     return `<div style="font-size:12px;color:var(--text-muted);font-style:italic;margin-bottom:12px;">[Remediation kind "${escapeHtml(r.kind)}" — UI pending]</div>`;
 }
 
-/// Open a console connected to the right target (host/docker/lxc/vm)
-/// for the proposal's scope, with the indexed command pre-run via
-/// `console.html`'s proposal_id+cmd_idx fetch path. The console
-/// resolves the target server-side from the proposal store, so the
-/// browser doesn't need to know where the finding lives.
+/// Embedded terminal for the Predictive Inbox right pane.
+///
+/// Holds a single live xterm + WebSocket session at a time. When a
+/// proposal's "▶ Run" button is clicked the first time, this opens a
+/// host/docker/lxc/vm console on the proposal's target node and
+/// auto-runs the indexed command. Subsequent Runs on the SAME
+/// proposal re-use the open shell — three non-destructive commands
+/// → three lines in one terminal, not three popup windows.
+///
+/// Cross-cluster: proposals on a peer node use
+/// `/ws/remote-console/{nodeId}/...`, which the local server's
+/// console proxy already bridges. Federated proposals (different
+/// cluster) aren't supported here — same-cluster fan-out only —
+/// because we don't have a federation-aware WS proxy. Frontend
+/// surfaces that as a clear toast pointing the operator to the
+/// originating cluster's dashboard rather than a silent failure.
+const predTermState = {
+    proposalId: null,
+    ws: null,
+    term: null,
+    fitAddon: null,
+    fitHandler: null,
+    target: null,
+};
+
 async function predictiveRunCmd(proposalId, cmdIdx) {
+    let meta;
     try {
-        // Pre-flight the metadata so we can pick the right console
-        // type and surface a useful error if the target's wrong.
         const r = await fetch(`/api/proposals/${encodeURIComponent(proposalId)}/command/${encodeURIComponent(cmdIdx)}`);
         if (!r.ok) {
             const data = await r.json().catch(() => ({}));
-            showToast(`Couldn't open terminal: ${data.error || r.statusText}`, 'error');
+            const msg = data.error || r.statusText;
+            // Federated proposals: pre-flight returns 404 because the
+            // local store + same-cluster fan-out can't reach the
+            // origin cluster. Tell the operator clearly instead of
+            // a generic "couldn't open".
+            if (r.status === 404) {
+                showToast(
+                    'This proposal lives on a federated cluster — open that cluster\'s dashboard to apply remediations from there.',
+                    'warning', 5000,
+                );
+            } else {
+                showToast(`Couldn't open terminal: ${msg}`, 'error');
+            }
             return;
         }
-        const meta = await r.json();
-        let url = '/console.html?type=' + encodeURIComponent(meta.console_type)
-            + '&name=' + encodeURIComponent(meta.console_name)
-            + '&proposal_id=' + encodeURIComponent(proposalId)
-            + '&cmd_idx=' + encodeURIComponent(cmdIdx);
-        if (meta.remote_node_id) {
-            url += '&node_id=' + encodeURIComponent(meta.remote_node_id);
-        }
-        window.open(url, 'console_predictive_' + proposalId + '_' + cmdIdx,
-            'width=960,height=600,menubar=no,toolbar=no');
+        meta = await r.json();
     } catch (e) {
         showToast(`Open terminal errored: ${e.message || String(e)}`, 'error');
+        return;
+    }
+
+    // Same-proposal re-use: just send the new command to the
+    // existing shell. This is the whole point of the rebuild — three
+    // non-destructive commands shouldn't open three windows.
+    if (predTermState.proposalId === proposalId
+        && predTermState.ws && predTermState.ws.readyState === WebSocket.OPEN) {
+        predTermState.ws.send(meta.command + '\n');
+        if (predTermState.term) predTermState.term.focus();
+        return;
+    }
+
+    // Different proposal already running → confirm before tearing
+    // down. Avoids killing an in-progress session by accident.
+    if (predTermState.proposalId && predTermState.proposalId !== proposalId) {
+        const ok = await confirmModal(
+            'Switch the embedded terminal to a different proposal? The current shell will be closed.'
+        );
+        if (!ok) return;
+    }
+
+    predTermClose();
+    predTermOpen(proposalId, meta);
+}
+
+function predTermOpen(proposalId, meta) {
+    const container = document.getElementById('predictive-term-container');
+    if (!container) return;
+    if (typeof Terminal === 'undefined') {
+        showToast('xterm.js failed to load — refresh the page.', 'error');
+        return;
+    }
+    container.innerHTML = '';
+
+    const term = new Terminal({
+        cursorBlink: true,
+        fontSize: 13,
+        fontFamily: '"JetBrains Mono", "Fira Code", "Cascadia Code", "Courier New", monospace',
+        theme: { background: '#0a0a0a', foreground: '#f0f0f0', cursor: '#10b981', selectionBackground: 'rgba(16,185,129,0.3)' },
+        scrollback: 5000,
+        // disableStdin lets us write commands programmatically while
+        // still allowing the operator to type. xterm interprets it as
+        // a render-only flag; we need it FALSE so user keystrokes
+        // reach the WS via term.onData below. Default is fine —
+        // explicit here for clarity.
+        disableStdin: false,
+    });
+    let fitAddon = null;
+    if (typeof FitAddon !== 'undefined') {
+        fitAddon = new FitAddon.FitAddon();
+        term.loadAddon(fitAddon);
+    }
+    term.open(container);
+    setTimeout(() => { try { fitAddon && fitAddon.fit(); } catch (_) {} }, 50);
+
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const isRemote = !!meta.remote_node_id;
+    const wsUrl = isRemote
+        ? `${protocol}//${window.location.host}/ws/remote-console/${encodeURIComponent(meta.remote_node_id)}/${encodeURIComponent(meta.console_type)}/${encodeURIComponent(meta.console_name)}`
+        : `${protocol}//${window.location.host}/ws/console/${encodeURIComponent(meta.console_type)}/${encodeURIComponent(meta.console_name)}`;
+
+    term.writeln(`\x1b[90m● Connecting to ${meta.console_type} on ${meta.console_name}…\x1b[0m`);
+    const ws = new WebSocket(wsUrl);
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = () => {
+        term.writeln('\x1b[32m● Connected\x1b[0m');
+        // Auto-run the requested remediation command if one was
+        // supplied. Empty meta.command (e.g. from the "Open terminal"
+        // button) leaves the operator at a clean prompt to poke
+        // around manually. Append \n so the shell executes the
+        // command instead of just buffering.
+        if (meta.command) {
+            ws.send(meta.command + '\n');
+        }
+        try { fitAddon && fitAddon.fit(); } catch (_) {}
+        term.focus();
+    };
+    ws.onmessage = (event) => {
+        if (typeof event.data === 'string') term.write(event.data);
+        else term.write(new Uint8Array(event.data));
+    };
+    ws.onclose = () => {
+        term.writeln('\r\n\x1b[31m● Disconnected\x1b[0m');
+    };
+    ws.onerror = () => {
+        term.writeln('\r\n\x1b[31m● Connection error — check the target node is online and try again.\x1b[0m');
+    };
+    term.onData(d => { if (ws.readyState === WebSocket.OPEN) ws.send(d); });
+
+    const fitHandler = () => { try { fitAddon && fitAddon.fit(); } catch (_) {} };
+    window.addEventListener('resize', fitHandler);
+
+    predTermState.proposalId = proposalId;
+    predTermState.ws = ws;
+    predTermState.term = term;
+    predTermState.fitAddon = fitAddon;
+    predTermState.fitHandler = fitHandler;
+    predTermState.target = meta;
+
+    const status = document.getElementById('predictive-term-status');
+    if (status) {
+        const where = isRemote ? `peer ${meta.console_name}` : meta.console_name;
+        status.textContent = `${meta.title || 'proposal'} → ${where}`;
+        status.style.color = '';
+    }
+    const closeBtn = document.getElementById('predictive-term-close');
+    if (closeBtn) closeBtn.style.display = '';
+}
+
+/// "Open terminal" button on a proposal — same pane, same connection
+/// model as predictiveRunCmd, but no command auto-runs. Operator
+/// drops at a clean prompt on the proposal's actual target (host /
+/// docker exec / lxc-attach / vm serial), so they can investigate or
+/// remediate manually without leaving the inbox.
+async function predictiveOpenTerm(proposalId) {
+    let meta;
+    try {
+        const r = await fetch(`/api/proposals/${encodeURIComponent(proposalId)}/console-target`);
+        if (!r.ok) {
+            const data = await r.json().catch(() => ({}));
+            if (r.status === 404) {
+                showToast(
+                    'This proposal lives on a federated cluster — open that cluster\'s dashboard to access its terminal.',
+                    'warning', 5000,
+                );
+            } else {
+                showToast(`Couldn't open terminal: ${data.error || r.statusText}`, 'error');
+            }
+            return;
+        }
+        meta = await r.json();
+    } catch (e) {
+        showToast(`Open terminal errored: ${e.message || String(e)}`, 'error');
+        return;
+    }
+
+    // Same proposal already open → just focus, don't tear down.
+    if (predTermState.proposalId === proposalId
+        && predTermState.ws && predTermState.ws.readyState === WebSocket.OPEN) {
+        if (predTermState.term) predTermState.term.focus();
+        return;
+    }
+    if (predTermState.proposalId && predTermState.proposalId !== proposalId) {
+        const ok = await confirmModal(
+            'Switch the embedded terminal to this proposal\'s target? The current shell will be closed.'
+        );
+        if (!ok) return;
+    }
+    predTermClose();
+    // Empty `command` so predTermOpen doesn't auto-send anything.
+    predTermOpen(proposalId, { ...meta, command: '' });
+}
+
+function predTermClose() {
+    if (predTermState.ws) {
+        try { predTermState.ws.close(); } catch (_) {}
+    }
+    if (predTermState.term) {
+        try { predTermState.term.dispose(); } catch (_) {}
+    }
+    if (predTermState.fitHandler) {
+        window.removeEventListener('resize', predTermState.fitHandler);
+    }
+    predTermState.proposalId = null;
+    predTermState.ws = null;
+    predTermState.term = null;
+    predTermState.fitAddon = null;
+    predTermState.fitHandler = null;
+    predTermState.target = null;
+
+    const status = document.getElementById('predictive-term-status');
+    if (status) {
+        status.textContent = 'No active terminal';
+        status.style.color = 'var(--text-muted)';
+    }
+    const closeBtn = document.getElementById('predictive-term-close');
+    if (closeBtn) closeBtn.style.display = 'none';
+    const container = document.getElementById('predictive-term-container');
+    if (container) {
+        container.innerHTML = `
+            <div style="color:var(--text-muted);padding:24px;text-align:center;font-size:13px;line-height:1.6;">
+                Click <strong>▶ Run</strong> on a remediation command to open a terminal here.<br>
+                <span style="font-size:11px;opacity:0.7;">Multiple commands from the same proposal share the session — no more 3-popup workflows.</span>
+            </div>
+        `;
     }
 }
 
@@ -48306,6 +48579,8 @@ window.predictiveStartBadgePoll = predictiveStartBadgePoll;
 window.predictiveSetNodeFilter = predictiveSetNodeFilter;
 window.predictiveSetClusterFilter = predictiveSetClusterFilter;
 window.predictiveRunCmd = predictiveRunCmd;
+window.predictiveOpenTerm = predictiveOpenTerm;
+window.predTermClose = predTermClose;
 
 // ─── Apps & Tools drawer ──────────────────────────────────────────
 //

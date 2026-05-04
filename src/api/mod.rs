@@ -18008,6 +18008,54 @@ pub async fn predictive_proposal_command(
     }))
 }
 
+/// GET /api/proposals/{id}/console-target — return just the
+/// `(console_type, console_name, remote_node_id, title)` for a
+/// proposal, without requiring it to have a Manual remediation
+/// command list. Used by the Inbox's "Open terminal" button: the
+/// operator wants an interactive shell on the proposal's target
+/// (host / docker exec / lxc-attach / vm serial) so they can poke
+/// around manually instead of running the suggested command. Uses
+/// the same scope→target resolver as `predictive_proposal_command`
+/// so the two paths can never disagree about *where* a proposal
+/// lives.
+pub async fn predictive_proposal_console_target(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+
+    let local_p: Option<crate::predictive::Proposal> = {
+        let store = state.predictive_proposals.read()
+            .unwrap_or_else(|e| e.into_inner());
+        store.get(&id).cloned()
+    };
+    let p = match local_p {
+        Some(p) => p,
+        None => match fetch_proposal_from_peers(&id, &state).await {
+            Some(p) => p,
+            None => return HttpResponse::NotFound().json(serde_json::json!({
+                "error": "proposal not found",
+            })),
+        },
+    };
+
+    let (console_type, console_name) = resolve_console_target(&p);
+    let remote_node_id: Option<String> = if p.scope.node_id != state.node_id {
+        Some(p.scope.node_id.clone())
+    } else {
+        None
+    };
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "console_type": console_type,
+        "console_name": console_name,
+        "remote_node_id": remote_node_id,
+        "title": p.title,
+    }))
+}
+
 /// Look for a proposal on every online wolfstack peer. Returns the
 /// first 200 response. Used as a fallback in `predictive_proposal_command`
 /// when the proposal id isn't in this node's local store — i.e. the
@@ -23939,6 +23987,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/proposals/run-now", web::post().to(predictive_proposals_run_now))
         .route("/api/proposals/{id}", web::get().to(predictive_proposal_get))
         .route("/api/proposals/{id}/command/{idx}", web::get().to(predictive_proposal_command))
+        .route("/api/proposals/{id}/console-target", web::get().to(predictive_proposal_console_target))
         .route("/api/proposals/{id}/snooze", web::post().to(predictive_proposal_snooze))
         .route("/api/proposals/{id}/dismiss", web::post().to(predictive_proposal_dismiss))
         .route("/api/proposals/{id}/approve", web::post().to(predictive_proposal_approve))
