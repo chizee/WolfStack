@@ -47700,16 +47700,23 @@ let predictiveBadgeTimer = null;
 function renderPredictiveInbox() {
     const container = document.getElementById('page-inbox');
     if (!container) return;
-    // Make this page-view a flex column at the height of .main-content
-    // so the inner predictive-shell's `height:100%` actually resolves
-    // to the available viewport-minus-chrome rather than the
-    // intrinsic content height. Without this, the terminal pane
-    // drops past the viewport bottom on tall lists.
-    container.style.height = '100%';
+    // Constrain this page-view to the live height of `.main-content`
+    // so the embedded terminal pane stays inside the viewport.
+    //
+    // `.main-content` has `min-height`/`max-height` (not `height`)
+    // tied to viewport-minus-chrome, so a CSS `height: 100%` on a
+    // child resolves against `auto` and the inner flex chain breaks
+    // — the split grows to the intrinsic height of the proposals
+    // list, pushing the terminal off the bottom of the screen.
+    // Reading `clientHeight` (a pixel value, always defined) and
+    // applying it as inline height side-steps the percentage
+    // resolution rule. ResizeObserver keeps it in sync if the
+    // operator resizes the window or expands the side-bar.
     container.style.display = 'flex';
     container.style.flexDirection = 'column';
     container.style.minHeight = '0';
     container.style.padding = '0';
+    predictiveSetupHeightSync(container);
     if (!container.querySelector('.predictive-shell')) {
         // Two-column layout: left = proposals list, right = embedded
         // terminal. Replaces the per-command popup-window terminal so
@@ -48311,6 +48318,41 @@ function predTermOpen(proposalId, meta) {
     }
     const closeBtn = document.getElementById('predictive-term-close');
     if (closeBtn) closeBtn.style.display = '';
+}
+
+/// Pin #page-inbox's pixel height to .main-content's clientHeight,
+/// re-syncing on window resize and on layout shifts inside
+/// .main-content (sidebar collapse, theme switch, task-log toggle).
+/// Without this, percentage heights inside #page-inbox don't resolve
+/// because .main-content uses min-height/max-height, not height.
+function predictiveSetupHeightSync(inbox) {
+    const main = document.querySelector('.main-content');
+    if (!main) return;
+    const apply = () => {
+        // clientHeight excludes scrollbars/borders, which is what
+        // we want — we're sizing INTO the visible area.
+        const h = main.clientHeight;
+        if (h > 0) inbox.style.height = h + 'px';
+    };
+    apply();
+    // Re-apply on a future paint to catch the case where this fires
+    // before .main-content has finished its own layout pass.
+    requestAnimationFrame(apply);
+
+    // Already wired up on a previous render — don't double-attach.
+    if (inbox._predHeightSync) return;
+    inbox._predHeightSync = true;
+
+    if (typeof ResizeObserver !== 'undefined') {
+        const ro = new ResizeObserver(apply);
+        ro.observe(main);
+        inbox._predHeightObserver = ro;
+    }
+    // Window resize covers viewport changes that don't trigger a
+    // .main-content size change directly (e.g. mobile browser
+    // address bar showing/hiding).
+    window.addEventListener('resize', apply);
+    inbox._predHeightApply = apply;
 }
 
 /// Show the inline spinner with a status message — used to give
