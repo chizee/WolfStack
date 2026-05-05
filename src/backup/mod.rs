@@ -1654,16 +1654,31 @@ fn store_pbs_with_notes_and_log(local_path: &Path, storage: &BackupStorage, file
                         }
                     }
                     if !best_snap.is_empty() {
-                        // proxmox-backup-client snapshot notes update <snapshot> --notes <text> --repository <repo>
+                        // proxmox-backup-client snapshot notes update [OPTIONS] <snapshot> <notes>
+                        //
+                        // Both `snapshot` and `notes` are POSITIONAL.
+                        // Earlier versions passed `--notes <text>`, which the
+                        // PBS CLI parser dropped as an unknown-option value
+                        // and then rejected with "parameter verification
+                        // failed - 'notes': missing argument" (reported
+                        // 2026-05-05).
+                        //
+                        // We put the trailing `--` before the positionals so
+                        // a notes string that happens to begin with `-`
+                        // (e.g. an operator-supplied comment field) can't
+                        // be re-interpreted as an option. Spaces in the
+                        // notes text are preserved automatically — every
+                        // arg goes to the child via execve as one argv
+                        // element, no shell expansion.
                         let mut notes_cmd = Command::new("proxmox-backup-client");
-                        notes_cmd.args(["snapshot", "notes", "update", &best_snap,
-                                       "--notes", notes_text, "--repository", &repo]);
+                        notes_cmd.args(["snapshot", "notes", "update", "--repository", &repo]);
                         if !storage.pbs_fingerprint.is_empty() {
                             notes_cmd.env("PBS_FINGERPRINT", &storage.pbs_fingerprint);
                         }
                         if !storage.pbs_namespace.is_empty() {
                             notes_cmd.arg("--ns").arg(&storage.pbs_namespace);
                         }
+                        notes_cmd.arg("--").arg(&best_snap).arg(notes_text);
                         if !pbs_pw.is_empty() {
                             notes_cmd.env("PBS_PASSWORD", pbs_pw);
                         }

@@ -17960,21 +17960,18 @@ async fn forward_proposal_action_to_peers(
     action: &str,
     body: serde_json::Value,
 ) -> HttpResponse {
-    let peers: Vec<_> = state.cluster.get_all_nodes().into_iter()
-        .filter(|n| !n.is_self && n.node_type == "wolfstack" && n.online)
-        .collect();
-    if peers.is_empty() {
-        return HttpResponse::NotFound().json(serde_json::json!({
-            "error": "proposal not found"
-        }));
-    }
-    let secret = state.cluster_secret.clone();
     let path = format!("/api/proposals/{}/{}",
         urlencoding::encode(proposal_id),
         urlencoding::encode(action));
     let body_bytes = serde_json::to_vec(&body).unwrap_or_default();
+
+    // ─── Local-cluster peers (X-WolfStack-Secret) ───
+    let peers: Vec<_> = state.cluster.get_all_nodes().into_iter()
+        .filter(|n| !n.is_self && n.node_type == "wolfstack" && n.online)
+        .collect();
+    let secret = state.cluster_secret.clone();
     let client = &*API_HTTP_CLIENT;
-    for peer in peers {
+    for peer in &peers {
         for url in build_node_urls(&peer.address, peer.port, &path) {
             let res = client.post(&url)
                 .timeout(std::time::Duration::from_secs(10))
@@ -17998,9 +17995,52 @@ async fn forward_proposal_action_to_peers(
             let _ = resp.bytes().await;
         }
     }
+
+    // ─── Federated clusters (Bearer wsk_…) ───
+    // Each federation's own handler runs the same fan-out internally,
+    // so forwarding once per federation reaches every node it owns.
+    let federations: Vec<crate::federation::FederatedCluster> = {
+        let s = state.federations.read().unwrap_or_else(|e| e.into_inner());
+        s.clusters.clone()
+    };
+    for fc in federations {
+        // build_client/insecure_tls handling lives inside federation::*;
+        // we reach for a small helper here because fetch_json is GET-only.
+        // Keep this duplication local to avoid widening federation's
+        // public surface for one caller.
+        let url = format!("{}{}", fc.base_url, path);
+        let cli = build_federation_client(fc.insecure_tls);
+        let res = cli.post(&url)
+            .timeout(std::time::Duration::from_secs(10))
+            .header("Authorization", format!("Bearer {}", fc.api_key))
+            .header("content-type", "application/json")
+            .body(body_bytes.clone())
+            .send()
+            .await;
+        let Ok(resp) = res else { continue; };
+        if resp.status().is_success() {
+            if let Ok(v) = resp.json::<serde_json::Value>().await {
+                return HttpResponse::Ok().json(v);
+            }
+            return HttpResponse::Ok().json(serde_json::json!({ "success": true }));
+        }
+        let _ = resp.bytes().await;
+    }
+
     HttpResponse::NotFound().json(serde_json::json!({
-        "error": "proposal not found on any reachable cluster peer"
+        "error": "proposal not found on any reachable cluster peer or federated cluster"
     }))
+}
+
+/// Reqwest client mirror of `federation::build_client`. Federation's
+/// helper is private and only used by GET; we inline a copy here so
+/// the POST fan-out path can re-use the same TLS-skip behaviour
+/// without exporting a new public function from federation/.
+fn build_federation_client(insecure_tls: bool) -> reqwest::Client {
+    let mut b = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10));
+    if insecure_tls { b = b.danger_accept_invalid_certs(true); }
+    b.build().unwrap_or_else(|_| reqwest::Client::new())
 }
 
 /// GET /api/proposals/{id}/command/{idx} — return one of a
@@ -18160,6 +18200,172 @@ pub async fn predictive_proposal_console_target(
         "remote_node_id": remote_node_id,
         "node_hostname": node_hostname,
         "title": p.title,
+    }))
+}
+
+/// GET /api/proposals/{id}/history — return the metric history
+/// (rolling samples + projected ETA) backing a trend-based proposal,
+/// so the inbox can render an inline sparkline next to the textual
+/// "fills in ~5 h" estimate.
+///
+/// Today only the three disk-fill variants have populated history
+/// (host filesystems via `disk_fill::METRIC`, Docker + LXC container
+/// storage via `container_disk::METRIC` — both use the proposal's
+/// `scope.resource_id` as the history key, by happy convention). For
+/// any other finding type we return an empty samples array; the
+/// frontend then just omits the graph rather than erroring.
+///
+/// Peer-owned proposals fall back to the cluster fan-out — same
+/// pattern as `predictive_proposal_command` — so the operator sees a
+/// graph even when the proposal lives on a peer in this cluster.
+pub async fn predictive_proposal_history(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+
+    let local_p: Option<crate::predictive::Proposal> = {
+        let store = state.predictive_proposals.read()
+            .unwrap_or_else(|e| e.into_inner());
+        store.get(&id).cloned()
+    };
+    // If the proposal isn't in the local store, forward the GET to
+    // peers using the cluster secret. Each peer runs the same handler
+    // against its OWN MetricsHistory, which is where the samples for
+    // that peer's resources live.
+    let p = match local_p {
+        Some(p) => p,
+        None => {
+            return forward_proposal_get_to_peers(&state, &id, "history").await;
+        }
+    };
+
+    // Map (finding_type, scope) → (history_key, metric_name). Only
+    // the trend-based analyzers have populated history; for others we
+    // return an empty samples array.
+    let (history_key, metric, target_pct): (&str, &str, f64) = match p.finding_type.as_str() {
+        "disk_fill_eta" => {
+            let key = p.scope.resource_id.as_deref().unwrap_or("");
+            (key, crate::predictive::disk_fill::METRIC,
+             crate::predictive::disk_verdict::FILL_TARGET_PCT)
+        }
+        "docker_storage_fill_eta" | "lxc_storage_fill_eta" => {
+            // container_disk records under the same resource_id
+            // form ("docker:foo" / "lxc:foo") that the analyzer
+            // stamps onto scope.resource_id.
+            let key = p.scope.resource_id.as_deref().unwrap_or("");
+            (key, crate::predictive::container_disk::METRIC,
+             crate::predictive::disk_verdict::FILL_TARGET_PCT)
+        }
+        _ => {
+            return HttpResponse::Ok().json(serde_json::json!({
+                "metric": "",
+                "unit": "",
+                "samples": [],
+                "supported": false,
+            }));
+        }
+    };
+    if history_key.is_empty() {
+        return HttpResponse::Ok().json(serde_json::json!({
+            "metric": metric,
+            "unit": "%",
+            "samples": [],
+            "supported": false,
+        }));
+    }
+
+    let metrics = state.predictive_metrics.read()
+        .unwrap_or_else(|e| e.into_inner()).clone();
+    let samples_vec: Vec<serde_json::Value> = match metrics.samples(history_key, metric) {
+        Some(deque) => deque.iter().map(|s| serde_json::json!({
+            "ts": s.ts.to_rfc3339(),
+            "value": s.value,
+        })).collect(),
+        None => Vec::new(),
+    };
+
+    // Compute the live verdict so the frontend doesn't have to
+    // re-implement linear_fit. Falls back to None when the series
+    // is too short / flat / shrinking (same gates as the analyzer).
+    let (current, slope_per_hour, eta_hours) = if let Some(deque) = metrics.samples(history_key, metric) {
+        let cur = deque.back().map(|s| s.value).unwrap_or(0.0);
+        let v = crate::predictive::disk_verdict::compute_verdict(deque, cur, target_pct);
+        let slope = v.as_ref().map(|x| x.slope_pct_per_hour).unwrap_or(0.0);
+        let eta = v.as_ref().and_then(|x| x.eta_hours);
+        (cur, slope, eta)
+    } else {
+        (0.0, 0.0, None)
+    };
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "metric": metric,
+        "unit": "%",
+        "supported": true,
+        "samples": samples_vec,
+        "current": current,
+        "slope_per_hour": slope_per_hour,
+        "fill_target_pct": target_pct,
+        "eta_hours": eta_hours,
+    }))
+}
+
+/// GET-equivalent fan-out for `/api/proposals/{id}/{action}`. Tries
+/// every online wolfstack peer in the local cluster first
+/// (X-WolfStack-Secret auth), then every federated cluster
+/// (Bearer wsk_… auth via `federation::fetch_json`). Returns the
+/// first 2xx response.
+async fn forward_proposal_get_to_peers(
+    state: &web::Data<AppState>,
+    proposal_id: &str,
+    action: &str,
+) -> HttpResponse {
+    let path = format!("/api/proposals/{}/{}",
+        urlencoding::encode(proposal_id),
+        urlencoding::encode(action));
+
+    // ─── Local-cluster peers ───
+    let peers: Vec<_> = state.cluster.get_all_nodes().into_iter()
+        .filter(|n| !n.is_self && n.node_type == "wolfstack" && n.online)
+        .collect();
+    let secret = state.cluster_secret.clone();
+    let client = &*API_HTTP_CLIENT;
+    for peer in &peers {
+        for url in build_node_urls(&peer.address, peer.port, &path) {
+            let res = client.get(&url)
+                .timeout(std::time::Duration::from_secs(8))
+                .header("X-WolfStack-Secret", &secret)
+                .send().await;
+            let Ok(resp) = res else { continue; };
+            if resp.status().is_success() {
+                if let Ok(v) = resp.json::<serde_json::Value>().await {
+                    return HttpResponse::Ok().json(v);
+                }
+            } else {
+                let _ = resp.bytes().await;
+            }
+        }
+    }
+
+    // ─── Federated clusters ───
+    // Each federation is a separate cluster reached via Bearer auth.
+    // Its own /api/proposals/{id}/{action} handler will fan out
+    // internally if needed (same logic, recursion stops at one hop
+    // because federations don't re-federate).
+    let federations: Vec<crate::federation::FederatedCluster> = {
+        let s = state.federations.read().unwrap_or_else(|e| e.into_inner());
+        s.clusters.clone()
+    };
+    for fc in federations {
+        if let Ok(v) = crate::federation::fetch_json(&fc, &path).await {
+            return HttpResponse::Ok().json(v);
+        }
+    }
+
+    HttpResponse::NotFound().json(serde_json::json!({
+        "error": "proposal not found on any reachable cluster peer or federated cluster"
     }))
 }
 
@@ -24110,6 +24316,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/proposals/{id}", web::get().to(predictive_proposal_get))
         .route("/api/proposals/{id}/command/{idx}", web::get().to(predictive_proposal_command))
         .route("/api/proposals/{id}/console-target", web::get().to(predictive_proposal_console_target))
+        .route("/api/proposals/{id}/history", web::get().to(predictive_proposal_history))
         .route("/api/proposals/{id}/snooze", web::post().to(predictive_proposal_snooze))
         .route("/api/proposals/{id}/dismiss", web::post().to(predictive_proposal_dismiss))
         .route("/api/proposals/{id}/approve", web::post().to(predictive_proposal_approve))

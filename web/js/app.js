@@ -47990,6 +47990,10 @@ function predictiveRender() {
     }
 
     list.innerHTML = html;
+    // Kick off the per-card history fetches now that the slots are
+    // in the DOM. Fire-and-forget — populates each slot as its
+    // response arrives, doesn't block the render.
+    predictivePopulateHistorySlots();
 }
 
 function predictiveSetClusterFilter(clusterName) {
@@ -48091,6 +48095,7 @@ function predictiveCardHtml(p) {
             </div>
             ${snoozeNotice}
             <div style="font-size:13px;color:var(--text-secondary);line-height:1.55;margin-bottom:12px;">${escapeHtml(p.why)}</div>
+            ${predictiveHistorySlot(p)}
             ${evidence ? `<div style="margin-bottom:12px;">${evidence}</div>` : ''}
             ${remediation}
             <div style="display:flex;gap:8px;flex-wrap:wrap;">
@@ -48101,6 +48106,164 @@ function predictiveCardHtml(p) {
                 <button class="btn btn-sm" onclick="predictiveAck('${escapeAttr(p.finding_type)}', '${escapeAttr(p.scope.node_id)}', '${escapeAttr(p.scope.resource_id || '')}')">🛡 Ack as intentional</button>
             </div>
         </div>
+    `;
+}
+
+// ─── Trend graphs ───
+//
+// For trend-based proposals (disk-fill ETA on host mounts, Docker
+// containers, LXC containers) we fetch the rolling sample series
+// from the backend and render a small inline SVG sparkline so the
+// operator can see how the resource is filling up + a dotted
+// projection to the alert threshold. The textual "fills in ~5h" is
+// already in the proposal title; the graph adds visual context.
+//
+// Lazy-fetched per card — the cluster aggregate already returns 30+
+// proposals in the worst case and not all of them have history. We
+// queue fetches via IntersectionObserver so off-screen graphs don't
+// burn requests, and cache results in `predHistoryCache` keyed by
+// proposal id so re-renders (badge polling) reuse the data.
+
+const predHistoryCache = new Map(); // proposal_id → { fetchedAt, data }
+const PRED_HISTORY_TYPES = new Set([
+    'disk_fill_eta',
+    'docker_storage_fill_eta',
+    'lxc_storage_fill_eta',
+]);
+const PRED_HISTORY_TTL_MS = 60 * 1000;
+
+function predictiveHistorySlot(p) {
+    if (!PRED_HISTORY_TYPES.has(p.finding_type)) return '';
+    return `<div class="predictive-history-slot" data-proposal-id="${escapeAttr(p.id)}" style="margin-bottom:12px;min-height:90px;background:rgba(96,165,250,0.04);border:1px solid rgba(96,165,250,0.15);border-radius:8px;padding:8px 10px;">
+        <div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;font-weight:600;margin-bottom:6px;">Growth trend</div>
+        <div class="predictive-history-body" style="color:var(--text-muted);font-size:12px;text-align:center;padding:14px 0;">Loading history…</div>
+    </div>`;
+}
+
+async function predictivePopulateHistorySlots() {
+    const slots = document.querySelectorAll('.predictive-history-slot[data-proposal-id]');
+    for (const slot of slots) {
+        // Avoid re-fetching the same slot during a single render pass.
+        if (slot.dataset.fetched === '1') continue;
+        slot.dataset.fetched = '1';
+        const id = slot.dataset.proposalId;
+        // Cache hit?
+        const cached = predHistoryCache.get(id);
+        if (cached && (Date.now() - cached.fetchedAt) < PRED_HISTORY_TTL_MS) {
+            predictiveRenderHistorySlot(slot, cached.data);
+            continue;
+        }
+        try {
+            const r = await fetch(`/api/proposals/${encodeURIComponent(id)}/history`);
+            if (!r.ok) {
+                slot.querySelector('.predictive-history-body').textContent = 'Trend data not available.';
+                continue;
+            }
+            const data = await r.json();
+            predHistoryCache.set(id, { fetchedAt: Date.now(), data });
+            predictiveRenderHistorySlot(slot, data);
+        } catch (e) {
+            slot.querySelector('.predictive-history-body').textContent = 'Trend data not available.';
+        }
+    }
+}
+
+function predictiveRenderHistorySlot(slot, data) {
+    const body = slot.querySelector('.predictive-history-body');
+    if (!body) return;
+    if (!data || !Array.isArray(data.samples) || data.samples.length < 2) {
+        body.innerHTML = `<span style="color:var(--text-muted);">Not enough history yet — analyzer needs ≥3 samples spanning ≥30 minutes.</span>`;
+        return;
+    }
+    body.innerHTML = predictiveHistorySvg(data);
+}
+
+/// Build an inline SVG showing the metric trend + a dotted projection
+/// to the fill target. Pure function over the API response so a
+/// future re-render with cached data doesn't re-fetch.
+function predictiveHistorySvg(data) {
+    const samples = data.samples || [];
+    const target = Number.isFinite(data.fill_target_pct) ? data.fill_target_pct : 95;
+    const eta = (typeof data.eta_hours === 'number' && !isNaN(data.eta_hours)) ? data.eta_hours : null;
+    const slope = data.slope_per_hour || 0;
+    const current = data.current || (samples[samples.length - 1] && samples[samples.length - 1].value) || 0;
+
+    const W = 600, H = 100, PAD_L = 36, PAD_R = 12, PAD_T = 8, PAD_B = 22;
+
+    // X domain: oldest-sample timestamp → projected ETA (or
+    // newest-sample if no projection). Y domain: 0..100 (% used).
+    const tsFirst = new Date(samples[0].ts).getTime();
+    const tsLast  = new Date(samples[samples.length - 1].ts).getTime();
+    const tsEta = (eta !== null && eta > 0)
+        ? tsLast + eta * 3_600_000
+        : tsLast;
+    const xMin = tsFirst, xMax = Math.max(tsEta, tsLast + 60_000); // never zero range
+    const yMin = 0, yMax = 100;
+
+    const xScale = (t) => PAD_L + ((t - xMin) / (xMax - xMin)) * (W - PAD_L - PAD_R);
+    const yScale = (v) => PAD_T + (1 - (v - yMin) / (yMax - yMin)) * (H - PAD_T - PAD_B);
+
+    // History polyline.
+    const pts = samples.map(s => `${xScale(new Date(s.ts).getTime()).toFixed(1)},${yScale(s.value).toFixed(1)}`).join(' ');
+
+    // Projection line (newest sample → ETA point at target_pct), only
+    // when slope is positive and ETA exists. Drawn dotted.
+    let projectionLine = '';
+    let etaMarker = '';
+    if (eta !== null && eta > 0 && slope > 0) {
+        const x1 = xScale(tsLast), y1 = yScale(current);
+        const x2 = xScale(tsEta),  y2 = yScale(target);
+        projectionLine = `<line x1="${x1.toFixed(1)}" y1="${y1.toFixed(1)}" x2="${x2.toFixed(1)}" y2="${y2.toFixed(1)}" stroke="#fbbf24" stroke-width="1.5" stroke-dasharray="4 3" />`;
+        etaMarker = `<circle cx="${x2.toFixed(1)}" cy="${y2.toFixed(1)}" r="4" fill="#ef4444" stroke="#0a0a0a" stroke-width="1.5"/>`;
+    }
+
+    // Fill-target horizontal line.
+    const targetY = yScale(target);
+    const targetLine = `<line x1="${PAD_L}" y1="${targetY.toFixed(1)}" x2="${W - PAD_R}" y2="${targetY.toFixed(1)}" stroke="#ef4444" stroke-width="1" stroke-dasharray="2 4" opacity="0.6"/>`;
+
+    // Y-axis ticks at 0, 50, 100.
+    const yTick = (v) => `<text x="${PAD_L - 6}" y="${(yScale(v) + 4).toFixed(1)}" font-size="10" fill="#94a3b8" text-anchor="end">${v}%</text>`;
+    const yGrid = (v) => `<line x1="${PAD_L}" y1="${yScale(v).toFixed(1)}" x2="${W - PAD_R}" y2="${yScale(v).toFixed(1)}" stroke="#2d2f3a" stroke-width="1" opacity="0.4"/>`;
+
+    // X labels: oldest, newest, ETA (if any).
+    const fmtTs = (ms) => {
+        const d = new Date(ms);
+        const now = Date.now();
+        const dayMs = 86_400_000;
+        if (Math.abs(now - ms) < dayMs) {
+            return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        }
+        return d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+    };
+    const xLabel = (t, anchor) => `<text x="${xScale(t).toFixed(1)}" y="${(H - 6)}" font-size="10" fill="#94a3b8" text-anchor="${anchor}">${fmtTs(t)}</text>`;
+    const labels = [
+        xLabel(tsFirst, 'start'),
+        xLabel(tsLast, 'middle'),
+        eta !== null && eta > 0 ? xLabel(tsEta, 'end') : '',
+    ].join('');
+
+    // Caption — under the graph: slope + ETA in human terms.
+    let caption = '';
+    if (eta !== null && eta > 0) {
+        const etaTxt = eta < 1 ? '<1 h' : eta < 24 ? `~${eta.toFixed(0)} h` : `~${(eta/24).toFixed(1)} d`;
+        caption = `<span style="color:var(--text-secondary);">Currently <strong>${current.toFixed(1)}%</strong> · growing <strong>${slope >= 0 ? '+' : ''}${slope.toFixed(2)}%/h</strong> · projected to hit <strong>${target}%</strong> in <strong style="color:#fbbf24;">${etaTxt}</strong></span>`;
+    } else if (slope <= 0) {
+        caption = `<span style="color:#34d399;">Currently <strong>${current.toFixed(1)}%</strong> · flat or shrinking — no projected fill.</span>`;
+    } else {
+        caption = `<span style="color:var(--text-secondary);">Currently <strong>${current.toFixed(1)}%</strong> · growth rate <strong>${slope.toFixed(2)}%/h</strong></span>`;
+    }
+
+    return `
+        <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="width:100%;height:120px;display:block;">
+            ${[0, 50, 100].map(yGrid).join('')}
+            ${targetLine}
+            <polyline points="${pts}" fill="none" stroke="#60a5fa" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+            ${projectionLine}
+            ${etaMarker}
+            ${[0, 50, 100].map(yTick).join('')}
+            ${labels}
+        </svg>
+        <div style="font-size:11px;margin-top:4px;text-align:center;line-height:1.5;">${caption}</div>
     `;
 }
 
@@ -48158,10 +48321,48 @@ const predTermState = {
 };
 
 async function predictiveRunCmd(proposalId, cmdIdx) {
-    // Spinner ON before the await so the operator gets immediate
-    // feedback. Otherwise nothing visible happens between click and
-    // WS open — especially noticeable when the proposal lives on a
-    // peer (cluster-secret round-trip first, then the WS hop).
+    // FAST PATH 1 — same proposal, WS already open. Pull the
+    // command text from the client-side cache and fire it down the
+    // existing WS without a server round-trip. The previous version
+    // always fetched metadata first, which made the second/third
+    // command on the same proposal feel like a fresh connection
+    // (the spinner showed for the duration of the fetch).
+    if (predTermState.proposalId === proposalId
+        && predTermState.ws && predTermState.ws.readyState === WebSocket.OPEN) {
+        const cached = (predictiveState.proposals || []).find(p => p.id === proposalId);
+        const cmd = cached && cached.remediation && cached.remediation.commands
+            ? cached.remediation.commands[cmdIdx] : null;
+        if (cmd) {
+            predTermState.ws.send(cmd + '\n');
+            if (predTermState.term) predTermState.term.focus();
+            return;
+        }
+        // Fall through to fetch — proposal not in client cache (very
+        // recent badge-poll race) or remediation changed.
+    }
+
+    // FAST PATH 2 — same proposal, WS still CONNECTING. Don't tear
+    // down and start over; queue the command to fire when the
+    // existing handshake completes. Otherwise an impatient operator
+    // who clicks twice during a slow connect ends up dropping the
+    // first attempt and waiting for a second handshake.
+    if (predTermState.proposalId === proposalId
+        && predTermState.ws && predTermState.ws.readyState === WebSocket.CONNECTING) {
+        const cached = (predictiveState.proposals || []).find(p => p.id === proposalId);
+        const cmd = cached && cached.remediation && cached.remediation.commands
+            ? cached.remediation.commands[cmdIdx] : null;
+        if (cmd) {
+            predTermState.pendingCommands = predTermState.pendingCommands || [];
+            predTermState.pendingCommands.push(cmd);
+            return;
+        }
+    }
+
+    // Slow path — first connect, or different proposal. Spinner ON
+    // before the await so the operator gets immediate feedback.
+    // Otherwise nothing visible happens between click and WS open
+    // (especially noticeable when the proposal lives on a peer:
+    // cluster-secret round-trip first, then the WS hop).
     predTermShowSpinner('Resolving target…');
     let meta;
     try {
@@ -48276,11 +48477,33 @@ function predTermOpen(proposalId, meta) {
 
     const where = meta.node_hostname || meta.console_name;
     term.writeln(`\x1b[90m● Connecting to ${meta.console_type} on ${where}…\x1b[0m`);
+
+    // Prominent centered overlay so the connect doesn't look hung.
+    // The terminal's static "Connecting…" line plus the small status
+    // bar spinner weren't visible enough on a slow remote-console
+    // hop — the operator perceived a frozen terminal. This overlay
+    // sits absolutely positioned over the terminal viewport and is
+    // removed on ws.onopen / onclose / onerror.
+    container.style.position = 'relative';
+    const overlay = document.createElement('div');
+    overlay.id = 'predictive-term-loading-overlay';
+    overlay.style.cssText = 'position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;background:rgba(10,10,10,0.85);backdrop-filter:blur(2px);z-index:5;color:#9ca3af;font-size:13px;pointer-events:none;';
+    overlay.innerHTML = `
+        <div style="width:36px;height:36px;border:3px solid rgba(96,165,250,0.25);border-top-color:#60a5fa;border-radius:50%;animation:predTermSpin 0.8s linear infinite;"></div>
+        <div>Connecting to <strong style="color:#e5e7eb;">${escapeHtml(where)}</strong>…</div>
+        <div style="font-size:11px;opacity:0.7;max-width:280px;text-align:center;">Cross-cluster connections route through the local cluster's proxy and may take a moment.</div>
+    `;
+    container.appendChild(overlay);
+
     const ws = new WebSocket(wsUrl);
     ws.binaryType = 'arraybuffer';
     ws.onopen = () => {
         if (spinner) spinner.style.display = 'none';
         if (icon)    icon.style.display    = '';
+        // Hide the centered loading overlay (added below for visible
+        // feedback during connect).
+        const overlay = document.getElementById('predictive-term-loading-overlay');
+        if (overlay) overlay.remove();
         term.writeln('\x1b[32m● Connected\x1b[0m');
         // Auto-run the requested remediation command if one was
         // supplied. Empty meta.command (e.g. from the "Open terminal"
@@ -48289,6 +48512,15 @@ function predTermOpen(proposalId, meta) {
         // command instead of just buffering.
         if (meta.command) {
             ws.send(meta.command + '\n');
+        }
+        // Drain any commands the operator queued by clicking Run
+        // additional times while the WS was still CONNECTING (fast
+        // path 2 in predictiveRunCmd).
+        if (Array.isArray(predTermState.pendingCommands)) {
+            for (const cmd of predTermState.pendingCommands) {
+                ws.send(cmd + '\n');
+            }
+            predTermState.pendingCommands = [];
         }
         try { fitAddon && fitAddon.fit(); } catch (_) {}
         term.focus();
@@ -48300,11 +48532,15 @@ function predTermOpen(proposalId, meta) {
     ws.onclose = () => {
         if (spinner) spinner.style.display = 'none';
         if (icon)    icon.style.display    = '';
+        const ov = document.getElementById('predictive-term-loading-overlay');
+        if (ov) ov.remove();
         term.writeln('\r\n\x1b[31m● Disconnected\x1b[0m');
     };
     ws.onerror = () => {
         if (spinner) spinner.style.display = 'none';
         if (icon)    icon.style.display    = '';
+        const ov = document.getElementById('predictive-term-loading-overlay');
+        if (ov) ov.remove();
         term.writeln('\r\n\x1b[31m● Connection error — check the target node is online and try again.\x1b[0m');
     };
     term.onData(d => { if (ws.readyState === WebSocket.OPEN) ws.send(d); });
@@ -48488,6 +48724,9 @@ function predTermClose() {
     predTermState.fitAddon = null;
     predTermState.fitHandler = null;
     predTermState.target = null;
+    predTermState.pendingCommands = [];
+    const overlay = document.getElementById('predictive-term-loading-overlay');
+    if (overlay) overlay.remove();
 
     const status = document.getElementById('predictive-term-status');
     if (status) {
