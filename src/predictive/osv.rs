@@ -1955,145 +1955,182 @@ fn should_emit(finding: &OsvFinding, config: &OsvConfig) -> bool {
     !matches!(sev, Severity::Info)
 }
 
-/// Group findings by (target, CVE) — one inbox card per CVE per
-/// target, listing every affected package inside.
+/// Group findings by target — one inbox card per (host or LXC),
+/// listing every CVE on that target as evidence rows. We deliberately
+/// do NOT emit per-CVE proposals: a host with 50 pending CVEs would
+/// otherwise produce 50 inbox rows on top of any other findings,
+/// turning the inbox into a wall of CVE text. The pocket scanner in
+/// [`vulnerability`](super::vulnerability) follows the same one-card-
+/// per-target pattern; OSV findings should match that UX.
 #[derive(Debug)]
-struct GroupedFinding<'a> {
+struct TargetGroup<'a> {
     target: ScanTargetOwned,
-    cve_or_id: String,
-    kev_listed: bool,
-    cvss_score: Option<f32>,
-    summary: String,
-    advisory_url: Option<String>,
-    packages: Vec<&'a OsvFinding>,
+    findings: Vec<&'a OsvFinding>,
 }
 
-fn group_findings(findings: &[OsvFinding]) -> Vec<GroupedFinding<'_>> {
-    let mut by_key: HashMap<(ScanTargetOwned, String), GroupedFinding<'_>> = HashMap::new();
+fn group_by_target<'a>(findings: &'a [OsvFinding]) -> Vec<TargetGroup<'a>> {
+    let mut by_target: HashMap<ScanTargetOwned, TargetGroup<'a>> = HashMap::new();
     for f in findings {
-        let key_id = f.vuln.display_id();
-        let key = (f.target.clone(), key_id.clone());
-        let entry = by_key.entry(key).or_insert_with(|| GroupedFinding {
+        by_target.entry(f.target.clone()).or_insert_with(|| TargetGroup {
             target: f.target.clone(),
-            cve_or_id: key_id.clone(),
-            kev_listed: f.kev_listed,
-            cvss_score: f.vuln.cvss_score,
-            summary: f.vuln.summary.clone(),
-            advisory_url: f.vuln.advisory_url.clone(),
-            packages: Vec::new(),
-        });
-        entry.packages.push(f);
+            findings: Vec::new(),
+        }).findings.push(f);
     }
-    let mut out: Vec<GroupedFinding<'_>> = by_key.into_values().collect();
-    // Stable order — KEV first, then by CVSS desc, then by CVE id
-    // ascending (so the inbox card order doesn't shuffle on every
-    // tick).
-    out.sort_by(|a, b| {
-        b.kev_listed.cmp(&a.kev_listed)
-            .then_with(|| b.cvss_score.unwrap_or(0.0)
-                .partial_cmp(&a.cvss_score.unwrap_or(0.0))
-                .unwrap_or(std::cmp::Ordering::Equal))
-            .then_with(|| a.cve_or_id.cmp(&b.cve_or_id))
+    let mut out: Vec<TargetGroup<'a>> = by_target.into_values().collect();
+    // Stable order: host first, then LXC alphabetical. Keeps the
+    // inbox card position consistent across ticks.
+    out.sort_by(|a, b| match (&a.target, &b.target) {
+        (ScanTargetOwned::Host, ScanTargetOwned::Host) => std::cmp::Ordering::Equal,
+        (ScanTargetOwned::Host, _) => std::cmp::Ordering::Less,
+        (_, ScanTargetOwned::Host) => std::cmp::Ordering::Greater,
+        (ScanTargetOwned::Lxc(a), ScanTargetOwned::Lxc(b)) => a.cmp(b),
     });
     out
 }
 
-/// Build one Proposal per grouped finding.
-fn build_proposal(g: &GroupedFinding<'_>, ctx: &Context) -> Proposal {
-    // Severity: pick the worst across packages (in practice they all
-    // share a CVE so the severity is the same — but a critical-pkg
-    // match on one package and not another could differ).
-    let severity = g.packages.iter()
+/// Sort findings within a target: KEV first, then CVSS desc, then
+/// CVE id ascending. Used to put the most-actionable items at the
+/// top of the evidence panel.
+fn sort_findings(findings: &[&OsvFinding]) -> Vec<OsvFinding> {
+    let mut sorted: Vec<OsvFinding> = findings.iter().map(|f| (*f).clone()).collect();
+    sorted.sort_by(|a, b| {
+        b.kev_listed.cmp(&a.kev_listed)
+            .then_with(|| b.vuln.cvss_score.unwrap_or(0.0)
+                .partial_cmp(&a.vuln.cvss_score.unwrap_or(0.0))
+                .unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| a.vuln.display_id().cmp(&b.vuln.display_id()))
+    });
+    sorted
+}
+
+/// How many CVE rows to render in the evidence panel before
+/// collapsing the rest into a "+N more" chip. Ten is enough to show
+/// the worst offenders without forcing the inbox card to the size of
+/// a small spreadsheet.
+const MAX_CVE_EVIDENCE_ROWS: usize = 10;
+
+/// Build the single Proposal that represents every OSV finding on
+/// one target.
+fn build_target_proposal(g: &TargetGroup<'_>, ctx: &Context) -> Proposal {
+    let total = g.findings.len();
+    let kev_count = g.findings.iter().filter(|f| f.kev_listed).count();
+    let critical_count = g.findings.iter()
+        .filter(|f| severity_for(f) == Severity::Critical).count();
+    let target_label = g.target.as_target().label();
+
+    // Severity: max across all findings. Severity::rank() is lower
+    // for more-severe — min_by_key gives us the worst tier.
+    let severity = g.findings.iter()
         .map(|f| severity_for(f))
         .min_by_key(|s| s.rank())
         .unwrap_or(Severity::Warn);
-    let target_label = g.target.as_target().label();
-    let kev_chip = if g.kev_listed { " — actively exploited (CISA KEV)" } else { "" };
-    let cvss_chip = match g.cvss_score {
-        Some(s) => format!(" CVSS {:.1}", s),
-        None => String::new(),
-    };
-    let title = format!(
-        "{}{}{} affecting {}",
-        g.cve_or_id, kev_chip, cvss_chip, target_label,
-    );
-    let pkg_list: String = g.packages.iter()
-        .map(|f| format!("{} {}", f.package, f.version))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let why = if g.kev_listed {
+
+    let title = if kev_count > 0 {
         format!(
-            "{} is on the CISA Known Exploited Vulnerabilities list — \
-             attackers are actively exploiting this in the wild. The \
-             OSV.dev database matched it against installed packages on \
-             {}: {}. {} Patch immediately, even if your distro has not \
-             yet shipped a security-pocket update.",
-            g.cve_or_id, target_label, pkg_list,
-            if g.summary.is_empty() { "" } else { g.summary.as_str() },
+            "{} OSV vulnerabilit{} on {} ({} actively exploited)",
+            total, if total == 1 { "y" } else { "ies" }, target_label, kev_count,
         )
     } else {
         format!(
-            "OSV.dev's vulnerability database reports {} affecting \
-             installed package(s) on {}: {}.{} {}",
-            g.cve_or_id, target_label, pkg_list,
-            if g.summary.is_empty() { "".to_string() }
-                else { format!(" Summary: {}", g.summary) },
-            "Apply your distro's update or upgrade to a fixed version.",
+            "{} OSV vulnerabilit{} on {}",
+            total, if total == 1 { "y" } else { "ies" }, target_label,
         )
     };
-    let mut evidence = Vec::new();
-    evidence.push(Evidence {
-        label: "CVE".into(),
-        value: g.cve_or_id.clone(),
-        detail: g.advisory_url.clone(),
-    });
-    if g.kev_listed {
+
+    let why = format!(
+        "OSV.dev's database matched {} CVE{} against installed package(s) on {}. {}{}",
+        total,
+        if total == 1 { "" } else { "s" },
+        target_label,
+        if kev_count > 0 {
+            format!(
+                "{} of these {} on the CISA Known Exploited Vulnerabilities list — \
+                 attackers are actively exploiting them in the wild. Patch \
+                 immediately, even if your distro has not yet shipped its security \
+                 advisory.",
+                kev_count,
+                if kev_count == 1 { "is" } else { "are" },
+            )
+        } else {
+            "Apply your distro's security update or upgrade affected packages \
+             to patched versions.".into()
+        },
+        if matches!(g.target, ScanTargetOwned::Lxc(_)) {
+            " The container needs to be patched separately from the host — \
+              upgrades on the host don't affect the container's package set."
+        } else { "" },
+    );
+
+    let mut evidence = vec![Evidence {
+        label: "Total".into(),
+        value: format!("{} CVE{}", total, if total == 1 { "" } else { "s" }),
+        detail: Some("Source: OSV.dev (https://osv.dev)".into()),
+    }];
+    if kev_count > 0 {
         evidence.push(Evidence {
             label: "KEV".into(),
-            value: "Actively exploited".into(),
+            value: format!(
+                "{} actively exploited",
+                kev_count,
+            ),
             detail: Some("Listed in CISA's Known Exploited Vulnerabilities catalog".into()),
         });
     }
-    if let Some(s) = g.cvss_score {
+    if critical_count > 0 {
         evidence.push(Evidence {
-            label: "CVSS".into(),
-            value: format!("{:.1}", s),
-            detail: None,
+            label: "Critical".into(),
+            value: format!(
+                "{} severe finding{}",
+                critical_count, if critical_count == 1 { "" } else { "s" },
+            ),
+            detail: Some("KEV-listed, critical-class package, or CVSS ≥ 9.0".into()),
         });
     }
-    for f in g.packages.iter().take(8) {
-        let fixed = f.vuln.fixed_versions.get(&f.package);
-        let value = match fixed {
-            Some(fv) => format!("{} → {}", f.version, fv),
-            None => f.version.clone(),
+
+    let sorted = sort_findings(&g.findings);
+    for f in sorted.iter().take(MAX_CVE_EVIDENCE_ROWS) {
+        let cve = f.vuln.display_id();
+        let kev_marker = if f.kev_listed { " ⚠ KEV" } else { "" };
+        let value = match f.vuln.cvss_score {
+            Some(s) => format!("CVSS {:.1}{}", s, kev_marker),
+            None => format!("unscored{}", kev_marker),
         };
-        evidence.push(Evidence {
-            label: f.package.clone(),
-            value,
-            detail: fixed.map(|fv| format!("Fixed in {}", fv)),
-        });
+        let fixed = f.vuln.fixed_versions.get(&f.package);
+        let detail = match fixed {
+            Some(fv) => Some(format!("{} {} → fixed in {}", f.package, f.version, fv)),
+            None => Some(format!("{} {}", f.package, f.version)),
+        };
+        evidence.push(Evidence { label: cve, value, detail });
     }
-    if g.packages.len() > 8 {
+    if total > MAX_CVE_EVIDENCE_ROWS {
         evidence.push(Evidence {
             label: "More".into(),
-            value: format!("+{} more affected package(s)", g.packages.len() - 8),
-            detail: None,
+            value: format!(
+                "+{} additional CVE{}",
+                total - MAX_CVE_EVIDENCE_ROWS,
+                if total - MAX_CVE_EVIDENCE_ROWS == 1 { "" } else { "s" },
+            ),
+            detail: Some("Run the upgrade command to patch all affected packages".into()),
         });
     }
-    let commands = remediation_commands(g);
+
+    let ecosystem = g.findings.first().map(|f| f.ecosystem.as_str()).unwrap_or("");
+    let commands = bulk_upgrade_commands(&g.target, ecosystem);
     let instructions = match &g.target {
         ScanTargetOwned::Host => {
-            "Apply the distro's security update for the affected \
-             package(s). Kernel CVEs require a reboot to take effect; \
-             user-space CVEs may need affected services restarted to \
-             pick up the new shared library."
+            "Run a full distro security upgrade. Kernel CVEs require a reboot \
+             to take effect; user-space CVEs may need affected services \
+             restarted (`needrestart` on Debian / `dnf needs-restarting` on \
+             RHEL) to pick up the new shared libraries.".to_string()
         }
         ScanTargetOwned::Lxc(_) => {
-            "Patch the LXC container from the host. `lxc-attach` runs \
-             the container's own package manager. Some packages need \
-             a container restart to take effect."
+            "Patch the LXC container from the host. `lxc-attach` runs the \
+             container's own package manager so the upgrade happens inside \
+             the container's filesystem. Some packages may need a container \
+             restart to take effect.".to_string()
         }
-    }.to_string();
+    };
+
     Proposal::new(
         FINDING_TYPE,
         ProposalSource::Rule,
@@ -2104,11 +2141,66 @@ fn build_proposal(g: &GroupedFinding<'_>, ctx: &Context) -> Proposal {
         RemediationPlan::Manual { instructions, commands },
         ProposalScope {
             node_id: ctx.node_id.clone(),
-            // resource_id = osv:host:CVE-... or osv:lxc:NAME:CVE-...
-            // so each CVE on each target has its own dedup key.
-            resource_id: Some(format!("{}:{}", g.target.as_target().resource_id(), g.cve_or_id)),
+            // One scope per target — `osv:host` or `osv:lxc:NAME`.
+            // Operator dismiss/snooze acts on the entire OSV inbox
+            // entry for that target, which matches what they'd
+            // intuitively expect when they snooze "vulnerabilities
+            // on this host".
+            resource_id: Some(g.target.as_target().resource_id()),
         },
     )
+}
+
+/// Bulk upgrade command for the target's ecosystem. We don't list
+/// per-package commands because a host with 50 CVEs would produce a
+/// 50-package command line; running the distro's full security
+/// upgrade is what the operator actually wants to do.
+fn bulk_upgrade_commands(target: &ScanTargetOwned, ecosystem: &str) -> Vec<String> {
+    let pm = pm_for_ecosystem(ecosystem);
+    match (target, pm) {
+        (ScanTargetOwned::Host, Some(PackageManager::Apt)) => vec![
+            "apt-get update".into(),
+            "apt-get upgrade -y".into(),
+        ],
+        (ScanTargetOwned::Host, Some(PackageManager::Dnf)) => vec![
+            "dnf upgrade --refresh -y".into(),
+        ],
+        (ScanTargetOwned::Host, Some(PackageManager::Zypper)) => vec![
+            "zypper refresh".into(),
+            "zypper update -y".into(),
+        ],
+        (ScanTargetOwned::Host, Some(PackageManager::Apk)) => vec![
+            "apk update".into(),
+            "apk upgrade".into(),
+        ],
+        (ScanTargetOwned::Lxc(name), Some(PackageManager::Apt)) => vec![
+            format!("lxc-attach -n {} -- apt-get update", name),
+            format!("lxc-attach -n {} -- apt-get upgrade -y", name),
+        ],
+        (ScanTargetOwned::Lxc(name), Some(PackageManager::Dnf)) => vec![
+            format!("lxc-attach -n {} -- dnf upgrade --refresh -y", name),
+        ],
+        (ScanTargetOwned::Lxc(name), Some(PackageManager::Zypper)) => vec![
+            format!("lxc-attach -n {} -- zypper refresh", name),
+            format!("lxc-attach -n {} -- zypper update -y", name),
+        ],
+        (ScanTargetOwned::Lxc(name), Some(PackageManager::Apk)) => vec![
+            format!("lxc-attach -n {} -- apk upgrade", name),
+        ],
+        (target, _) => {
+            let prefix = match target {
+                ScanTargetOwned::Host => String::new(),
+                ScanTargetOwned::Lxc(name) => format!("lxc-attach -n {} -- ", name),
+            };
+            vec![
+                format!("# Choose the line for your distro's package manager:"),
+                format!("{}apt-get update && {}apt-get upgrade -y", prefix, prefix),
+                format!("{}dnf upgrade --refresh -y", prefix),
+                format!("{}zypper update -y", prefix),
+                format!("{}apk upgrade", prefix),
+            ]
+        }
+    }
 }
 
 /// Pick the package manager from an OSV ecosystem string. Lets the
@@ -2145,60 +2237,6 @@ fn pm_for_ecosystem(ecosystem: &str) -> Option<PackageManager> {
     None
 }
 
-fn remediation_commands(g: &GroupedFinding<'_>) -> Vec<String> {
-    let pkg_names: Vec<&str> = g.packages.iter().map(|f| f.package.as_str()).collect();
-    let pkgs = pkg_names.join(" ");
-    let ecosystem = g.packages.first().map(|f| f.ecosystem.as_str()).unwrap_or("");
-    let pm = pm_for_ecosystem(ecosystem);
-    match (&g.target, pm) {
-        (ScanTargetOwned::Host, Some(PackageManager::Apt)) => vec![
-            format!("apt-get update"),
-            format!("apt-get install --only-upgrade -y {}", pkgs),
-        ],
-        (ScanTargetOwned::Host, Some(PackageManager::Dnf)) => vec![
-            format!("dnf upgrade --refresh -y {}", pkgs),
-        ],
-        (ScanTargetOwned::Host, Some(PackageManager::Zypper)) => vec![
-            format!("zypper refresh"),
-            format!("zypper update -y {}", pkgs),
-        ],
-        (ScanTargetOwned::Host, Some(PackageManager::Apk)) => vec![
-            format!("apk update"),
-            format!("apk upgrade {}", pkgs),
-        ],
-        (ScanTargetOwned::Lxc(name), Some(PackageManager::Apt)) => vec![
-            format!("lxc-attach -n {} -- apt-get update", name),
-            format!("lxc-attach -n {} -- apt-get install --only-upgrade -y {}", name, pkgs),
-        ],
-        (ScanTargetOwned::Lxc(name), Some(PackageManager::Dnf)) => vec![
-            format!("lxc-attach -n {} -- dnf upgrade --refresh -y {}", name, pkgs),
-        ],
-        (ScanTargetOwned::Lxc(name), Some(PackageManager::Zypper)) => vec![
-            format!("lxc-attach -n {} -- zypper refresh", name),
-            format!("lxc-attach -n {} -- zypper update -y {}", name, pkgs),
-        ],
-        (ScanTargetOwned::Lxc(name), Some(PackageManager::Apk)) => vec![
-            format!("lxc-attach -n {} -- apk upgrade {}", name, pkgs),
-        ],
-        // Unknown PM (rolling ecosystem we couldn't classify, or PM
-        // probe outside our list): fall through to all four options
-        // and let the operator pick. Honest about uncertainty.
-        (target, _) => {
-            let prefix = match target {
-                ScanTargetOwned::Host => String::new(),
-                ScanTargetOwned::Lxc(name) => format!("lxc-attach -n {} -- ", name),
-            };
-            vec![
-                format!("# Choose the line for your distro's package manager:"),
-                format!("{}apt-get update && {}apt-get install --only-upgrade -y {}", prefix, prefix, pkgs),
-                format!("{}dnf upgrade --refresh -y {}", prefix, pkgs),
-                format!("{}zypper update -y {}", prefix, pkgs),
-                format!("{}apk upgrade {}", prefix, pkgs),
-            ]
-        }
-    }
-}
-
 /// Public analyzer entry point.
 pub fn analyze(
     ctx: &Context,
@@ -2211,10 +2249,10 @@ pub fn analyze(
         .filter(|f| should_emit(f, &facts.config))
         .collect();
     let owned: Vec<OsvFinding> = visible.iter().map(|f| (*f).clone()).collect();
-    let grouped = group_findings(&owned);
+    let grouped = group_by_target(&owned);
     let mut out = Vec::new();
     for g in &grouped {
-        let prop = build_proposal(g, ctx);
+        let prop = build_target_proposal(g, ctx);
         if acks.suppresses(FINDING_TYPE, &prop.scope) { continue; }
         if proposals.is_suppressed(FINDING_TYPE, &prop.scope) { continue; }
         out.push(prop);
@@ -2351,18 +2389,18 @@ pub fn covered_scopes(
         // dedicated extension below.
         let _ = tgt;
     }
-    // Emit one entry per CURRENTLY-vulnerable (target, CVE) so that
-    // an auto-resolve pass over an unchanged inventory keeps them
-    // pending. This is the same mechanism vulnerability::analyze
-    // uses indirectly.
-    for f in &facts.findings {
-        if !should_emit(f, &facts.config) { continue; }
-        let cve = f.vuln.display_id();
+    // Emit one (FINDING_TYPE, scope) entry per target whose
+    // inventory we actually scanned this tick — covered_targets is
+    // exactly that set. `auto_resolve_cleared` consults this against
+    // the emitted set: a target whose proposal we scanned but didn't
+    // re-emit has had its CVEs all clear, so the prior pending
+    // finding closes naturally on the next tick.
+    for tgt in &facts.covered_targets {
         out.push((
             FINDING_TYPE.to_string(),
             ProposalScope {
                 node_id: ctx.node_id.clone(),
-                resource_id: Some(format!("{}:{}", f.target.as_target().resource_id(), cve)),
+                resource_id: Some(tgt.as_target().resource_id()),
             },
         ));
     }
@@ -2859,15 +2897,37 @@ mod tests {
     }
 
     #[test]
-    fn group_findings_collapses_same_cve_per_target() {
+    fn group_by_target_collapses_all_cves_to_one_card_per_host() {
+        // The whole point of the v22.9.22 redesign: 50 CVEs on one
+        // host produce ONE inbox card, not 50.
         let mk = |pkg: &str, cve: &str| OsvFinding {
             target: ScanTargetOwned::Host,
-            ecosystem: "Ubuntu:22.04:LTS".into(),
+            ecosystem: "Debian:12".into(),
             package: pkg.into(),
             version: "1.0".into(),
             vuln: OsvVuln {
-                id: cve.into(),
-                aliases: vec![cve.into()],
+                id: cve.into(), aliases: vec![cve.into()],
+                summary: "".into(), cvss_score: Some(7.5),
+                advisory_url: None, modified: None,
+                fixed_versions: HashMap::new(),
+            },
+            kev_listed: false,
+        };
+        let findings: Vec<OsvFinding> = (0..50)
+            .map(|i| mk("openssl", &format!("CVE-2026-{:04}", i)))
+            .collect();
+        let grouped = group_by_target(&findings);
+        assert_eq!(grouped.len(), 1, "50 CVEs on one host = 1 card, not 50");
+        assert_eq!(grouped[0].findings.len(), 50);
+    }
+
+    #[test]
+    fn group_by_target_separates_host_from_lxc() {
+        let mk = |target: ScanTargetOwned| OsvFinding {
+            target, ecosystem: "Debian:12".into(),
+            package: "x".into(), version: "1".into(),
+            vuln: OsvVuln {
+                id: "CVE-X".into(), aliases: vec!["CVE-X".into()],
                 summary: "".into(), cvss_score: Some(7.5),
                 advisory_url: None, modified: None,
                 fixed_versions: HashMap::new(),
@@ -2875,38 +2935,104 @@ mod tests {
             kev_listed: false,
         };
         let findings = vec![
-            mk("linux-image-6.8.0-39-generic", "CVE-2026-31431"),
-            mk("linux-headers-6.8.0-39-generic", "CVE-2026-31431"),
-            mk("openssh-server", "CVE-2024-6387"),
+            mk(ScanTargetOwned::Host),
+            mk(ScanTargetOwned::Lxc("ct1".into())),
+            mk(ScanTargetOwned::Lxc("ct2".into())),
         ];
-        let grouped = group_findings(&findings);
-        assert_eq!(grouped.len(), 2);
-        let copy_fail = grouped.iter().find(|g| g.cve_or_id == "CVE-2026-31431").unwrap();
-        assert_eq!(copy_fail.packages.len(), 2);
+        let grouped = group_by_target(&findings);
+        assert_eq!(grouped.len(), 3);
+        // Host first, then LXC alphabetical.
+        assert!(matches!(grouped[0].target, ScanTargetOwned::Host));
+        assert!(matches!(&grouped[1].target, ScanTargetOwned::Lxc(n) if n == "ct1"));
+        assert!(matches!(&grouped[2].target, ScanTargetOwned::Lxc(n) if n == "ct2"));
     }
 
     #[test]
-    fn group_findings_sorts_kev_first() {
-        let mk = |cve: &str, kev: bool, score: f32| OsvFinding {
-            target: ScanTargetOwned::Host, ecosystem: "Ubuntu:22.04:LTS".into(),
-            package: "x".into(), version: "1".into(),
+    fn target_proposal_severity_is_max_across_findings() {
+        let ctx = Context::for_node("n");
+        let warn_finding = OsvFinding {
+            target: ScanTargetOwned::Host,
+            ecosystem: "Debian:12".into(),
+            package: "htop".into(), version: "3.0.5".into(),
             vuln: OsvVuln {
-                id: cve.into(), aliases: vec![cve.into()], summary: "".into(),
-                cvss_score: Some(score), advisory_url: None, modified: None,
+                id: "CVE-LOW".into(), aliases: vec!["CVE-LOW".into()],
+                summary: "".into(), cvss_score: Some(5.0),
+                advisory_url: None, modified: None,
+                fixed_versions: HashMap::new(),
+            },
+            kev_listed: false,
+        };
+        let critical_kev_finding = OsvFinding {
+            target: ScanTargetOwned::Host,
+            ecosystem: "Debian:12".into(),
+            package: "openssl".into(), version: "3.0.13".into(),
+            vuln: OsvVuln {
+                id: "CVE-2026-31431".into(),
+                aliases: vec!["CVE-2026-31431".into()],
+                summary: "".into(), cvss_score: Some(7.8),
+                advisory_url: None, modified: None,
+                fixed_versions: HashMap::new(),
+            },
+            kev_listed: true,
+        };
+        let f = vec![warn_finding, critical_kev_finding];
+        let g = TargetGroup { target: ScanTargetOwned::Host, findings: f.iter().collect() };
+        let prop = build_target_proposal(&g, &ctx);
+        assert_eq!(prop.severity, Severity::Critical,
+            "any KEV-listed finding must lift the whole card to Critical");
+    }
+
+    #[test]
+    fn target_proposal_evidence_lists_kev_first_and_caps_at_ten() {
+        let ctx = Context::for_node("n");
+        let mk = |i: u32, kev: bool| OsvFinding {
+            target: ScanTargetOwned::Host,
+            ecosystem: "Debian:12".into(),
+            package: "p".into(), version: "1".into(),
+            vuln: OsvVuln {
+                id: format!("CVE-2026-{:04}", i),
+                aliases: vec![format!("CVE-2026-{:04}", i)],
+                summary: "".into(), cvss_score: Some(7.0),
+                advisory_url: None, modified: None,
                 fixed_versions: HashMap::new(),
             },
             kev_listed: kev,
         };
-        let findings = vec![
-            mk("CVE-A", false, 9.9),    // not KEV but very high
-            mk("CVE-B", true, 5.0),     // KEV, lower CVSS
-            mk("CVE-C", false, 7.0),
-        ];
-        let grouped = group_findings(&findings);
-        assert_eq!(grouped[0].cve_or_id, "CVE-B", "KEV must sort first regardless of CVSS");
-        // Among non-KEV, higher CVSS wins.
-        assert_eq!(grouped[1].cve_or_id, "CVE-A");
-        assert_eq!(grouped[2].cve_or_id, "CVE-C");
+        let findings: Vec<OsvFinding> = (0..15).map(|i| mk(i, i == 7)).collect();
+        let g = TargetGroup { target: ScanTargetOwned::Host, findings: findings.iter().collect() };
+        let prop = build_target_proposal(&g, &ctx);
+        // Evidence: Total + KEV-count chip + Critical-count chip + 10 CVE rows + "+5 more"
+        let labels: Vec<&str> = prop.evidence.iter().map(|e| e.label.as_str()).collect();
+        assert!(labels.contains(&"Total"));
+        assert!(labels.contains(&"KEV"));
+        assert!(labels.contains(&"More"));
+        // First CVE row must be the KEV one (CVE-2026-0007).
+        let first_cve_row = prop.evidence.iter().find(|e| e.label.starts_with("CVE-2026-")).unwrap();
+        assert_eq!(first_cve_row.label, "CVE-2026-0007",
+            "KEV-listed CVE must surface at the top of the evidence list");
+    }
+
+    #[test]
+    fn target_proposal_scope_has_no_cve_suffix() {
+        // Critical for one-card-per-target dedup: scope must be the
+        // bare target id, otherwise upserts won't collapse.
+        let ctx = Context::for_node("n");
+        let f = OsvFinding {
+            target: ScanTargetOwned::Lxc("ct1".into()),
+            ecosystem: "Debian:12".into(),
+            package: "p".into(), version: "1".into(),
+            vuln: OsvVuln {
+                id: "CVE-X".into(), aliases: vec!["CVE-X".into()],
+                summary: "".into(), cvss_score: Some(7.0),
+                advisory_url: None, modified: None,
+                fixed_versions: HashMap::new(),
+            },
+            kev_listed: false,
+        };
+        let g = TargetGroup { target: ScanTargetOwned::Lxc("ct1".into()), findings: vec![&f] };
+        let prop = build_target_proposal(&g, &ctx);
+        assert_eq!(prop.scope.resource_id.as_deref(), Some("osv:lxc:ct1"));
+        assert!(!prop.scope.resource_id.as_deref().unwrap().contains("CVE"));
     }
 
     #[test]
@@ -3027,63 +3153,42 @@ mod tests {
     }
 
     #[test]
-    fn remediation_uses_apt_for_ubuntu() {
-        let f = OsvFinding {
-            target: ScanTargetOwned::Host,
-            ecosystem: "Ubuntu:24.04:LTS".into(),
-            package: "openssl".into(),
-            version: "3.0.13".into(),
-            vuln: OsvVuln {
-                id: "x".into(), aliases: vec![], summary: "".into(),
-                cvss_score: Some(9.0), advisory_url: None, modified: None,
-                fixed_versions: HashMap::new(),
-            },
-            kev_listed: false,
-        };
-        let g = GroupedFinding {
-            target: ScanTargetOwned::Host,
-            cve_or_id: "CVE-X".into(),
-            kev_listed: false,
-            cvss_score: Some(9.0),
-            summary: "".into(),
-            advisory_url: None,
-            packages: vec![&f],
-        };
-        let cmds = remediation_commands(&g);
-        // Must NOT include dnf / zypper / apk lines — Ubuntu host
-        // should only see apt commands.
-        assert!(cmds.iter().any(|c| c.contains("apt-get install --only-upgrade")));
-        assert!(!cmds.iter().any(|c| c.contains("dnf upgrade")));
+    fn bulk_upgrade_commands_use_apt_for_ubuntu_host() {
+        let cmds = bulk_upgrade_commands(&ScanTargetOwned::Host, "Ubuntu:24.04:LTS");
+        // One bulk upgrade — not a per-package install line.
+        assert_eq!(cmds, vec!["apt-get update".to_string(), "apt-get upgrade -y".to_string()]);
+        assert!(!cmds.iter().any(|c| c.contains("dnf")));
         assert!(!cmds.iter().any(|c| c.contains("zypper")));
-        assert!(!cmds.iter().any(|c| c.contains("apk upgrade")));
+        assert!(!cmds.iter().any(|c| c.contains("apk")));
     }
 
     #[test]
-    fn remediation_uses_lxc_attach_dnf_for_rocky_lxc() {
-        let f = OsvFinding {
-            target: ScanTargetOwned::Lxc("db1".into()),
-            ecosystem: "Rocky Linux:9".into(),
-            package: "kernel".into(),
-            version: "5.14.0-503.el9".into(),
-            vuln: OsvVuln {
-                id: "x".into(), aliases: vec![], summary: "".into(),
-                cvss_score: Some(9.0), advisory_url: None, modified: None,
-                fixed_versions: HashMap::new(),
-            },
-            kev_listed: false,
-        };
-        let g = GroupedFinding {
-            target: ScanTargetOwned::Lxc("db1".into()),
-            cve_or_id: "CVE-X".into(),
-            kev_listed: false, cvss_score: Some(9.0),
-            summary: "".into(), advisory_url: None,
-            packages: vec![&f],
-        };
-        let cmds = remediation_commands(&g);
-        assert!(cmds.iter().any(|c| c == "lxc-attach -n db1 -- dnf upgrade --refresh -y kernel"),
-            "got: {:?}", cmds);
-        // No apt / zypper / apk for a Rocky LXC.
+    fn bulk_upgrade_commands_use_lxc_attach_dnf_for_rocky_lxc() {
+        let cmds = bulk_upgrade_commands(
+            &ScanTargetOwned::Lxc("db1".into()),
+            "Rocky Linux:9",
+        );
+        assert_eq!(cmds, vec!["lxc-attach -n db1 -- dnf upgrade --refresh -y".to_string()]);
         assert!(!cmds.iter().any(|c| c.contains("apt-get")));
+    }
+
+    #[test]
+    fn bulk_upgrade_commands_fall_through_for_unknown_ecosystem() {
+        // Unknown ecosystem (or the rare classifiable-but-unknown-PM
+        // case) emits all four common commands prefixed by lxc-attach
+        // for the LXC target. Caller picks.
+        let cmds = bulk_upgrade_commands(
+            &ScanTargetOwned::Lxc("ct1".into()),
+            "FutureDistro:1.0",
+        );
+        assert!(cmds.iter().any(|c| c.contains("apt-get upgrade")));
+        assert!(cmds.iter().any(|c| c.contains("dnf upgrade")));
+        assert!(cmds.iter().any(|c| c.contains("zypper update")));
+        assert!(cmds.iter().any(|c| c.contains("apk upgrade")));
+        // Every non-comment line must be lxc-attach-prefixed.
+        for c in cmds.iter().filter(|c| !c.starts_with('#')) {
+            assert!(c.contains("lxc-attach -n ct1 --"), "missing prefix on: {}", c);
+        }
     }
 
     #[test]
