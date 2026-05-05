@@ -48785,22 +48785,60 @@ function predictiveSnoozeMenu(id, btn) {
 
 async function predictiveSnooze(id, hours) {
     document.getElementById('predictive-snooze-menu')?.remove();
+    // Optimistic UI: same pattern as dismiss. Note that
+    // `predictiveOptimisticRemove` is defined further down — JS
+    // function declarations are hoisted, so the forward reference is
+    // safe.
+    const point = predictiveOptimisticRemove(id);
+    showToast(`Snoozed for ${hours} hour${hours === 1 ? '' : 's'}`, 'success', 2000);
     try {
         const r = await fetch(`/api/proposals/${encodeURIComponent(id)}/snooze`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ hours }),
         });
-        const data = await r.json().catch(() => ({}));
         if (!r.ok) {
+            const data = await r.json().catch(() => ({}));
+            predictiveOptimisticRestore(point);
             showToast(`Snooze failed: ${data.error || r.statusText}`, 'error');
-            return;
         }
-        showToast(`Snoozed for ${hours} hour${hours === 1 ? '' : 's'}`, 'success', 2000);
-        predictiveLoad();
     } catch (e) {
+        predictiveOptimisticRestore(point);
         showToast(`Snooze errored: ${e.message || String(e)}`, 'error');
     }
+}
+
+/// Optimistic-remove helper for inbox actions (dismiss / approve /
+/// snooze / ack). The cluster-aggregate POST + fan-out to peers +
+/// federations can take several seconds; waiting for it before
+/// updating the UI made operators think the click had been lost.
+/// We now drop the proposal locally + re-render, fire the API in
+/// the background, and restore on failure.
+///
+/// Returns a "restore point" the caller can pass back to
+/// `predictiveOptimisticRestore` if the API call fails.
+function predictiveOptimisticRemove(id) {
+    const list = predictiveState.proposals || [];
+    const idx = list.findIndex(p => p.id === id);
+    let removed = null;
+    if (idx >= 0) {
+        removed = list[idx];
+        list.splice(idx, 1);
+        predictiveRender();
+        predictiveBadgeUpdate();
+    }
+    return { idx, removed };
+}
+
+function predictiveOptimisticRestore(point) {
+    if (!point || !point.removed || point.idx < 0) return;
+    const list = predictiveState.proposals || [];
+    // Insert at the original index, but cap to current length in
+    // case the list has shrunk further from another action.
+    const insertAt = Math.min(point.idx, list.length);
+    list.splice(insertAt, 0, point.removed);
+    predictiveRender();
+    predictiveBadgeUpdate();
 }
 
 async function predictiveDismiss(id) {
@@ -48814,20 +48852,22 @@ async function predictiveDismiss(id) {
         showToast('A reason is required so the dismissal is auditable', 'warning', 3500);
         return;
     }
+    // Optimistic UI: remove now, restore if the API rejects.
+    const point = predictiveOptimisticRemove(id);
+    showToast('Dismissed', 'success', 1500);
     try {
         const r = await fetch(`/api/proposals/${encodeURIComponent(id)}/dismiss`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ reason: reason.trim() }),
         });
-        const data = await r.json().catch(() => ({}));
         if (!r.ok) {
+            const data = await r.json().catch(() => ({}));
+            predictiveOptimisticRestore(point);
             showToast(`Dismiss failed: ${data.error || r.statusText}`, 'error');
-            return;
         }
-        showToast('Dismissed', 'success', 1800);
-        predictiveLoad();
     } catch (e) {
+        predictiveOptimisticRestore(point);
         showToast(`Dismiss errored: ${e.message || String(e)}`, 'error');
     }
 }
@@ -48838,19 +48878,21 @@ async function predictiveApprove(id) {
         'Mark applied',
     );
     if (!ok) return;
+    // Optimistic UI: same pattern as dismiss.
+    const point = predictiveOptimisticRemove(id);
+    showToast('Marked applied', 'success', 1500);
     try {
         const r = await fetch(`/api/proposals/${encodeURIComponent(id)}/approve`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
         });
-        const data = await r.json().catch(() => ({}));
         if (!r.ok) {
+            const data = await r.json().catch(() => ({}));
+            predictiveOptimisticRestore(point);
             showToast(`Mark applied failed: ${data.error || r.statusText}`, 'error');
-            return;
         }
-        showToast('Marked applied', 'success', 1800);
-        predictiveLoad();
     } catch (e) {
+        predictiveOptimisticRestore(point);
         showToast(`Mark applied errored: ${e.message || String(e)}`, 'error');
     }
 }
@@ -48880,6 +48922,18 @@ async function predictiveAck(findingType, nodeId, resourceId) {
         return;
     }
     const scope = { kind: 'resource', node_id: nodeId, resource_id: resourceId };
+    // Optimistic UI: ack-as-intentional on a Resource scope filters
+    // the matching proposal at read time, so removing it now matches
+    // what the next predictiveLoad will return. Find the proposal id
+    // by (finding_type, node_id, resource_id) since the ack scope
+    // doesn't carry the id.
+    const matched = (predictiveState.proposals || []).find(p =>
+        p.finding_type === findingType
+        && p.scope && p.scope.node_id === nodeId
+        && (p.scope.resource_id || '') === resourceId
+    );
+    const point = matched ? predictiveOptimisticRemove(matched.id) : null;
+    showToast('Acknowledged for 180 days', 'success', 2000);
     try {
         const r = await fetch('/api/proposal-acks', {
             method: 'POST',
@@ -48890,14 +48944,13 @@ async function predictiveAck(findingType, nodeId, resourceId) {
                 reason: reason.trim(),
             }),
         });
-        const data = await r.json().catch(() => ({}));
         if (!r.ok) {
+            const data = await r.json().catch(() => ({}));
+            if (point) predictiveOptimisticRestore(point);
             showToast(`Ack failed: ${data.error || r.statusText}`, 'error');
-            return;
         }
-        showToast('Acknowledged for 180 days', 'success', 2200);
-        predictiveLoad();
     } catch (e) {
+        if (point) predictiveOptimisticRestore(point);
         showToast(`Ack errored: ${e.message || String(e)}`, 'error');
     }
 }
