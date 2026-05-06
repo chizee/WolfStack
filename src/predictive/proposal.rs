@@ -87,12 +87,31 @@ pub enum RemediationPlan {
 /// One supporting fact attached to a proposal. Rendered as a small
 /// chip in the inbox card. Always has a label and a value; `detail`
 /// is for the "expand" panel.
+///
+/// `links` carries authoritative external references (e.g. vendor
+/// advisories, distro security trackers) and is rendered as small
+/// pill links beside the chip. Used by the OSV analyzer to surface
+/// mitigation guidance for unpatched CVEs without us synthesising the
+/// advice ourselves. Empty for analyzers that don't have references
+/// to surface — `skip_serializing_if = "Vec::is_empty"` keeps the
+/// JSON wire size unchanged for those callers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Evidence {
     pub label: String,
     pub value: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<EvidenceLink>,
+}
+
+/// One labelled URL attached to an [`Evidence`] entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvidenceLink {
+    /// Short human label for the chip. The OSV analyzer uses values
+    /// like "Advisory", "Fix", "Web", or a derived host name.
+    pub label: String,
+    pub url: String,
 }
 
 /// Where in the cluster the proposal applies. `resource_id` is the

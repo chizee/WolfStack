@@ -187,11 +187,13 @@ fn build_proposal(fact: &MemoryFact, scope: &ProposalScope, severity: Severity) 
             label: "Memory".into(),
             value: format!("{:.1}% of limit", fact.memory_pct),
             detail: Some(format!("{:.2} GB used of {:.2} GB", used_gb, limit_gb)),
+            links: Vec::new(),
         },
         Evidence {
             label: "Container".into(),
             value: fact.name.clone(),
             detail: Some(runtime_label.into()),
+            links: Vec::new(),
         },
     ];
 

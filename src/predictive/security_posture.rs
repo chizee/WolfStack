@@ -221,6 +221,7 @@ fn build_listening_proposal(
                     label: "Bind".into(),
                     value: format!("{}:{} ({})", sock.bind, sock.port, proto),
                     detail: sock.process.clone(),
+                    links: Vec::new(),
                 }],
                 RemediationPlan::Manual {
                     instructions: format!("Bind '{}' is overlay-scoped — review whether the exposure is intentional.", service),
@@ -257,11 +258,13 @@ fn build_listening_proposal(
             label: "Service".into(),
             value: format!("{} ({}/{})", service, proto, sock.port),
             detail: sock.process.clone(),
+            links: Vec::new(),
         },
         Evidence {
             label: "Bind".into(),
             value: format!("{}:{}", sock.bind, sock.port),
             detail: Some(format!("Reachability class: {:?}", reach)),
+            links: Vec::new(),
         },
     ];
 
@@ -377,6 +380,7 @@ fn build_sshd_root_proposal(
             label: "sshd reachability".into(),
             value: format!("{:?}", reach),
             detail: Some("Computed via `NetworkReachability::classify_bind` on every listener for port 22.".into()),
+            links: Vec::new(),
         }],
         RemediationPlan::Manual {
             instructions: "Set `PermitRootLogin no` in /etc/ssh/sshd_config and reload sshd. Make sure you have a non-root user with sudo first.".into(),
@@ -411,6 +415,7 @@ fn build_sshd_password_proposal(
             label: "sshd reachability".into(),
             value: format!("{:?}", reach),
             detail: None,
+            links: Vec::new(),
         }],
         RemediationPlan::Manual {
             instructions: "Set `PasswordAuthentication no` in /etc/ssh/sshd_config — confirm your key works first by logging in via key in a separate session BEFORE you reload sshd.".into(),

@@ -231,16 +231,19 @@ fn build_proposal(
             label: "Schedule".into(),
             value: fact.name.clone(),
             detail: Some(format!("{} cadence (interval ~{:.0}h)", interval_label, fact.interval_hours)),
+            links: Vec::new(),
         },
         Evidence {
             label: "Last run".into(),
             value: if fact.last_run_iso.is_empty() { "never".into() } else { fact.last_run_iso.clone() },
             detail: fact.since_last_run_hours.map(|h| format!("{:.1} hours ago", h)),
+            links: Vec::new(),
         },
         Evidence {
             label: "Missed by".into(),
             value: format!("{:.1}× interval", mult),
             detail: None,
+            links: Vec::new(),
         },
     ];
 

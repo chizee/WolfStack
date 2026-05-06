@@ -111,7 +111,8 @@ use crate::predictive::{
     Context,
     ack::AckStore,
     proposal::{
-        Evidence, Proposal, ProposalScope, ProposalSource, RemediationPlan, Severity,
+        Evidence, EvidenceLink, Proposal, ProposalScope, ProposalSource, RemediationPlan,
+        Severity,
     },
     vulnerability::{is_critical_package, PackageManager},
 };
@@ -216,6 +217,34 @@ pub struct OsvConfig {
     /// shortest possible alert stream.
     #[serde(default)]
     pub kev_only: bool,
+    /// Lowest severity tier that should surface in the inbox. Findings
+    /// below this floor are dropped before the per-target Proposal is
+    /// built. KEV-listed CVEs always bypass the floor (a KEV listing
+    /// promotes severity to Critical anyway, but the bypass is explicit
+    /// in `should_emit` so a future floor=Critical doesn't accidentally
+    /// hide a borderline KEV).
+    ///
+    /// Default `High` — for a fresh Debian/Ubuntu host, this typically
+    /// trims the OSV finding count from ~150 to ~30 by hiding the long
+    /// tail of CVSS 4.0–6.9 issues, while keeping every Critical and
+    /// every actively-exploited (KEV) CVE.
+    #[serde(default = "default_severity_floor")]
+    pub severity_floor: Severity,
+    /// When set, OSV findings whose upstream record carries no `fixed`
+    /// version (i.e. the distro hasn't shipped a patch yet) are auto-
+    /// suppressed unless they are KEV-listed or hit the Critical tier.
+    /// The suppressed count is reported on `OsvFacts.suppressed_no_fix`
+    /// so the inbox card can surface the hidden total honestly.
+    ///
+    /// Rationale: distro security teams routinely take 4–12 weeks to
+    /// ship a patched package after CVE disclosure. Until that lands,
+    /// there is literally nothing the operator can do — we'd just be
+    /// re-asking them to run an upgrade that won't help. Once OSV
+    /// publishes a `fixed` version, the finding resurfaces on the next
+    /// scan automatically. KEV-listed and Critical findings are NEVER
+    /// auto-suppressed because they need eyeballs even without a fix.
+    #[serde(default = "default_true")]
+    pub suppress_no_fix: bool,
     /// Per-distro ecosystem override. Keyed by `/etc/os-release` `ID=`
     /// field (lowercase); value is the literal OSV ecosystem string
     /// (e.g. `"Ubuntu:24.04:LTS"`). This is the operator escape hatch
@@ -228,6 +257,7 @@ pub struct OsvConfig {
 fn default_true() -> bool { true }
 fn default_osv_endpoint() -> String { OSV_DEFAULT_ENDPOINT.to_string() }
 fn default_kev_endpoint() -> String { KEV_DEFAULT_ENDPOINT.to_string() }
+fn default_severity_floor() -> Severity { Severity::High }
 
 impl Default for OsvConfig {
     fn default() -> Self {
@@ -236,6 +266,8 @@ impl Default for OsvConfig {
             endpoint: OSV_DEFAULT_ENDPOINT.to_string(),
             kev_endpoint: KEV_DEFAULT_ENDPOINT.to_string(),
             kev_only: false,
+            severity_floor: default_severity_floor(),
+            suppress_no_fix: true,
             distro_overrides: HashMap::new(),
         }
     }
@@ -397,9 +429,19 @@ pub struct OsvVuln {
     #[serde(default)]
     pub cvss_score: Option<f32>,
     /// First reference URL whose `type` is `ADVISORY`. Used as the
-    /// canonical link in the inbox card.
+    /// canonical link in the inbox card. Kept for back-compat with
+    /// existing cache files; new code should prefer `references` and
+    /// pick the most relevant link by type.
     #[serde(default)]
     pub advisory_url: Option<String>,
+    /// All references attached to the OSV record — vendor advisories,
+    /// distro trackers, CISA KEV pages, vulnerability writeups. Used
+    /// to render mitigation chips on the inbox card so the operator
+    /// can read authoritative guidance for unpatched CVEs (instead of
+    /// us synthesising it). Empty for very old cached records — they
+    /// will repopulate on the next OSV refresh.
+    #[serde(default)]
+    pub references: Vec<OsvVulnReference>,
     /// `modified` timestamp from the OSV record. Used to invalidate
     /// the cache when the upstream record changes.
     #[serde(default)]
@@ -409,6 +451,17 @@ pub struct OsvVuln {
     /// the upstream record lists no fixed event.
     #[serde(default)]
     pub fixed_versions: HashMap<String, String>,
+}
+
+/// One reference URL on an OSV record, with its `type` so the inbox
+/// can label the chip ("Advisory", "Web", "Fix", etc.). The cached
+/// twin of [`OsvReference`] — kept separate so the on-disk schema
+/// is decoupled from the wire schema.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OsvVulnReference {
+    #[serde(rename = "type")]
+    pub ty: String,
+    pub url: String,
 }
 
 impl OsvVuln {
@@ -1403,6 +1456,13 @@ fn distill_full(full: OsvFullVuln) -> OsvVuln {
         .find(|r| r.ty.eq_ignore_ascii_case("ADVISORY"))
         .or_else(|| full.references.iter().find(|r| r.ty.eq_ignore_ascii_case("WEB")))
         .map(|r| r.url.clone());
+    let references: Vec<OsvVulnReference> = full.references.iter()
+        .filter(|r| !r.url.is_empty())
+        .map(|r| OsvVulnReference {
+            ty: if r.ty.is_empty() { "WEB".to_string() } else { r.ty.clone() },
+            url: r.url.clone(),
+        })
+        .collect();
     let mut fixed_versions: HashMap<String, String> = HashMap::new();
     for aff in &full.affected {
         let pkg_name = aff.package.as_ref().map(|p| p.name.clone()).unwrap_or_default();
@@ -1424,6 +1484,7 @@ fn distill_full(full: OsvFullVuln) -> OsvVuln {
         summary: full.summary,
         cvss_score,
         advisory_url,
+        references,
         modified: full.modified,
         fixed_versions,
     }
@@ -1659,6 +1720,13 @@ pub struct OsvFinding {
     pub version: String,
     pub vuln: OsvVuln,
     pub kev_listed: bool,
+    /// Whether OSV's record carries a `fixed` version for this
+    /// finding's package. False means the upstream distro has not
+    /// (yet) shipped a patched build, so `apt upgrade` etc. will not
+    /// resolve the CVE — the operator can only mitigate or wait.
+    /// Computed at sample time by looking up `vuln.fixed_versions`
+    /// keyed by the matched package name.
+    pub fix_available: bool,
 }
 
 /// What the analyzer consumes — the per-target findings plus a
@@ -1679,6 +1747,12 @@ pub struct OsvFacts {
     pub unrecognized_derivatives: Vec<UnrecognizedDerivativeBreadcrumb>,
     pub config: OsvConfig,
     pub kev_cve_count: usize,
+    /// Findings hidden by `OsvConfig.suppress_no_fix`. Reported on the
+    /// per-target inbox card so the operator sees, honestly, that "143
+    /// CVEs are awaiting an upstream patch" rather than a count of zero.
+    /// Keyed by target so each card can render its own subtotal; the
+    /// host group's count covers host findings, each LXC's its own.
+    pub suppressed_no_fix_by_target: HashMap<ScanTargetOwned, usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -1727,6 +1801,7 @@ pub fn sample_now() -> OsvFacts {
         unrecognized_derivatives: Vec::new(),
         config: config.clone(),
         kev_cve_count: 0,
+        suppressed_no_fix_by_target: HashMap::new(),
     };
     if !config.enabled { return facts; }
 
@@ -1831,14 +1906,31 @@ pub fn sample_now() -> OsvFacts {
                 };
                 let kev_listed = vuln.cve_ids().iter().any(|c| kev.cves.contains(c));
                 if config.kev_only && !kev_listed { continue; }
-                facts.findings.push(OsvFinding {
+                let fix_available = vuln.fixed_versions.contains_key(&entry.name);
+                let finding = OsvFinding {
                     target: inv.target.clone(),
                     ecosystem: entry.ecosystem.clone(),
                     package: entry.name.clone(),
                     version: entry.version.clone(),
                     vuln,
                     kev_listed,
-                });
+                    fix_available,
+                };
+                // Auto-suppress CVEs with no upstream patch yet — the
+                // operator cannot do anything about these via package
+                // updates. KEV-listed and Critical findings always
+                // surface even without a fix because they need
+                // attention regardless (mitigation, isolation, etc.).
+                if config.suppress_no_fix
+                    && !fix_available
+                    && !kev_listed
+                    && severity_for(&finding) != Severity::Critical
+                {
+                    *facts.suppressed_no_fix_by_target
+                        .entry(inv.target.clone()).or_insert(0) += 1;
+                    continue;
+                }
+                facts.findings.push(finding);
             }
         }
     }
@@ -1951,8 +2043,14 @@ fn severity_for(finding: &OsvFinding) -> Severity {
 /// Should this finding actually surface in the inbox?
 fn should_emit(finding: &OsvFinding, config: &OsvConfig) -> bool {
     if config.kev_only { return finding.kev_listed; }
+    // KEV-listed always surfaces — the floor only applies to non-KEV
+    // findings. severity_for() already promotes KEV to Critical, but
+    // make the bypass explicit so a future "floor=Critical, kev_only=
+    // false" never accidentally hides one.
+    if finding.kev_listed { return true; }
     let sev = severity_for(finding);
-    !matches!(sev, Severity::Info)
+    if matches!(sev, Severity::Info) { return false; }
+    sev.rank() <= config.severity_floor.rank()
 }
 
 /// Group findings by target — one inbox card per (host or LXC),
@@ -2003,19 +2101,30 @@ fn sort_findings(findings: &[&OsvFinding]) -> Vec<OsvFinding> {
     sorted
 }
 
-/// How many CVE rows to render in the evidence panel before
-/// collapsing the rest into a "+N more" chip. Ten is enough to show
-/// the worst offenders without forcing the inbox card to the size of
-/// a small spreadsheet.
-const MAX_CVE_EVIDENCE_ROWS: usize = 10;
+/// How many CVE rows to render per section in the evidence panel
+/// before collapsing the rest into a "+N more" chip. Six is enough to
+/// show the worst offenders in each section (patchable / awaiting fix)
+/// without forcing the inbox card to the size of a small spreadsheet.
+const MAX_CVE_EVIDENCE_ROWS_PER_SECTION: usize = 6;
+
+/// How many advisory/fix/web reference chips to attach to each CVE
+/// row. Three is enough to surface the canonical advisory plus a
+/// distro tracker plus a CISA KEV link without overflowing the row.
+const MAX_REFERENCES_PER_ROW: usize = 3;
 
 /// Build the single Proposal that represents every OSV finding on
-/// one target.
-fn build_target_proposal(g: &TargetGroup<'_>, ctx: &Context) -> Proposal {
+/// one target. `suppressed_no_fix` is the number of additional findings
+/// that were dropped at sample time because no upstream patch is yet
+/// available — surfaced honestly on the card so the operator never
+/// sees a misleading "0 issues" when in reality there are many waiting
+/// on a distro fix.
+fn build_target_proposal(g: &TargetGroup<'_>, ctx: &Context, suppressed_no_fix: usize) -> Proposal {
     let total = g.findings.len();
     let kev_count = g.findings.iter().filter(|f| f.kev_listed).count();
     let critical_count = g.findings.iter()
         .filter(|f| severity_for(f) == Severity::Critical).count();
+    let patchable_count = g.findings.iter().filter(|f| f.fix_available).count();
+    let awaiting_count = total - patchable_count;
     let target_label = g.target.as_target().label();
 
     // Severity: max across all findings. Severity::rank() is lower
@@ -2038,7 +2147,7 @@ fn build_target_proposal(g: &TargetGroup<'_>, ctx: &Context) -> Proposal {
     };
 
     let why = format!(
-        "OSV.dev's database matched {} CVE{} against installed package(s) on {}. {}{}",
+        "OSV.dev's database matched {} CVE{} against installed package(s) on {}. {}{}{}",
         total,
         if total == 1 { "" } else { "s" },
         target_label,
@@ -2047,16 +2156,34 @@ fn build_target_proposal(g: &TargetGroup<'_>, ctx: &Context) -> Proposal {
                 "{} of these {} on the CISA Known Exploited Vulnerabilities list — \
                  attackers are actively exploiting them in the wild. Patch \
                  immediately, even if your distro has not yet shipped its security \
-                 advisory.",
+                 advisory. ",
                 kev_count,
                 if kev_count == 1 { "is" } else { "are" },
             )
+        } else if patchable_count > 0 {
+            format!(
+                "{} can be patched now by running your distro's security upgrade; \
+                 {} need a patched version from upstream that has not yet shipped. ",
+                patchable_count, awaiting_count,
+            )
         } else {
-            "Apply your distro's security update or upgrade affected packages \
-             to patched versions.".into()
+            "None of these have a patched build available upstream yet — \
+             follow the linked advisories for mitigation guidance until the \
+             distro publishes a fix. ".into()
+        },
+        if suppressed_no_fix > 0 {
+            format!(
+                "{} additional finding{} hidden because no upstream patch \
+                 exists yet — they will resurface automatically once OSV \
+                 publishes a fixed version. ",
+                suppressed_no_fix,
+                if suppressed_no_fix == 1 { " is" } else { "s are" },
+            )
+        } else {
+            String::new()
         },
         if matches!(g.target, ScanTargetOwned::Lxc(_)) {
-            " The container needs to be patched separately from the host — \
+            "The container needs to be patched separately from the host — \
               upgrades on the host don't affect the container's package set."
         } else { "" },
     );
@@ -2065,6 +2192,7 @@ fn build_target_proposal(g: &TargetGroup<'_>, ctx: &Context) -> Proposal {
         label: "Total".into(),
         value: format!("{} CVE{}", total, if total == 1 { "" } else { "s" }),
         detail: Some("Source: OSV.dev (https://osv.dev)".into()),
+        links: Vec::new(),
     }];
     if kev_count > 0 {
         evidence.push(Evidence {
@@ -2074,6 +2202,7 @@ fn build_target_proposal(g: &TargetGroup<'_>, ctx: &Context) -> Proposal {
                 kev_count,
             ),
             detail: Some("Listed in CISA's Known Exploited Vulnerabilities catalog".into()),
+            links: Vec::new(),
         });
     }
     if critical_count > 0 {
@@ -2084,34 +2213,88 @@ fn build_target_proposal(g: &TargetGroup<'_>, ctx: &Context) -> Proposal {
                 critical_count, if critical_count == 1 { "" } else { "s" },
             ),
             detail: Some("KEV-listed, critical-class package, or CVSS ≥ 9.0".into()),
+            links: Vec::new(),
+        });
+    }
+    if suppressed_no_fix > 0 {
+        evidence.push(Evidence {
+            label: "Hidden — no upstream fix".into(),
+            value: format!("+{}", suppressed_no_fix),
+            detail: Some(
+                "Auto-suppressed because no patched version is published yet. \
+                 Will resurface on the next scan once OSV records a fix. \
+                 Set OsvConfig.suppress_no_fix=false to surface them anyway.".into(),
+            ),
+            links: Vec::new(),
         });
     }
 
-    let sorted = sort_findings(&g.findings);
-    for f in sorted.iter().take(MAX_CVE_EVIDENCE_ROWS) {
-        let cve = f.vuln.display_id();
-        let kev_marker = if f.kev_listed { " ⚠ KEV" } else { "" };
-        let value = match f.vuln.cvss_score {
-            Some(s) => format!("CVSS {:.1}{}", s, kev_marker),
-            None => format!("unscored{}", kev_marker),
-        };
-        let fixed = f.vuln.fixed_versions.get(&f.package);
-        let detail = match fixed {
-            Some(fv) => Some(format!("{} {} → fixed in {}", f.package, f.version, fv)),
-            None => Some(format!("{} {}", f.package, f.version)),
-        };
-        evidence.push(Evidence { label: cve, value, detail });
-    }
-    if total > MAX_CVE_EVIDENCE_ROWS {
+    // Split visible findings by whether a patch is available. Each
+    // section is independently sorted by KEV → CVSS → CVE id so the
+    // worst offender in each bucket sits at the top.
+    let patchable_sorted = sort_findings(
+        &g.findings.iter().filter(|f| f.fix_available).copied().collect::<Vec<_>>(),
+    );
+    let awaiting_sorted = sort_findings(
+        &g.findings.iter().filter(|f| !f.fix_available).copied().collect::<Vec<_>>(),
+    );
+
+    if !patchable_sorted.is_empty() {
         evidence.push(Evidence {
-            label: "More".into(),
+            label: "Patchable now".into(),
             value: format!(
-                "+{} additional CVE{}",
-                total - MAX_CVE_EVIDENCE_ROWS,
-                if total - MAX_CVE_EVIDENCE_ROWS == 1 { "" } else { "s" },
+                "{} CVE{}",
+                patchable_count,
+                if patchable_count == 1 { "" } else { "s" },
             ),
-            detail: Some("Run the upgrade command to patch all affected packages".into()),
+            detail: Some("Run the upgrade command — fix is available upstream".into()),
+            links: Vec::new(),
         });
+        for f in patchable_sorted.iter().take(MAX_CVE_EVIDENCE_ROWS_PER_SECTION) {
+            evidence.push(cve_evidence_row(f));
+        }
+        if patchable_count > MAX_CVE_EVIDENCE_ROWS_PER_SECTION {
+            evidence.push(Evidence {
+                label: "More patchable".into(),
+                value: format!(
+                    "+{} additional",
+                    patchable_count - MAX_CVE_EVIDENCE_ROWS_PER_SECTION,
+                ),
+                detail: Some("Run the upgrade command below to patch all of them".into()),
+                links: Vec::new(),
+            });
+        }
+    }
+
+    if !awaiting_sorted.is_empty() {
+        evidence.push(Evidence {
+            label: "Awaiting upstream fix".into(),
+            value: format!(
+                "{} CVE{}",
+                awaiting_count,
+                if awaiting_count == 1 { "" } else { "s" },
+            ),
+            detail: Some(
+                "No patched build published yet — read the linked advisories \
+                 for mitigation. KEV-listed and Critical issues are still \
+                 shown here even without a fix.".into(),
+            ),
+            links: Vec::new(),
+        });
+        for f in awaiting_sorted.iter().take(MAX_CVE_EVIDENCE_ROWS_PER_SECTION) {
+            evidence.push(cve_evidence_row(f));
+        }
+        if awaiting_count > MAX_CVE_EVIDENCE_ROWS_PER_SECTION {
+            evidence.push(Evidence {
+                label: "More awaiting".into(),
+                value: format!(
+                    "+{} additional",
+                    awaiting_count - MAX_CVE_EVIDENCE_ROWS_PER_SECTION,
+                ),
+                detail: Some("Track upstream for fixes; mitigate via advisory links".into()),
+                links: Vec::new(),
+            });
+        }
     }
 
     let ecosystem = g.findings.first().map(|f| f.ecosystem.as_str()).unwrap_or("");
@@ -2149,6 +2332,154 @@ fn build_target_proposal(g: &TargetGroup<'_>, ctx: &Context) -> Proposal {
             resource_id: Some(g.target.as_target().resource_id()),
         },
     )
+}
+
+/// Card for the case where the only OSV signal on a target is the
+/// suppressed-no-fix counter. Info-tier: nothing the operator can do
+/// today, but they should know the count.
+fn build_no_fix_only_card(
+    target: &ScanTargetOwned,
+    hidden: usize,
+    scope: &ProposalScope,
+) -> Proposal {
+    let target_label = target.as_target().label();
+    let title = format!(
+        "{} OSV CVE{} on {} awaiting upstream fix",
+        hidden, if hidden == 1 { "" } else { "s" }, target_label,
+    );
+    let why = format!(
+        "OSV.dev's database matched {} CVE{} against installed packages on {} \
+         that have no patched build published yet. There is nothing to upgrade — \
+         the distro security team has not shipped a fix. These will resurface \
+         as actionable findings on the next scan once OSV records a fixed \
+         version. Critical and KEV-listed CVEs are NEVER hidden by this \
+         filter; if you want to see every unpatched CVE on this target, \
+         disable `suppress_no_fix` in /etc/wolfstack/osv-config.json.",
+        hidden,
+        if hidden == 1 { "" } else { "s" },
+        target_label,
+    );
+    let evidence = vec![
+        Evidence {
+            label: "Hidden — no upstream fix".into(),
+            value: format!("{} CVE{}", hidden, if hidden == 1 { "" } else { "s" }),
+            detail: Some("Auto-suppressed; will resurface when a fix is published".into()),
+            links: Vec::new(),
+        },
+        Evidence {
+            label: "Source".into(),
+            value: "OSV.dev".into(),
+            detail: Some("https://osv.dev".into()),
+            links: Vec::new(),
+        },
+    ];
+    Proposal::new(
+        FINDING_TYPE,
+        ProposalSource::Rule,
+        Severity::Info,
+        title,
+        why,
+        evidence,
+        RemediationPlan::Manual {
+            instructions: "No action available right now — distro fix not yet \
+                published. Track upstream advisories. To surface every unpatched \
+                CVE regardless, set `suppress_no_fix: false` in \
+                /etc/wolfstack/osv-config.json.".into(),
+            commands: Vec::new(),
+        },
+        scope.clone(),
+    )
+}
+
+/// Build one Evidence row for a single CVE, including up to
+/// MAX_REFERENCES_PER_ROW external advisory links so the operator can
+/// read authoritative mitigation guidance (vendor advisory, distro
+/// security tracker, CISA KEV page) from the inbox itself.
+fn cve_evidence_row(f: &OsvFinding) -> Evidence {
+    let cve = f.vuln.display_id();
+    let kev_marker = if f.kev_listed { " ⚠ KEV" } else { "" };
+    let value = match f.vuln.cvss_score {
+        Some(s) => format!("CVSS {:.1}{}", s, kev_marker),
+        None => format!("unscored{}", kev_marker),
+    };
+    let detail = match f.vuln.fixed_versions.get(&f.package) {
+        Some(fv) => Some(format!("{} {} → fixed in {}", f.package, f.version, fv)),
+        None => Some(format!("{} {} — no upstream fix yet", f.package, f.version)),
+    };
+    Evidence {
+        label: cve,
+        value,
+        detail,
+        links: pick_reference_links(f),
+    }
+}
+
+/// Pick the most useful reference links for a finding, capped at
+/// MAX_REFERENCES_PER_ROW. Priority: ADVISORY > FIX > REPORT > WEB,
+/// de-duplicated by URL. Each link gets a short host-derived label
+/// (or the type if the host is generic) so chips stay compact.
+fn pick_reference_links(f: &OsvFinding) -> Vec<EvidenceLink> {
+    let prio = |ty: &str| -> u8 {
+        match ty.to_ascii_uppercase().as_str() {
+            "ADVISORY" => 0,
+            "FIX" => 1,
+            "REPORT" => 2,
+            "WEB" => 3,
+            _ => 4,
+        }
+    };
+    let mut sorted: Vec<&OsvVulnReference> = f.vuln.references.iter().collect();
+    sorted.sort_by_key(|r| (prio(&r.ty), r.url.clone()));
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<EvidenceLink> = Vec::new();
+    for r in sorted {
+        if !seen.insert(r.url.clone()) { continue; }
+        let label = label_for_reference(&r.ty, &r.url);
+        out.push(EvidenceLink { label, url: r.url.clone() });
+        if out.len() >= MAX_REFERENCES_PER_ROW { break; }
+    }
+    out
+}
+
+/// Derive a short chip label from a reference's URL. Recognised hosts
+/// get a friendly name (e.g. `security-tracker.debian.org` → "Debian");
+/// anything else falls back to the URL host or the OSV type.
+fn label_for_reference(ty: &str, url: &str) -> String {
+    let host = url
+        .splitn(2, "://").nth(1).unwrap_or(url)
+        .split('/').next().unwrap_or("")
+        .trim_start_matches("www.")
+        .to_ascii_lowercase();
+    let from_host: Option<&'static str> = match host.as_str() {
+        "security-tracker.debian.org" | "www.debian.org" | "debian.org" => Some("Debian"),
+        "ubuntu.com" | "people.canonical.com" | "wiki.ubuntu.com" => Some("Ubuntu"),
+        "access.redhat.com" | "bugzilla.redhat.com" | "redhat.com" => Some("Red Hat"),
+        "errata.almalinux.org" => Some("AlmaLinux"),
+        "errata.rockylinux.org" => Some("Rocky"),
+        "lists.opensuse.org" | "bugzilla.suse.com" | "www.suse.com" => Some("SUSE"),
+        "secdb.alpinelinux.org" | "alpinelinux.org" => Some("Alpine"),
+        "security.archlinux.org" => Some("Arch"),
+        "cisa.gov" | "www.cisa.gov" => Some("CISA"),
+        "nvd.nist.gov" => Some("NVD"),
+        "cve.mitre.org" | "cve.org" => Some("CVE"),
+        "github.com" | "github.blog" => Some("GitHub"),
+        "gitlab.com" => Some("GitLab"),
+        "bugs.chromium.org" => Some("Chromium"),
+        "kernel.org" | "git.kernel.org" => Some("kernel.org"),
+        _ => None,
+    };
+    if let Some(s) = from_host { return s.to_string(); }
+    // Fallback to a Title-cased version of the OSV reference type.
+    let lower = ty.to_ascii_lowercase();
+    match lower.as_str() {
+        "advisory" => "Advisory".to_string(),
+        "fix" => "Fix".to_string(),
+        "report" => "Report".to_string(),
+        "web" => "Web".to_string(),
+        "package" => "Package".to_string(),
+        "article" => "Article".to_string(),
+        _ => if host.is_empty() { "Link".to_string() } else { host },
+    }
 }
 
 /// Bulk upgrade command for the target's ecosystem. We don't list
@@ -2252,10 +2583,35 @@ pub fn analyze(
     let grouped = group_by_target(&owned);
     let mut out = Vec::new();
     for g in &grouped {
-        let prop = build_target_proposal(g, ctx);
+        let suppressed_no_fix = facts.suppressed_no_fix_by_target
+            .get(&g.target).copied().unwrap_or(0);
+        let prop = build_target_proposal(g, ctx, suppressed_no_fix);
         if acks.suppresses(FINDING_TYPE, &prop.scope) { continue; }
         if proposals.is_suppressed(FINDING_TYPE, &prop.scope) { continue; }
         out.push(prop);
+    }
+    // A target may have ZERO visible findings but still have hidden
+    // (no-upstream-fix) findings — `findings` was filtered by
+    // `should_emit`, but `suppressed_no_fix_by_target` is sampled
+    // before `should_emit`. If a target's only contribution to the
+    // inbox is "N hidden, awaiting upstream fix", surface that as a
+    // dedicated Info-tier card so the operator sees the count instead
+    // of nothing. `Info` keeps the entry visible without spamming
+    // High/Critical channels.
+    let surfaced_targets: std::collections::HashSet<&ScanTargetOwned> =
+        grouped.iter().map(|g| &g.target).collect();
+    for (tgt, hidden) in &facts.suppressed_no_fix_by_target {
+        if *hidden == 0 { continue; }
+        if surfaced_targets.contains(tgt) { continue; }
+        let scope = ProposalScope {
+            node_id: ctx.node_id.clone(),
+            resource_id: Some(format!(
+                "{}:no-fix-tracker", tgt.as_target().resource_id(),
+            )),
+        };
+        if acks.suppresses(FINDING_TYPE, &scope) { continue; }
+        if proposals.is_suppressed(FINDING_TYPE, &scope) { continue; }
+        out.push(build_no_fix_only_card(tgt, *hidden, &scope));
     }
     // Unrecognised-derivative breadcrumbs. One per (target, derivative
     // id). Suppressed in kev_only mode — that's a noise-floor preference,
@@ -2327,16 +2683,19 @@ fn build_breadcrumb(b: &UnrecognizedDerivativeBreadcrumb, scope: &ProposalScope)
             label: "Distro ID".into(),
             value: b.id.clone(),
             detail: Some(format!("Parent family: {}", parent)),
+            links: Vec::new(),
         },
         Evidence {
             label: "Codename".into(),
             value: codename.clone(),
             detail: Some("From UBUNTU_CODENAME / DEBIAN_CODENAME / VERSION_CODENAME in /etc/os-release".into()),
+            links: Vec::new(),
         },
         Evidence {
             label: "distro-info-data".into(),
             value: if b.distro_info_present { "installed".into() } else { "missing".into() },
             detail: Some("Debian/Canonical's authoritative codename → release map".into()),
+            links: Vec::new(),
         },
     ];
     Proposal::new(
@@ -2401,6 +2760,20 @@ pub fn covered_scopes(
             ProposalScope {
                 node_id: ctx.node_id.clone(),
                 resource_id: Some(tgt.as_target().resource_id()),
+            },
+        ));
+        // Also cover the no-fix-tracker scope so the dedicated
+        // "N hidden — awaiting upstream fix" card auto-resolves
+        // when the suppressed_no_fix count drops to zero (operator
+        // disabled the filter, or every awaiting CVE got a fix).
+        // Without this the tracker sits in the inbox forever.
+        out.push((
+            FINDING_TYPE.to_string(),
+            ProposalScope {
+                node_id: ctx.node_id.clone(),
+                resource_id: Some(format!(
+                    "{}:no-fix-tracker", tgt.as_target().resource_id(),
+                )),
             },
         ));
     }
@@ -2811,8 +3184,10 @@ mod tests {
                 advisory_url: None,
                 modified: None,
                 fixed_versions: HashMap::new(),
+                references: Vec::new(),
             },
             kev_listed: true,
+            fix_available: false,
         };
         assert_eq!(severity_for(&f), Severity::Critical);
     }
@@ -2832,8 +3207,10 @@ mod tests {
                 advisory_url: None,
                 modified: None,
                 fixed_versions: HashMap::new(),
+                references: Vec::new(),
             },
             kev_listed: false,
+            fix_available: false,
         };
         assert_eq!(severity_for(&f), Severity::Critical);
     }
@@ -2849,8 +3226,10 @@ mod tests {
                 id: "x".into(), aliases: vec![], summary: "".into(),
                 cvss_score: score, advisory_url: None, modified: None,
                 fixed_versions: HashMap::new(),
+                references: Vec::new(),
             },
             kev_listed: false,
+            fix_available: false,
         };
         assert_eq!(severity_for(&mk(Some(9.5))), Severity::Critical);
         assert_eq!(severity_for(&mk(Some(7.5))), Severity::High);
@@ -2870,8 +3249,10 @@ mod tests {
                 id: "x".into(), aliases: vec![], summary: "".into(),
                 cvss_score: Some(9.0), advisory_url: None, modified: None,
                 fixed_versions: HashMap::new(),
+                references: Vec::new(),
             },
             kev_listed: kev,
+            fix_available: false,
         };
         let mut cfg = OsvConfig::default();
         cfg.kev_only = true;
@@ -2888,6 +3269,7 @@ mod tests {
             aliases: vec!["CVE-2026-31431".into(), "CVE-2025-9999".into(), "OSV-1".into()],
             summary: "".into(), cvss_score: None, advisory_url: None,
             modified: None, fixed_versions: HashMap::new(),
+            references: Vec::new(),
         };
         let cves = v.cve_ids();
         assert_eq!(cves.len(), 2);
@@ -2910,8 +3292,10 @@ mod tests {
                 summary: "".into(), cvss_score: Some(7.5),
                 advisory_url: None, modified: None,
                 fixed_versions: HashMap::new(),
+                references: Vec::new(),
             },
             kev_listed: false,
+            fix_available: false,
         };
         let findings: Vec<OsvFinding> = (0..50)
             .map(|i| mk("openssl", &format!("CVE-2026-{:04}", i)))
@@ -2931,8 +3315,10 @@ mod tests {
                 summary: "".into(), cvss_score: Some(7.5),
                 advisory_url: None, modified: None,
                 fixed_versions: HashMap::new(),
+                references: Vec::new(),
             },
             kev_listed: false,
+            fix_available: false,
         };
         let findings = vec![
             mk(ScanTargetOwned::Host),
@@ -2959,8 +3345,10 @@ mod tests {
                 summary: "".into(), cvss_score: Some(5.0),
                 advisory_url: None, modified: None,
                 fixed_versions: HashMap::new(),
+                references: Vec::new(),
             },
             kev_listed: false,
+            fix_available: false,
         };
         let critical_kev_finding = OsvFinding {
             target: ScanTargetOwned::Host,
@@ -2972,18 +3360,20 @@ mod tests {
                 summary: "".into(), cvss_score: Some(7.8),
                 advisory_url: None, modified: None,
                 fixed_versions: HashMap::new(),
+                references: Vec::new(),
             },
             kev_listed: true,
+            fix_available: false,
         };
         let f = vec![warn_finding, critical_kev_finding];
         let g = TargetGroup { target: ScanTargetOwned::Host, findings: f.iter().collect() };
-        let prop = build_target_proposal(&g, &ctx);
+        let prop = build_target_proposal(&g, &ctx, 0);
         assert_eq!(prop.severity, Severity::Critical,
             "any KEV-listed finding must lift the whole card to Critical");
     }
 
     #[test]
-    fn target_proposal_evidence_lists_kev_first_and_caps_at_ten() {
+    fn target_proposal_evidence_lists_kev_first_and_caps_per_section() {
         let ctx = Context::for_node("n");
         let mk = |i: u32, kev: bool| OsvFinding {
             target: ScanTargetOwned::Host,
@@ -2995,21 +3385,32 @@ mod tests {
                 summary: "".into(), cvss_score: Some(7.0),
                 advisory_url: None, modified: None,
                 fixed_versions: HashMap::new(),
+                references: Vec::new(),
             },
             kev_listed: kev,
+            fix_available: false,
         };
         let findings: Vec<OsvFinding> = (0..15).map(|i| mk(i, i == 7)).collect();
         let g = TargetGroup { target: ScanTargetOwned::Host, findings: findings.iter().collect() };
-        let prop = build_target_proposal(&g, &ctx);
-        // Evidence: Total + KEV-count chip + Critical-count chip + 10 CVE rows + "+5 more"
+        let prop = build_target_proposal(&g, &ctx, 0);
+        // Evidence: Total + KEV-count chip + section header + 6 CVE rows + "+9 more awaiting".
+        // No "Patchable now" header because every finding has fix_available=false.
         let labels: Vec<&str> = prop.evidence.iter().map(|e| e.label.as_str()).collect();
         assert!(labels.contains(&"Total"));
         assert!(labels.contains(&"KEV"));
-        assert!(labels.contains(&"More"));
+        assert!(labels.contains(&"Awaiting upstream fix"));
+        assert!(labels.contains(&"More awaiting"));
+        assert!(!labels.contains(&"Patchable now"),
+            "all findings have fix_available=false; the patchable section must not render");
         // First CVE row must be the KEV one (CVE-2026-0007).
         let first_cve_row = prop.evidence.iter().find(|e| e.label.starts_with("CVE-2026-")).unwrap();
         assert_eq!(first_cve_row.label, "CVE-2026-0007",
             "KEV-listed CVE must surface at the top of the evidence list");
+        // The cap kicks in: only 6 CVE rows render in the section.
+        let cve_row_count = prop.evidence.iter()
+            .filter(|e| e.label.starts_with("CVE-2026-")).count();
+        assert_eq!(cve_row_count, MAX_CVE_EVIDENCE_ROWS_PER_SECTION,
+            "section cap must trim the row list at MAX_CVE_EVIDENCE_ROWS_PER_SECTION");
     }
 
     #[test]
@@ -3026,11 +3427,13 @@ mod tests {
                 summary: "".into(), cvss_score: Some(7.0),
                 advisory_url: None, modified: None,
                 fixed_versions: HashMap::new(),
+                references: Vec::new(),
             },
             kev_listed: false,
+            fix_available: false,
         };
         let g = TargetGroup { target: ScanTargetOwned::Lxc("ct1".into()), findings: vec![&f] };
-        let prop = build_target_proposal(&g, &ctx);
+        let prop = build_target_proposal(&g, &ctx, 0);
         assert_eq!(prop.scope.resource_id.as_deref(), Some("osv:lxc:ct1"));
         assert!(!prop.scope.resource_id.as_deref().unwrap().contains("CVE"));
     }
@@ -3072,15 +3475,192 @@ mod tests {
             endpoint: "https://example.com".into(),
             kev_endpoint: "https://example.com/kev.json".into(),
             kev_only: true,
+            severity_floor: Severity::Critical,
+            suppress_no_fix: false,
             distro_overrides: HashMap::new(),
         };
         cfg.save().unwrap();
         let loaded = OsvConfig::load();
         assert!(!loaded.enabled);
         assert!(loaded.kev_only);
+        assert_eq!(loaded.severity_floor, Severity::Critical);
+        assert!(!loaded.suppress_no_fix);
         assert_eq!(loaded.endpoint, "https://example.com");
         unsafe { std::env::remove_var("WOLFSTACK_OSV_CONFIG_FILE"); }
         let _ = std::fs::remove_file(tmp);
+    }
+
+    fn mk_finding(score: Option<f32>, kev: bool, fix_available: bool) -> OsvFinding {
+        OsvFinding {
+            target: ScanTargetOwned::Host,
+            ecosystem: "Debian:12".into(),
+            package: "p".into(),
+            version: "1".into(),
+            vuln: OsvVuln {
+                id: "CVE-X".into(),
+                aliases: vec!["CVE-X".into()],
+                summary: "".into(),
+                cvss_score: score,
+                advisory_url: None,
+                modified: None,
+                fixed_versions: HashMap::new(),
+                references: Vec::new(),
+            },
+            kev_listed: kev,
+            fix_available,
+        }
+    }
+
+    #[test]
+    fn severity_floor_hides_findings_below_threshold_but_keeps_kev() {
+        // Floor=High should hide CVSS 5.0 (Warn tier) but always
+        // surface KEV-listed findings regardless of score.
+        let mut cfg = OsvConfig::default();
+        cfg.severity_floor = Severity::High;
+        cfg.suppress_no_fix = false;
+
+        let warn_finding   = mk_finding(Some(5.0), false, true);
+        let high_finding   = mk_finding(Some(7.5), false, true);
+        let kev_low_score  = mk_finding(Some(3.5), true,  true);
+
+        assert!(!should_emit(&warn_finding, &cfg),
+            "CVSS 5.0 (Warn) must be hidden when severity_floor=High");
+        assert!(should_emit(&high_finding, &cfg),
+            "CVSS 7.5 (High) must surface at floor=High");
+        assert!(should_emit(&kev_low_score, &cfg),
+            "KEV-listed findings must surface even with CVSS < floor");
+    }
+
+    #[test]
+    fn severity_floor_critical_hides_high_keeps_kev() {
+        let mut cfg = OsvConfig::default();
+        cfg.severity_floor = Severity::Critical;
+        cfg.suppress_no_fix = false;
+
+        let high   = mk_finding(Some(7.5), false, true);
+        let crit   = mk_finding(Some(9.5), false, true);
+        let kev    = mk_finding(Some(5.0), true,  true);
+        assert!(!should_emit(&high, &cfg),
+            "CVSS 7.5 (High) must be hidden when severity_floor=Critical");
+        assert!(should_emit(&crit, &cfg),
+            "CVSS 9.5 (Critical) surfaces at floor=Critical");
+        assert!(should_emit(&kev, &cfg),
+            "KEV bypasses the Critical floor — exploited-in-wild always surfaces");
+    }
+
+    #[test]
+    fn target_proposal_splits_patchable_and_awaiting() {
+        let ctx = Context::for_node("n");
+        let patchable_kev = OsvFinding { kev_listed: true, fix_available: true,
+            ..mk_finding(Some(8.0), true, true) };
+        let patchable_norm = mk_finding(Some(7.5), false, true);
+        let awaiting_kev = mk_finding(Some(8.0), true, false);
+        let f = vec![patchable_kev, patchable_norm, awaiting_kev];
+        let g = TargetGroup { target: ScanTargetOwned::Host, findings: f.iter().collect() };
+        let prop = build_target_proposal(&g, &ctx, /*suppressed_no_fix=*/0);
+        let labels: Vec<&str> = prop.evidence.iter().map(|e| e.label.as_str()).collect();
+        assert!(labels.contains(&"Patchable now"),
+            "two patchable findings must produce the Patchable section");
+        assert!(labels.contains(&"Awaiting upstream fix"),
+            "one no-fix finding must produce the Awaiting section");
+    }
+
+    #[test]
+    fn target_proposal_surfaces_suppressed_no_fix_count() {
+        let ctx = Context::for_node("n");
+        let f = vec![mk_finding(Some(7.5), false, true)];
+        let g = TargetGroup { target: ScanTargetOwned::Host, findings: f.iter().collect() };
+        let prop = build_target_proposal(&g, &ctx, /*suppressed_no_fix=*/42);
+        let row = prop.evidence.iter()
+            .find(|e| e.label == "Hidden — no upstream fix")
+            .expect("suppressed-no-fix subtotal must render when count > 0");
+        assert!(row.value.contains("42"),
+            "subtotal value must include the hidden count, got {:?}", row.value);
+    }
+
+    #[test]
+    fn no_fix_only_card_emitted_when_target_has_no_visible_findings() {
+        // A target whose only contribution is a hidden no-fix count
+        // gets its own Info card so the operator sees the total.
+        let ctx = Context::for_node("n");
+        let mut suppressed = HashMap::new();
+        suppressed.insert(ScanTargetOwned::Host, 12);
+        let facts = OsvFacts {
+            findings: Vec::new(),
+            covered_targets: vec![ScanTargetOwned::Host],
+            unrecognized_derivatives: Vec::new(),
+            config: OsvConfig::default(),
+            kev_cve_count: 0,
+            suppressed_no_fix_by_target: suppressed,
+        };
+        let store = crate::predictive::proposal::ProposalStore::default();
+        let acks = AckStore::default();
+        let props = analyze(&ctx, &facts, &acks, &store);
+        let card = props.iter()
+            .find(|p| p.scope.resource_id.as_deref()
+                .map(|s| s.contains("no-fix-tracker")).unwrap_or(false))
+            .expect("must emit a no-fix-only card when all findings are suppressed");
+        assert_eq!(card.severity, Severity::Info,
+            "no-fix-only card is informational — there's nothing actionable yet");
+        assert!(card.title.contains("12"),
+            "title must include the hidden count, got {:?}", card.title);
+    }
+
+    #[test]
+    fn pick_reference_links_orders_advisory_first_and_caps_at_three() {
+        let f = OsvFinding {
+            target: ScanTargetOwned::Host,
+            ecosystem: "Debian:12".into(),
+            package: "p".into(), version: "1".into(),
+            vuln: OsvVuln {
+                id: "CVE-X".into(),
+                aliases: vec!["CVE-X".into()],
+                summary: "".into(),
+                cvss_score: None,
+                advisory_url: None,
+                modified: None,
+                fixed_versions: HashMap::new(),
+                references: vec![
+                    OsvVulnReference { ty: "WEB".into(), url: "https://www.example.com/blog".into() },
+                    OsvVulnReference { ty: "ADVISORY".into(), url: "https://security-tracker.debian.org/tracker/CVE-X".into() },
+                    OsvVulnReference { ty: "FIX".into(), url: "https://github.com/example/repo/commit/abc".into() },
+                    OsvVulnReference { ty: "REPORT".into(), url: "https://bugzilla.redhat.com/123".into() },
+                    OsvVulnReference { ty: "WEB".into(), url: "https://nvd.nist.gov/vuln/detail/CVE-X".into() },
+                ],
+            },
+            kev_listed: false,
+            fix_available: false,
+        };
+        let links = pick_reference_links(&f);
+        assert_eq!(links.len(), 3, "cap to MAX_REFERENCES_PER_ROW");
+        // Highest-priority (ADVISORY) goes first; the Debian tracker
+        // should produce the "Debian" chip label.
+        assert_eq!(links[0].label, "Debian",
+            "ADVISORY ranks first; debian-tracker host gets a friendly label");
+        assert_eq!(links[1].label, "GitHub",
+            "FIX comes second; github.com host gets a friendly label");
+        assert_eq!(links[2].label, "Red Hat",
+            "REPORT comes third; bugzilla.redhat.com gets a friendly label");
+    }
+
+    #[test]
+    fn distill_full_preserves_references_for_chip_rendering() {
+        let raw = r#"{
+            "id": "OSV-X",
+            "aliases": ["CVE-X"],
+            "summary": "",
+            "severity": [],
+            "affected": [],
+            "references": [
+                {"type":"ADVISORY","url":"https://security-tracker.debian.org/tracker/CVE-X"},
+                {"type":"WEB","url":"https://nvd.nist.gov/vuln/detail/CVE-X"}
+            ]
+        }"#;
+        let full: OsvFullVuln = serde_json::from_str(raw).unwrap();
+        let v = distill_full(full);
+        assert_eq!(v.references.len(), 2,
+            "every non-empty reference must round-trip into the cached struct");
+        assert_eq!(v.references[0].ty, "ADVISORY");
     }
 
     #[test]
@@ -3128,6 +3708,7 @@ mod tests {
             unrecognized_derivatives: Vec::new(),
             config: OsvConfig::default(),
             kev_cve_count: 0,
+            suppressed_no_fix_by_target: HashMap::new(),
         };
         let extra = extra_covered_from_store(&ctx, &facts, &store);
         assert_eq!(extra.len(), 1, "the stale OSV proposal must be marked covered so auto-resolve can close it");
@@ -3208,6 +3789,7 @@ mod tests {
             }],
             config: OsvConfig::default(),
             kev_cve_count: 0,
+            suppressed_no_fix_by_target: HashMap::new(),
         };
         let out = analyze(&ctx, &facts, &acks, &proposals);
         assert_eq!(out.len(), 1, "exactly one breadcrumb should fire");
@@ -3238,6 +3820,7 @@ mod tests {
             }],
             config,
             kev_cve_count: 0,
+            suppressed_no_fix_by_target: HashMap::new(),
         };
         // kev_only mode = highest-signal-only inbox; a breadcrumb is by
         // definition not a CVE event, so it should be suppressed.
@@ -3260,6 +3843,7 @@ mod tests {
             }],
             config: OsvConfig::default(),
             kev_cve_count: 0,
+            suppressed_no_fix_by_target: HashMap::new(),
         };
         let scopes = covered_scopes(&ctx, &facts);
         assert!(scopes.iter().any(|(ft, _)| ft == FINDING_UNRECOGNIZED_DERIVATIVE),
@@ -3289,6 +3873,7 @@ mod tests {
             unrecognized_derivatives: Vec::new(),
             config: OsvConfig::default(),
             kev_cve_count: 0,
+            suppressed_no_fix_by_target: HashMap::new(),
         };
         let extra = extra_covered_from_store(&ctx, &facts, &store);
         assert_eq!(extra.len(), 1,
@@ -3320,6 +3905,7 @@ mod tests {
             unrecognized_derivatives: Vec::new(),
             config: OsvConfig::default(),
             kev_cve_count: 0,
+            suppressed_no_fix_by_target: HashMap::new(),
         };
         let extra = extra_covered_from_store(&ctx, &facts, &store);
         assert!(extra.is_empty(),
@@ -3353,6 +3939,7 @@ mod tests {
             unrecognized_derivatives: Vec::new(),
             config: OsvConfig::default(),
             kev_cve_count: 0,
+            suppressed_no_fix_by_target: HashMap::new(),
         };
         let extra = extra_covered_from_store(&ctx, &facts, &store);
         assert!(extra.is_empty(), "uncovered LXC must not be auto-resolved");

@@ -216,6 +216,7 @@ fn check_cpu(
                 metrics.load_avg.one, metrics.load_avg.five,
                 metrics.load_avg.fifteen, metrics.cpu_count,
             )),
+            links: Vec::new(),
         }],
         RemediationPlan::Manual {
             instructions: "Identify the largest CPU consumers and \
@@ -266,6 +267,7 @@ fn check_memory(
             label: "Memory".into(),
             value: format!("{:.1}%", pct),
             detail: Some(format!("{:.1} GB used of {:.1} GB", used_gb, total_gb)),
+            links: Vec::new(),
         }],
         RemediationPlan::Manual {
             instructions: "Identify the largest memory consumers and \
@@ -330,11 +332,13 @@ fn check_disks(
                         "{:.1} GB used / {:.1} GB total ({:.1}%)",
                         used_gb, total_gb, d.usage_percent,
                     )),
+                    links: Vec::new(),
                 },
                 Evidence {
                     label: "Filesystem".into(),
                     value: d.fs_type.clone(),
                     detail: Some(d.name.clone()),
+                    links: Vec::new(),
                 },
             ],
             RemediationPlan::Manual {
@@ -393,6 +397,7 @@ fn check_swap(
             label: "Swap".into(),
             value: format!("{:.0}%", pct),
             detail: Some(format!("{:.1} GB used of {:.1} GB", used_gb, total_gb)),
+            links: Vec::new(),
         }],
         RemediationPlan::Manual {
             instructions: "Identify which processes are holding pages \
@@ -442,6 +447,7 @@ fn check_load(
             value: format!("{:.2} / {:.2} / {:.2}",
                 metrics.load_avg.one, metrics.load_avg.five, metrics.load_avg.fifteen),
             detail: Some(format!("{} CPUs, ratio {:.1}×", metrics.cpu_count, mult)),
+            links: Vec::new(),
         }],
         RemediationPlan::Manual {
             instructions: "Top the runnable-task queue and check for \
@@ -484,6 +490,7 @@ fn check_failed_units(
                 label: "Unit".into(),
                 value: unit.clone(),
                 detail: None,
+                links: Vec::new(),
             }],
             RemediationPlan::Manual {
                 instructions: format!(

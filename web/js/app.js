@@ -13248,6 +13248,30 @@ function svgPie(pct, color, size = 48, label = '') {
 function renderDockerCards(containers) {
     const grid = document.getElementById('docker-card-grid');
     if (!grid) return;
+    // Tab-level alert: count containers with at least one
+    // requested-but-unpublished port. The whole point of this banner
+    // is that Klas's reboot scenario produced an empty Ports column
+    // and no warning anywhere — even one such container is worth a
+    // loud strip at the top of the tab so it can never be missed.
+    const banner = document.getElementById('docker-port-warning');
+    // Only running containers count — a stopped container's empty
+    // NetworkSettings.Ports is the expected state, not a bug.
+    const offenders = containers.filter(c =>
+        c.state === 'running' &&
+        Array.isArray(c.port_mappings) && c.port_mappings.some(m => !m.published));
+    if (banner) {
+        if (offenders.length > 0) {
+            banner.innerHTML = `<div style="padding:10px 14px;margin:0 0 12px;background:rgba(239,68,68,0.12);border:1px solid #ef4444;border-radius:8px;color:#fca5a5;font-size:13px;">
+                ⚠️ <strong>${offenders.length} container${offenders.length === 1 ? '' : 's'}</strong> requested host ports the Docker daemon never bound — those services are offline.
+                Likely a host-port conflict. Affected: ${offenders.slice(0, 5).map(c => `<code>${escapeHtml(c.name)}</code>`).join(', ')}${offenders.length > 5 ? `, +${offenders.length - 5} more` : ''}.
+                See the Predictive Inbox for the conflict detail.
+            </div>`;
+            banner.style.display = '';
+        } else {
+            banner.innerHTML = '';
+            banner.style.display = 'none';
+        }
+    }
     if (containers.length === 0) { grid.innerHTML = ''; return; }
     grid.innerHTML = containers.map(c => dockerCardHtml(c)).join('');
 }
@@ -13266,7 +13290,44 @@ function dockerCardHtml(c) {
     const hasStorage = c.disk_usage !== undefined && c.disk_total;
     const diskPct = hasStorage ? Math.round((c.disk_usage / c.disk_total) * 100) : 0;
     const diskColor = diskPct > 90 ? '#ef4444' : diskPct > 70 ? '#f59e0b' : '#10b981';
-    const ports = c.ports.length > 0 ? c.ports.slice(0, 3).map(p => escapeHtml(p)).join(', ') : '-';
+    // Port column: prefer the structured `port_mappings` (which carry
+    // the requested-vs-published flag) over the legacy free-form
+    // `ports`. Unpublished mappings render with a strikethrough +
+    // warning glyph so a silent publish failure (compose collision
+    // after reboot — the bug Klas reported) is impossible to miss.
+    let ports;
+    // A stopped container's NetworkSettings.Ports is empty by design —
+    // counting that as "unpublished" would tag every stopped container
+    // red. Mirror the backend analyzer: only running containers can
+    // have a true unpublished-port problem.
+    let unpublishedCount = 0;
+    if (c.port_mappings && c.port_mappings.length > 0) {
+        if (isRunning) {
+            unpublishedCount = c.port_mappings.filter(m => !m.published).length;
+        }
+        const formatPm = pm => {
+            const ip = (!pm.host_ip || pm.host_ip === '0.0.0.0') ? '' : pm.host_ip + ':';
+            const text = `${ip}${pm.host_port}→${pm.container_port}/${pm.proto}`;
+            // For stopped containers we render every mapping in muted
+            // grey — the binding state is "expected absent", not
+            // "broken", so don't use the alarming red strikethrough.
+            if (!isRunning) {
+                return `<span style="color:var(--text-muted);" title="Container is not running — mapping is requested but not yet bound">${escapeHtml(text)}</span>`;
+            }
+            if (pm.published) {
+                return `<span style="color:#34d399;" title="Published — daemon confirms this binding is live">${escapeHtml(text)}</span>`;
+            }
+            return `<span style="color:#ef4444;text-decoration:line-through;" title="UNPUBLISHED — Docker accepted the container start but never bound this host port. Service is offline. Check the Predictive Inbox for the conflict.">⚠️ ${escapeHtml(text)}</span>`;
+        };
+        const shown = c.port_mappings.slice(0, 3).map(formatPm).join(', ');
+        const overflow = c.port_mappings.length > 3 ? ` +${c.port_mappings.length - 3}` : '';
+        ports = shown + overflow;
+    } else {
+        ports = c.ports && c.ports.length > 0 ? c.ports.slice(0, 3).map(p => escapeHtml(p)).join(', ') : '-';
+    }
+    const portWarning = unpublishedCount > 0
+        ? `<div style="grid-column:1/-1;margin-top:4px;padding:4px 8px;background:rgba(239,68,68,0.12);border-left:3px solid #ef4444;font-size:10px;color:#fca5a5;">⚠️ ${unpublishedCount} requested port${unpublishedCount === 1 ? '' : 's'} not bound by the daemon — service is unreachable. Check Predictive Inbox.</div>`
+        : '';
     const svcItems = (c.services && c.services.length > 0) ? c.services.map(sv => {
         const sColor = sv.status === 'running' ? '#10b981' : '#ef4444';
         return `<span style="font-size:9px;padding:1px 4px;border-radius:2px;background:${sColor}22;color:${sColor};">${sv.name}</span>`;
@@ -13296,6 +13357,7 @@ function dockerCardHtml(c) {
                 ${hasStorage ? `<span>💾 ${formatBytes(c.disk_usage)}/${formatBytes(c.disk_total)}</span>` : ''}
                 ${memPct >= 0 ? `<span>🧠 ${formatBytes(s.memory_usage)}/${formatBytes(s.memory_limit)}</span>` : ''}
                 ${cpuPct >= 0 ? `<span>⚡ ${s.cpu_percent.toFixed(1)}%</span>` : ''}
+                ${portWarning}
             </div>
             <span data-update-badge="docker:${c.name}"></span>
         </div>
@@ -13449,7 +13511,25 @@ function renderDockerContainers(containers) {
         const isRunning = c.state === 'running';
         const isPaused = c.state === 'paused';
         const stateColor = isRunning ? '#10b981' : (isPaused ? '#f59e0b' : '#6b7280');
-        const ports = c.ports.length > 0 ? c.ports.join('<br>') : '-';
+        // Same requested-vs-published treatment as the card view —
+        // stopped containers render in muted grey; only running
+        // containers earn the red unpublished marker.
+        let ports;
+        if (c.port_mappings && c.port_mappings.length > 0) {
+            ports = c.port_mappings.map(pm => {
+                const ip = (!pm.host_ip || pm.host_ip === '0.0.0.0') ? '' : pm.host_ip + ':';
+                const text = `${ip}${pm.host_port}→${pm.container_port}/${pm.proto}`;
+                if (!isRunning) {
+                    return `<span style="color:var(--text-muted);">${escapeHtml(text)}</span>`;
+                }
+                if (pm.published) {
+                    return `<span style="color:#34d399;">${escapeHtml(text)}</span>`;
+                }
+                return `<span style="color:#ef4444;text-decoration:line-through;" title="UNPUBLISHED — daemon never bound this host port. Service is offline.">⚠️ ${escapeHtml(text)}</span>`;
+            }).join('<br>');
+        } else {
+            ports = c.ports.length > 0 ? c.ports.join('<br>') : '-';
+        }
         const hasStorage = c.disk_usage !== undefined && c.disk_total;
         const pct = hasStorage ? Math.round((c.disk_usage / c.disk_total) * 100) : 0;
         const barColor = pct > 90 ? '#ef4444' : pct > 70 ? '#f59e0b' : '#10b981';
@@ -48589,6 +48669,7 @@ function predictiveRender() {
                        title="Select all visible"
                        style="margin:0;cursor:pointer;width:16px;height:16px;">
                 <label for="predictive-bulk-master" style="font-size:11px;color:var(--text-muted);cursor:pointer;">Select all (${filtered.length})</label>
+                <button class="btn btn-sm" onclick="osvSettingsOpen()" title="Tune the OSV CVE scanner — severity floor, KEV-only mode, suppress findings with no upstream patch" style="margin-left:8px;">⚙ OSV scanner</button>
                 <div id="predictive-bulk-bar" style="display:none;align-items:center;gap:8px;margin-left:auto;flex-wrap:wrap;">
                     <span class="pred-bulk-count" style="font-size:12px;color:var(--text-secondary);font-weight:500;">0 selected</span>
                     <button class="btn btn-sm btn-primary" onclick="predictiveBulkApprove()" title="Mark every selected proposal as applied">✓ Mark applied</button>
@@ -48599,6 +48680,12 @@ function predictiveRender() {
                 </div>
             </div>
         `;
+    } else {
+        // No findings — still expose the OSV settings button so
+        // operators with quiet inboxes can change the noise floor.
+        html += `<div style="display:flex;justify-content:flex-end;margin-bottom:10px;">
+            <button class="btn btn-sm" onclick="osvSettingsOpen()" title="Tune the OSV CVE scanner — severity floor, KEV-only mode, suppress findings with no upstream patch">⚙ OSV scanner</button>
+        </div>`;
     }
 
     if (filtered.length === 0) {
@@ -48648,6 +48735,116 @@ function predictiveSetClusterFilter(clusterName) {
 function predictiveSetNodeFilter(nodeId) {
     predictiveState.nodeFilter = nodeId || null;
     predictiveRender();
+}
+
+/// Open the OSV scanner settings modal. Pulls the current config from
+/// /api/predictive/osv-config, renders a small form with the operator
+/// knobs (severity floor, KEV-only, suppress-no-fix), and posts the
+/// updated config back via PUT. Triggers a predictive refresh on save
+/// so the inbox immediately reflects the new noise floor.
+async function osvSettingsOpen() {
+    let cfg;
+    try {
+        const resp = await fetch('/api/predictive/osv-config', { credentials: 'same-origin' });
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        cfg = await resp.json();
+    } catch (e) {
+        showModal('Could not load OSV scanner config: ' + (e.message || e), 'OSV scanner');
+        return;
+    }
+    const sevFloor = cfg.severity_floor || 'high';
+    const kevOnly = !!cfg.kev_only;
+    const suppressNoFix = cfg.suppress_no_fix !== false;
+    const enabled = cfg.enabled !== false;
+    const sevOpt = (v, label, hint) =>
+        `<option value="${v}"${sevFloor === v ? ' selected' : ''}>${label} — ${hint}</option>`;
+    const html = `
+        <div style="font-size:13px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px;">
+            Tune the noise floor for OSV.dev CVE findings. These knobs apply <strong>after</strong> the scan —
+            the scanner still queries OSV the same way; it just decides what to show in the inbox.
+        </div>
+        <div style="display:flex;flex-direction:column;gap:14px;">
+            <label style="display:flex;flex-direction:column;gap:4px;">
+                <span style="font-size:12px;color:var(--text-primary);font-weight:600;">Scanner</span>
+                <select id="osv-cfg-enabled" style="background:var(--bg-tertiary);color:var(--text-primary);border:1px solid var(--border-color);border-radius:6px;padding:6px 10px;font-size:13px;">
+                    <option value="true" ${enabled ? 'selected' : ''}>Enabled</option>
+                    <option value="false" ${enabled ? '' : 'selected'}>Disabled</option>
+                </select>
+                <span style="font-size:11px;color:var(--text-muted);">Disabling stops OSV inventory + HTTP queries entirely. The distro-pocket scanner still runs.</span>
+            </label>
+            <label style="display:flex;flex-direction:column;gap:4px;">
+                <span style="font-size:12px;color:var(--text-primary);font-weight:600;">Severity floor</span>
+                <select id="osv-cfg-floor" style="background:var(--bg-tertiary);color:var(--text-primary);border:1px solid var(--border-color);border-radius:6px;padding:6px 10px;font-size:13px;" ${kevOnly ? 'disabled' : ''}>
+                    ${sevOpt('critical', 'Critical', 'CVSS ≥ 9.0, KEV-listed, or critical-class package')}
+                    ${sevOpt('high',     'High',     'CVSS ≥ 7.0 + Critical (recommended)')}
+                    ${sevOpt('warn',     'Warn',     'CVSS ≥ 4.0 — every scored CVE')}
+                    ${sevOpt('info',     'All',      'every finding, including unscored')}
+                </select>
+                <span style="font-size:11px;color:var(--text-muted);">KEV-listed CVEs always surface, regardless of the floor.</span>
+            </label>
+            <label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;">
+                <input id="osv-cfg-suppress-no-fix" type="checkbox" ${suppressNoFix ? 'checked' : ''} style="margin-top:2px;">
+                <span style="font-size:12px;color:var(--text-primary);">
+                    <strong>Hide CVEs awaiting an upstream fix</strong>
+                    <span style="display:block;font-size:11px;color:var(--text-muted);font-weight:normal;margin-top:2px;">
+                        When OSV has no patched version yet, hide the finding until a fix is published.
+                        KEV-listed and Critical findings are <strong>never</strong> hidden by this filter — they need eyeballs even without a patch.
+                        The hidden count is shown on each card so you always see the real total.
+                    </span>
+                </span>
+            </label>
+            <label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;">
+                <input id="osv-cfg-kev-only" type="checkbox" ${kevOnly ? 'checked' : ''} onchange="document.getElementById('osv-cfg-floor').disabled=this.checked;">
+                <span style="font-size:12px;color:var(--text-primary);">
+                    <strong>KEV-only mode</strong>
+                    <span style="display:block;font-size:11px;color:var(--text-muted);font-weight:normal;margin-top:2px;">
+                        Show only CVEs that appear on CISA's Known Exploited Vulnerabilities list — attackers are actively exploiting these in the wild. Highest signal-to-noise; suppresses the severity-floor filter entirely.
+                    </span>
+                </span>
+            </label>
+        </div>
+        <div style="margin-top:18px;display:flex;gap:8px;justify-content:flex-end;">
+            <button class="btn btn-sm" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
+            <button class="btn btn-sm btn-primary" onclick="osvSettingsSave(this)">Save</button>
+        </div>
+    `;
+    showModal(html, '⚙ OSV scanner settings', { noOk: true });
+    // Stash the original config so the save handler can preserve fields
+    // we don't expose (endpoint, kev_endpoint, distro_overrides) without
+    // requiring the operator to retype them.
+    window._osvCfgOriginal = cfg;
+}
+
+async function osvSettingsSave(btn) {
+    const cfg = Object.assign({}, window._osvCfgOriginal || {});
+    cfg.enabled        = document.getElementById('osv-cfg-enabled').value === 'true';
+    cfg.severity_floor = document.getElementById('osv-cfg-floor').value;
+    cfg.kev_only       = document.getElementById('osv-cfg-kev-only').checked;
+    cfg.suppress_no_fix = document.getElementById('osv-cfg-suppress-no-fix').checked;
+    btn.disabled = true;
+    btn.textContent = 'Saving…';
+    try {
+        const resp = await fetch('/api/predictive/osv-config', {
+            method: 'PUT',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(cfg),
+        });
+        if (!resp.ok) {
+            const j = await resp.json().catch(() => ({}));
+            throw new Error(j.error || ('HTTP ' + resp.status));
+        }
+        const overlay = btn.closest('.modal-overlay');
+        if (overlay) overlay.remove();
+        showToast && showToast('OSV scanner settings saved — inbox will update on the next scan tick (≤5 min).');
+        // Trigger a refresh now so the operator sees the new floor on
+        // already-cached findings without waiting for the next tick.
+        if (typeof predictiveLoad === 'function') predictiveLoad();
+    } catch (e) {
+        btn.disabled = false;
+        btn.textContent = 'Save';
+        showModal('Failed to save OSV scanner settings: ' + (e.message || e), 'OSV scanner');
+    }
 }
 
 // Map a proposal's finding_type + scope to a (label, icon, color)
@@ -48751,13 +48948,54 @@ function predictiveExpandedBody(p) {
         ? '<span style="background:rgba(168,85,247,0.18);color:#c084fc;padding:1px 7px;border-radius:4px;font-size:10px;font-weight:600;margin-left:6px;">🤖 AI</span>'
         : '';
     const runtime = predictiveRuntimeBadge(p);
-    const evidence = (p.evidence || []).map(e => `
+    const evidence = (p.evidence || []).map(e => {
+        // Optional advisory / mitigation reference chips. Used by the
+        // OSV analyzer to surface authoritative external links (Debian
+        // security tracker, Red Hat advisory, CISA KEV) so the operator
+        // can read mitigation guidance without leaving the inbox.
+        // Other analyzers leave `links` empty and this renders nothing.
+        // Only allow http(s) URLs through. OSV references are
+        // expected to be vendor advisories / web pages, never
+        // `javascript:` or `data:` URIs. Defense-in-depth even though
+        // OSV.dev is a trusted source — the same rendering is reused
+        // for any analyzer that ever populates `links`, so a strict
+        // allowlist here keeps the surface tight forever.
+        const isSafeUrl = u => typeof u === 'string' && /^https?:\/\//i.test(u);
+        const linksHtml = (e.links && e.links.length)
+            ? '<span style="margin-left:8px;display:inline-flex;gap:4px;flex-wrap:wrap;vertical-align:middle;">' +
+              e.links.filter(l => l && isSafeUrl(l.url)).map(l =>
+                  `<a href="${escapeAttr(l.url)}" target="_blank" rel="noopener noreferrer" `
+                  + `style="display:inline-block;background:rgba(96,165,250,0.16);color:#60a5fa;`
+                  + `padding:1px 7px;border-radius:4px;font-size:10px;font-weight:600;text-decoration:none;`
+                  + `border:1px solid rgba(96,165,250,0.3);" title="${escapeAttr(l.url)}">`
+                  + escapeHtml(l.label) + ' ↗</a>'
+              ).join('') +
+              '</span>'
+            : '';
+        // Section-header style for evidence rows whose label flags a
+        // group split — the OSV analyzer uses these to delimit
+        // "Patchable now" from "Awaiting upstream fix". Treated as a
+        // visual divider rather than just another chip.
+        const isSection = e.label === 'Patchable now'
+            || e.label === 'Awaiting upstream fix'
+            || e.label === 'Hidden — no upstream fix';
+        if (isSection) {
+            const accent = e.label === 'Patchable now' ? '#34d399'
+                : e.label === 'Hidden — no upstream fix' ? '#a1a1aa'
+                : '#fbbf24';
+            return `<div style="display:block;width:100%;margin:10px 0 4px;padding:4px 8px;border-left:3px solid ${accent};background:rgba(255,255,255,0.02);font-size:12px;color:var(--text-primary);font-weight:600;">
+                ${escapeHtml(e.label)} <span style="color:var(--text-muted);font-weight:normal;margin-left:6px;">${escapeHtml(e.value)}</span>
+                ${e.detail ? `<div style="font-size:11px;color:var(--text-muted);font-weight:normal;margin-top:2px;">${escapeHtml(e.detail)}</div>` : ''}
+            </div>`;
+        }
+        return `
         <div style="display:inline-block;background:var(--bg-tertiary,#2d2f3a);padding:4px 10px;border-radius:6px;margin-right:6px;margin-bottom:6px;font-size:12px;">
             <span style="color:var(--text-muted);">${escapeHtml(e.label)}:</span>
             <strong style="color:var(--text-primary);margin-left:4px;">${escapeHtml(e.value)}</strong>
             ${e.detail ? `<span style="color:var(--text-muted);margin-left:8px;font-size:11px;">${escapeHtml(e.detail)}</span>` : ''}
+            ${linksHtml}
         </div>
-    `).join('');
+    `;}).join('');
     const remediation = predictiveRemediationHtml(p.remediation, p.id);
 
     let snoozeNotice = '';

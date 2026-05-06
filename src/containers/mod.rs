@@ -2280,6 +2280,43 @@ pub struct ContainerInfo {
     /// init handles its own restart accounting).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart_count: Option<u64>,
+    /// Per-mapping published status. One entry per requested host-port
+    /// binding (`HostConfig.PortBindings`), cross-checked against what
+    /// the Docker daemon actually published (`NetworkSettings.Ports`).
+    /// When `published` is false, the operator's compose spec asked
+    /// for a host port but the daemon never bound it — typically a
+    /// host-port collision after a reboot, where the second container
+    /// to start lost the race. The frontend renders unpublished
+    /// mappings with a strikethrough + warning so the operator can
+    /// see the silent failure that previously left the inbox blank.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub port_mappings: Vec<PortMapping>,
+}
+
+/// One requested host→container port mapping, with the published flag
+/// indicating whether Docker actually bound the host side. Modelled as
+/// its own struct (rather than a tuple in `ports: Vec<String>`) so the
+/// JSON wire format and the analyzer can both read structured fields
+/// without re-parsing free-form strings like `"8080:80/tcp"`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortMapping {
+    /// Listen IP inside `HostConfig.PortBindings.*.HostIp`. Empty
+    /// string and `0.0.0.0` both mean "all IPv4 addresses"; `::` means
+    /// "all IPv6". We preserve the raw value so the frontend can
+    /// distinguish `127.0.0.1:5432` from `0.0.0.0:5432`.
+    pub host_ip: String,
+    pub host_port: u16,
+    pub container_port: u16,
+    /// Lowercased: `"tcp"` or `"udp"` — taken from the
+    /// `<port>/<proto>` key in PortBindings. Unknown protos pass
+    /// through verbatim.
+    pub proto: String,
+    /// True iff `NetworkSettings.Ports."<container_port>/<proto>"`
+    /// contains an entry whose `HostIp`/`HostPort` matches this
+    /// requested mapping. False means the daemon never published the
+    /// binding — the operator's URL pointing at this host port is
+    /// effectively dead.
+    pub published: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2618,6 +2655,7 @@ fn docker_list(all: bool) -> Vec<ContainerInfo> {
                 mac_address: container_mac,
                 network_name: net_name,
                 restart_count: Some(fields.restart_count),
+                port_mappings: fields.port_mappings.clone(),
             }
         })
         .collect()
@@ -2639,6 +2677,13 @@ struct DockerInspectFields {
     /// The predictive restart-loop analyzer reads the delta of this
     /// across ticks to detect crash-loops.
     restart_count: u64,
+    /// Per-binding requested-vs-published port map, derived from
+    /// `HostConfig.PortBindings` cross-checked with
+    /// `NetworkSettings.Ports`. Used to surface the silent
+    /// host-port-conflict failure mode where Docker accepted the
+    /// container's restart on boot but couldn't bind a published port
+    /// because another container had already grabbed it.
+    port_mappings: Vec<PortMapping>,
 }
 
 /// Run ONE `docker inspect <id1> <id2> ...` and parse the resulting JSON
@@ -2718,9 +2763,115 @@ fn docker_batched_inspect(ids: &[String])
         if let Some(n) = entry.pointer("/State/RestartCount").and_then(|v| v.as_u64()) {
             fields.restart_count = n;
         }
+        fields.port_mappings = parse_port_mappings(&entry);
         map.insert(id, fields);
     }
     map
+}
+
+/// Build the requested-vs-published port map for one inspected
+/// container. Compares `HostConfig.PortBindings` (operator intent —
+/// what compose / `docker run -p` asked for) against
+/// `NetworkSettings.Ports` (daemon truth — what's actually bound).
+///
+/// Algorithm:
+///   1. Walk PortBindings → list of (host_ip, host_port, cport, proto).
+///   2. Walk NetworkSettings.Ports → set of bound (host_ip, host_port,
+///      cport, proto) tuples (entries with `null` values mean Docker
+///      knows about the container port but didn't bind a host port).
+///   3. For each requested entry, mark `published=true` iff the
+///      published set contains the same tuple.
+///
+/// IPv4/IPv6 dual-stack note: Docker on Linux publishes a `0.0.0.0`
+/// host-port binding twice — once as `0.0.0.0` and once as `::` — and
+/// reports both in `NetworkSettings.Ports`. PortBindings still only
+/// has the single `0.0.0.0` request, so we treat any `::` published
+/// entry whose port matches as a confirmation. Avoids false positives
+/// where the requested IP is `0.0.0.0` and the published IP is `::`.
+pub fn parse_port_mappings(inspect: &serde_json::Value) -> Vec<PortMapping> {
+    use std::collections::HashSet;
+
+    // Step 2: actual published bindings. Tuple is (host_ip, host_port,
+    // container_port, proto). `host_ip == ""` means the published
+    // record had no HostIp string (Docker shouldn't emit this in
+    // practice, but be defensive).
+    let mut published: HashSet<(String, u16, u16, String)> = HashSet::new();
+    if let Some(net_ports) = inspect.pointer("/NetworkSettings/Ports").and_then(|v| v.as_object()) {
+        for (cport_proto_key, host_list) in net_ports {
+            let (cport, proto) = split_port_proto(cport_proto_key);
+            let arr = match host_list.as_array() {
+                Some(a) => a,
+                None => continue, // null value = container port known but not bound
+            };
+            for binding in arr {
+                let host_ip = binding.get("HostIp").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let host_port_str = binding.get("HostPort").and_then(|v| v.as_str()).unwrap_or("");
+                let host_port: u16 = match host_port_str.parse() {
+                    Ok(n) => n,
+                    Err(_) => continue,
+                };
+                published.insert((host_ip, host_port, cport, proto.clone()));
+            }
+        }
+    }
+
+    // Step 1 + 3: requested bindings, with published flag.
+    let mut out: Vec<PortMapping> = Vec::new();
+    if let Some(bindings) = inspect.pointer("/HostConfig/PortBindings").and_then(|v| v.as_object()) {
+        for (cport_proto_key, host_list) in bindings {
+            let (cport, proto) = split_port_proto(cport_proto_key);
+            let arr = match host_list.as_array() {
+                Some(a) => a,
+                None => continue,
+            };
+            for binding in arr {
+                let host_ip_raw = binding.get("HostIp").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let host_port_str = binding.get("HostPort").and_then(|v| v.as_str()).unwrap_or("");
+                let host_port: u16 = match host_port_str.parse() {
+                    Ok(n) => n,
+                    Err(_) => continue,
+                };
+                // Look for a matching published entry. Treat empty
+                // and `0.0.0.0` requests as equivalent on the IPv4
+                // side, and accept either `0.0.0.0` or `::` from the
+                // published side as a match — Docker reports the
+                // dual-stack pair and we don't want to flag that as
+                // unpublished.
+                let is_v4_wildcard = host_ip_raw.is_empty() || host_ip_raw == "0.0.0.0";
+                let published_flag = published.iter().any(|(pip, pport, pcport, pproto)| {
+                    pport == &host_port
+                        && pcport == &cport
+                        && pproto == &proto
+                        && (
+                            pip == &host_ip_raw
+                            || (is_v4_wildcard && (pip == "0.0.0.0" || pip == "::" || pip.is_empty()))
+                        )
+                });
+                out.push(PortMapping {
+                    host_ip: host_ip_raw,
+                    host_port,
+                    container_port: cport,
+                    proto: proto.clone(),
+                    published: published_flag,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Split a PortBindings map key like `"8080/tcp"` into
+/// (container_port, proto). Defaults to `"tcp"` when the proto suffix
+/// is absent (Docker always emits the suffix in modern versions, but
+/// we accept the older `"8080"` form too). Bad keys produce
+/// (0, "tcp") which is harmless — they'll never match a published
+/// entry and the analyzer skips port 0.
+fn split_port_proto(key: &str) -> (u16, String) {
+    let mut split = key.splitn(2, '/');
+    let port_str = split.next().unwrap_or("0");
+    let proto = split.next().unwrap_or("tcp").to_ascii_lowercase();
+    let port: u16 = port_str.parse().unwrap_or(0);
+    (port, proto)
 }
 
 /// Get Docker container stats (one-shot)
@@ -3642,6 +3793,7 @@ pub fn lxc_list_all() -> Vec<ContainerInfo> {
                 mac_address: lxc_mac,
                 network_name: lxc_link,
                 restart_count: None,  // LXC: see ContainerInfo::restart_count doc
+                port_mappings: Vec::new(),
             });
         }
     }
@@ -3955,6 +4107,7 @@ fn pct_list_all() -> Vec<ContainerInfo> {
                     mac_address: pve_mac,
                     network_name: pve_bridge,
                     restart_count: None,  // PVE-LXC: see ContainerInfo::restart_count doc
+                    port_mappings: Vec::new(),
                 }
             })
         }).collect();
@@ -7231,6 +7384,16 @@ pub fn docker_create_with_cmd(name: &str, image: &str, ports: &[String], env: &[
                      memory: Option<&str>, cpus: Option<&str>, _storage: Option<&str>,
                      volumes: &[String], cmd: &[String]) -> Result<String, String> {
 
+    // Pre-flight: refuse the create if any requested host port is
+    // already bound by another Docker container or a host process.
+    // Without this guard, Docker happily creates the container — the
+    // collision only surfaces at start time and (per the bug Klas
+    // reported) sometimes silently as an unbound port instead of an
+    // error. Failing at create time means the operator gets a clear
+    // error in the UI before they even try to start the service.
+    if let Err(msg) = validate_host_ports_free(ports, name) {
+        return Err(msg);
+    }
 
     let mut args = vec![
         "create".to_string(),
@@ -7330,6 +7493,234 @@ pub fn docker_create_with_cmd(name: &str, image: &str, ports: &[String], env: &[
         error!("Docker create failed: {}", stderr);
         Err(format!("Create failed: {}", stderr))
     }
+}
+
+/// One entry from `ss -tlnp` / `ss -ulnp`. Used by the pre-flight
+/// validator and by `predictive::port_conflict` to know which host
+/// processes already hold a port. Lives here (not in `predictive`)
+/// so the data layer never reaches up into the analysis layer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostListener {
+    pub host_ip: String,
+    pub host_port: u16,
+    pub proto: String,
+    /// Process name as ss reports it via `users:(("name",pid=N,fd=N))`.
+    /// Empty when ss couldn't enumerate (run as non-root, missing
+    /// proc), in which case the conflict still surfaces but the
+    /// "owner" line will say "host process (unknown)".
+    pub process: String,
+}
+
+/// Run `ss -tlnp` + `ss -ulnp` and parse listening sockets. Returns
+/// an empty Vec when ss is missing or fails — callers fall back to
+/// "no host-side listeners known" rather than blocking on a missing
+/// tool.
+pub fn sample_host_listeners() -> Vec<HostListener> {
+    let mut out: Vec<HostListener> = Vec::new();
+    for proto in &["tcp", "udp"] {
+        let flag = match *proto {
+            "tcp" => "-tlnp",
+            "udp" => "-ulnp",
+            _ => continue,
+        };
+        let output = match Command::new("ss").arg(flag).output() {
+            Ok(o) if o.status.success() => o,
+            _ => continue,
+        };
+        out.extend(parse_ss_output(&String::from_utf8_lossy(&output.stdout), proto));
+    }
+    out
+}
+
+/// Parse the body of `ss -tlnp` / `ss -ulnp`. Format:
+///
+/// ```text
+/// State    Recv-Q Send-Q Local Address:Port  Peer Address:Port  Process
+/// LISTEN   0      4096   0.0.0.0:8553        0.0.0.0:*          users:(("wolfstack",pid=1485,fd=23))
+/// ```
+///
+/// Local Address may be `0.0.0.0`, `127.0.0.1`, `::`, `[::1]`, or
+/// `*`. We handle bracketed v6 (`[::1]:8080`) by splitting on the
+/// closing bracket; everything else falls back to splitting on the
+/// last colon.
+pub fn parse_ss_output(text: &str, proto: &str) -> Vec<HostListener> {
+    let mut out = Vec::new();
+    for line in text.lines().skip(1) {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 5 { continue; }
+        // For TCP `ss -tlnp`, the local-address column is index 3
+        // (State, Recv-Q, Send-Q, Local). For UDP `ss -ulnp` the
+        // first column is "UNCONN" instead of "LISTEN" but the
+        // layout is the same. Some ss builds drop the State column
+        // for UDP — be defensive: try col 3 first, then col 4.
+        let local_addr_candidates = [cols[3], cols.get(4).copied().unwrap_or("")];
+        let local = local_addr_candidates.iter()
+            .find(|s| s.contains(':'))
+            .copied()
+            .unwrap_or(cols[3]);
+        let (ip, port) = match split_host_port_for_ss(local) {
+            Some(p) => p,
+            None => continue,
+        };
+        // Process name: anything inside the first quoted span. Empty
+        // when ss couldn't enumerate. Look across the whole line so
+        // we don't miss it when extra columns push it past col 5.
+        let proc_name = line.split('"').nth(1).unwrap_or("").to_string();
+        out.push(HostListener {
+            host_ip: ip,
+            host_port: port,
+            proto: proto.to_string(),
+            process: proc_name,
+        });
+    }
+    out
+}
+
+/// Split a "host:port" address as `ss` prints it. Handles
+/// `[::1]:8080` (bracketed v6), `0.0.0.0:8080`, `127.0.0.1:8080`,
+/// and `*:8080`. `*` is treated as `0.0.0.0` (ss's wildcard form).
+fn split_host_port_for_ss(s: &str) -> Option<(String, u16)> {
+    let (ip, port_str) = if let Some(close) = s.rfind(']') {
+        // Bracketed v6: `[::1]:8080`
+        let port_part = s.get(close + 1..).unwrap_or("").trim_start_matches(':');
+        let host_part = s.get(1..close).unwrap_or("");
+        (host_part.to_string(), port_part.to_string())
+    } else {
+        // v4 or `*`: split on the last `:`.
+        let idx = s.rfind(':')?;
+        let host = &s[..idx];
+        let port = &s[idx + 1..];
+        (host.to_string(), port.to_string())
+    };
+    let host = if ip == "*" { "0.0.0.0".to_string() } else { ip };
+    let port: u16 = port_str.parse().ok()?;
+    Some((host, port))
+}
+
+/// One requested host-port binding parsed out of a Docker `-p` string.
+/// Public so the predictive port_conflict analyzer's tests can drive
+/// the same parser without re-implementing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestedHostPort {
+    pub host_ip: String,
+    pub host_port: u16,
+    pub proto: String,
+}
+
+/// Parse a Docker `-p` argument like `"8080:80"`, `"127.0.0.1:8080:80"`,
+/// `"8080:80/udp"`, or `"443"` (publish-only — host port chosen
+/// randomly). Returns `None` when no specific host port is requested
+/// (the random-port form), since there's nothing for the validator
+/// to collide-check.
+///
+/// This deliberately rejects ranges (`8000-8010:8000-8010`) — those
+/// are valid Docker syntax but rare in practice and the validator
+/// doesn't need to handle them right now. Returns `None` for ranges
+/// so the create proceeds; Docker itself will reject conflicts at
+/// start time.
+pub fn parse_docker_port_arg(arg: &str) -> Option<RequestedHostPort> {
+    // Strip optional `/proto` suffix.
+    let (body, proto) = match arg.rsplit_once('/') {
+        Some((b, p)) => (b, p.to_ascii_lowercase()),
+        None => (arg, "tcp".to_string()),
+    };
+
+    // Three valid shapes:
+    //   "<container_port>"                          → random host port; nothing to check
+    //   "<host_port>:<container_port>"              → wildcard host_ip = 0.0.0.0
+    //   "<host_ip>:<host_port>:<container_port>"    → bound to host_ip
+    let parts: Vec<&str> = body.split(':').collect();
+    let (host_ip, host_port_str) = match parts.len() {
+        1 => return None, // random host port
+        2 => ("0.0.0.0".to_string(), parts[0].to_string()),
+        3 => (parts[0].to_string(), parts[1].to_string()),
+        _ => return None, // unexpected shape — let Docker handle it
+    };
+    // Reject ranges in the host port: dashes mean "8000-8010".
+    if host_port_str.contains('-') { return None; }
+    let host_port: u16 = host_port_str.parse().ok()?;
+    if host_port == 0 { return None; }
+    Some(RequestedHostPort { host_ip, host_port, proto })
+}
+
+/// Refuse a `docker create` if any requested host port is already
+/// bound. Walks the same data sources as the predictive analyzer:
+///   * existing Docker containers' published port bindings
+///   * non-docker-proxy host listeners from `ss -tlnp`/`-ulnp`
+///
+/// `name` is only used in the error message — we don't try to be
+/// "clever" and skip the validation when a container with that name
+/// already exists (Docker rejects duplicate names anyway with a
+/// clearer error).
+pub fn validate_host_ports_free(ports: &[String], name: &str) -> Result<(), String> {
+    let mut requested: Vec<RequestedHostPort> = Vec::new();
+    for arg in ports {
+        if arg.is_empty() { continue; }
+        if let Some(r) = parse_docker_port_arg(arg) {
+            requested.push(r);
+        }
+    }
+    if requested.is_empty() { return Ok(()); }
+
+    // Build the in-use set from Docker's view. Use the FRESH list
+    // (not the 5-second cache) — back-to-back creates within the
+    // cache window would otherwise miss the just-created container's
+    // bindings and let a second create slip through with the same
+    // host port.
+    let mut in_use: Vec<(String, u16, String, String)> = Vec::new(); // (host_ip, host_port, proto, owner)
+    for c in docker_list_all() {
+        if c.runtime != "docker" { continue; }
+        if c.name == name { continue; } // shouldn't be a hit; safety
+        for m in &c.port_mappings {
+            // We block on REQUESTED bindings, not just published.
+            // If container A *requested* :8080 and didn't publish,
+            // container B requesting :8080 is still going to lose.
+            let ip = if m.host_ip.is_empty() { "0.0.0.0".to_string() } else { m.host_ip.clone() };
+            in_use.push((ip, m.host_port, m.proto.clone(),
+                format!("docker container `{}`", c.name)));
+        }
+    }
+
+    // Add host listeners.
+    for hl in sample_host_listeners() {
+        if hl.process == "docker-proxy" { continue; }
+        let proc_label = if hl.process.is_empty() {
+            "host process".to_string()
+        } else {
+            format!("host process `{}`", hl.process)
+        };
+        in_use.push((hl.host_ip, hl.host_port, hl.proto, proc_label));
+    }
+
+    // Check each requested port. Match on (port, proto) and treat
+    // wildcard-vs-specific as a conflict (binding `0.0.0.0:8080`
+    // collides with `127.0.0.1:8080` and vice versa).
+    for r in &requested {
+        for (uip, uport, uproto, uowner) in &in_use {
+            if *uport != r.host_port { continue; }
+            if !uproto.eq_ignore_ascii_case(&r.proto) { continue; }
+            let ips_collide = uip == &r.host_ip
+                || uip == "0.0.0.0"
+                || r.host_ip == "0.0.0.0"
+                || uip == "::"
+                || r.host_ip == "::";
+            if !ips_collide { continue; }
+            let ip_str = if r.host_ip == "0.0.0.0" { "*".to_string() } else { r.host_ip.clone() };
+            return Err(format!(
+                "Cannot create container `{name}`: requested host port \
+                 {ip}:{port}/{proto} is already bound by {owner}. Pick a \
+                 different host port for `{name}` (edit your compose file \
+                 or the port mapping in the WolfStack UI), or stop the \
+                 conflicting owner first.",
+                name = name,
+                ip = ip_str,
+                port = r.host_port,
+                proto = r.proto,
+                owner = uowner,
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Set resource limits for an LXC container
@@ -8521,5 +8912,159 @@ pub fn docker_import(
 
 
     Ok(format!("Container '{}' imported and running", container_name))
+}
+
+#[cfg(test)]
+mod port_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn parse_published_port_marks_published_true() {
+        // PortBindings asks for 0.0.0.0:8080 → 80/tcp, NetworkSettings
+        // confirms 0.0.0.0:8080 is bound. Result: published=true.
+        let inspect: serde_json::Value = serde_json::from_str(r#"{
+            "HostConfig": {
+                "PortBindings": {
+                    "80/tcp": [{ "HostIp": "", "HostPort": "8080" }]
+                }
+            },
+            "NetworkSettings": {
+                "Ports": {
+                    "80/tcp": [{ "HostIp": "0.0.0.0", "HostPort": "8080" }]
+                }
+            }
+        }"#).unwrap();
+        let mappings = parse_port_mappings(&inspect);
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].host_port, 8080);
+        assert_eq!(mappings[0].container_port, 80);
+        assert_eq!(mappings[0].proto, "tcp");
+        assert!(mappings[0].published,
+            "0.0.0.0 wildcard request must match a 0.0.0.0 published binding");
+    }
+
+    #[test]
+    fn parse_unpublished_port_marks_published_false() {
+        // The Klas case: PortBindings asks for 8080, but
+        // NetworkSettings.Ports.80/tcp is null (no host binding).
+        let inspect: serde_json::Value = serde_json::from_str(r#"{
+            "HostConfig": {
+                "PortBindings": {
+                    "80/tcp": [{ "HostIp": "", "HostPort": "8080" }]
+                }
+            },
+            "NetworkSettings": {
+                "Ports": {
+                    "80/tcp": null
+                }
+            }
+        }"#).unwrap();
+        let mappings = parse_port_mappings(&inspect);
+        assert_eq!(mappings.len(), 1);
+        assert!(!mappings[0].published,
+            "null NetworkSettings.Ports entry means the daemon never published the binding");
+    }
+
+    #[test]
+    fn parse_dual_stack_v4_v6_publish_counts_as_published() {
+        // Docker on a dual-stack host emits both 0.0.0.0 and ::
+        // entries when a wildcard PortBindings request is published.
+        // The matcher must accept either as a confirmation.
+        let inspect: serde_json::Value = serde_json::from_str(r#"{
+            "HostConfig": {
+                "PortBindings": {
+                    "443/tcp": [{ "HostIp": "0.0.0.0", "HostPort": "443" }]
+                }
+            },
+            "NetworkSettings": {
+                "Ports": {
+                    "443/tcp": [
+                        { "HostIp": "0.0.0.0", "HostPort": "443" },
+                        { "HostIp": "::",      "HostPort": "443" }
+                    ]
+                }
+            }
+        }"#).unwrap();
+        let mappings = parse_port_mappings(&inspect);
+        assert_eq!(mappings.len(), 1);
+        assert!(mappings[0].published);
+    }
+
+    #[test]
+    fn parse_specific_host_ip_does_not_match_wildcard() {
+        // PortBindings asks for 127.0.0.1:5432 → 5432, but the
+        // published entry is 0.0.0.0:5432. Different IP — different
+        // binding, so the request was NOT honoured the way the
+        // operator asked.
+        let inspect: serde_json::Value = serde_json::from_str(r#"{
+            "HostConfig": {
+                "PortBindings": {
+                    "5432/tcp": [{ "HostIp": "127.0.0.1", "HostPort": "5432" }]
+                }
+            },
+            "NetworkSettings": {
+                "Ports": {
+                    "5432/tcp": [{ "HostIp": "0.0.0.0", "HostPort": "5432" }]
+                }
+            }
+        }"#).unwrap();
+        let mappings = parse_port_mappings(&inspect);
+        assert_eq!(mappings.len(), 1);
+        assert!(!mappings[0].published,
+            "127.0.0.1 request != 0.0.0.0 published — operator's bind-IP intent wasn't met");
+    }
+
+    #[test]
+    fn parse_udp_proto_preserved() {
+        let inspect: serde_json::Value = serde_json::from_str(r#"{
+            "HostConfig": {
+                "PortBindings": {
+                    "53/udp": [{ "HostIp": "", "HostPort": "53" }]
+                }
+            },
+            "NetworkSettings": {
+                "Ports": {
+                    "53/udp": [{ "HostIp": "0.0.0.0", "HostPort": "53" }]
+                }
+            }
+        }"#).unwrap();
+        let mappings = parse_port_mappings(&inspect);
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].proto, "udp");
+        assert!(mappings[0].published);
+    }
+
+    #[test]
+    fn parse_empty_port_bindings_yields_empty_vec() {
+        let inspect: serde_json::Value = serde_json::from_str(r#"{
+            "HostConfig": { "PortBindings": {} },
+            "NetworkSettings": { "Ports": {} }
+        }"#).unwrap();
+        assert!(parse_port_mappings(&inspect).is_empty());
+    }
+
+    #[test]
+    fn parse_docker_port_arg_handles_all_canonical_shapes() {
+        // "8080:80" — wildcard host, default tcp
+        let r = parse_docker_port_arg("8080:80").unwrap();
+        assert_eq!(r.host_ip, "0.0.0.0");
+        assert_eq!(r.host_port, 8080);
+        assert_eq!(r.proto, "tcp");
+
+        // "127.0.0.1:8080:80" — specific host IP
+        let r = parse_docker_port_arg("127.0.0.1:8080:80").unwrap();
+        assert_eq!(r.host_ip, "127.0.0.1");
+        assert_eq!(r.host_port, 8080);
+
+        // "53:53/udp" — UDP suffix
+        let r = parse_docker_port_arg("53:53/udp").unwrap();
+        assert_eq!(r.proto, "udp");
+
+        // "443" — random host port form: nothing to validate
+        assert!(parse_docker_port_arg("443").is_none());
+
+        // "8000-8010:8000-8010" — range form: skip (Docker handles)
+        assert!(parse_docker_port_arg("8000-8010:8000-8010").is_none());
+    }
 }
 

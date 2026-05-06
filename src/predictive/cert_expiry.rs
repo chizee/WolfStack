@@ -319,6 +319,7 @@ fn build_proposal(fact: &CertFact, scope: &ProposalScope, severity: Severity) ->
             label: "Days remaining".into(),
             value: fact.days_remaining.to_string(),
             detail: Some(format!("Expires at {}", fact.expires_iso)),
+            links: Vec::new(),
         },
         Evidence {
             label: "Domains".into(),
@@ -326,6 +327,7 @@ fn build_proposal(fact: &CertFact, scope: &ProposalScope, severity: Severity) ->
             detail: if fact.domains.len() > 3 {
                 Some(format!("Full list: {}", fact.domains.join(", ")))
             } else { None },
+            links: Vec::new(),
         },
     ];
 

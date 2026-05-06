@@ -4663,6 +4663,14 @@ pub async fn docker_create(
     let storage = body.storage_limit.as_deref();
     match containers::docker_create(&body.name, &body.image, ports, env, wolfnet_ip, memory, cpus, storage, &body.volumes) {
         Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
+        // Port-conflict pre-flight rejections start with "Cannot
+        // create container `…`: requested host port …" — that's a
+        // user input error, not a server fault, so return 409
+        // Conflict instead of 500. The frontend's create-container
+        // handler already shows the JSON `error` field as a toast,
+        // so the operator gets the named-owner explanation directly.
+        Err(e) if e.starts_with("Cannot create container") =>
+            HttpResponse::Conflict().json(serde_json::json!({ "error": e })),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
     }
 }

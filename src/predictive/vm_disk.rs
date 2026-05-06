@@ -212,11 +212,13 @@ fn build_proposal(fact: &VmDiskFact, scope: &ProposalScope, severity: Severity) 
             label: "VM".into(),
             value: fact.vm_name.clone(),
             detail: Some(fact.disk_path.display().to_string()),
+            links: Vec::new(),
         },
         Evidence {
             label: "qcow2 actual".into(),
             value: format!("{:.1} GB", used_gb),
             detail: Some(format!("of {:.0} GB allocated ({:.1}%)", alloc_gb, fact.used_pct)),
+            links: Vec::new(),
         },
     ];
     let remediation = RemediationPlan::Manual {

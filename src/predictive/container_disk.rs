@@ -325,6 +325,7 @@ fn build_proposal(fact: &ContainerDiskFact, scope: &ProposalScope, v: &Verdict) 
             label: "Container".into(),
             value: fact.name.clone(),
             detail: Some(format!("{} · {}", runtime_label, fact.image)),
+            links: Vec::new(),
         },
         Evidence {
             label: "Current usage".into(),
@@ -334,6 +335,7 @@ fn build_proposal(fact: &ContainerDiskFact, scope: &ProposalScope, v: &Verdict) 
                 fact.used_bytes as f64 / 1_073_741_824.0,
                 fact.total_bytes as f64 / 1_073_741_824.0,
             )),
+            links: Vec::new(),
         },
         Evidence {
             label: "Growth rate".into(),
@@ -342,6 +344,7 @@ fn build_proposal(fact: &ContainerDiskFact, scope: &ProposalScope, v: &Verdict) 
                 "Linear fit over {} samples spanning {} min",
                 v.samples_used, v.span_minutes,
             )),
+            links: Vec::new(),
         },
     ];
 
@@ -489,6 +492,7 @@ mod tests {
             disk_usage: Some(50_000_000), disk_total: Some(100_000_000),
             fs_type: None, version: None, services: vec![],
             gateway: "".into(), mac_address: "".into(), network_name: "".into(), restart_count: None,
+            port_mappings: Vec::new(),
         };
         assert!(container_to_fact(&info, Runtime::Docker).is_none(),
             "stopped containers must not be analyzed — disk usage is frozen");
@@ -505,6 +509,7 @@ mod tests {
             disk_usage: Some(50), disk_total: None,
             fs_type: None, version: None, services: vec![],
             gateway: "".into(), mac_address: "".into(), network_name: "".into(), restart_count: None,
+            port_mappings: Vec::new(),
         };
         assert!(container_to_fact(&info, Runtime::Docker).is_none());
     }
@@ -520,6 +525,7 @@ mod tests {
             disk_usage: Some(50), disk_total: Some(0),
             fs_type: None, version: None, services: vec![],
             gateway: "".into(), mac_address: "".into(), network_name: "".into(), restart_count: None,
+            port_mappings: Vec::new(),
         };
         assert!(container_to_fact(&info, Runtime::Docker).is_none());
     }

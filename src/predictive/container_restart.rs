@@ -292,16 +292,19 @@ fn build_proposal(fact: &RestartFact, scope: &ProposalScope, v: &Verdict) -> Pro
             label: "Container".into(),
             value: fact.name.clone(),
             detail: Some(format!("docker · {}", fact.image)),
+            links: Vec::new(),
         },
         Evidence {
             label: format!("Restarts (last {}m)", RAPID_WINDOW_MINUTES),
             value: v.rapid_delta.to_string(),
             detail: None,
+            links: Vec::new(),
         },
         Evidence {
             label: format!("Restarts (last {}m)", SUSTAINED_WINDOW_MINUTES),
             value: v.sustained_delta.to_string(),
             detail: None,
+            links: Vec::new(),
         },
         Evidence {
             label: "Current state".into(),
@@ -309,6 +312,7 @@ fn build_proposal(fact: &RestartFact, scope: &ProposalScope, v: &Verdict) -> Pro
             detail: if v.actively_restarting {
                 Some("Severity bumped one tier — the loop hasn't paused.".into())
             } else { None },
+            links: Vec::new(),
         },
     ];
 

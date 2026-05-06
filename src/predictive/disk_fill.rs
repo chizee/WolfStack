@@ -239,6 +239,7 @@ fn build_proposal(fact: &DiskFact, scope: &ProposalScope, v: &Verdict) -> Propos
                 fact.avail_bytes as f64 / 1_073_741_824.0,
                 fact.total_bytes as f64 / 1_073_741_824.0,
             )),
+            links: Vec::new(),
         },
         Evidence {
             label: "Growth rate".into(),
@@ -247,6 +248,7 @@ fn build_proposal(fact: &DiskFact, scope: &ProposalScope, v: &Verdict) -> Propos
                 "Linear fit over {} samples spanning {} min",
                 v.samples_used, v.span_minutes,
             )),
+            links: Vec::new(),
         },
     ];
 
