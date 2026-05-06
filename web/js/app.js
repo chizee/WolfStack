@@ -48263,15 +48263,37 @@ function renderPredictiveInbox() {
                             height: 380px !important;
                         }
                     }
-                    /* Phone — tighter outer padding, shorter terminal
-                       so at least one proposal stays visible above it
-                       without scrolling. */
+                    /* Phone — terminal hidden by default so the list
+                       gets the full viewport. The list is the primary
+                       view; the terminal only appears when the operator
+                       runs a command (predictiveShowTerminalStub and
+                       predTermOpen toggle .term-active on the split
+                       container). Without this, the fixed 300-380px
+                       terminal pane combined with flex-shrink:0 leaves
+                       the list squeezed to ~20px on phones with the
+                       address bar visible. */
                     @media (max-width: 640px) {
                         .predictive-shell { padding: 12px !important; }
-                        #predictive-list-scroll { max-height: 55vh; }
-                        #predictive-terminal-pane {
-                            flex: 0 0 300px !important;
-                            height: 300px !important;
+                        /* No terminal active → list fills the inbox. */
+                        .predictive-split:not(.term-active) #predictive-terminal-pane {
+                            display: none !important;
+                        }
+                        .predictive-split:not(.term-active) #predictive-list-scroll {
+                            max-height: none !important;
+                            flex: 1 1 auto !important;
+                        }
+                        /* Terminal active → list compact above, terminal
+                           takes the rest. The list still scrolls so the
+                           operator can change which proposal is active
+                           without dismissing the terminal first. */
+                        .predictive-split.term-active #predictive-list-scroll {
+                            max-height: 30vh !important;
+                            flex: 0 1 auto !important;
+                        }
+                        .predictive-split.term-active #predictive-terminal-pane {
+                            flex: 1 1 auto !important;
+                            height: auto !important;
+                            min-height: 50vh !important;
                         }
                         /* xterm uses fixed font sizing — drop one
                            notch on phones so an 80-col line fits the
@@ -49145,6 +49167,11 @@ function predTermOpen(proposalId, meta) {
         showToast('xterm.js failed to load — refresh the page.', 'error');
         return;
     }
+    // Reveal the terminal pane on phones (hidden by default; see the
+    // `.term-active` rules in the inbox media query above). On desktop
+    // this class is harmless — the terminal pane is already visible.
+    const split = document.querySelector('.predictive-split');
+    if (split) split.classList.add('term-active');
     container.innerHTML = '';
 
     const term = new Terminal({
@@ -49358,6 +49385,11 @@ function predictiveSetupHeightSync(inbox) {
 function predictiveShowTerminalStub(message) {
     const container = document.getElementById('predictive-term-container');
     if (!container) return;
+    // Mark the split container as term-active so the mobile media
+    // query reveals the terminal pane (it's hidden by default on
+    // phones to stop a fixed-height terminal squeezing the list).
+    const split = document.querySelector('.predictive-split');
+    if (split) split.classList.add('term-active');
     container.innerHTML = `
         <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;height:100%;color:#9ca3af;font-size:13px;text-align:center;padding:20px;">
             <div style="width:36px;height:36px;border:3px solid rgba(96,165,250,0.25);border-top-color:#60a5fa;border-radius:50%;animation:predTermSpin 0.8s linear infinite;"></div>
@@ -49486,6 +49518,10 @@ function predTermClose() {
     if (icon)    icon.style.display    = '';
     const closeBtn = document.getElementById('predictive-term-close');
     if (closeBtn) closeBtn.style.display = 'none';
+    // Hand the screen back to the proposals list on phones — without
+    // this the terminal pane stays mounted (and visible) after Close.
+    const split = document.querySelector('.predictive-split');
+    if (split) split.classList.remove('term-active');
     const container = document.getElementById('predictive-term-container');
     if (container) {
         container.innerHTML = `
