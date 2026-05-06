@@ -48988,9 +48988,22 @@ function predictiveExpandedBody(p) {
                 ${e.detail ? `<div style="font-size:11px;color:var(--text-muted);font-weight:normal;margin-top:2px;">${escapeHtml(e.detail)}</div>` : ''}
             </div>`;
         }
+        // Make CVE-shaped labels (CVE-YYYY-NNNNN, GHSA-…, OSV-…)
+        // clickable straight through to OSV.dev's canonical record
+        // — that's where the operator gets the full summary, CVSS
+        // breakdown, every advisory link, and affected/fixed
+        // versions in one page. Saves a copy-paste step that
+        // operators were doing manually before this.
+        const cveLike = /^(CVE-\d{4}-\d{4,}|GHSA-[a-z0-9]{4}(-[a-z0-9]{4}){2}|OSV-\d{4}-\d+|RUSTSEC-\d{4}-\d+)$/i;
+        const labelHtml = cveLike.test(e.label)
+            ? `<a href="https://osv.dev/vulnerability/${escapeAttr(e.label)}" target="_blank" rel="noopener noreferrer" `
+              + `style="color:var(--accent-light,#60a5fa);text-decoration:none;border-bottom:1px dashed var(--accent-light,#60a5fa);" `
+              + `title="Open ${escapeAttr(e.label)} on OSV.dev — full summary + advisories">`
+              + `${escapeHtml(e.label)} ↗</a>`
+            : `<span style="color:var(--text-muted);">${escapeHtml(e.label)}:</span>`;
         return `
         <div style="display:inline-block;background:var(--bg-tertiary,#2d2f3a);padding:4px 10px;border-radius:6px;margin-right:6px;margin-bottom:6px;font-size:12px;">
-            <span style="color:var(--text-muted);">${escapeHtml(e.label)}:</span>
+            ${labelHtml}
             <strong style="color:var(--text-primary);margin-left:4px;">${escapeHtml(e.value)}</strong>
             ${e.detail ? `<span style="color:var(--text-muted);margin-left:8px;font-size:11px;">${escapeHtml(e.detail)}</span>` : ''}
             ${linksHtml}

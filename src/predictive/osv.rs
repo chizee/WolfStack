@@ -2406,11 +2406,28 @@ fn cve_evidence_row(f: &OsvFinding) -> Evidence {
         Some(fv) => Some(format!("{} {} → fixed in {}", f.package, f.version, fv)),
         None => Some(format!("{} {} — no upstream fix yet", f.package, f.version)),
     };
+    // Prepend a canonical "Details" link to OSV.dev so the operator
+    // can click straight into the authoritative CVE page (summary,
+    // CVSS breakdown, every reference, affected/fixed versions). This
+    // is the single most-asked-for "what does this CVE actually do?"
+    // surface and the reason the CVE label is also wrapped in an
+    // anchor in the inbox renderer. Vendor-specific chips (Debian /
+    // Red Hat / NVD / CISA) follow as before.
+    let mut links = vec![EvidenceLink {
+        label: "Details".into(),
+        url: format!("https://osv.dev/vulnerability/{}", urlencoding::encode(&f.vuln.id)),
+    }];
+    links.extend(pick_reference_links(f));
+    // Cap at MAX_REFERENCES_PER_ROW + 1 — the OSV.dev link is
+    // always-on so the cap applies to vendor refs only.
+    if links.len() > MAX_REFERENCES_PER_ROW + 1 {
+        links.truncate(MAX_REFERENCES_PER_ROW + 1);
+    }
     Evidence {
         label: cve,
         value,
         detail,
-        links: pick_reference_links(f),
+        links,
     }
 }
 
@@ -3604,6 +3621,75 @@ mod tests {
             "no-fix-only card is informational — there's nothing actionable yet");
         assert!(card.title.contains("12"),
             "title must include the hidden count, got {:?}", card.title);
+    }
+
+    #[test]
+    fn cve_evidence_row_prepends_osv_dev_details_link() {
+        // Operators asked for "click a CVE → see details". Every
+        // CVE row must carry an `OSV.dev` link as the first chip
+        // pointing at the canonical record. Pin the URL shape and
+        // ordering so a future rendering change can't drop it.
+        let f = OsvFinding {
+            target: ScanTargetOwned::Host,
+            ecosystem: "Debian:12".into(),
+            package: "openssl".into(),
+            version: "3.0.13".into(),
+            vuln: OsvVuln {
+                id: "CVE-2099-1234".into(),
+                aliases: vec!["CVE-2099-1234".into()],
+                summary: "test".into(),
+                cvss_score: Some(7.5),
+                advisory_url: None,
+                modified: None,
+                fixed_versions: HashMap::new(),
+                references: vec![
+                    OsvVulnReference {
+                        ty: "ADVISORY".into(),
+                        url: "https://security-tracker.debian.org/tracker/CVE-2099-1234".into(),
+                    },
+                ],
+            },
+            kev_listed: false,
+            fix_available: false,
+        };
+        let row = cve_evidence_row(&f);
+        assert!(!row.links.is_empty(), "evidence row must have at least the Details link");
+        assert_eq!(row.links[0].label, "Details",
+            "Details link must be the FIRST chip — that's the click target operators expect");
+        assert_eq!(row.links[0].url, "https://osv.dev/vulnerability/CVE-2099-1234",
+            "Details URL must point at osv.dev's canonical record");
+        // Vendor links still rendered after.
+        assert!(row.links.iter().any(|l| l.label == "Debian"),
+            "existing reference chips must still surface alongside the Details link");
+    }
+
+    #[test]
+    fn cve_evidence_row_total_chip_cap_includes_details_plus_three_vendors() {
+        // Sanity: the row caps at 4 chips total — 1 Details + 3
+        // vendors. Stops a CVE with 20 references from blowing out
+        // the inbox card width.
+        let mut refs = Vec::new();
+        for i in 0..10 {
+            refs.push(OsvVulnReference {
+                ty: "WEB".into(),
+                url: format!("https://example-{}.com/cve", i),
+            });
+        }
+        let f = OsvFinding {
+            target: ScanTargetOwned::Host,
+            ecosystem: "Debian:12".into(),
+            package: "p".into(), version: "1".into(),
+            vuln: OsvVuln {
+                id: "CVE-X".into(), aliases: vec!["CVE-X".into()],
+                summary: "".into(), cvss_score: None, advisory_url: None,
+                modified: None, fixed_versions: HashMap::new(),
+                references: refs,
+            },
+            kev_listed: false, fix_available: false,
+        };
+        let row = cve_evidence_row(&f);
+        assert_eq!(row.links.len(), MAX_REFERENCES_PER_ROW + 1,
+            "row must show OSV.dev + exactly MAX_REFERENCES_PER_ROW vendor chips");
     }
 
     #[test]
