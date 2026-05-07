@@ -2249,6 +2249,25 @@ impl VmManager {
         // Suppress ICMP redirects — we handle routing ourselves
         let _ = Command::new("sysctl").args(["-w", &format!("net.ipv4.conf.{}.send_redirects=0", tap)]).output();
 
+        // Per-interface ARP scoping. Every WolfNet VM TAP gets the same
+        // `<subnet>.254` gateway so that statically-configured guests
+        // (WolfRouter, HA appliances) keep working unchanged. With the
+        // gateway repeated on multiple TAPs, the default kernel ARP
+        // behaviour replies for `.254` on whichever TAP is up — meaning
+        // a VM on tap-A can receive an ARP reply with tap-B's MAC, then
+        // black-hole every packet it sends to its gateway.
+        //
+        //   arp_ignore=1  → only reply to ARP for an IP that is configured
+        //                   on the interface the request arrived on. The
+        //                   reply for `.254` on tap-A always uses tap-A's
+        //                   MAC, never tap-B's.
+        //   arp_announce=2→ when sourcing an ARP, prefer a local address
+        //                   on the outgoing interface. Stops the host from
+        //                   announcing `.254` on tap-A as if it were on
+        //                   tap-B during gratuitous-ARP / proxy traffic.
+        let _ = Command::new("sysctl").args(["-w", &format!("net.ipv4.conf.{}.arp_ignore=1", tap)]).output();
+        let _ = Command::new("sysctl").args(["-w", &format!("net.ipv4.conf.{}.arp_announce=2", tap)]).output();
+
         // Add route: wolfnet_ip/32 via TAP
         let _ = Command::new("ip").args(["route", "del", &format!("{}/32", wolfnet_ip)]).output();
         let route_result = Command::new("ip")
@@ -2307,38 +2326,50 @@ impl VmManager {
 
         // ── DHCP server on the TAP so VMs get their WolfNet IP automatically ──
         //
-        // The original two-VM-DHCP collision (two dnsmasq instances
-        // racing on the same gateway IP+port) is fixed by a single
-        // change: `--bind-dynamic` (SO_BINDTODEVICE) below. That lets
-        // two dnsmasq instances coexist on the same IP as long as
-        // they're each scoped to their own TAP.
+        // History recap, because this is the third time we've touched it:
+        //   * Pre-v22.9.26: every TAP got `<subnet>.254/24` and dnsmasq
+        //     ran with `--bind-interfaces`. Two WolfNet VMs at once →
+        //     second dnsmasq died on bind() (`Address already in use`).
+        //   * v22.9.26: switched to per-TAP unique mirror gateways
+        //     (`subnet.X` → `subnet.(255-X)`) and `/32` on the TAP. That
+        //     broke statically-configured guests (WolfRouter and
+        //     PapaSchlumpf's HA workaround) because they have `.254`
+        //     baked into their config; it also broke fresh DHCP'd guests
+        //     because dnsmasq derived a `/32` netmask from the TAP and
+        //     handed it out, leaving the gateway off-link.
+        //   * v22.9.28: reverted to historic `<subnet>.254/24`. That
+        //     restored single-VM and WolfRouter, but two simultaneous
+        //     WolfNet VMs each get `.254/24` on their own TAP → the
+        //     kernel installs duplicate connected /24 routes and ARP
+        //     for `.254` returns whichever TAP's MAC the kernel feels
+        //     like, so the second VM (PapaSchlumpf's HA VM) silently
+        //     loses its WolfNet uplink.
         //
-        // v22.9.26 also tried to pick a per-TAP unique gateway IP
-        // (mirroring `subnet.X` → `subnet.(255-X)`) AND switched the
-        // TAP from `/24` to `/32`. Both changes broke real-world VMs:
-        //   * Pre-existing VMs (especially WolfRouter) had `subnet.254`
-        //     baked into their static configs as the default gateway.
-        //     The mirror change moved the gateway to a different IP so
-        //     those VMs lost their uplink the moment they started after
-        //     the upgrade — no PPPoE, no DHCP, no LAN. Reported by
-        //     PapaSchlumpf 2026-05-06.
-        //   * `/32` on the TAP causes dnsmasq to derive a `/32` netmask
-        //     for the offered DHCP lease (since `dhcp-range` doesn't
-        //     specify one), so every VM that DHCP'd got an IP it could
-        //     not route from — gateway not on-link.
-        //
-        // Reverted to the historic `subnet.254` gateway and `/24`
-        // address, which restores backward compatibility and is
-        // sufficient because `--bind-dynamic` already handles the
-        // multi-VM coexistence the mirror was meant to address.
+        // Current design — keeps every prior promise:
+        //   * Gateway IP stays `<subnet>.254` — static guests untouched.
+        //   * TAP carries `.254/32` instead of `/24`, so the kernel
+        //     does NOT auto-add the `<subnet>.0/24 dev <tap>` connected
+        //     route. Only the explicit per-VM `/32` route to
+        //     `wolfnet_ip` exists, so packets always egress the right
+        //     TAP regardless of how many WolfNet VMs are running.
+        //   * `arp_ignore=1` / `arp_announce=2` (set above) make ARP
+        //     replies for `.254` interface-scoped: a VM on tap-A only
+        //     ever learns tap-A's MAC for its gateway.
+        //   * dnsmasq runs with `--bind-dynamic` (SO_BINDTODEVICE) so
+        //     multiple instances on different TAPs coexist on the same
+        //     IP+port.
+        //   * dnsmasq offers `--dhcp-option=1,255.255.255.0` so the
+        //     guest gets a /24 view (gateway on-link), regardless of
+        //     the /32 we put on the TAP. This is the bit v22.9.26
+        //     missed and is why fresh-DHCP'd guests broke back then.
         let parts: Vec<&str> = wolfnet_ip.split('.').collect();
         if parts.len() == 4 {
             let gateway_ip = format!("{}.{}.{}.254", parts[0], parts[1], parts[2]);
             let _ = Command::new("ip").args(["addr", "flush", "dev", tap]).output();
             let _ = Command::new("ip")
-                .args(["addr", "add", &format!("{}/24", gateway_ip), "dev", tap])
+                .args(["addr", "add", &format!("{}/32", gateway_ip), "dev", tap])
                 .output();
-            info!("TAP gateway: {} on {}", gateway_ip, tap);
+            info!("TAP gateway: {}/32 on {} (DHCP offers /24 via option 1)", gateway_ip, tap);
 
             // Kill any existing dnsmasq on this TAP
             let _ = Command::new("pkill")
@@ -2368,6 +2399,13 @@ impl VmManager {
                     "--bind-dynamic",
                     "--except-interface=lo",
                     &format!("--dhcp-range={},{},12h", wolfnet_ip, wolfnet_ip),
+                    // Force the offered subnet mask to /24. The TAP
+                    // carries `gateway_ip/32` (so the kernel doesn't
+                    // install a duplicate connected /24 across every
+                    // WolfNet TAP) — without this option dnsmasq would
+                    // derive `/32` from the interface and hand out a
+                    // lease whose gateway is off-link.
+                    "--dhcp-option=1,255.255.255.0",
                     &format!("--dhcp-option=3,{}", gateway_ip),
                     &format!("--dhcp-option=6,{}", dns_server),
                     "--no-resolv",
@@ -5633,14 +5671,18 @@ fn verify_dnsmasq_running(tap: &str, gateway_ip: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tap_gateway_tests {
-    /// Mirrors the historic gateway derivation used in
-    /// `setup_wolfnet_routing` and `probe_wolfnet_tap_health`. Kept
-    /// in tests as documentation of the contract: every VM in the
-    /// same /24 gets the same `<subnet>.254` gateway, and dnsmasq's
-    /// `--bind-dynamic` (SO_BINDTODEVICE) is what keeps multiple
-    /// VMs from racing on the same IP+port. The v22.9.26 attempt
-    /// to give each TAP a unique mirrored gateway is gone because
-    /// it broke pre-existing VMs that hardcoded `.254`.
+    /// Mirrors the gateway derivation used by `setup_wolfnet_routing`
+    /// and `probe_wolfnet_tap_health`. Documents the contract:
+    ///
+    ///   * Every VM in the same /24 gets the same `<subnet>.254`
+    ///     gateway. Static guests (WolfRouter, HA appliances) hardcode
+    ///     this value, so it must stay stable.
+    ///   * The TAP carries `gateway/32` (not `/24`) so the kernel
+    ///     doesn't auto-install duplicate connected /24 routes when
+    ///     more than one WolfNet VM is up; ARP scoping plus
+    ///     `--dhcp-option=1` give the guest a clean /24 view.
+    ///   * dnsmasq `--bind-dynamic` is what lets multiple instances
+    ///     coexist on the same IP+port across different TAPs.
     fn historic_gateway(ip: &str) -> String {
         let parts: Vec<&str> = ip.split('.').collect();
         if parts.len() == 4 {
@@ -5655,6 +5697,18 @@ mod tap_gateway_tests {
         assert_eq!(historic_gateway("10.10.10.5"),  "10.10.10.254");
         assert_eq!(historic_gateway("10.10.10.50"), "10.10.10.254");
         assert_eq!(historic_gateway("192.168.1.7"), "192.168.1.254");
+    }
+
+    #[test]
+    fn distinct_vms_share_gateway_ip() {
+        // PapaSchlumpf's scenario: WolfRouter at .5, HA VM at .10 on
+        // the same WolfNet /24. They MUST resolve to the same gateway
+        // (.254) so static configs keep working. Multi-VM coexistence
+        // is handled at the L2/ARP layer — see the `arp_ignore` /
+        // `arp_announce` sysctls and the `/32` TAP address in
+        // `setup_wolfnet_routing` — not by per-VM gateway tricks.
+        assert_eq!(historic_gateway("10.10.10.5"),  "10.10.10.254");
+        assert_eq!(historic_gateway("10.10.10.10"), "10.10.10.254");
     }
 
     #[test]
