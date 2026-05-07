@@ -2,12 +2,12 @@
   {
     "id": "wolfhost",
     "name": "WolfHost",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "description": "Complete web hosting platform — customer management, billing, domains, email, SSL, FTP, and a white-label customer portal. Includes DirectAdmin backend support.",
     "author": "Wolf Software Systems Ltd",
     "icon": "🌐",
     "enterprise_only": true,
-    "download_url": "https://github.com/wolfsoftwaresystemsltd/WolfStack/releases/download/plugins/wolfhost.tar.gz",
+    "download_url": "https://github.com/wolfsoftwaresystemsltd/wolfhost/releases/latest/download/wolfhost.tar.gz",
     "category": "hosting",
     "tags": ["hosting", "billing", "domains", "email", "ssl", "ftp", "directadmin"]
   },
