@@ -328,6 +328,101 @@ impl XoClient {
         Ok(())
     }
 
+    /// List VM templates available for cloning. P3 uses this to
+    /// populate the "Provision new VM" form. Returns lightweight
+    /// rows; full details come from `/rest/v0/vm-templates/{uuid}`
+    /// when the operator clicks one.
+    pub async fn list_templates(&self) -> Result<Vec<XoTemplate>, String> {
+        let data = self.get("/rest/v0/vm-templates?fields=uuid,name_label,$pool,os_version,memory,VBDs").await?;
+        let arr = data.as_array().cloned().unwrap_or_default();
+        let mut out = Vec::with_capacity(arr.len());
+        for v in &arr {
+            let mem = v.get("memory")
+                .and_then(|m| m.get("size").or_else(|| m.get("static").and_then(|s| s.get(1))))
+                .and_then(|n| n.as_u64()).unwrap_or(0);
+            let os = v.get("os_version")
+                .and_then(|x| x.get("name").or_else(|| x.get("uname")))
+                .and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let disks = v.get("VBDs").and_then(|b| b.as_array()).map(|a| a.len() as u32).unwrap_or(0);
+            out.push(XoTemplate {
+                uuid: v.get("uuid").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                name: v.get("name_label").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                pool_uuid: v.get("$pool").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                os,
+                memory: mem,
+                disks,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Create a VM from a template, optionally with a cloud-init
+    /// `user_data` payload. XO's "create from template" REST call
+    /// is `POST /rest/v0/vms` with a body of clone params.
+    /// Returns the new VM's UUID.
+    pub async fn create_vm(&self, r: CreateVmRequest) -> Result<String, String> {
+        if r.template_uuid.is_empty() || r.name.is_empty() {
+            return Err("template_uuid and name are required".into());
+        }
+        let mut body = serde_json::json!({
+            "template": r.template_uuid,
+            "name_label": r.name,
+        });
+        if r.memory_mb > 0 {
+            // XO accepts memory in bytes.
+            body["memoryMax"] = serde_json::json!(r.memory_mb as u64 * 1024 * 1024);
+        }
+        if r.cpus > 0 {
+            body["CPUs"] = serde_json::json!(r.cpus);
+        }
+        if !r.user_data.is_empty() {
+            // XO accepts cloud-config under `cloudConfig`. The VM
+            // template needs the cloud-init guest tools installed
+            // for this to take effect on first boot. The Vates
+            // and the upstream XO templates include them.
+            body["cloudConfig"] = serde_json::json!(r.user_data);
+        }
+
+        let url = format!("{}/rest/v0/vms", self.base_url);
+        let resp = XO_CLIENT.post(&url)
+            .header("Authorization", format!("Bearer {}", self.token))
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .json(&body)
+            .send().await
+            .map_err(|e| format!("XO create_vm request failed: {}", e))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("XO HTTP {} on create_vm: {}", status,
+                body.chars().take(400).collect::<String>()));
+        }
+        // XO sometimes returns the new UUID as a JSON string,
+        // sometimes as `{ "uuid": "..." }`, sometimes as a redirect
+        // URL. Handle each.
+        let body_text = resp.text().await.map_err(|e| format!("XO read: {}", e))?;
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body_text) {
+            if let Some(s) = v.as_str() {
+                // bare string UUID
+                return Ok(s.trim_matches('"').to_string());
+            }
+            if let Some(s) = v.get("uuid").and_then(|x| x.as_str()) {
+                return Ok(s.to_string());
+            }
+            if let Some(s) = v.get("id").and_then(|x| x.as_str()) {
+                return Ok(s.to_string());
+            }
+        }
+        // Fallback: treat the trimmed body as the UUID — a few XO
+        // builds return a raw UUID string outside JSON.
+        let trimmed = body_text.trim().trim_matches('"').to_string();
+        if !trimmed.is_empty() {
+            Ok(trimmed)
+        } else {
+            Err("XO returned empty body on create_vm".into())
+        }
+    }
+
     pub async fn full_inventory(&self) -> Result<XoInventory, String> {
         // Fire the three calls in parallel — XO returns them
         // independently and they don't depend on each other.
@@ -425,3 +520,119 @@ impl XoStore {
 
 #[allow(dead_code)]
 pub const POOLS_FILE: &str = POOLS_FILE_DEFAULT;
+
+#[derive(Debug, Clone)]
+pub struct CreateVmRequest {
+    pub template_uuid: String,
+    pub name: String,
+    pub memory_mb: u32,
+    pub cpus: u32,
+    pub user_data: String,
+}
+
+// ─── Cloud-init payload generator ─────────────────────────────────
+//
+// P3's headline feature: the Provision wizard ticks a box and the
+// new VM auto-installs WolfStack on first boot, joins the customer
+// cluster, registers with the SP's federation token, and comes up
+// with WolfNet pre-configured for the inside-VM environment.
+//
+// Cloud-init runs as root on first boot, so this is privileged
+// code that lands on the customer's VM. Keep it minimal and
+// auditable — every line should be defensible.
+
+pub mod cloud_init {
+    pub struct WolfStackBootstrap {
+        /// Hostname to set on the new VM.
+        pub hostname: String,
+        /// If empty: this VM becomes a fresh cluster leader and
+        /// generates its own secret. If set: VM joins an existing
+        /// cluster using this secret.
+        pub cluster_secret: String,
+        /// `host:port` of an existing cluster member to bootstrap
+        /// from. Required when joining; ignored when leading.
+        pub cluster_leader_endpoint: String,
+        /// SP's federation URL (e.g. `https://sp.example.com:8553`).
+        /// When set together with `federation_token`, the new
+        /// cluster registers itself back with the SP for the
+        /// aggregator dashboard.
+        pub federation_url: String,
+        /// Federation token previously minted on the SP side.
+        pub federation_token: String,
+    }
+
+    /// Generate a cloud-config (YAML) that:
+    ///   1. Sets hostname
+    ///   2. Installs WolfStack via the published setup.sh
+    ///   3. Configures WolfNet with MTU 1380 (room for nested LXC
+    ///      WolfNet inside) and joins the cluster
+    ///   4. Registers federation if creds were supplied
+    pub fn build_wolfstack_user_data(b: WolfStackBootstrap) -> String {
+        let hostname = b.hostname.replace('"', "");
+        // YAML-safe field interpolation. None of these can contain
+        // newlines (form validation upstream), but we still escape
+        // quotes defensively — a token with an accidental quote
+        // would otherwise corrupt the YAML.
+        let esc = |s: &str| s.replace('"', "\\\"");
+        let cluster_secret = esc(&b.cluster_secret);
+        let cluster_leader = esc(&b.cluster_leader_endpoint);
+        let federation_url = esc(&b.federation_url);
+        let federation_token = esc(&b.federation_token);
+
+        // The runcmd block runs in order. setup.sh idempotently
+        // installs the wolfstack binary and starts the systemd
+        // unit. Cluster + federation setup happens after via the
+        // wolfstack CLI.
+        let mut runcmds: Vec<String> = vec![
+            format!("hostnamectl set-hostname {}", hostname),
+            "curl -fsSL https://wolfstack.org/setup.sh | sudo bash -s -- --quiet".into(),
+            "systemctl enable --now wolfstack || true".into(),
+            // WolfNet MTU 1380 — leaves headroom for nested
+            // wireguard inside any LXC the customer runs later.
+            "mkdir -p /etc/wolfnet".into(),
+            "[ -f /etc/wolfnet/config.toml ] || echo 'mtu = 1380' > /etc/wolfnet/config.toml".into(),
+        ];
+        if !cluster_secret.is_empty() && !cluster_leader.is_empty() {
+            runcmds.push(format!(
+                "wolfstack cluster join --leader '{}' --secret '{}' || true",
+                cluster_leader, cluster_secret,
+            ));
+        } else if !cluster_secret.is_empty() {
+            runcmds.push(format!(
+                "wolfstack cluster init --secret '{}' || true",
+                cluster_secret,
+            ));
+        }
+        if !federation_url.is_empty() && !federation_token.is_empty() {
+            // Have the new cluster register itself back with the
+            // SP. We POST our public URL to the SP's tenant
+            // register endpoint with the federation token in the
+            // body — admin-side validation will accept it because
+            // the token was minted by the SP a moment ago.
+            runcmds.push(format!(
+                "curl -fsSL --max-time 10 -X POST '{}/api/tenants' \
+                 -H 'Authorization: Bearer {}' \
+                 -H 'Content-Type: application/json' \
+                 -d \"{{\\\"name\\\":\\\"$(hostname)\\\",\\\"url\\\":\\\"https://$(hostname -I | awk '{{print $1}}'):8553\\\",\\\"token\\\":\\\"{}\\\"}}\" || true",
+                federation_url, federation_token, federation_token,
+            ));
+        }
+        let runcmd_yaml = runcmds.iter()
+            .map(|c| format!("  - {}", c.replace('\n', " ").replace('\\', "\\\\")))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        format!(
+            "#cloud-config\n\
+             # WolfStack auto-bootstrap — generated by SP via XO Provision wizard\n\
+             hostname: {hostname}\n\
+             package_update: false\n\
+             package_upgrade: false\n\
+             runcmd:\n\
+             {runcmd}\n\
+             final_message: \"WolfStack auto-install finished — first-boot took $UPTIME seconds\"\n",
+            hostname = hostname,
+            runcmd = runcmd_yaml,
+        )
+    }
+}

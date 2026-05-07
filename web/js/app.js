@@ -1851,7 +1851,7 @@ function selectView(page) {
     document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
     document.querySelector(`.nav-item[data-page="${page}"]`)?.classList.add('active');
 
-    const titles = { datacenter: 'Datacenter', settings: 'Settings', docs: 'Help & Documentation', appstore: 'App Store', issues: 'Issues', inbox: 'Predictive Inbox', 'global-wolfnet': 'Global View', kubernetes: 'WolfKube', topology: '3D Server Room', wolfflow: 'WolfFlow', wolfagents: 'WolfAgents', 'cluster-browser': 'Cluster Browser', databases: 'Databases', 'control-panel': 'Control Panel', array: 'Storage Array', xopools: 'XO Pools' };
+    const titles = { datacenter: 'Datacenter', settings: 'Settings', docs: 'Help & Documentation', appstore: 'App Store', issues: 'Issues', inbox: 'Predictive Inbox', 'global-wolfnet': 'Global View', kubernetes: 'WolfKube', topology: '3D Server Room', wolfflow: 'WolfFlow', wolfagents: 'WolfAgents', 'cluster-browser': 'Cluster Browser', databases: 'Databases', 'control-panel': 'Control Panel', array: 'Storage Array', xopools: 'XO Pools', tenants: 'Tenants' };
     document.getElementById('page-title').textContent = titles[page] || page;
 
     if (page === 'datacenter') {
@@ -2052,7 +2052,215 @@ function selectServerView(nodeId, view) {
     if (view === 'wolfram') loadWolframStatus().finally(() => hidePageLoadingOverlay(el));
     if (view === 'wolfusb') loadWolfUsbPage().finally(() => hidePageLoadingOverlay(el));
     if (view === 'xopools') renderXoPools().finally(() => hidePageLoadingOverlay(el));
+    if (view === 'tenants') renderTenants().finally(() => hidePageLoadingOverlay(el));
 }
+
+// ─── Tenant federation aggregator (SP-side dashboard) ────────────
+//
+// Each customer's WolfStack cluster mints a federation token and
+// hands it to the SP. The SP registers the tenant with that token
+// + the customer cluster's URL; this page polls each registered
+// tenant's `/api/federation/status` and rolls the answers into a
+// summary tile + per-tenant table.
+
+async function renderTenants() {
+    const host = document.getElementById('tenants-content');
+    if (!host) return;
+    host.innerHTML = `
+        <div class="card" style="margin-bottom:16px;">
+            <div class="card-body" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;">
+                <div>
+                    <h2 style="margin:0;display:flex;align-items:center;gap:10px;"><span style="font-size:28px;">🏢</span>Tenants</h2>
+                    <p style="margin:6px 0 0;color:var(--text-muted);font-size:13px;max-width:780px;line-height:1.5;">
+                        One pane of glass over every customer cluster you federate to. Each tenant registered here
+                        polls its <code>/api/federation/status</code> endpoint with a per-tenant token.
+                        The customer mints the token under <em>Settings → Federation Tokens</em> on their cluster.
+                    </p>
+                </div>
+                <div style="display:flex;gap:8px;">
+                    <button class="btn" onclick="renderTenants()">🔄 Refresh all</button>
+                    <button class="btn btn-primary" onclick="tenantRegisterModal()">+ Register tenant</button>
+                </div>
+            </div>
+        </div>
+        <div id="tenants-rollup" style="margin-bottom:16px;"></div>
+        <div id="tenants-list">
+            <div style="color:var(--text-muted);padding:20px;text-align:center;">Loading…</div>
+        </div>
+    `;
+    await tenantLoadList();
+}
+
+async function tenantLoadList() {
+    const list = document.getElementById('tenants-list');
+    const rollup = document.getElementById('tenants-rollup');
+    if (!list || !rollup) return;
+    let tenants = [];
+    try {
+        const r = await fetch(apiUrl('/api/tenants'));
+        if (!r.ok) throw new Error(await r.text());
+        tenants = await r.json();
+    } catch (e) {
+        list.innerHTML = `<div class="card"><div class="card-body" style="color:var(--danger);">Couldn't load tenants: ${escapeHtml(String(e.message || e))}</div></div>`;
+        return;
+    }
+    if (!tenants.length) {
+        rollup.innerHTML = '';
+        list.innerHTML = `<div class="card"><div class="card-body" style="text-align:center;padding:40px;color:var(--text-muted);">
+            <div style="font-size:36px;margin-bottom:10px;">🏢</div>
+            <div style="font-size:15px;margin-bottom:6px;">No tenants registered yet.</div>
+            <div style="font-size:12px;">Click <strong>Register tenant</strong> above. Each customer cluster mints its own federation token to give you.</div>
+        </div></div>`;
+        return;
+    }
+    // Roll-up summary
+    const totalHosts = tenants.reduce((a, t) => a + (t.host_count || 0), 0);
+    const totalVms = tenants.reduce((a, t) => a + (t.vm_count || 0), 0);
+    const totalContainers = tenants.reduce((a, t) => a + (t.container_count || 0), 0);
+    const totalMemMb = tenants.reduce((a, t) => a + (t.mem_total_mb || 0), 0);
+    const usedMemMb = tenants.reduce((a, t) => a + (t.mem_used_mb || 0), 0);
+    const memPct = totalMemMb > 0 ? Math.round((usedMemMb / totalMemMb) * 100) : 0;
+    const reachable = tenants.filter(t => t.last_status === 'ok').length;
+    rollup.innerHTML = `<div class="card"><div class="card-body" style="display:grid;grid-template-columns:repeat(auto-fit, minmax(140px, 1fr));gap:14px;">
+        <div><div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;">Tenants</div><div style="font-size:24px;font-weight:700;">${tenants.length}</div><div style="font-size:11px;color:${reachable === tenants.length ? 'var(--success)' : 'var(--warning,#f59e0b)'};">${reachable} reachable</div></div>
+        <div><div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;">Hosts</div><div style="font-size:24px;font-weight:700;">${totalHosts}</div></div>
+        <div><div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;">VMs</div><div style="font-size:24px;font-weight:700;">${totalVms}</div></div>
+        <div><div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;">Containers</div><div style="font-size:24px;font-weight:700;">${totalContainers}</div></div>
+        <div><div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;">Memory</div><div style="font-size:24px;font-weight:700;">${memPct}%</div><div style="font-size:11px;color:var(--text-muted);">${Math.round(usedMemMb / 1024)} / ${Math.round(totalMemMb / 1024)} GB</div></div>
+    </div></div>`;
+
+    list.innerHTML = `<div style="display:grid;grid-template-columns:repeat(auto-fill, minmax(320px, 1fr));gap:14px;">${tenants.map(tenantTile).join('')}</div>`;
+}
+
+function tenantTile(t) {
+    const colour = t.last_status === 'ok' ? 'var(--success)'
+        : t.last_status === 'auth_failed' ? 'var(--warning,#f59e0b)'
+        : t.last_status === 'unreachable' ? 'var(--danger)'
+        : 'var(--text-muted)';
+    const label = ({ ok: 'Healthy', auth_failed: 'Token rejected', unreachable: 'Unreachable' })[t.last_status] || (t.last_status || 'Unknown');
+    const memPct = t.mem_total_mb > 0 ? Math.round((t.mem_used_mb / t.mem_total_mb) * 100) : 0;
+    return `<div class="card" style="border-left:3px solid ${colour};">
+        <div class="card-body">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap;">
+                <div style="min-width:0;flex:1;">
+                    <h3 style="margin:0 0 4px;display:flex;align-items:center;gap:8px;">
+                        <span style="font-size:18px;">🏢</span>${escapeHtml(t.name)}
+                    </h3>
+                    <div style="font-size:11px;color:${colour};font-weight:600;text-transform:uppercase;letter-spacing:0.05em;">● ${escapeHtml(label)}</div>
+                    <div style="font-size:11px;color:var(--text-muted);font-family:'JetBrains Mono',monospace;word-break:break-all;margin-top:4px;">${escapeHtml(t.url)}</div>
+                </div>
+                <div style="display:flex;gap:4px;flex-shrink:0;">
+                    <button class="btn btn-xs" title="Open the tenant cluster in a new tab" onclick="window.open('${escapeAttr(t.url)}', '_blank', 'noopener')">↗</button>
+                    <button class="btn btn-xs" onclick="tenantRefresh('${escapeAttr(t.id)}')">🔄</button>
+                    <button class="btn btn-xs btn-danger" onclick="tenantDelete('${escapeAttr(t.id)}','${escapeAttr(t.name)}')">×</button>
+                </div>
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:14px;font-size:12px;">
+                <div><div style="color:var(--text-muted);font-size:10px;text-transform:uppercase;">Hosts</div><div style="font-weight:600;">${t.host_count || 0}</div></div>
+                <div><div style="color:var(--text-muted);font-size:10px;text-transform:uppercase;">VMs</div><div style="font-weight:600;">${t.vm_count || 0}</div></div>
+                <div><div style="color:var(--text-muted);font-size:10px;text-transform:uppercase;">CTs</div><div style="font-weight:600;">${t.container_count || 0}</div></div>
+                <div style="grid-column:1 / -1;"><div style="color:var(--text-muted);font-size:10px;text-transform:uppercase;">Memory</div><div style="font-weight:600;">${memPct}% (${Math.round((t.mem_used_mb||0)/1024)} / ${Math.round((t.mem_total_mb||0)/1024)} GB)</div></div>
+                <div style="grid-column:1 / -1;font-size:10px;color:var(--text-muted);">Last seen: ${t.last_seen ? new Date(t.last_seen).toLocaleString() : '—'}</div>
+            </div>
+        </div>
+    </div>`;
+}
+
+window.tenantRefresh = async function(id) {
+    try {
+        const r = await fetch(apiUrl(`/api/tenants/${encodeURIComponent(id)}/refresh`), { method: 'POST' });
+        if (!r.ok) {
+            const body = await r.text().catch(() => '');
+            alert('Refresh failed: ' + body);
+        }
+    } catch (e) {
+        alert('Refresh errored: ' + (e.message || e));
+    }
+    await tenantLoadList();
+};
+
+window.tenantDelete = async function(id, name) {
+    if (!confirm(`Unregister "${name}"?\n\nThe tenant cluster itself isn't touched — this only removes the registration on this WolfStack.`)) return;
+    const r = await fetch(apiUrl(`/api/tenants/${encodeURIComponent(id)}`), { method: 'DELETE' });
+    if (!r.ok) {
+        const body = await r.text().catch(() => '');
+        alert('Delete failed: ' + body);
+        return;
+    }
+    await tenantLoadList();
+};
+
+window.tenantRegisterModal = function() {
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);z-index:100000;display:flex;align-items:center;justify-content:center;';
+    overlay.onclick = e => { if (e.target === overlay) overlay.remove(); };
+    overlay.innerHTML = `
+        <div style="background:var(--bg-card,#1e2028);border:1px solid var(--border-color,#2d2f3a);border-radius:12px;padding:24px 28px;max-width:560px;width:90%;color:var(--text-primary,#e4e4e7);font-family:inherit;">
+            <div style="font-size:16px;font-weight:600;margin-bottom:14px;display:flex;align-items:center;gap:10px;">
+                <span style="font-size:22px;">🏢</span>Register tenant cluster
+            </div>
+            <div style="font-size:13px;color:var(--text-secondary,#a1a1aa);margin-bottom:14px;line-height:1.5;">
+                Tell the customer to mint a token on their WolfStack via
+                <code>POST /api/federation/tokens</code> (or the future Settings → Federation Tokens UI),
+                then paste it here along with their cluster's public URL.
+                The token is sent on every poll as <code>Authorization: Bearer</code>.
+            </div>
+            <div style="display:flex;flex-direction:column;gap:10px;">
+                <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.05em;">Display name</label>
+                <input id="tenant-reg-name" placeholder="Customer A" style="background:var(--bg-input,#0d1225);border:1px solid var(--border-color,#2d2f3a);border-radius:6px;padding:10px 12px;color:var(--text-primary,#e4e4e7);font-family:inherit;font-size:13px;">
+                <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.05em;">Cluster URL</label>
+                <input id="tenant-reg-url" placeholder="https://customer-a.example.com:8553" type="url" style="background:var(--bg-input,#0d1225);border:1px solid var(--border-color,#2d2f3a);border-radius:6px;padding:10px 12px;color:var(--text-primary,#e4e4e7);font-family:inherit;font-size:13px;">
+                <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.05em;">Federation token</label>
+                <input id="tenant-reg-token" type="password" placeholder="paste from the tenant cluster" style="background:var(--bg-input,#0d1225);border:1px solid var(--border-color,#2d2f3a);border-radius:6px;padding:10px 12px;color:var(--text-primary,#e4e4e7);font-family:inherit;font-size:13px;">
+            </div>
+            <div style="font-size:11px;color:var(--text-muted);margin-top:10px;line-height:1.5;">A federation status probe runs before the token is stored. Bad URL or rejected token → registration is rejected and nothing is saved.</div>
+            <div id="tenant-reg-error" style="display:none;color:var(--danger);font-size:12px;margin-top:10px;"></div>
+            <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:18px;">
+                <button class="btn" id="tenant-reg-cancel">Cancel</button>
+                <button class="btn btn-primary" id="tenant-reg-submit">🔌 Probe &amp; register</button>
+            </div>
+        </div>`;
+    document.body.appendChild(overlay);
+    document.getElementById('tenant-reg-name').focus();
+    document.getElementById('tenant-reg-cancel').onclick = () => overlay.remove();
+    document.getElementById('tenant-reg-submit').onclick = async () => {
+        const errEl = document.getElementById('tenant-reg-error');
+        errEl.style.display = 'none';
+        const name = document.getElementById('tenant-reg-name').value.trim();
+        const url = document.getElementById('tenant-reg-url').value.trim();
+        const token = document.getElementById('tenant-reg-token').value.trim();
+        if (!name || !url || !token) {
+            errEl.textContent = 'Name, URL, and token are all required.';
+            errEl.style.display = '';
+            return;
+        }
+        const submitBtn = document.getElementById('tenant-reg-submit');
+        submitBtn.disabled = true;
+        submitBtn.textContent = 'Probing…';
+        try {
+            const r = await fetch(apiUrl('/api/tenants'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name, url, token }),
+            });
+            if (!r.ok) {
+                const body = await r.text().catch(() => '');
+                errEl.textContent = 'Registration failed: ' + body;
+                errEl.style.display = '';
+                submitBtn.disabled = false;
+                submitBtn.textContent = '🔌 Probe & register';
+                return;
+            }
+            overlay.remove();
+            await tenantLoadList();
+        } catch (e) {
+            errEl.textContent = 'Network error: ' + (e.message || e);
+            errEl.style.display = '';
+            submitBtn.disabled = false;
+            submitBtn.textContent = '🔌 Probe & register';
+        }
+    };
+};
 
 // ─── XCP-ng / Xen Orchestra Pools ────────────────────────────────
 //
@@ -2172,6 +2380,11 @@ function xoPoolCardHtml(p) {
     </div>`;
 }
 
+// Track which pool each VM belongs to so action buttons can target
+// the right backend endpoint. Re-populated on every inventory
+// fetch — simple key/value cache.
+const _xoVmPoolMap = {};
+
 async function xoFetchInventory(id) {
     const slot = document.getElementById(`xopool-inv-${id}`);
     if (!slot) return;
@@ -2183,20 +2396,20 @@ async function xoFetchInventory(id) {
             return;
         }
         const inv = await r.json();
-        slot.innerHTML = xoInventoryHtml(inv);
+        for (const vm of (inv.vms || [])) { _xoVmPoolMap[vm.uuid] = id; }
+        slot.innerHTML = xoInventoryHtml(inv, id);
     } catch (e) {
         slot.innerHTML = `<div style="color:var(--danger);">Inventory failed: ${escapeHtml(String(e.message || e))}</div>`;
     }
 }
 
-function xoInventoryHtml(inv) {
+function xoInventoryHtml(inv, poolId) {
     const pools = inv.pools || [];
     const hosts = inv.hosts || [];
     const vms = inv.vms || [];
     if (pools.length === 0 && hosts.length === 0 && vms.length === 0) {
         return '<div style="color:var(--text-muted);">XO returned no pools / hosts / VMs. Either the instance is empty or the token can\'t see them.</div>';
     }
-    // Group VMs by host so the tree reads top-down: pool → host → VMs.
     const sectionStyle = 'margin-top:10px;font-size:12px;';
     return pools.map(pool => {
         const poolHosts = hosts.filter(h => h.pool_uuid === pool.uuid);
@@ -2207,19 +2420,30 @@ function xoInventoryHtml(inv) {
             const vmsHtml = hostVms.length === 0
                 ? '<div style="color:var(--text-muted);font-style:italic;padding:6px 0 0 22px;">No VMs on this host.</div>'
                 : `<table class="data-table" style="margin-top:6px;font-size:12px;width:100%;">
-                    <thead><tr><th style="width:24px;"></th><th>Name</th><th style="width:90px;">State</th><th style="width:60px;">CPUs</th><th style="width:120px;">Memory</th><th>IP</th></tr></thead>
+                    <thead><tr><th style="width:24px;"></th><th>Name</th><th style="width:90px;">State</th><th style="width:60px;">CPUs</th><th style="width:120px;">Memory</th><th>IP</th><th style="width:240px;">Actions</th></tr></thead>
                     <tbody>${hostVms.map(v => {
                         const vmMem = v.memory_total > 0 ? `${Math.round(v.memory_used / 1048576)} / ${Math.round(v.memory_total / 1048576)} MB` : '—';
                         const vmStateColour = v.power_state === 'Running' ? 'var(--success)'
                             : v.power_state === 'Halted' ? 'var(--text-muted)'
                             : 'var(--warning,#f59e0b)';
+                        const running = v.power_state === 'Running';
+                        const halted = v.power_state === 'Halted';
+                        const actions = [
+                            !running ? `<button class="btn btn-xs" title="Power on" onclick="xoVmAction('${escapeAttr(poolId)}','${escapeAttr(v.uuid)}','start','${escapeAttr(v.name)}')">▶ Start</button>` : '',
+                            running ? `<button class="btn btn-xs" title="Graceful reboot" onclick="xoVmAction('${escapeAttr(poolId)}','${escapeAttr(v.uuid)}','clean_reboot','${escapeAttr(v.name)}')">↻ Reboot</button>` : '',
+                            running ? `<button class="btn btn-xs" title="Graceful shutdown" onclick="xoVmAction('${escapeAttr(poolId)}','${escapeAttr(v.uuid)}','clean_shutdown','${escapeAttr(v.name)}')">⏻ Stop</button>` : '',
+                            running ? `<button class="btn btn-xs btn-danger" title="Force-kill (data loss possible)" onclick="xoVmAction('${escapeAttr(poolId)}','${escapeAttr(v.uuid)}','hard_shutdown','${escapeAttr(v.name)}')">⚡ Halt</button>` : '',
+                            running ? `<button class="btn btn-xs" title="Suspend (saves state to disk)" onclick="xoVmAction('${escapeAttr(poolId)}','${escapeAttr(v.uuid)}','suspend','${escapeAttr(v.name)}')">⏸ Suspend</button>` : '',
+                            (!running && !halted) ? `<button class="btn btn-xs" title="Resume from suspended state" onclick="xoVmAction('${escapeAttr(poolId)}','${escapeAttr(v.uuid)}','resume','${escapeAttr(v.name)}')">⏯ Resume</button>` : '',
+                        ].filter(Boolean).join(' ');
                         return `<tr>
-                            <td>${v.power_state === 'Running' ? '🟢' : '⚫'}</td>
+                            <td>${running ? '🟢' : '⚫'}</td>
                             <td><strong>${escapeHtml(v.name)}</strong>${v.tags && v.tags.length ? `<div style="font-size:10px;color:var(--text-muted);">${v.tags.map(t => escapeHtml(t)).join(', ')}</div>` : ''}</td>
                             <td><span style="color:${vmStateColour};font-weight:600;">${escapeHtml(v.power_state)}</span></td>
                             <td>${v.cpus || 0}</td>
                             <td>${vmMem}</td>
                             <td><code style="font-size:11px;">${v.ip_addresses && v.ip_addresses.length ? escapeHtml(v.ip_addresses.join(', ')) : '—'}</code></td>
+                            <td><div style="display:flex;gap:4px;flex-wrap:wrap;">${actions}</div></td>
                         </tr>`;
                     }).join('')}</tbody>
                 </table>`;
@@ -2237,11 +2461,179 @@ function xoInventoryHtml(inv) {
             </div>`;
         }).join('');
         return `<div style="${sectionStyle}">
-            <div style="font-weight:700;font-size:13px;margin-bottom:6px;">📦 ${escapeHtml(pool.name)} <span style="font-size:11px;color:var(--text-muted);font-weight:400;">${pool.host_count} hosts${pool.ha_enabled ? ' · HA' : ''}</span></div>
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;flex-wrap:wrap;gap:8px;">
+                <div style="font-weight:700;font-size:13px;">📦 ${escapeHtml(pool.name)} <span style="font-size:11px;color:var(--text-muted);font-weight:400;">${pool.host_count} hosts${pool.ha_enabled ? ' · HA' : ''}</span></div>
+                <button class="btn btn-sm btn-primary" onclick="xoProvisionModal('${escapeAttr(poolId)}','${escapeAttr(pool.uuid)}','${escapeAttr(pool.name)}')">+ Provision VM</button>
+            </div>
             ${hostsHtml || '<div style="color:var(--text-muted);font-style:italic;">No hosts in this pool.</div>'}
         </div>`;
     }).join('');
 }
+
+window.xoVmAction = async function(poolId, vmUuid, action, vmName) {
+    const dangerous = (action === 'hard_shutdown');
+    const confirmable = ['hard_shutdown', 'clean_shutdown', 'clean_reboot', 'suspend'];
+    const labels = {
+        start: 'start', clean_reboot: 'reboot', clean_shutdown: 'shut down',
+        hard_shutdown: 'force-halt', suspend: 'suspend', resume: 'resume',
+    };
+    if (confirmable.includes(action)) {
+        const msg = dangerous
+            ? `Force-halt "${vmName}"?\n\nThis is the equivalent of pulling the power cord. Unsaved data and in-flight writes will be lost.`
+            : `${(labels[action] || action)[0].toUpperCase()}${(labels[action] || action).slice(1)} "${vmName}"?`;
+        if (!confirm(msg)) return;
+    }
+    try {
+        const r = await fetch(apiUrl(`/api/xo/pools/${encodeURIComponent(poolId)}/vms/${encodeURIComponent(vmUuid)}/action`), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action }),
+        });
+        if (!r.ok) {
+            const body = await r.text().catch(() => '');
+            alert(`Action failed: ${body}`);
+            return;
+        }
+        // XO actions are async — give it a moment, then refetch.
+        setTimeout(() => xoFetchInventory(poolId), 1500);
+    } catch (e) {
+        alert(`Action errored: ${e.message || e}`);
+    }
+};
+
+window.xoProvisionModal = async function(poolId, _poolUuid, poolName) {
+    // Pull templates first so we can populate the dropdown.
+    let templates = [];
+    try {
+        const r = await fetch(apiUrl(`/api/xo/pools/${encodeURIComponent(poolId)}/templates`));
+        if (!r.ok) {
+            alert('Couldn\'t load templates: ' + (await r.text().catch(() => '')));
+            return;
+        }
+        templates = await r.json();
+    } catch (e) {
+        alert('Templates errored: ' + (e.message || e));
+        return;
+    }
+    if (!Array.isArray(templates) || templates.length === 0) {
+        alert(`No VM templates found in pool "${poolName}". Add a template in XO first.`);
+        return;
+    }
+    const tplOptions = templates.map(t =>
+        `<option value="${escapeAttr(t.uuid)}">${escapeHtml(t.name)}${t.os ? ' — ' + escapeHtml(t.os) : ''}${t.memory ? ' (' + Math.round(t.memory / 1048576) + ' MB)' : ''}</option>`
+    ).join('');
+
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);z-index:100000;display:flex;align-items:center;justify-content:center;';
+    overlay.onclick = e => { if (e.target === overlay) overlay.remove(); };
+    overlay.innerHTML = `
+        <div style="background:var(--bg-card,#1e2028);border:1px solid var(--border-color,#2d2f3a);border-radius:12px;padding:24px 28px;max-width:680px;width:92%;max-height:90vh;overflow-y:auto;color:var(--text-primary,#e4e4e7);font-family:inherit;">
+            <div style="font-size:16px;font-weight:600;margin-bottom:14px;display:flex;align-items:center;gap:10px;">
+                <span style="font-size:22px;">🦊</span>Provision VM in <strong>${escapeHtml(poolName)}</strong>
+            </div>
+            <div style="font-size:13px;color:var(--text-secondary,#a1a1aa);margin-bottom:14px;line-height:1.5;">
+                Clone a template and (optionally) auto-install WolfStack on first boot. The cloud-init payload sets the
+                hostname, runs <code>setup.sh</code>, configures WolfNet with MTU 1380, and joins the chosen cluster.
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+                <div style="grid-column:1 / -1;">
+                    <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.05em;">Template</label>
+                    <select id="xo-prov-template" style="width:100%;background:var(--bg-input,#0d1225);border:1px solid var(--border-color,#2d2f3a);border-radius:6px;padding:10px 12px;color:var(--text-primary,#e4e4e7);font-family:inherit;font-size:13px;">${tplOptions}</select>
+                </div>
+                <div style="grid-column:1 / -1;">
+                    <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.05em;">VM name</label>
+                    <input id="xo-prov-name" placeholder="customer-A-leader" style="width:100%;background:var(--bg-input,#0d1225);border:1px solid var(--border-color,#2d2f3a);border-radius:6px;padding:10px 12px;color:var(--text-primary,#e4e4e7);font-family:inherit;font-size:13px;">
+                </div>
+                <div>
+                    <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.05em;">CPUs</label>
+                    <input id="xo-prov-cpus" type="number" min="1" placeholder="(template default)" style="width:100%;background:var(--bg-input,#0d1225);border:1px solid var(--border-color,#2d2f3a);border-radius:6px;padding:10px 12px;color:var(--text-primary,#e4e4e7);font-family:inherit;font-size:13px;">
+                </div>
+                <div>
+                    <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.05em;">Memory (MB)</label>
+                    <input id="xo-prov-mem" type="number" min="256" placeholder="(template default)" style="width:100%;background:var(--bg-input,#0d1225);border:1px solid var(--border-color,#2d2f3a);border-radius:6px;padding:10px 12px;color:var(--text-primary,#e4e4e7);font-family:inherit;font-size:13px;">
+                </div>
+            </div>
+            <div style="margin-top:18px;padding:12px 14px;border:1px solid var(--border-color,#2d2f3a);border-radius:8px;background:var(--bg-secondary,#16181f);">
+                <label style="font-size:13px;display:flex;align-items:center;gap:8px;cursor:pointer;">
+                    <input type="checkbox" id="xo-prov-autoinstall" checked>
+                    <strong>Auto-install WolfStack on first boot</strong>
+                </label>
+                <div style="font-size:11px;color:var(--text-muted);margin-top:4px;margin-left:24px;">Generates a cloud-init payload that runs <code>setup.sh</code>, sets WolfNet MTU 1380, and (optionally) joins a cluster + registers federation.</div>
+                <div id="xo-prov-bootstrap-fields" style="margin-top:12px;display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+                    <div style="grid-column:1 / -1;">
+                        <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.05em;">Cluster secret <span style="text-transform:none;color:var(--text-muted);">(empty = create a fresh cluster)</span></label>
+                        <input id="xo-prov-cluster-secret" placeholder="paste from existing cluster, or leave empty" style="width:100%;background:var(--bg-input,#0d1225);border:1px solid var(--border-color,#2d2f3a);border-radius:6px;padding:8px 12px;color:var(--text-primary,#e4e4e7);font-family:inherit;font-size:12px;">
+                    </div>
+                    <div style="grid-column:1 / -1;">
+                        <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.05em;">Cluster leader endpoint <span style="text-transform:none;color:var(--text-muted);">(host:port — required when joining)</span></label>
+                        <input id="xo-prov-cluster-leader" placeholder="customer-A-leader:8553" style="width:100%;background:var(--bg-input,#0d1225);border:1px solid var(--border-color,#2d2f3a);border-radius:6px;padding:8px 12px;color:var(--text-primary,#e4e4e7);font-family:inherit;font-size:12px;">
+                    </div>
+                    <div>
+                        <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.05em;">SP federation URL <span style="text-transform:none;color:var(--text-muted);">(optional)</span></label>
+                        <input id="xo-prov-federation-url" placeholder="https://sp.example.com:8553" style="width:100%;background:var(--bg-input,#0d1225);border:1px solid var(--border-color,#2d2f3a);border-radius:6px;padding:8px 12px;color:var(--text-primary,#e4e4e7);font-family:inherit;font-size:12px;">
+                    </div>
+                    <div>
+                        <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.05em;">Federation token <span style="text-transform:none;color:var(--text-muted);">(optional)</span></label>
+                        <input id="xo-prov-federation-token" type="password" placeholder="from /api/federation/tokens" style="width:100%;background:var(--bg-input,#0d1225);border:1px solid var(--border-color,#2d2f3a);border-radius:6px;padding:8px 12px;color:var(--text-primary,#e4e4e7);font-family:inherit;font-size:12px;">
+                    </div>
+                </div>
+            </div>
+            <div id="xo-prov-error" style="display:none;color:var(--danger);font-size:12px;margin-top:10px;"></div>
+            <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:18px;">
+                <button class="btn" id="xo-prov-cancel">Cancel</button>
+                <button class="btn btn-primary" id="xo-prov-submit">Provision</button>
+            </div>
+        </div>`;
+    document.body.appendChild(overlay);
+    document.getElementById('xo-prov-name').focus();
+    document.getElementById('xo-prov-cancel').onclick = () => overlay.remove();
+    const ai = document.getElementById('xo-prov-autoinstall');
+    const bf = document.getElementById('xo-prov-bootstrap-fields');
+    ai.onchange = () => { bf.style.display = ai.checked ? 'grid' : 'none'; };
+    document.getElementById('xo-prov-submit').onclick = async () => {
+        const errEl = document.getElementById('xo-prov-error');
+        errEl.style.display = 'none';
+        const template_uuid = document.getElementById('xo-prov-template').value;
+        const vm_name = document.getElementById('xo-prov-name').value.trim();
+        if (!vm_name) { errEl.textContent = 'VM name is required.'; errEl.style.display = ''; return; }
+        const payload = {
+            template_uuid,
+            vm_name,
+            cpus: parseInt(document.getElementById('xo-prov-cpus').value) || 0,
+            memory_mb: parseInt(document.getElementById('xo-prov-mem').value) || 0,
+            auto_install_wolfstack: ai.checked,
+            cluster_secret: ai.checked ? document.getElementById('xo-prov-cluster-secret').value.trim() : '',
+            cluster_leader_endpoint: ai.checked ? document.getElementById('xo-prov-cluster-leader').value.trim() : '',
+            federation_url: ai.checked ? document.getElementById('xo-prov-federation-url').value.trim() : '',
+            federation_token: ai.checked ? document.getElementById('xo-prov-federation-token').value.trim() : '',
+        };
+        const submitBtn = document.getElementById('xo-prov-submit');
+        submitBtn.disabled = true;
+        submitBtn.textContent = 'Provisioning…';
+        try {
+            const r = await fetch(apiUrl(`/api/xo/pools/${encodeURIComponent(poolId)}/vms`), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+            });
+            if (!r.ok) {
+                const body = await r.text().catch(() => '');
+                errEl.textContent = 'Provision failed: ' + body;
+                errEl.style.display = '';
+                submitBtn.disabled = false;
+                submitBtn.textContent = 'Provision';
+                return;
+            }
+            overlay.remove();
+            await xoFetchInventory(poolId);
+        } catch (e) {
+            errEl.textContent = 'Network error: ' + (e.message || e);
+            errEl.style.display = '';
+            submitBtn.disabled = false;
+            submitBtn.textContent = 'Provision';
+        }
+    };
+};
 
 window.xoRegisterModal = function() {
     // Build a self-contained registration modal — wolfstack's
@@ -50626,6 +51018,10 @@ const APP_DRAWER_TILES = [
     {
         id: 'xopools', icon: '🦊', name: 'XO Pools',
         desc: 'Drive XCP-ng pools through Xen Orchestra — pools, hosts, VMs, templates.',
+    },
+    {
+        id: 'tenants', icon: '🏢', name: 'Tenants',
+        desc: 'Aggregator dashboard across every customer cluster you federate to.',
     },
     {
         id: 'databases', icon: '🗄️', name: 'Databases',

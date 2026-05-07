@@ -1975,6 +1975,14 @@
             <div id="xopools-content" style="padding: 8px;"></div>
         </div>
 
+        <!-- Tenant federation aggregator — SP polls each customer
+             cluster via /api/federation/status with a tenant
+             token. Page renders client-side; this is just the
+             mount point. -->
+        <div id="page-tenants" class="page-view" style="display:none;">
+            <div id="tenants-content" style="padding: 8px;"></div>
+        </div>
+
         <div id="page-cluster-browser" class="page-view" style="display:none;">
             <div class="card" style="margin-bottom:16px;">
                 <div class="card-body" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;">

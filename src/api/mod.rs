@@ -24082,6 +24082,513 @@ pub async fn xo_pools_inventory(
     }
 }
 
+#[derive(Deserialize)]
+pub struct XoVmActionRequest {
+    pub action: String,
+}
+
+/// POST /api/xo/pools/{id}/vms/{vm_uuid}/action — drive a VM
+/// lifecycle action through XO. The body's `action` is one of
+/// the strings `XoClient::vm_action` accepts. Whitelisted there
+/// to keep typo'd actions from being forwarded to XO.
+pub async fn xo_vm_action(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<(String, String)>,
+    body: web::Json<XoVmActionRequest>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let (pool_id, vm_uuid) = path.into_inner();
+    let pool = match state.xo.read().unwrap().get(&pool_id) {
+        Some(p) => p,
+        None => return HttpResponse::NotFound().json(serde_json::json!({"error": "pool not found"})),
+    };
+    let token = crate::xo::deobfuscate_token(&pool.token_enc);
+    let client = crate::xo::XoClient::new(&pool.url, &token);
+    match client.vm_action(&vm_uuid, &body.action).await {
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"status": "queued", "action": body.action})),
+        Err(e) => HttpResponse::BadGateway().json(serde_json::json!({"error": e})),
+    }
+}
+
+/// GET /api/xo/pools/{id}/templates — VM templates the operator
+/// can clone. Used by the Provision wizard (P3).
+pub async fn xo_templates_list(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let pool = match state.xo.read().unwrap().get(&id) {
+        Some(p) => p,
+        None => return HttpResponse::NotFound().json(serde_json::json!({"error": "pool not found"})),
+    };
+    let token = crate::xo::deobfuscate_token(&pool.token_enc);
+    let client = crate::xo::XoClient::new(&pool.url, &token);
+    match client.list_templates().await {
+        Ok(t) => HttpResponse::Ok().json(t),
+        Err(e) => HttpResponse::BadGateway().json(serde_json::json!({"error": e})),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct XoProvisionRequest {
+    pub template_uuid: String,
+    pub vm_name: String,
+    /// MB of RAM. Optional — XO falls back to template default.
+    #[serde(default)]
+    pub memory_mb: u32,
+    /// Number of CPUs. Optional.
+    #[serde(default)]
+    pub cpus: u32,
+    /// Optional cloud-init `user_data`. Empty string → caller does
+    /// not want WolfStack auto-installed; we only generate the
+    /// auto-install payload when `auto_install_wolfstack` is true.
+    #[serde(default)]
+    pub user_data: String,
+    /// Auto-generate a cloud-init payload that installs WolfStack
+    /// on first boot, joins it to the supplied `cluster_secret`
+    /// (creates a fresh cluster if empty), and configures WolfNet
+    /// with the right MTU + endpoint settings for an XCP-ng VM.
+    /// This is the headline P3 feature.
+    #[serde(default)]
+    pub auto_install_wolfstack: bool,
+    #[serde(default)]
+    pub cluster_secret: String,
+    #[serde(default)]
+    pub cluster_leader_endpoint: String,
+    /// Tenant federation token to register with on first boot.
+    /// When set, the new cluster automatically calls back to the
+    /// SP's WolfStack to register itself. Useful for the
+    /// "provision tenant" flow.
+    #[serde(default)]
+    pub federation_url: String,
+    #[serde(default)]
+    pub federation_token: String,
+}
+
+/// POST /api/xo/pools/{id}/vms — create a VM from a template,
+/// optionally with a cloud-init payload that auto-installs
+/// WolfStack. Returns the new VM's UUID.
+pub async fn xo_vm_provision(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<XoProvisionRequest>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let r = body.into_inner();
+    if r.template_uuid.trim().is_empty() || r.vm_name.trim().is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "template_uuid and vm_name are required"
+        }));
+    }
+    let pool = match state.xo.read().unwrap().get(&id) {
+        Some(p) => p,
+        None => return HttpResponse::NotFound().json(serde_json::json!({"error": "pool not found"})),
+    };
+    let token = crate::xo::deobfuscate_token(&pool.token_enc);
+    let client = crate::xo::XoClient::new(&pool.url, &token);
+
+    // Build the cloud-init user-data. If the caller supplied
+    // their own, we use it verbatim — otherwise the helper
+    // generates a self-installing WolfStack payload.
+    let user_data = if !r.user_data.trim().is_empty() {
+        r.user_data.clone()
+    } else if r.auto_install_wolfstack {
+        crate::xo::cloud_init::build_wolfstack_user_data(crate::xo::cloud_init::WolfStackBootstrap {
+            hostname: r.vm_name.clone(),
+            cluster_secret: r.cluster_secret.clone(),
+            cluster_leader_endpoint: r.cluster_leader_endpoint.clone(),
+            federation_url: r.federation_url.clone(),
+            federation_token: r.federation_token.clone(),
+        })
+    } else {
+        String::new()
+    };
+
+    match client.create_vm(crate::xo::CreateVmRequest {
+        template_uuid: r.template_uuid.clone(),
+        name: r.vm_name.clone(),
+        memory_mb: r.memory_mb,
+        cpus: r.cpus,
+        user_data,
+    }).await {
+        Ok(uuid) => HttpResponse::Created().json(serde_json::json!({
+            "uuid": uuid,
+            "message": format!("VM `{}` provisioned. Cloud-init is running on the VM; allow a few minutes for first-boot.", r.vm_name),
+        })),
+        Err(e) => HttpResponse::BadGateway().json(serde_json::json!({
+            "error": format!("XO refused the create call: {}", e)
+        })),
+    }
+}
+
+// ─── P4: Tenant federation aggregator ─────────────────────────────
+//
+// Each customer's WolfStack cluster registers as a "tenant" on the
+// SP's WolfStack. The SP polls `/api/federation/status` on the
+// tenant cluster with a tenant token and rolls up the answers into
+// an aggregator dashboard.
+//
+// The federation status endpoint itself is below the tenant-CRUD
+// handlers — both the SP-side WolfStack AND the customer-side
+// WolfStack ship the same code, so the customer's cluster gets the
+// status endpoint for free; the SP only uses the CRUD side.
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Tenant {
+    pub id: String,
+    pub name: String,
+    /// Public URL the SP polls. e.g. `https://customerA.wolfstack:8553`.
+    pub url: String,
+    /// Bearer token the customer cluster minted; SP sends it as
+    /// `Authorization: Bearer <token>` to the federation status
+    /// endpoint. Stored XOR-obfuscated like XO tokens.
+    pub token_enc: String,
+    /// Last status row from a poll. Empty until first poll runs.
+    #[serde(default)]
+    pub last_status: String,
+    #[serde(default)]
+    pub last_seen: String,
+    #[serde(default)]
+    pub host_count: u32,
+    #[serde(default)]
+    pub vm_count: u32,
+    #[serde(default)]
+    pub container_count: u32,
+    #[serde(default)]
+    pub mem_total_mb: u64,
+    #[serde(default)]
+    pub mem_used_mb: u64,
+    #[serde(default)]
+    pub cpu_pct: f32,
+}
+
+const TENANTS_FILE: &str = "/etc/wolfstack/tenants.json";
+
+fn load_tenants() -> Vec<Tenant> {
+    match std::fs::read_to_string(TENANTS_FILE) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn save_tenants(tenants: &[Tenant]) -> Result<(), String> {
+    let s = serde_json::to_string_pretty(tenants).map_err(|e| format!("serialize: {}", e))?;
+    let _ = std::fs::create_dir_all("/etc/wolfstack");
+    let tmp = format!("{}.tmp", TENANTS_FILE);
+    std::fs::write(&tmp, &s).map_err(|e| format!("write: {}", e))?;
+    std::fs::rename(&tmp, TENANTS_FILE).map_err(|e| format!("rename: {}", e))?;
+    Ok(())
+}
+
+#[derive(Deserialize)]
+pub struct TenantRegisterRequest {
+    pub name: String,
+    pub url: String,
+    pub token: String,
+}
+
+/// GET /api/tenants — list registered tenants. Token never leaves
+/// the backend.
+pub async fn tenants_list(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let tenants = load_tenants();
+    let safe: Vec<serde_json::Value> = tenants.into_iter().map(|t| serde_json::json!({
+        "id": t.id, "name": t.name, "url": t.url,
+        "last_status": t.last_status, "last_seen": t.last_seen,
+        "host_count": t.host_count, "vm_count": t.vm_count,
+        "container_count": t.container_count,
+        "mem_total_mb": t.mem_total_mb, "mem_used_mb": t.mem_used_mb,
+        "cpu_pct": t.cpu_pct,
+    })).collect();
+    HttpResponse::Ok().json(safe)
+}
+
+/// POST /api/tenants — register a tenant cluster. Probes
+/// federation status before persisting; bad URL or rejected token
+/// → 502, nothing saved (mirror of the XO Pools register flow).
+pub async fn tenants_register(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<TenantRegisterRequest>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let r = body.into_inner();
+    if r.name.trim().is_empty() || r.url.trim().is_empty() || r.token.trim().is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "name, url and token are all required"
+        }));
+    }
+    // Probe before persist — avoids storing tokens that don't
+    // actually authenticate.
+    match probe_federation_status(&r.url, &r.token).await {
+        Ok(_) => {}
+        Err(e) => return HttpResponse::BadGateway().json(serde_json::json!({
+            "error": format!("Couldn't reach the tenant federation endpoint: {}", e)
+        })),
+    }
+    let mut tenants = load_tenants();
+    let t = Tenant {
+        id: uuid::Uuid::new_v4().to_string(),
+        name: r.name.trim().to_string(),
+        url: r.url.trim().trim_end_matches('/').to_string(),
+        token_enc: crate::xo::obfuscate_token(r.token.trim()),
+        last_status: "ok".into(),
+        last_seen: chrono::Utc::now().to_rfc3339(),
+        host_count: 0, vm_count: 0, container_count: 0,
+        mem_total_mb: 0, mem_used_mb: 0, cpu_pct: 0.0,
+    };
+    let id = t.id.clone();
+    tenants.push(t);
+    if let Err(e) = save_tenants(&tenants) {
+        return HttpResponse::InternalServerError().json(serde_json::json!({"error": e}));
+    }
+    HttpResponse::Created().json(serde_json::json!({"id": id}))
+}
+
+/// DELETE /api/tenants/{id} — unregister.
+pub async fn tenants_delete(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let mut tenants = load_tenants();
+    let before = tenants.len();
+    tenants.retain(|t| t.id != id);
+    if tenants.len() == before {
+        return HttpResponse::NotFound().json(serde_json::json!({"error": "tenant not found"}));
+    }
+    if let Err(e) = save_tenants(&tenants) {
+        return HttpResponse::InternalServerError().json(serde_json::json!({"error": e}));
+    }
+    HttpResponse::Ok().json(serde_json::json!({"status": "removed"}))
+}
+
+/// POST /api/tenants/{id}/refresh — re-poll a single tenant.
+pub async fn tenants_refresh(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let mut tenants = load_tenants();
+    let t = match tenants.iter_mut().find(|t| t.id == id) {
+        Some(x) => x,
+        None => return HttpResponse::NotFound().json(serde_json::json!({"error": "tenant not found"})),
+    };
+    let token = crate::xo::deobfuscate_token(&t.token_enc);
+    match probe_federation_status(&t.url, &token).await {
+        Ok(snap) => {
+            t.last_status = "ok".into();
+            t.last_seen = chrono::Utc::now().to_rfc3339();
+            t.host_count = snap.host_count;
+            t.vm_count = snap.vm_count;
+            t.container_count = snap.container_count;
+            t.mem_total_mb = snap.mem_total_mb;
+            t.mem_used_mb = snap.mem_used_mb;
+            t.cpu_pct = snap.cpu_pct;
+            let _ = save_tenants(&tenants);
+            HttpResponse::Ok().json(snap)
+        }
+        Err(e) => {
+            t.last_status = if e.contains("401") { "auth_failed".into() } else { "unreachable".into() };
+            let _ = save_tenants(&tenants);
+            HttpResponse::BadGateway().json(serde_json::json!({"error": e}))
+        }
+    }
+}
+
+/// Federation status payload — the tenant-side endpoint and the
+/// SP-side poll both round-trip this struct.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FederationStatus {
+    pub host_count: u32,
+    pub vm_count: u32,
+    pub container_count: u32,
+    pub mem_total_mb: u64,
+    pub mem_used_mb: u64,
+    pub cpu_pct: f32,
+    pub wolfstack_version: String,
+    pub timestamp: String,
+}
+
+async fn probe_federation_status(url: &str, token: &str) -> Result<FederationStatus, String> {
+    let url = format!("{}/api/federation/status", url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("HTTP client: {}", e))?;
+    let resp = client.get(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .send().await
+        .map_err(|e| format!("request: {}", e))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err("tenant rejected token (401)".into());
+    }
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("HTTP {}: {}", status, body.chars().take(200).collect::<String>()));
+    }
+    let body = resp.text().await.map_err(|e| format!("read: {}", e))?;
+    serde_json::from_str(&body).map_err(|e| format!("JSON parse: {} ({})", e, body.chars().take(200).collect::<String>()))
+}
+
+/// GET /api/federation/status — TENANT-SIDE endpoint. The SP
+/// WolfStack polls this with a tenant token. Returns a snapshot
+/// of this cluster's inventory + current usage so the SP's
+/// aggregator dashboard can roll it up.
+///
+/// Auth: bearer token must match an entry in
+/// `/etc/wolfstack/federation_tokens.json` (one per SP that
+/// federates this cluster). Tokens are managed by the cluster's
+/// admin in the Settings UI.
+pub async fn federation_status(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    // Bearer token from Authorization header.
+    let auth = req.headers().get("authorization").and_then(|h| h.to_str().ok()).unwrap_or("");
+    let token = auth.strip_prefix("Bearer ").unwrap_or("").trim();
+    if token.is_empty() {
+        return HttpResponse::Unauthorized().json(serde_json::json!({"error": "missing bearer token"}));
+    }
+    let valid_tokens = load_federation_tokens();
+    if !valid_tokens.iter().any(|t| t == token) {
+        return HttpResponse::Unauthorized().json(serde_json::json!({"error": "token not authorised"}));
+    }
+
+    // Compose a snapshot from existing in-process state.
+    let mut host_count: u32 = 1; // self always counts
+    let mut container_count: u32 = 0;
+    let mut vm_count: u32 = 0;
+    let mut mem_total_mb: u64 = 0;
+    let mut mem_used_mb: u64 = 0;
+    let mut cpu_pct: f32 = 0.0;
+
+    // Cluster nodes
+    if let Some(cluster) = state.cached_status.read().ok().and_then(|c| c.clone()) {
+        if let Some(nodes) = cluster.get("nodes").and_then(|n| n.as_array()) {
+            host_count = nodes.len() as u32;
+        }
+    }
+
+    // Self metrics from SystemMonitor.collect — same call the
+    // dashboard uses, refreshes CPU + memory in place. Holding
+    // the lock across `collect()` is fine because the call is
+    // microseconds long.
+    if let Ok(mut monitor) = state.monitor.lock() {
+        let m = monitor.collect();
+        mem_total_mb = m.memory_total_bytes / 1024 / 1024;
+        mem_used_mb = m.memory_used_bytes / 1024 / 1024;
+        cpu_pct = m.cpu_usage_percent;
+    }
+
+    // Containers / VMs aren't free to compute on demand, so we
+    // cheap them: read from cached cluster status if present.
+    if let Some(cluster) = state.cached_status.read().ok().and_then(|c| c.clone()) {
+        if let Some(arr) = cluster.get("nodes").and_then(|n| n.as_array()) {
+            for n in arr {
+                container_count += n.get("lxc_count").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                container_count += n.get("docker_count").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                vm_count += n.get("kvm_count").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+            }
+        }
+    }
+
+    let snap = FederationStatus {
+        host_count, vm_count, container_count,
+        mem_total_mb, mem_used_mb, cpu_pct,
+        wolfstack_version: env!("CARGO_PKG_VERSION").to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+    };
+    HttpResponse::Ok().json(snap)
+}
+
+const FEDERATION_TOKENS_FILE: &str = "/etc/wolfstack/federation_tokens.json";
+
+fn load_federation_tokens() -> Vec<String> {
+    match std::fs::read_to_string(FEDERATION_TOKENS_FILE) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn save_federation_tokens(tokens: &[String]) -> Result<(), String> {
+    let s = serde_json::to_string_pretty(tokens).map_err(|e| format!("serialize: {}", e))?;
+    let _ = std::fs::create_dir_all("/etc/wolfstack");
+    let tmp = format!("{}.tmp", FEDERATION_TOKENS_FILE);
+    std::fs::write(&tmp, &s).map_err(|e| format!("write: {}", e))?;
+    std::fs::rename(&tmp, FEDERATION_TOKENS_FILE).map_err(|e| format!("rename: {}", e))?;
+    Ok(())
+}
+
+/// GET /api/federation/tokens — admin-only, list issued tokens
+/// (just first 8 chars of each) so the operator can see what's
+/// authorised without leaking the secrets.
+pub async fn federation_tokens_list(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let tokens = load_federation_tokens();
+    let masked: Vec<String> = tokens.into_iter()
+        .map(|t| if t.len() <= 8 { t } else { format!("{}…", &t[..8]) })
+        .collect();
+    HttpResponse::Ok().json(masked)
+}
+
+/// POST /api/federation/tokens — mint a new federation token.
+/// Operator gives this to the SP; SP pastes it into their
+/// "Add tenant" form.
+pub async fn federation_tokens_create(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let token: String = (0..48)
+        .map(|_| {
+            let n: u8 = rng.gen_range(0..62);
+            match n {
+                0..=9 => (b'0' + n) as char,
+                10..=35 => (b'a' + (n - 10)) as char,
+                _ => (b'A' + (n - 36)) as char,
+            }
+        })
+        .collect();
+    let mut tokens = load_federation_tokens();
+    tokens.push(token.clone());
+    if let Err(e) = save_federation_tokens(&tokens) {
+        return HttpResponse::InternalServerError().json(serde_json::json!({"error": e}));
+    }
+    HttpResponse::Created().json(serde_json::json!({
+        "token": token,
+        "warning": "This is the only time the token will be shown. Copy it now.",
+    }))
+}
+
+/// DELETE /api/federation/tokens/{prefix} — revoke a token by its
+/// first-8-char prefix (the visible part in the list).
+pub async fn federation_tokens_revoke(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let prefix = path.into_inner();
+    let mut tokens = load_federation_tokens();
+    let before = tokens.len();
+    tokens.retain(|t| !t.starts_with(&prefix));
+    if tokens.len() == before {
+        return HttpResponse::NotFound().json(serde_json::json!({"error": "no token with that prefix"}));
+    }
+    if let Err(e) = save_federation_tokens(&tokens) {
+        return HttpResponse::InternalServerError().json(serde_json::json!({"error": e}));
+    }
+    HttpResponse::Ok().json(serde_json::json!({"status": "revoked", "removed": before - tokens.len()}))
+}
+
 /// Configure all API routes
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg
@@ -24793,6 +25300,23 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/xo/pools/{id}", web::delete().to(xo_pools_delete))
         .route("/api/xo/pools/{id}/test", web::post().to(xo_pools_test))
         .route("/api/xo/pools/{id}/inventory", web::get().to(xo_pools_inventory))
+        .route("/api/xo/pools/{id}/vms/{vm_uuid}/action", web::post().to(xo_vm_action))
+        .route("/api/xo/pools/{id}/templates", web::get().to(xo_templates_list))
+        .route("/api/xo/pools/{id}/vms", web::post().to(xo_vm_provision))
+        // Tenant federation aggregator (P4). The SP-side WolfStack
+        // polls each registered tenant's /api/federation/status.
+        .route("/api/tenants", web::get().to(tenants_list))
+        .route("/api/tenants", web::post().to(tenants_register))
+        .route("/api/tenants/{id}", web::delete().to(tenants_delete))
+        .route("/api/tenants/{id}/refresh", web::post().to(tenants_refresh))
+        // Federation status — TENANT-SIDE endpoint. Bearer-token
+        // auth, returns this cluster's snapshot. Same code on
+        // both SP and customer wolfstack — only the customer
+        // mints tokens and only the SP polls.
+        .route("/api/federation/status", web::get().to(federation_status))
+        .route("/api/federation/tokens", web::get().to(federation_tokens_list))
+        .route("/api/federation/tokens", web::post().to(federation_tokens_create))
+        .route("/api/federation/tokens/{prefix}", web::delete().to(federation_tokens_revoke))
         // Platform calibration & access tokens
         .route("/api/platform/status", web::get().to(platform_status))
         .route("/api/platform/apply", web::post().to(platform_apply))
