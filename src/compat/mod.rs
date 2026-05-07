@@ -178,10 +178,42 @@ pub fn resolve_tier(dm: &PlatformManifest) -> &'static str {
 
 /// True when the licence grants access to a named feature
 /// (e.g. "sso", "api_keys", "plugins", "wolfcustom", "wolfhost").
+///
+/// Two ways a licence can grant a feature:
+///   1. The literal feature string is in `dm.features` — the
+///      explicit per-feature flag added by the billing webhook.
+///   2. The licence's tier bundles the feature implicitly. This
+///      matters because pre-v22.8.0 Enterprise licences were issued
+///      without a `features` list at all (Enterprise was "everything"
+///      back then) — without tier inheritance, every plugin gate
+///      silently denies them after upgrade.
+///
+/// Tier bundles:
+///   * Enterprise — every feature. The contract is "all of WolfStack",
+///     full stop. Hard-coding a feature whitelist here would mean each
+///     new feature retroactively breaks existing Enterprise installs
+///     until a manifest is reissued.
+///   * Pro — `plugins`, `api_keys`, `wolfhost`. Anything that's
+///     "Pro+" in the marketing copy.
+///   * Homelab / community — explicit features only.
 pub fn has_feature(name: &str) -> bool {
     match load_dm() {
-        Some(dm) => dm.features.iter().any(|f| f == name),
+        Some(dm) => manifest_has_feature(&dm, name),
         None => false,
+    }
+}
+
+/// Pure inspection: same logic as `has_feature` but operating on a
+/// caller-supplied manifest. Split out so unit tests can exercise the
+/// tier-inheritance rules without reading from disk.
+fn manifest_has_feature(dm: &PlatformManifest, name: &str) -> bool {
+    if dm.features.iter().any(|f| f == name) {
+        return true;
+    }
+    match resolve_tier(dm) {
+        "enterprise" => true,
+        "pro" => matches!(name, "plugins" | "api_keys" | "wolfhost"),
+        _ => false,
     }
 }
 
@@ -559,5 +591,71 @@ mod tests {
     #[test]
     fn test_probe() {
         let _ = probe_runtime();
+    }
+
+    fn dm(tier: &str, features: &[&str]) -> PlatformManifest {
+        PlatformManifest {
+            customer: String::new(),
+            email: String::new(),
+            max_nodes: 0,
+            expires: "2099-12-31".into(),
+            features: features.iter().map(|s| s.to_string()).collect(),
+            tier: tier.into(),
+        }
+    }
+
+    #[test]
+    fn enterprise_tier_grants_every_feature() {
+        let m = dm("enterprise", &[]);
+        assert!(manifest_has_feature(&m, "plugins"));
+        assert!(manifest_has_feature(&m, "wolfcustom"));
+        assert!(manifest_has_feature(&m, "sso"));
+        assert!(manifest_has_feature(&m, "anything-future"));
+    }
+
+    #[test]
+    fn pre_v22_8_enterprise_licence_with_no_tier_field_still_grants_features() {
+        // Pre-v22.8.0 the `tier` field didn't exist; resolve_tier
+        // falls through to "enterprise" when neither the tier field
+        // nor a homelab/pro marker is present in features. Those
+        // legacy licences must keep working — without inheritance
+        // here, every plugin gate would silently deny them after the
+        // upgrade. (PapaSchlumpf bug, 2026-05-07.)
+        let m = dm("", &[]);
+        assert_eq!(resolve_tier(&m), "enterprise");
+        assert!(manifest_has_feature(&m, "plugins"));
+    }
+
+    #[test]
+    fn pro_tier_grants_pro_bundle_only() {
+        let m = dm("pro", &[]);
+        assert!(manifest_has_feature(&m, "plugins"));
+        assert!(manifest_has_feature(&m, "api_keys"));
+        assert!(manifest_has_feature(&m, "wolfhost"));
+        // Enterprise-only feature stays gated for Pro.
+        assert!(!manifest_has_feature(&m, "wolfcustom"));
+        assert!(!manifest_has_feature(&m, "sso"));
+    }
+
+    #[test]
+    fn homelab_tier_grants_only_explicit_features() {
+        let m = dm("homelab", &[]);
+        assert!(!manifest_has_feature(&m, "plugins"));
+        assert!(!manifest_has_feature(&m, "api_keys"));
+
+        // Explicit per-feature flag still works (e.g. a hand-issued
+        // licence with one paid add-on).
+        let m_with_plugins = dm("homelab", &["plugins"]);
+        assert!(manifest_has_feature(&m_with_plugins, "plugins"));
+        assert!(!manifest_has_feature(&m_with_plugins, "api_keys"));
+    }
+
+    #[test]
+    fn explicit_feature_flag_still_wins_over_tier() {
+        // A community licence with an explicit feature flag (e.g. a
+        // hand-issued sponsor licence) keeps that feature regardless
+        // of tier — explicit grants are additive, never restrictive.
+        let m = dm("homelab", &["wolfcustom"]);
+        assert!(manifest_has_feature(&m, "wolfcustom"));
     }
 }
