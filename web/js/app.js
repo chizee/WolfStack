@@ -1897,6 +1897,10 @@ function selectView(page) {
         cpInit();
     } else if (page === 'array') {
         arrayLoad();
+    } else if (page === 'xopools') {
+        renderXoPools();
+    } else if (page === 'tenants') {
+        renderTenants();
     }
 
     // Restore task log toggle button when leaving topology
@@ -2051,8 +2055,12 @@ function selectServerView(nodeId, view) {
     if (view === 'wolfkube') loadNodeWolfKube().finally(() => hidePageLoadingOverlay(el));
     if (view === 'wolfram') loadWolframStatus().finally(() => hidePageLoadingOverlay(el));
     if (view === 'wolfusb') loadWolfUsbPage().finally(() => hidePageLoadingOverlay(el));
-    if (view === 'xopools') renderXoPools().finally(() => hidePageLoadingOverlay(el));
-    if (view === 'tenants') renderTenants().finally(() => hidePageLoadingOverlay(el));
+    // XCP-ng / Xen Orchestra pools and Tenants are *cluster-wide*
+    // views (not per-node) so they only dispatch from the
+    // top-level selectView, never from selectServerView. The
+    // drawer click → appDrawerNav → selectView path is the only
+    // way they're reached. Listing them here would be dead code
+    // and a confusing noise hint to anyone reading.
 }
 
 // ─── Tenant federation aggregator (SP-side dashboard) ────────────
