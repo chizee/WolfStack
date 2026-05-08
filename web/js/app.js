@@ -49945,61 +49945,86 @@ async function osvSettingsOpen() {
     const enabled = cfg.enabled !== false;
     const sevOpt = (v, label, hint) =>
         `<option value="${v}"${sevFloor === v ? ' selected' : ''}>${label} — ${hint}</option>`;
-    const html = `
-        <div style="font-size:13px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px;">
-            Tune the noise floor for OSV.dev CVE findings. These knobs apply <strong>after</strong> the scan —
-            the scanner still queries OSV the same way; it just decides what to show in the inbox.
-        </div>
-        <div style="display:flex;flex-direction:column;gap:14px;">
-            <label style="display:flex;flex-direction:column;gap:4px;">
-                <span style="font-size:12px;color:var(--text-primary);font-weight:600;">Scanner</span>
-                <select id="osv-cfg-enabled" style="background:var(--bg-tertiary);color:var(--text-primary);border:1px solid var(--border-color);border-radius:6px;padding:6px 10px;font-size:13px;">
-                    <option value="true" ${enabled ? 'selected' : ''}>Enabled</option>
-                    <option value="false" ${enabled ? '' : 'selected'}>Disabled</option>
-                </select>
-                <span style="font-size:11px;color:var(--text-muted);">Disabling stops OSV inventory + HTTP queries entirely. The distro-pocket scanner still runs.</span>
-            </label>
-            <label style="display:flex;flex-direction:column;gap:4px;">
-                <span style="font-size:12px;color:var(--text-primary);font-weight:600;">Severity floor</span>
-                <select id="osv-cfg-floor" style="background:var(--bg-tertiary);color:var(--text-primary);border:1px solid var(--border-color);border-radius:6px;padding:6px 10px;font-size:13px;" ${kevOnly ? 'disabled' : ''}>
-                    ${sevOpt('critical', 'Critical', 'CVSS ≥ 9.0, KEV-listed, or critical-class package')}
-                    ${sevOpt('high',     'High',     'CVSS ≥ 7.0 + Critical (recommended)')}
-                    ${sevOpt('warn',     'Warn',     'CVSS ≥ 4.0 — every scored CVE')}
-                    ${sevOpt('info',     'All',      'every finding, including unscored')}
-                </select>
-                <span style="font-size:11px;color:var(--text-muted);">KEV-listed CVEs always surface, regardless of the floor.</span>
-            </label>
-            <label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;">
-                <input id="osv-cfg-suppress-no-fix" type="checkbox" ${suppressNoFix ? 'checked' : ''} style="margin-top:2px;">
-                <span style="font-size:12px;color:var(--text-primary);">
-                    <strong>Hide CVEs awaiting an upstream fix</strong>
-                    <span style="display:block;font-size:11px;color:var(--text-muted);font-weight:normal;margin-top:2px;">
-                        When OSV has no patched version yet, hide the finding until a fix is published.
-                        KEV-listed and Critical findings are <strong>never</strong> hidden by this filter — they need eyeballs even without a patch.
-                        The hidden count is shown on each card so you always see the real total.
-                    </span>
-                </span>
-            </label>
-            <label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;">
-                <input id="osv-cfg-kev-only" type="checkbox" ${kevOnly ? 'checked' : ''} onchange="document.getElementById('osv-cfg-floor').disabled=this.checked;">
-                <span style="font-size:12px;color:var(--text-primary);">
-                    <strong>KEV-only mode</strong>
-                    <span style="display:block;font-size:11px;color:var(--text-muted);font-weight:normal;margin-top:2px;">
-                        Show only CVEs that appear on CISA's Known Exploited Vulnerabilities list — attackers are actively exploiting these in the wild. Highest signal-to-noise; suppresses the severity-floor filter entirely.
-                    </span>
-                </span>
-            </label>
-        </div>
-        <div style="margin-top:18px;display:flex;gap:8px;justify-content:flex-end;">
-            <button class="btn btn-sm" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
-            <button class="btn btn-sm btn-primary" onclick="osvSettingsSave(this)">Save</button>
-        </div>
-    `;
-    showModal(html, '⚙ OSV scanner settings', { noOk: true });
-    // Stash the original config so the save handler can preserve fields
-    // we don't expose (endpoint, kev_endpoint, distro_overrides) without
-    // requiring the operator to retype them.
+
+    // Custom modal (NOT showModal) — showModal's body style sets
+    // `white-space:pre-wrap` + `max-height:400px` which mangles HTML
+    // forms (whitespace artifacts + clipping). Same pattern as the
+    // Pool wizard and tenant-register modal; keeps the form properly
+    // sized and styled.
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);z-index:100000;display:flex;align-items:center;justify-content:center;animation:fadeIn 0.15s ease;';
+    overlay.onclick = e => { if (e.target === overlay) overlay.remove(); };
+
+    overlay.innerHTML = `
+        <div style="background:var(--bg-card,#1e2028);border:1px solid var(--border-color,#2d2f3a);border-radius:12px;padding:22px 26px;max-width:560px;width:94%;max-height:92vh;overflow-y:auto;color:var(--text-primary,#e4e4e7);font-family:inherit;box-shadow:0 20px 60px rgba(0,0,0,0.5);">
+            <div style="font-size:16px;font-weight:600;margin-bottom:8px;display:flex;align-items:center;gap:10px;color:var(--text-primary,#e4e4e7);">
+                <span style="font-size:22px;">⚙</span>OSV scanner settings
+            </div>
+            <div style="font-size:12px;color:var(--text-secondary,#a1a1aa);line-height:1.55;margin-bottom:18px;">
+                Tune the noise floor for OSV.dev CVE findings. These knobs apply <strong>after</strong> the scan — the scanner still queries OSV the same way; it just decides what to show in the inbox.
+            </div>
+
+            <div style="display:flex;flex-direction:column;gap:14px;">
+
+                <div>
+                    <label for="osv-cfg-enabled" style="display:block;font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px;">Scanner</label>
+                    <select id="osv-cfg-enabled" style="width:100%;background:var(--bg-input,#0d1225);border:1px solid var(--border-color,#2d2f3a);border-radius:6px;padding:9px 11px;color:var(--text-primary,#e4e4e7);font-family:inherit;font-size:13px;">
+                        <option value="true" ${enabled ? 'selected' : ''}>Enabled</option>
+                        <option value="false" ${enabled ? '' : 'selected'}>Disabled</option>
+                    </select>
+                    <div style="font-size:11px;color:var(--text-muted);margin-top:5px;line-height:1.45;">Disabling stops OSV inventory + HTTP queries entirely. The distro-pocket scanner still runs.</div>
+                </div>
+
+                <div>
+                    <label for="osv-cfg-floor" style="display:block;font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px;">Severity floor</label>
+                    <select id="osv-cfg-floor" style="width:100%;background:var(--bg-input,#0d1225);border:1px solid var(--border-color,#2d2f3a);border-radius:6px;padding:9px 11px;color:var(--text-primary,#e4e4e7);font-family:inherit;font-size:13px;${kevOnly ? 'opacity:0.5;cursor:not-allowed;' : ''}" ${kevOnly ? 'disabled' : ''}>
+                        ${sevOpt('critical', 'Critical', 'CVSS ≥ 9.0, KEV-listed, or critical-class package')}
+                        ${sevOpt('high',     'High',     'CVSS ≥ 7.0 + Critical (recommended)')}
+                        ${sevOpt('warn',     'Warn',     'CVSS ≥ 4.0 — every scored CVE')}
+                        ${sevOpt('info',     'All',      'every finding, including unscored')}
+                    </select>
+                    <div style="font-size:11px;color:var(--text-muted);margin-top:5px;line-height:1.45;">KEV-listed CVEs always surface regardless of the floor.</div>
+                </div>
+
+                <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;background:var(--bg-input,#0d1225);border:1px solid var(--border-color,#2d2f3a);border-radius:8px;padding:12px 14px;transition:border-color 0.12s;"
+                       onmouseenter="this.style.borderColor='var(--accent,#3b82f6)';"
+                       onmouseleave="this.style.borderColor='var(--border-color,#2d2f3a)';">
+                    <input id="osv-cfg-suppress-no-fix" type="checkbox" ${suppressNoFix ? 'checked' : ''} style="margin-top:2px;cursor:pointer;width:16px;height:16px;flex-shrink:0;accent-color:var(--accent,#3b82f6);">
+                    <div style="min-width:0;">
+                        <div style="font-size:13px;color:var(--text-primary,#e4e4e7);font-weight:600;">Hide CVEs awaiting an upstream fix</div>
+                        <div style="font-size:11px;color:var(--text-muted);margin-top:4px;line-height:1.5;">When OSV has no patched version yet, hide the finding until a fix is published. KEV-listed and Critical findings are <strong>never</strong> hidden by this filter — they need eyeballs even without a patch. The hidden count is shown on each card so you always see the real total.</div>
+                    </div>
+                </label>
+
+                <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;background:var(--bg-input,#0d1225);border:1px solid var(--border-color,#2d2f3a);border-radius:8px;padding:12px 14px;transition:border-color 0.12s;"
+                       onmouseenter="this.style.borderColor='var(--accent,#3b82f6)';"
+                       onmouseleave="this.style.borderColor='var(--border-color,#2d2f3a)';">
+                    <input id="osv-cfg-kev-only" type="checkbox" ${kevOnly ? 'checked' : ''}
+                           onchange="(()=>{const f=document.getElementById('osv-cfg-floor');f.disabled=this.checked;f.style.opacity=this.checked?'0.5':'';f.style.cursor=this.checked?'not-allowed':'';})()"
+                           style="margin-top:2px;cursor:pointer;width:16px;height:16px;flex-shrink:0;accent-color:var(--accent,#3b82f6);">
+                    <div style="min-width:0;">
+                        <div style="font-size:13px;color:var(--text-primary,#e4e4e7);font-weight:600;">KEV-only mode</div>
+                        <div style="font-size:11px;color:var(--text-muted);margin-top:4px;line-height:1.5;">Show only CVEs that appear on CISA's Known Exploited Vulnerabilities list — attackers are actively exploiting these in the wild. Highest signal-to-noise; suppresses the severity-floor filter entirely.</div>
+                    </div>
+                </label>
+
+            </div>
+
+            <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:22px;padding-top:16px;border-top:1px solid var(--border-color,#2d2f3a);">
+                <button class="btn" id="osv-cfg-cancel" style="font-size:13px;">Cancel</button>
+                <button class="btn btn-primary" id="osv-cfg-save" style="font-size:13px;">Save</button>
+            </div>
+        </div>`;
+    document.body.appendChild(overlay);
+
+    // Stash the original config so the save handler can preserve
+    // fields we don't expose (endpoint, kev_endpoint, distro_overrides)
+    // without requiring the operator to retype them.
     window._osvCfgOriginal = cfg;
+
+    document.getElementById('osv-cfg-cancel').onclick = () => overlay.remove();
+    document.getElementById('osv-cfg-save').onclick = (ev) => osvSettingsSave(ev.currentTarget);
 }
 
 async function osvSettingsSave(btn) {
