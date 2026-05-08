@@ -925,6 +925,11 @@ function showModal(message, title, opts) {
     overlay.onclick = function (e) { if (e.target === overlay) overlay.remove(); };
     modal.appendChild(h);
     modal.appendChild(body);
+    // Host: fullscreenElement when a page is fullscreened (e.g. DB
+    // editor); otherwise <body>. A modal attached to <body> while
+    // something is fullscreen is painted behind the fullscreen layer
+    // and is invisible until the operator exits fullscreen.
+    var host = document.fullscreenElement || document.body;
     if (!opts.noOk) {
         var btnWrap = document.createElement('div');
         btnWrap.style.cssText = 'margin-top:18px;text-align:right';
@@ -937,11 +942,11 @@ function showModal(message, title, opts) {
         btnWrap.appendChild(btn);
         modal.appendChild(btnWrap);
         overlay.appendChild(modal);
-        document.body.appendChild(overlay);
+        host.appendChild(overlay);
         btn.focus();
     } else {
         overlay.appendChild(modal);
-        document.body.appendChild(overlay);
+        host.appendChild(overlay);
     }
 }
 
@@ -980,7 +985,7 @@ function showConfirm(message, title) {
         modal.appendChild(body);
         modal.appendChild(btnWrap);
         overlay.appendChild(modal);
-        document.body.appendChild(overlay);
+        (document.fullscreenElement || document.body).appendChild(overlay);
         confirmBtn.focus();
     });
 }
@@ -1069,7 +1074,7 @@ function showDangerConfirm(opts) {
         if (detail) modal.appendChild(detailEl);
         modal.appendChild(btnWrap);
         overlay.appendChild(modal);
-        document.body.appendChild(overlay);
+        (document.fullscreenElement || document.body).appendChild(overlay);
         cancelBtn.focus();
 
         const timerHandle = setInterval(function () {
@@ -1133,7 +1138,7 @@ function showPrompt(message, title, defaultValue) {
         modal.appendChild(input);
         modal.appendChild(btnWrap);
         overlay.appendChild(modal);
-        document.body.appendChild(overlay);
+        (document.fullscreenElement || document.body).appendChild(overlay);
         input.focus();
         input.select();
     });
@@ -10249,8 +10254,14 @@ function _wolfDialogPrepare() {
         console.error('wolfConfirm/Prompt: #wolf-dialog-modal missing from DOM');
         return null;
     }
-    if (!document.body.contains(modal) || modal.parentElement !== document.body) {
-        document.body.appendChild(modal);
+    // Pick the right host. When a page is in fullscreen mode (e.g. the
+    // Databases editor) the browser only paints descendants of the
+    // fullscreen element, so a modal attached to <body> renders BEHIND
+    // the fullscreen layer and is invisible until the user exits
+    // fullscreen. Reparent into the fullscreen element instead.
+    const host = document.fullscreenElement || document.body;
+    if (modal.parentElement !== host) {
+        host.appendChild(modal);
     }
     if (_wolfDialogResolve) {
         // Previous caller's promise is orphaned — resolve it false/null
@@ -46932,7 +46943,7 @@ function dbAcShowPopup(ta) {
     popup.id = 'db-ac-popup';
     popup.style.cssText = 'position:fixed; background:var(--bg-card); border:1px solid var(--border); border-radius:6px; box-shadow:0 4px 16px rgba(0,0,0,0.3); z-index:10001; max-height:280px; overflow-y:auto; min-width:200px; font-family:var(--font-mono, ui-monospace, monospace); font-size:13px;';
     dbAcRenderItems(popup);
-    document.body.appendChild(popup);
+    dbModalHost().appendChild(popup);
     _dbAcState.popup = popup;
     // Position: use getBoundingClientRect + a rough cursor offset
     // (we can't easily measure exact cursor pixel without a mirror
