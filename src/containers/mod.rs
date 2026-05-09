@@ -2701,6 +2701,15 @@ fn docker_batched_inspect(ids: &[String])
     let mut map = std::collections::HashMap::new();
     if ids.is_empty() { return map; }
 
+    // One `docker network ls` up-front so parse_port_mappings can ask
+    // "what driver is this network?" without an extra subprocess per
+    // container. Empty map on failure → parse_port_mappings falls back
+    // to its conservative empty-Ports heuristic. See the doc comment on
+    // parse_port_mappings for why the driver matters (macvlan / ipvlan
+    // never NAT, so the requested-vs-published port diff is a false
+    // positive there even when the operator declared `ports:`).
+    let net_drivers = docker_network_drivers();
+
     // Pass IDs as positional args. Avoid building a single space-joined
     // string — IDs never contain spaces but argv passing is the right
     // shape for the tool anyway.
@@ -2763,8 +2772,51 @@ fn docker_batched_inspect(ids: &[String])
         if let Some(n) = entry.pointer("/State/RestartCount").and_then(|v| v.as_u64()) {
             fields.restart_count = n;
         }
-        fields.port_mappings = parse_port_mappings(&entry);
+        fields.port_mappings = parse_port_mappings(&entry, &net_drivers);
         map.insert(id, fields);
+    }
+    map
+}
+
+/// Run `docker network ls --format '{{.Name}}\t{{.Driver}}'` once and
+/// return a `name → driver` map. Used by `parse_port_mappings` to skip
+/// the requested-vs-published port diff for `macvlan` / `ipvlan`
+/// networks, where Docker doesn't NAT and the diff is a false positive
+/// even when compose declared `ports:`.
+///
+/// Empty map on failure (daemon down, permission denied, etc.) — the
+/// caller treats a missing driver entry as "unknown" and falls back to
+/// the conservative empty-Ports heuristic from v22.10.2. That heuristic
+/// only catches the no-`ports:` macvlan case; the driver lookup is
+/// what catches the with-`ports:` macvlan case (Frigate).
+fn docker_network_drivers() -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let out = match Command::new("docker")
+        .args(["network", "ls", "--format", "{{.Name}}\t{{.Driver}}"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            warn!(
+                "docker network ls exited {}: {}",
+                o.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            return map;
+        }
+        Err(e) => {
+            warn!("docker network ls spawn failed: {}", e);
+            return map;
+        }
+    };
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if line.is_empty() { continue; }
+        let mut split = line.splitn(2, '\t');
+        let name = split.next().unwrap_or("").trim().to_string();
+        let driver = split.next().unwrap_or("").trim().to_string();
+        if !name.is_empty() && !driver.is_empty() {
+            map.insert(name, driver);
+        }
     }
     map
 }
@@ -2790,11 +2842,10 @@ fn docker_batched_inspect(ids: &[String])
 /// where the requested IP is `0.0.0.0` and the published IP is `::`.
 ///
 /// Host-mode / shared-namespace / direct-routing note: when Docker isn't
-/// doing host-port NAT for the container, `NetworkSettings.Ports` is
-/// empty even when the operator declared `ports:` in compose. Diffing
-/// the two would flag every declared port as unpublished even though
-/// the service is fully reachable on its container/LAN IP. We
-/// short-circuit in three cases:
+/// doing host-port NAT for the container, the requested-vs-published
+/// diff is meaningless even when the operator declared `ports:` in
+/// compose — the container is reachable on its own IP. We short-circuit
+/// in these cases:
 ///
 ///   * `NetworkMode == "host"` — container shares the host's network
 ///     namespace, listens directly on its stack (e.g. AdGuard Home
@@ -2803,17 +2854,24 @@ fn docker_batched_inspect(ids: &[String])
 ///     container's namespace, same property as host mode.
 ///   * `NetworkMode == "none"` — container has no network at all;
 ///     port-mapping declarations are vestigial.
-///   * `NetworkMode` is a user-defined network name (anything other
-///     than the standard reserved values) AND `NetworkSettings.Ports`
-///     is empty/null — this catches **macvlan**, **ipvlan**, and
-///     custom IPAM bridge configurations where the container has its
-///     own LAN IP and Docker doesn't manage port forwarding (e.g.
-///     Frigate on a macvlan reachable at 10.0.10.4:5000 directly).
-///     User-defined bridges that DO use port mapping populate
-///     `NetworkSettings.Ports` properly, so the silent-publish detector
-///     still works for those — we only skip when there's no published
-///     evidence to diff against.
-pub fn parse_port_mappings(inspect: &serde_json::Value) -> Vec<PortMapping> {
+///   * `NetworkMode` resolves (via `net_drivers`) to a network whose
+///     driver is `macvlan` or `ipvlan` — Docker never NATs those, and
+///     `NetworkSettings.Ports` may be either `{}` *or* a map of
+///     `{"5000/tcp": null, ...}` depending on whether compose declared
+///     `ports:`. The latter shape is byte-identical to a real
+///     silent-publish failure on a bridge, so we *must* consult the
+///     network driver to tell them apart. This is the v22.10.3 fix for
+///     PapaSchlumpf's Frigate (macvlan + declared `ports:`).
+///   * Fallback (driver unknown — `docker network ls` failed): if
+///     `NetworkSettings.Ports` is *truly* empty `{}` on a user-defined
+///     network, skip. Catches macvlan-without-`ports:` and is
+///     conservative when the driver lookup misses. User-defined bridges
+///     with port mapping populate `Ports` properly so the silent-publish
+///     detector still works for those.
+pub fn parse_port_mappings(
+    inspect: &serde_json::Value,
+    net_drivers: &std::collections::HashMap<String, String>,
+) -> Vec<PortMapping> {
     use std::collections::HashSet;
 
     // ─── Network-mode short-circuits (see doc comment) ─────────────────
@@ -2827,17 +2885,28 @@ pub fn parse_port_mappings(inspect: &serde_json::Value) -> Vec<PortMapping> {
         return Vec::new();
     }
 
-    // User-defined network: NetworkMode is anything other than the
-    // reserved names. Could be a bridge (port mapping applies) OR a
-    // macvlan/ipvlan/etc (no port mapping). Distinguish by checking
-    // whether `NetworkSettings.Ports` is *truly* empty — Docker emits
-    // `{}` for macvlan/ipvlan (no NAT bindings to record) but emits
-    // `{"80/tcp": null}` for a bridge where the host-port bind failed
-    // silently (the original Klas case the detector was built for).
-    // We only skip on the empty-object case so the silent-publish
-    // detector still fires on user-defined bridges with failed binds.
     let is_user_defined = !matches!(network_mode, "" | "default" | "bridge");
     if is_user_defined {
+        // Authoritative check: ask Docker what driver this network uses.
+        // macvlan / ipvlan don't NAT, so the requested-vs-published diff
+        // is meaningless regardless of what `Ports` happens to look
+        // like. This is what catches Frigate-on-macvlan with declared
+        // `ports:`, where Docker emits `{"5000/tcp": null, ...}` —
+        // identical in shape to a real silent-publish failure on a
+        // bridge.
+        if let Some(driver) = net_drivers.get(network_mode) {
+            if driver == "macvlan" || driver == "ipvlan" {
+                return Vec::new();
+            }
+        }
+        // Fallback for when the driver lookup missed (docker network ls
+        // failed, or the network was removed between calls). Same
+        // heuristic as v22.10.2: a truly empty `{}` Ports on a
+        // user-defined network is almost certainly macvlan/ipvlan-
+        // without-`ports:`. This branch does NOT catch the
+        // declared-`ports:` macvlan case (those have null entries) —
+        // that's the driver-map check above. We keep this fallback so
+        // we degrade gracefully when the driver list is unavailable.
         let ports_truly_empty = match inspect.pointer("/NetworkSettings/Ports") {
             None | Some(serde_json::Value::Null) => true,
             Some(serde_json::Value::Object(o)) => o.is_empty(),
@@ -8975,6 +9044,13 @@ pub fn docker_import(
 mod port_mapping_tests {
     use super::*;
 
+    /// Empty driver map — used by tests that don't depend on driver
+    /// information (the inspect JSON alone is sufficient to derive
+    /// the expected outcome via the bridge / null-Ports fallbacks).
+    fn no_drivers() -> std::collections::HashMap<String, String> {
+        std::collections::HashMap::new()
+    }
+
     #[test]
     fn parse_published_port_marks_published_true() {
         // PortBindings asks for 0.0.0.0:8080 → 80/tcp, NetworkSettings
@@ -8991,7 +9067,7 @@ mod port_mapping_tests {
                 }
             }
         }"#).unwrap();
-        let mappings = parse_port_mappings(&inspect);
+        let mappings = parse_port_mappings(&inspect, &no_drivers());
         assert_eq!(mappings.len(), 1);
         assert_eq!(mappings[0].host_port, 8080);
         assert_eq!(mappings[0].container_port, 80);
@@ -9016,7 +9092,7 @@ mod port_mapping_tests {
                 }
             }
         }"#).unwrap();
-        let mappings = parse_port_mappings(&inspect);
+        let mappings = parse_port_mappings(&inspect, &no_drivers());
         assert_eq!(mappings.len(), 1);
         assert!(!mappings[0].published,
             "null NetworkSettings.Ports entry means the daemon never published the binding");
@@ -9042,7 +9118,7 @@ mod port_mapping_tests {
                 }
             }
         }"#).unwrap();
-        let mappings = parse_port_mappings(&inspect);
+        let mappings = parse_port_mappings(&inspect, &no_drivers());
         assert_eq!(mappings.len(), 1);
         assert!(mappings[0].published);
     }
@@ -9065,7 +9141,7 @@ mod port_mapping_tests {
                 }
             }
         }"#).unwrap();
-        let mappings = parse_port_mappings(&inspect);
+        let mappings = parse_port_mappings(&inspect, &no_drivers());
         assert_eq!(mappings.len(), 1);
         assert!(!mappings[0].published,
             "127.0.0.1 request != 0.0.0.0 published — operator's bind-IP intent wasn't met");
@@ -9085,7 +9161,7 @@ mod port_mapping_tests {
                 }
             }
         }"#).unwrap();
-        let mappings = parse_port_mappings(&inspect);
+        let mappings = parse_port_mappings(&inspect, &no_drivers());
         assert_eq!(mappings.len(), 1);
         assert_eq!(mappings[0].proto, "udp");
         assert!(mappings[0].published);
@@ -9097,7 +9173,7 @@ mod port_mapping_tests {
             "HostConfig": { "PortBindings": {} },
             "NetworkSettings": { "Ports": {} }
         }"#).unwrap();
-        assert!(parse_port_mappings(&inspect).is_empty());
+        assert!(parse_port_mappings(&inspect, &no_drivers()).is_empty());
     }
 
     #[test]
@@ -9123,7 +9199,7 @@ mod port_mapping_tests {
                 "Ports": {}
             }
         }"#).unwrap();
-        assert!(parse_port_mappings(&inspect).is_empty(),
+        assert!(parse_port_mappings(&inspect, &no_drivers()).is_empty(),
             "host-mode containers must not produce port mappings — \
              NetworkSettings.Ports is empty by design and the diff is meaningless");
     }
@@ -9144,7 +9220,7 @@ mod port_mapping_tests {
                 "Ports": {}
             }
         }"#).unwrap();
-        assert!(parse_port_mappings(&inspect).is_empty(),
+        assert!(parse_port_mappings(&inspect, &no_drivers()).is_empty(),
             "shared-namespace containers must not produce port mappings");
     }
 
@@ -9167,20 +9243,20 @@ mod port_mapping_tests {
                 }
             }
         }"#).unwrap();
-        let mappings = parse_port_mappings(&inspect);
+        let mappings = parse_port_mappings(&inspect, &no_drivers());
         assert_eq!(mappings.len(), 1);
         assert!(mappings[0].published);
     }
 
     #[test]
     fn parse_macvlan_network_skips_publish_check() {
-        // PapaSchlumpf's Frigate case: container on a user-defined
-        // macvlan with its own LAN IP. Compose declared `ports:` so
-        // PortBindings is non-empty, but Docker doesn't do host port
-        // forwarding for macvlan — NetworkSettings.Ports is empty {}.
-        // The diff would flag every port as unpublished even though the
-        // container is reachable directly at its LAN IP. Must short-
-        // circuit the same way host mode does.
+        // Fallback path (driver lookup unavailable): a user-defined
+        // network with truly-empty Ports `{}` is conservatively assumed
+        // to be macvlan/ipvlan/etc and skipped. This is what catches
+        // macvlan containers that did NOT declare `ports:` in compose.
+        // The with-`ports:` macvlan case (which produces null entries,
+        // not empty `{}`) is caught by the driver-map lookup instead —
+        // see parse_macvlan_with_declared_ports_skips_via_driver_map.
         let inspect: serde_json::Value = serde_json::from_str(r#"{
             "HostConfig": {
                 "NetworkMode": "frigate_macvlan",
@@ -9195,9 +9271,96 @@ mod port_mapping_tests {
                 "Ports": {}
             }
         }"#).unwrap();
-        assert!(parse_port_mappings(&inspect).is_empty(),
+        assert!(parse_port_mappings(&inspect, &no_drivers()).is_empty(),
             "user-defined network with empty Ports = macvlan/ipvlan/etc; \
              port-mapping diff is meaningless");
+    }
+
+    #[test]
+    fn parse_macvlan_with_declared_ports_skips_via_driver_map() {
+        // PapaSchlumpf's actual Frigate case (the v22.10.3 fix):
+        // container on a macvlan with its own LAN IP, and compose
+        // declared `ports:` for the documented services. Docker still
+        // records the port keys in NetworkSettings.Ports — but with
+        // null values, because it doesn't NAT for macvlan. That shape
+        // (`{"5000/tcp": null, ...}`) is byte-identical to a real
+        // silent-publish failure on a bridge, so the empty-Ports
+        // heuristic alone can't distinguish them.
+        //
+        // The driver map is the authoritative tiebreaker: ask Docker
+        // what driver this network uses, and skip when it's macvlan or
+        // ipvlan regardless of what Ports looks like.
+        let inspect: serde_json::Value = serde_json::from_str(r#"{
+            "HostConfig": {
+                "NetworkMode": "frigate_macvlan",
+                "PortBindings": {
+                    "5000/tcp": [{ "HostIp": "", "HostPort": "5000" }],
+                    "8554/tcp": [{ "HostIp": "", "HostPort": "8554" }],
+                    "8555/tcp": [{ "HostIp": "", "HostPort": "8555" }],
+                    "8555/udp": [{ "HostIp": "", "HostPort": "8555" }]
+                }
+            },
+            "NetworkSettings": {
+                "Ports": {
+                    "5000/tcp": null,
+                    "8554/tcp": null,
+                    "8555/tcp": null,
+                    "8555/udp": null
+                }
+            }
+        }"#).unwrap();
+        let mut drivers = std::collections::HashMap::new();
+        drivers.insert("frigate_macvlan".to_string(), "macvlan".to_string());
+        assert!(parse_port_mappings(&inspect, &drivers).is_empty(),
+            "macvlan-driver lookup must short-circuit even when Ports has null entries (Frigate case)");
+    }
+
+    #[test]
+    fn parse_ipvlan_with_declared_ports_skips_via_driver_map() {
+        // Same as above but ipvlan — the other driver Docker provides
+        // that doesn't NAT host ports. Treat identically.
+        let inspect: serde_json::Value = serde_json::from_str(r#"{
+            "HostConfig": {
+                "NetworkMode": "lan_ipvlan",
+                "PortBindings": {
+                    "443/tcp": [{ "HostIp": "", "HostPort": "443" }]
+                }
+            },
+            "NetworkSettings": {
+                "Ports": { "443/tcp": null }
+            }
+        }"#).unwrap();
+        let mut drivers = std::collections::HashMap::new();
+        drivers.insert("lan_ipvlan".to_string(), "ipvlan".to_string());
+        assert!(parse_port_mappings(&inspect, &drivers).is_empty(),
+            "ipvlan-driver lookup must short-circuit the same way macvlan does");
+    }
+
+    #[test]
+    fn parse_user_defined_bridge_driver_known_still_detects_silent_publish() {
+        // Counter-test for the v22.10.3 fix: when the driver map is
+        // populated and tells us the network is a *bridge*, the
+        // silent-publish detector must still fire on null Ports
+        // entries. This is the scenario the detector was built for —
+        // we must not regress it while fixing the macvlan false
+        // positive.
+        let inspect: serde_json::Value = serde_json::from_str(r#"{
+            "HostConfig": {
+                "NetworkMode": "myapp_default",
+                "PortBindings": {
+                    "5000/tcp": [{ "HostIp": "", "HostPort": "5000" }]
+                }
+            },
+            "NetworkSettings": {
+                "Ports": { "5000/tcp": null }
+            }
+        }"#).unwrap();
+        let mut drivers = std::collections::HashMap::new();
+        drivers.insert("myapp_default".to_string(), "bridge".to_string());
+        let mappings = parse_port_mappings(&inspect, &drivers);
+        assert_eq!(mappings.len(), 1, "must still produce a mapping on a known-bridge network");
+        assert!(!mappings[0].published,
+            "null Ports entry on a known-bridge network = silent-publish failure; must be flagged");
     }
 
     #[test]
@@ -9221,7 +9384,7 @@ mod port_mapping_tests {
                 "Ports": { "5000/tcp": null }
             }
         }"#).unwrap();
-        let mappings = parse_port_mappings(&inspect);
+        let mappings = parse_port_mappings(&inspect, &no_drivers());
         assert_eq!(mappings.len(), 1, "must still produce a mapping");
         assert!(!mappings[0].published,
             "null Ports entry on a user-defined bridge = silent-publish failure (Klas case); must be flagged unpublished");
@@ -9247,7 +9410,7 @@ mod port_mapping_tests {
                 }
             }
         }"#).unwrap();
-        let mappings = parse_port_mappings(&inspect);
+        let mappings = parse_port_mappings(&inspect, &no_drivers());
         assert_eq!(mappings.len(), 1, "user-defined bridge with real port mapping must produce a mapping");
         assert!(mappings[0].published, "the binding is genuinely published — must not be flagged unpublished");
     }
@@ -9269,7 +9432,7 @@ mod port_mapping_tests {
                 "Ports": {}
             }
         }"#).unwrap();
-        assert!(parse_port_mappings(&inspect).is_empty(),
+        assert!(parse_port_mappings(&inspect, &no_drivers()).is_empty(),
             "`network_mode: none` containers have no networking; port mappings are meaningless");
     }
 
