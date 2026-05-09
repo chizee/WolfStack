@@ -275,18 +275,25 @@
 - AI can execute read-only commands on the server via [EXEC] tags
 - Health monitoring: periodic scans with AI-generated recommendations
 
-## Pricing & Tiers (v22.8.0+)
-Four-tier model on Stripe — replaces the old single £79/installation price.
-- **Community** (no licence) — core platform, no Pro/Enterprise gates
-- **Homelab** — explicit feature flags only; entry tier for hobbyists
-- **Pro** — bundles `plugins`, `api_keys`, `wolfhost`. Anything marketed as "Pro+"
-- **Enterprise** — every feature, including future ones. Pre-2026-05-06 Enterprise was unlimited; self-serve Enterprise sold from 2026-05-06 onward carries `max_nodes=100`. Custom-tier quotes carry whatever sales scoped (250/500/1000)
-- **Soft host cap**: over-cap nodes still join with a warning; never blocks usage. Legacy `max_nodes=0` continues to mean "unlimited" for grandfathered customers
-- License propagation: install on one node, all cluster nodes pick it up automatically
-- Tier resolution: `compat::resolve_tier` reads the signed `tier` field on newer licences, falls back to inferring from the `features` list for older ones
-- Dashboard header badge shows tier + current/max host count, paints amber when over cap, links to the Stripe billing portal
-- Endpoint: `GET /api/platform/status` returns tier, current_nodes, over_cap (no email — that used to leak before v22.8.0)
-- Plugin gates use `has_feature("plugins")` not "any valid licence" so Homelab can't unlock Pro features
+## Pricing & Tiers (v22.10.0+ rebrand)
+Five-tier model on Stripe. Pro renamed to MSP; new Team tier added in the middle. Pre-rebrand `tier=pro` licences alias to `msp` in the binary.
+- **Community** (no licence) — source-available, free for personal/non-commercial use, capped at 3 hosts
+- **Homelab £12/mo** (10 hosts) — clustering, WireGuard bridge, branded status pages, scheduled backups, AI agent, Predictive Inbox + AUTOFIX, OSV scanner, REST API keys
+- **Team £149/mo** (50 hosts) — adds OIDC/SSO (Authentik/Azure/Okta/Keycloak), white-label status pages, plugin store access, 24h email support
+- **MSP £499/mo** (unlimited hosts) — adds WolfCustom white-label, multi-tenant client portals, plugin SDK, WolfHost, Slack support, 99.5% SLA. Was "Pro" before 2026-05-09 rebrand
+- **Enterprise** — sales-led only, no public price. Custom SLA, dedicated CSM, SOC2/ISO collateral, on-prem/air-gap, bespoke development
+- **Soft host cap**: over-cap nodes still join with a warning; never blocks usage. `max_nodes=0` means unlimited
+- **Tier resolution**: `compat::resolve_tier` reads the signed `tier` field on the licence. `pro` → resolves to `msp` (legacy alias for the rebrand). Unknown slugs fall through to `enterprise` (defensive — never deny a paid customer a feature on tier-string drift)
+- **Feature bundles** in `compat::has_feature`: enterprise gets every feature; msp = `plugins`, `api_keys`, `wolfhost`, `wolfcustom`, `multi_tenancy`, `sso`; team = `sso`, `api_keys`; homelab/community = explicit features in licence only
+- **Stripe lookup_keys** under `wolfstack_<tier>_2026_05` per `web/includes/stripe-tiers.php`. Bumping the date suffix forces a fresh Stripe Price to be created on next checkout
+
+## Licensing model (v22.10.0+)
+Dual licensing replaces the old MIT licence. Older v22.x.y releases stay MIT forever (irrevocable for already-released code).
+- **Public source-available**: PolyForm Noncommercial 1.0.0. Free for personal & non-commercial use. NOT OSI-approved "open source" — explicit no-commercial-use clause
+- **Commercial licence**: granted automatically when subscribing to any paid tier (Homelab/Team/MSP/Enterprise). Overrides the noncommercial restriction
+- "Commercial use" = running WolfStack at a company, in a managed-service offering, or as part of a paid product. Personal homelab use is non-commercial
+- MariaDB-aligned positioning (similar dual-licence pattern), supports the technology partnership story
+- Contributions accepted via short CLA so any single contributor can't block future commercial-licence issuance
 
 ## Enterprise Features
 - REST API keys (wsk_* tokens) with scoped permissions

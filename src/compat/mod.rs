@@ -162,17 +162,26 @@ pub fn license_manifest() -> Option<PlatformManifest> {
 /// Resolve the licence tier name. Newer licences include `tier` in the
 /// signed payload; older licences are inferred from the `features` list
 /// (the webhook always sets the first feature to the tier slug).
+///
+/// Tier slugs in use today: `homelab`, `team`, `msp`, `enterprise`.
+/// `pro` is a legacy alias for `msp` — pre-2026-05 licences carried
+/// `tier=pro`; the rebrand to MSP is display-only, so we resolve `pro`
+/// to `msp` to give those licences the same feature bundle they had
+/// before. Unknown slugs fall through to `enterprise` to avoid
+/// retroactively denying paid customers a feature on tier-string drift.
 pub fn resolve_tier(dm: &PlatformManifest) -> &'static str {
     if !dm.tier.is_empty() {
         return match dm.tier.as_str() {
             "homelab" => "homelab",
-            "pro" => "pro",
+            "team" => "team",
+            "pro" | "msp" => "msp",
             "enterprise" => "enterprise",
             _ => "enterprise",
         };
     }
     if dm.features.iter().any(|f| f == "homelab") { "homelab" }
-    else if dm.features.iter().any(|f| f == "pro") { "pro" }
+    else if dm.features.iter().any(|f| f == "team") { "team" }
+    else if dm.features.iter().any(|f| f == "msp" || f == "pro") { "msp" }
     else { "enterprise" }
 }
 
@@ -193,9 +202,16 @@ pub fn resolve_tier(dm: &PlatformManifest) -> &'static str {
 ///     full stop. Hard-coding a feature whitelist here would mean each
 ///     new feature retroactively breaks existing Enterprise installs
 ///     until a manifest is reissued.
-///   * Pro — `plugins`, `api_keys`, `wolfhost`. Anything that's
-///     "Pro+" in the marketing copy.
-///   * Homelab / community — explicit features only.
+///   * MSP (formerly Pro) — `plugins`, `api_keys`, `wolfhost`,
+///     `wolfcustom`, `multi_tenancy`, `sso`. The white-label / managed-
+///     service-provider bundle. Pre-rebrand `tier=pro` licences resolve
+///     here too via `resolve_tier`.
+///   * Team — `sso`, `api_keys`. The "missing middle" tier: SMB IT
+///     teams who need accountability and a real auth story but aren't
+///     reselling. Plugin distribution and white-label stay MSP-only.
+///   * Homelab / community — explicit features only. Homelab licences
+///     ship with `api_keys` in the features list; SSO is intentionally
+///     not in the Homelab bundle so it's a meaningful Team upsell.
 pub fn has_feature(name: &str) -> bool {
     match load_dm() {
         Some(dm) => manifest_has_feature(&dm, name),
@@ -212,7 +228,11 @@ fn manifest_has_feature(dm: &PlatformManifest, name: &str) -> bool {
     }
     match resolve_tier(dm) {
         "enterprise" => true,
-        "pro" => matches!(name, "plugins" | "api_keys" | "wolfhost"),
+        "msp" => matches!(
+            name,
+            "plugins" | "api_keys" | "wolfhost" | "wolfcustom" | "multi_tenancy" | "sso"
+        ),
+        "team" => matches!(name, "sso" | "api_keys"),
         _ => false,
     }
 }
@@ -627,14 +647,44 @@ mod tests {
     }
 
     #[test]
-    fn pro_tier_grants_pro_bundle_only() {
-        let m = dm("pro", &[]);
+    fn msp_tier_grants_full_msp_bundle() {
+        let m = dm("msp", &[]);
+        assert_eq!(resolve_tier(&m), "msp");
         assert!(manifest_has_feature(&m, "plugins"));
         assert!(manifest_has_feature(&m, "api_keys"));
         assert!(manifest_has_feature(&m, "wolfhost"));
-        // Enterprise-only feature stays gated for Pro.
+        assert!(manifest_has_feature(&m, "wolfcustom"));
+        assert!(manifest_has_feature(&m, "multi_tenancy"));
+        assert!(manifest_has_feature(&m, "sso"));
+        // Random unknown feature still gated.
+        assert!(!manifest_has_feature(&m, "anything-future"));
+    }
+
+    #[test]
+    fn legacy_pro_slug_resolves_to_msp_bundle() {
+        // Pre-rebrand licences carry tier=pro. They must keep working
+        // after the Pro→MSP rename — resolve_tier maps pro→msp so
+        // they inherit the MSP bundle (which is a strict superset of
+        // the old Pro bundle, so this is never a downgrade).
+        let m = dm("pro", &[]);
+        assert_eq!(resolve_tier(&m), "msp");
+        assert!(manifest_has_feature(&m, "plugins"));
+        assert!(manifest_has_feature(&m, "wolfhost"));
+        assert!(manifest_has_feature(&m, "wolfcustom"),
+            "pro→msp aliasing must grant the MSP bundle, not the old Pro bundle");
+    }
+
+    #[test]
+    fn team_tier_grants_sso_and_api_keys_only() {
+        let m = dm("team", &[]);
+        assert_eq!(resolve_tier(&m), "team");
+        assert!(manifest_has_feature(&m, "sso"));
+        assert!(manifest_has_feature(&m, "api_keys"));
+        // Plugin distribution and white-label stay MSP-only.
+        assert!(!manifest_has_feature(&m, "plugins"));
         assert!(!manifest_has_feature(&m, "wolfcustom"));
-        assert!(!manifest_has_feature(&m, "sso"));
+        assert!(!manifest_has_feature(&m, "wolfhost"));
+        assert!(!manifest_has_feature(&m, "multi_tenancy"));
     }
 
     #[test]
