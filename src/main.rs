@@ -1048,6 +1048,24 @@ async fn main() -> std::io::Result<()> {
             }
         });
 
+        // Background: clean up duplicate IPs on `br-pt-*` slaves (every
+        // 60s). Bridge-creation flushes the slave's IP, but NetworkManager
+        // / systemd-networkd / dhclient on the slave often re-add it
+        // afterwards — leaving the same IP on both the slave and the
+        // bridge, plus duplicate routes. PapaSchlumpf's `ens1` /
+        // `br-pt-ens1` both had 10.10.10.1/24 with two routes for
+        // 10.10.10.0/24 from this exact race. The reconciliation only
+        // removes IPs from the slave that ALSO exist on the bridge —
+        // never the slave's only address.
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                tokio::task::spawn_blocking(|| {
+                    networking::cleanup_passthrough_slave_ips();
+                }).await.ok();
+            }
+        });
+
         // Background: reconcile IP mappings (DNAT rules) until every
         // enabled mapping has its iptables rules in place. The
         // synchronous startup pass at boot fails silently when wolfnet0

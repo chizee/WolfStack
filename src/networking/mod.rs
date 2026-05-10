@@ -13,7 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::process::Command;
-use tracing::warn;
+use tracing::{info, warn};
 
 pub mod router;
 
@@ -2217,6 +2217,88 @@ pub fn apply_ip_mappings() -> usize {
         }
     }
     failed
+}
+
+/// Periodic reconciliation: ensure NICs enslaved to `br-pt-*`
+/// passthrough bridges don't carry a duplicate of any IP that's already
+/// on the bridge.
+///
+/// `vms::manager::create_linux_passthrough_bridge` flushes the slave's
+/// IP at bridge-creation time and then re-adds it on the bridge — but
+/// external IP managers (NetworkManager, systemd-networkd, dhclient
+/// running on the slave) often re-assign the IP to the slave shortly
+/// after we flush it. Result: the same IP lives on the slave AND the
+/// bridge, plus duplicate kernel routes for the same subnet via two
+/// devices. The kernel resolves the route by some arbitrary tiebreak
+/// and ARP gets confused.
+///
+/// PapaSchlumpf's box hit this on `ens1` (enslaved to `br-pt-ens1`):
+/// both interfaces had `10.10.10.1/24`, with two routes for
+/// `10.10.10.0/24`. The slave should be IP-less. This function cleans
+/// up after the external manager every tick.
+///
+/// Safety: only removes IPs from the slave that ALSO exist on the
+/// bridge (true duplicates). Never strips an IP that only exists on
+/// the slave — that would leave the host without an address if the
+/// migration to the bridge had failed.
+pub fn cleanup_passthrough_slave_ips() {
+    let entries = match std::fs::read_dir("/sys/class/net") {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let bridge = match entry.file_name().into_string() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        if !bridge.starts_with("br-pt-") { continue; }
+
+        let bridge_ips = iface_ipv4_cidrs(&bridge);
+        if bridge_ips.is_empty() { continue; } // bridge has no IP — don't risk stripping the slave's
+
+        let brif_path = format!("/sys/class/net/{}/brif", bridge);
+        let slaves = match std::fs::read_dir(&brif_path) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        for slave_entry in slaves.flatten() {
+            let slave = match slave_entry.file_name().into_string() {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            for cidr in iface_ipv4_cidrs(&slave) {
+                if !bridge_ips.contains(&cidr) { continue; } // not a duplicate
+                let res = Command::new("ip")
+                    .args(["addr", "del", &cidr, "dev", &slave])
+                    .output();
+                if res.map(|o| o.status.success()).unwrap_or(false) {
+                    info!(
+                        "Passthrough cleanup: removed duplicate {} from {} (already on bridge {})",
+                        cidr, slave, bridge
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Return all IPv4 addresses (in `addr/prefix` form) currently bound to
+/// the given interface. Helper for `cleanup_passthrough_slave_ips`.
+fn iface_ipv4_cidrs(iface: &str) -> Vec<String> {
+    let out = match Command::new("ip").args(["-4", "addr", "show", "dev", iface]).output() {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines()
+        .filter_map(|l| {
+            let l = l.trim_start();
+            if !l.starts_with("inet ") { return None; }
+            l.split_whitespace().nth(1).map(|s| s.to_string())
+        })
+        .collect()
 }
 
 /// Detect this node's WolfNet IP address (for SNAT source)

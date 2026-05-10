@@ -734,6 +734,57 @@ pub fn cleanup_stale_wolfnet_routes() {
         }
     }
 
+    // ─── Subnet-collision /32 host routes ──────────────────────────────
+    //
+    // PapaSchlumpf's case: a Docker macvlan whose subnet happens to be
+    // the same as WolfNet's (`10.0.10.0/24` here). The kernel's /24 route
+    // for the WolfNet subnet sends every packet for that range into
+    // wolfnet0 (the WireGuard tunnel) — where the container doesn't
+    // exist. DNAT rules to such containers black-hole because routing
+    // happens AFTER DNAT. The container is reachable on the LAN at L2
+    // via the macvlan's parent NIC, so a /32 host route via that parent
+    // wins by longest-prefix-match and packets get delivered.
+    //
+    // We do this for any running Docker container whose IP falls in the
+    // WolfNet subnet AND isn't already accounted for by the
+    // `wolfnet_ip`-labelled path above. Idempotent: `ip route replace`
+    // creates or overrides as needed.
+    if let Ok(output) = Command::new("docker")
+        .args(["ps", "--format", "{{.Names}}"])
+        .output()
+    {
+        let text = String::from_utf8_lossy(&output.stdout);
+        for name in text.lines().filter(|l| !l.is_empty()) {
+            // Skip if this container is the WolfStack-managed flavour —
+            // the labelled-WolfNet-IP loop above already added its /32
+            // route via the WolfStack-managed bridge.
+            if docker_effective_wolfnet_ip(name).is_some() { continue; }
+
+            let (cip, egress) = match docker_container_egress(name) {
+                Some(t) => t,
+                None => continue,
+            };
+
+            // Only act when the container's IP falls in WolfNet's range.
+            // Other subnets aren't this loop's concern.
+            if !cip.starts_with(&prefix) { continue; }
+            // Belt-and-braces: don't fight the labelled path if we
+            // somehow disagree about what's a wolfnet IP.
+            if local_ips.contains(&cip) { continue; }
+
+            let res = Command::new("ip")
+                .args(["route", "replace", &format!("{}/32", cip), "dev", &egress])
+                .output();
+            if res.map(|o| o.status.success()).unwrap_or(false) {
+                bridge_devs.insert(egress.clone());
+                info!(
+                    "subnet-collision route: {}/32 dev {} (container '{}' uses Docker network in WolfNet subnet)",
+                    cip, egress, name
+                );
+            }
+        }
+    }
+
     // Inject WolfNet subnet route into ALL running Docker containers (not just ones with WolfNet IPs)
     // so any container can reach remote WolfNet hosts via the Docker gateway
     if let Ok(output) = Command::new("docker")
@@ -1325,6 +1376,71 @@ fn docker_bridge_info(container: &str) -> (String, String) {
     };
 
     (bridge_dev, gateway)
+}
+
+/// For a running Docker container, return `(ip, egress_iface)` —
+/// the container's primary IP and the host-side interface that
+/// reaches the container at L2.
+///
+///   * macvlan / ipvlan networks → egress is the network's `parent`
+///     option (the host NIC the macvlan attaches to). The container
+///     is reachable at L2 via that NIC, even though no Linux interface
+///     for the macvlan child exists on the host side.
+///   * everything else (bridge networks) → egress is the network's
+///     explicit `com.docker.network.bridge.name` option, or
+///     `br-<first-12-chars-of-network-id>` (Docker's default naming).
+///
+/// Returns `None` when Docker can't be reached, the container has no
+/// network, or the network's required option is missing. Used by the
+/// subnet-collision /32 router in `cleanup_stale_wolfnet_routes`.
+fn docker_container_egress(container: &str) -> Option<(String, String)> {
+    let inspect_fmt = "{{range $net, $cfg := .NetworkSettings.Networks}}{{$net}}|{{$cfg.IPAddress}}\n{{end}}";
+    let info = Command::new("docker")
+        .args(["inspect", "--format", inspect_fmt, container])
+        .output()
+        .ok()?;
+    if !info.status.success() { return None; }
+    let text = String::from_utf8_lossy(&info.stdout);
+    let first_line = text.lines().next()?;
+    let parts: Vec<&str> = first_line.split('|').collect();
+    if parts.len() < 2 { return None; }
+    let net_name = parts[0].trim();
+    let ip = parts[1].trim().to_string();
+    if ip.is_empty() || net_name.is_empty() { return None; }
+
+    // Inspect the network for driver + parent (macvlan/ipvlan) +
+    // bridge name (custom bridges) + ID (default-named bridges).
+    let net_info = Command::new("docker")
+        .args(["network", "inspect", net_name, "--format",
+               "{{.Driver}}|{{index .Options \"parent\"}}|{{index .Options \"com.docker.network.bridge.name\"}}|{{.Id}}"])
+        .output()
+        .ok()?;
+    if !net_info.status.success() { return None; }
+    let net_text = String::from_utf8_lossy(&net_info.stdout);
+    let np: Vec<&str> = net_text.trim().split('|').collect();
+    if np.len() < 4 { return None; }
+    let driver = np[0].trim();
+    let parent = np[1].trim();
+    let bridge_name_opt = np[2].trim();
+    let net_id = np[3].trim();
+
+    let egress = match driver {
+        "macvlan" | "ipvlan" => {
+            if parent.is_empty() || parent == "<no value>" { return None; }
+            parent.to_string()
+        }
+        _ => {
+            if !bridge_name_opt.is_empty() && bridge_name_opt != "<no value>" {
+                bridge_name_opt.to_string()
+            } else if net_id.len() >= 12 {
+                format!("br-{}", &net_id[..12])
+            } else {
+                return None;
+            }
+        }
+    };
+
+    Some((ip, egress))
 }
 
 /// Connect a Docker container to WolfNet via host routing (IP alias)
