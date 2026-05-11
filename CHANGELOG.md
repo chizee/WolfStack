@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v22.14.2: Real icon library (Lucide v1.14.0) + sidebar tree icons + header cleanup** _(2026-05-11 — [`7555bcd`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/7555bcd478fe53fd7962030caab867eff4ddd975))_
 - **v22.14.1: auto-apply safeguard — skip peer subnet that's also local** _(2026-05-11 — [`4573e90`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/4573e90f3224a77472b9a8beda772f26f2b8890d))_
 - **v22.14.0: Auto-apply missing peer subnet routes + aggressive emoji purge** _(2026-05-11 — [`a32ad37`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/a32ad376585a3d0880a16f435e246f39167258bf))_
 - **v22.13.0: WolfNet diagnostics — three predictive analyzers + cluster workload-subnet plumbing + emoji purge** _(2026-05-11 — [`a67e283`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/a67e28303a3c2ae74c1d3003029024b0758b1c59))_
