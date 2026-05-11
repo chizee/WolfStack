@@ -2395,14 +2395,88 @@ pub fn detect_public_ips() -> Vec<String> {
     public_ips
 }
 
-/// Check if an IPv4 address is RFC1918 private
-fn is_private_ip(ip: std::net::Ipv4Addr) -> bool {
+/// Collect every CIDR on this node that represents a *workload* network —
+/// Docker bridges (`docker0`, `br-*`), LXC bridges (`lxcbr*`), KVM/libvirt
+/// bridges (`virbr*`), and the passthrough bridges that VMs sit on
+/// (`br-pt-*`). The set returned is what remote WolfNet peers need
+/// subnet_routes for so traffic to "the VMs behind klnet-12gb" actually
+/// reaches them rather than dropping at the wolfnet edge.
+///
+/// Klas 2026-05-11: his cluster peers can ping each other's WolfNet IPs
+/// but can't ping VMs / containers / LXC instances behind those peers
+/// because nobody has manually configured subnet_routes for those
+/// workload subnets. This function is the data source the cluster gossip
+/// then ships round, and the missing-route analyzer consumes.
+///
+/// Skips:
+///   • `lo`, `enp*`/`eth*`/`eno*`/`wlp*` (host uplinks, not workloads)
+///   • `wolfnet*` / `wn*` (the overlay itself)
+///   • IPv6 addresses (subnet_routes are IPv4 today)
+///   • Interfaces with no addresses
+///   • Duplicate CIDRs
+pub fn collect_workload_subnets() -> Vec<String> {
+    use std::collections::BTreeSet;
+    let mut out: BTreeSet<String> = BTreeSet::new();
+    for iface in list_interfaces() {
+        let name = iface.name.as_str();
+        let is_workload =
+            name.starts_with("docker")
+            || name.starts_with("lxcbr")
+            || name.starts_with("br-")     // Docker user-defined bridges (br-<id>) + br-pt-*
+            || name.starts_with("virbr");  // libvirt
+        if !is_workload { continue; }
+        for addr in &iface.addresses {
+            if addr.family != "inet" { continue; }
+            // Derive the network address from address + prefix so two
+            // containers on the same /24 don't each contribute their
+            // own /32.
+            let ip = match addr.address.parse::<std::net::Ipv4Addr>() {
+                Ok(ip) => ip,
+                Err(_) => continue,
+            };
+            let prefix = addr.prefix.min(32);
+            let mask: u32 = if prefix == 0 { 0 }
+                else { 0xFFFF_FFFFu32.checked_shl(32 - prefix).unwrap_or(0) };
+            let net = u32::from(ip) & mask;
+            let net_ip = std::net::Ipv4Addr::from(net);
+            out.insert(format!("{}/{}", net_ip, prefix));
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// Check if an IPv4 address is RFC1918 private (plus loopback and link-local).
+/// Pub so predictive analyzers can flag the case where a peer's endpoint
+/// is a private address but the local node has only public addresses —
+/// klasSponsor 2026-05-11 hit exactly that: peer endpoint `10.10.10.30:9630`
+/// advertised from a LAN node, then klas's public VPS faithfully sent
+/// handshake UDP to 10.10.10.30 which doesn't exist on the internet.
+pub fn is_private_ip(ip: std::net::Ipv4Addr) -> bool {
     let octets = ip.octets();
     if octets[0] == 10 { return true; }
     if octets[0] == 172 && (16..=31).contains(&octets[1]) { return true; }
     if octets[0] == 192 && octets[1] == 168 { return true; }
     if octets[0] == 127 || (octets[0] == 169 && octets[1] == 254) { return true; }
     false
+}
+
+/// Extract the host portion (IPv4 or hostname) from an endpoint string
+/// of the form `host:port` or `[v6]:port`. Returns None for empty input.
+/// Used by the reachability analyzer to classify peer endpoints by RFC1918
+/// scope without taking on a full URL/socket parsing dependency.
+pub fn endpoint_host(endpoint: &str) -> Option<&str> {
+    let s = endpoint.trim();
+    if s.is_empty() { return None; }
+    // IPv6 bracketed form
+    if let Some(rest) = s.strip_prefix('[') {
+        if let Some(end) = rest.find(']') { return Some(&rest[..end]); }
+        return None;
+    }
+    // host:port (split on the LAST colon; IPv4 host has no other colons)
+    match s.rfind(':') {
+        Some(idx) => Some(&s[..idx]),
+        None => Some(s),
+    }
 }
 
 /// Collect WolfNet IPs in use (peers + this node)

@@ -1011,6 +1011,7 @@ async fn main() -> std::io::Result<()> {
                     has_docker,
                     has_lxc,
                     has_kvm,
+                    workload_subnets: networking::collect_workload_subnets(),
                     // Propagate license to cluster nodes
                     license_key: if crate::compat::platform_ready() {
                         std::fs::read_to_string(crate::compat::dm_path()).ok().map(|s| s.trim().to_string())

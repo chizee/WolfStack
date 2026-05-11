@@ -3322,7 +3322,7 @@ function buildServerTree(nodes) {
                     <span class="k8s-cluster-count" id="k8s-count-${clusterId}" style="margin-left:auto; font-size:10px; padding:1px 6px; background:#326ce5; color:#fff; border-radius:10px; display:none;"></span>
                 </a>
                 <a class="nav-item server-child-item wolfdisk-cluster-item" data-cluster="${escapedName}" data-view="wolfdisk-cluster" onclick="showWolfDiskPage('${escapedName}')" style="margin-left: 8px; padding: 0 10px; line-height:1.4; display:flex; align-items:center; gap:5px;">
-                    <span class="icon" style="font-size:15px;">🐺</span> <span style="font-weight:600;">WolfDisk</span>
+                    <span class="icon" style="font-size:15px;"></span> <span style="font-weight:600;">WolfDisk</span>
                 </a>
                 <a class="nav-item server-child-item wolfrouter-cluster-item" data-cluster="${escapedName}" data-view="wolfrouter-cluster" onclick="showWolfRouterForCluster('${escapedName}')" style="margin-left: 8px; padding: 0 10px; line-height:1.4; display:flex; align-items:center; gap:5px;">
                     <span class="icon" style="font-size:15px;">🧩</span> <span style="font-weight:600;">WolfRouter</span>
@@ -9111,7 +9111,7 @@ async function addServer() {
         }
         showToast('Server ' + address + ' added', 'success');
         taskLog('Added server: ' + address);
-        setTimeout(() => showToast('💡 When done adding nodes, use "Update WolfNet Connections" in Cluster Settings to sync networking', 'info'), 1500);
+        setTimeout(() => showToast('When done adding nodes, use "Update WolfNet Connections" in Cluster Settings to sync networking', 'info'), 1500);
         closeModal();
         document.getElementById('new-server-address').value = '';
         if (document.getElementById('new-server-join-token')) document.getElementById('new-server-join-token').value = '';
@@ -13603,7 +13603,7 @@ async function createIpMapping() {
         // iptables rules got written regardless, but the operator needs to know
         // packets will be black-holed until WolfNet routing to the target comes up.
         if (data.warning) {
-            showModal(data.warning, '⚠️ Mapping saved but target unreachable');
+            showModal(data.warning, 'Mapping saved but target unreachable');
         } else {
             showToast(data.message, 'success');
         }
@@ -15180,7 +15180,7 @@ async function openDockerSettings(name) {
                     <div style="font-size:11px;color:var(--text-muted);margin-top:6px;">⚠️ Port mappings can only be changed by recreating the container.</div>
                 </div>
                 <div style="padding:12px;background:var(--bg-tertiary);border-radius:8px;border:1px solid var(--border);">
-                    <h4 style="margin:0 0 8px 0;font-size:13px;">🐺 WolfNet</h4>
+                    <h4 style="margin:0 0 8px 0;font-size:13px;">WolfNet</h4>
                     <div style="display:grid;grid-template-columns:1fr auto;gap:8px;align-items:end;">
                         <div class="form-group" style="margin:0;">
                             <label>WolfNet IP</label>
@@ -16380,7 +16380,7 @@ async function openLxcSettings(name) {
                 <button class="btn btn-sm" onclick="addLxcNic()" style="margin-top:4px;font-size:11px;padding:6px 12px;">+ Add Interface</button>
 
                 <div style="margin-top:12px;padding:12px;background:var(--bg-tertiary);border-radius:8px;border:1px solid var(--border);">
-                    <h4 style="margin:0 0 8px 0;font-size:13px;">🐺 WolfNet</h4>
+                    <h4 style="margin:0 0 8px 0;font-size:13px;">WolfNet</h4>
                     <div style="display:grid;grid-template-columns:1fr auto;gap:8px;align-items:end;">
                         <div class="form-group" style="margin:0;">
                             <label>WolfNet IP</label>
@@ -16427,7 +16427,7 @@ async function openLxcSettings(name) {
                             <button class="btn btn-sm" onclick="addMountPoint('${name}')"
                                 style="font-size:11px;padding:4px 8px;">+ Mount</button>
                             <button class="btn btn-sm" onclick="addWolfDiskMount('${name}')"
-                                style="font-size:11px;padding:4px 8px;">🐺 WolfDisk</button>
+                                style="font-size:11px;padding:4px 8px;">WolfDisk</button>
                         </div>
                     </div>
                     ${mountRows}
@@ -16607,7 +16607,7 @@ async function saveLxcSettings(name) {
                     if (c.severity === 'error') {
                         showToast('⛔ Duplicate MAC ' + c.value + ' on: ' + c.containers.join(', '), 'error');
                     } else {
-                        showToast('⚠️ Duplicate IP ' + c.value + ' on: ' + c.containers.join(', '), 'warning');
+                        showToast('Duplicate IP ' + c.value + ' on: ' + c.containers.join(', '), 'warning');
                     }
                 });
             } catch (e) { /* ignore conflict check errors */ }
@@ -18287,7 +18287,7 @@ function selectDockerImage(imageName) {
             </div>
             <div id="docker-wolfnet-section" style="margin-bottom:12px; padding:12px; background:var(--bg-tertiary); border-radius:8px; border:1px solid var(--border);">
                 <div style="display:flex; align-items:center; gap:8px; margin-bottom:8px;">
-                    <span>🐺</span>
+                    <span></span>
                     <strong style="font-size:13px;">WolfNet Networking</strong>
                     <span id="docker-wolfnet-status" style="font-size:12px; color:var(--text-muted);">Checking...</span>
                 </div>
@@ -18767,7 +18767,7 @@ function selectLxcTemplate(distro, release, arch, variant) {
                 </div>
                 <div style="display:flex; gap:8px; margin-bottom:10px; flex-wrap:wrap;">
                     <button type="button" class="btn btn-sm lxc-net-preset" data-net="wolfnet" onclick="lxcSelectNetPreset('wolfnet')" style="flex:1; min-width:140px; padding:10px 12px; text-align:left; border:2px solid var(--primary,#a855f7); background:rgba(168,85,247,0.1);">
-                        <strong style="display:block; font-size:12px;">🐺 WolfNet</strong>
+                        <strong style="display:block; font-size:12px;">WolfNet</strong>
                         <span style="font-size:10px; color:var(--text-muted);">Recommended — reachable from every cluster node, auto-assigned IP, zero config.</span>
                     </button>
                     <button type="button" class="btn btn-sm lxc-net-preset" data-net="bridge" onclick="lxcSelectNetPreset('bridge')" style="flex:1; min-width:140px; padding:10px 12px; text-align:left; border:2px solid transparent;">
@@ -21131,7 +21131,7 @@ async function restoreBackup(id, overwrite) {
     const btn = event && event.target;
     const origText = btn ? btn.textContent : '';
     if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner" style="display:inline-block; width:12px; height:12px; border:2px solid var(--border); border-top-color:#fff; border-radius:50%; animation:spin 0.8s linear infinite; vertical-align:middle;"></span> Restoring...'; }
-    showToast('🔄 Restore in progress...', 'info');
+    showToast('Restore in progress...', 'info');
     const taskId = taskLogStart('Restoring backup...');
     let failed = false;
     let resultMsg = '';
@@ -21674,7 +21674,7 @@ async function restorePbsSnapshot(snapshot, backupType, overwrite) {
         btn.disabled = true;
         btn.innerHTML = '<span style="display:inline-block; width:12px; height:12px; border:2px solid rgba(255,255,255,0.3); border-top-color:#fff; border-radius:50%; animation:spin 0.8s linear infinite; vertical-align:middle;"></span> Starting...';
     }
-    showToast('🔄 Starting PBS restore... Progress will update live.', 'info');
+    showToast('Starting PBS restore... Progress will update live.', 'info');
     var taskId = taskLogStart('PBS restore: ' + snapshot);
 
     try {
@@ -21737,13 +21737,13 @@ async function restorePbsSnapshot(snapshot, backupType, overwrite) {
                             return restorePbsSnapshot(snapshot, backupType, true);
                         }
                     } else if (progress.success) {
-                        showToast('✅ PBS restore complete: ' + progress.message, 'success');
+                        showToast('PBS restore complete: ' + progress.message, 'success');
                         updateTaskLogEntry(taskId, { status: 'completed', description: progress.message });
                         if (typeof loadContainers === 'function') loadContainers();
                         if (typeof loadVMs === 'function') loadVMs();
                         if (btn) { btn.disabled = false; btn.innerHTML = origText; }
                     } else {
-                        showToast('❌ PBS restore failed: ' + progress.message, 'error');
+                        showToast('PBS restore failed: ' + progress.message, 'error');
                         updateTaskLogEntry(taskId, { status: 'failed', description: progress.message });
                         if (btn) { btn.disabled = false; btn.innerHTML = origText; }
                     }
@@ -22604,7 +22604,7 @@ function _aiRenderAgentProposal(p) {
     pushLine('API paths', scope.allowed_api_paths);
     pushLine('Email recipients', scope.allowed_email_recipients);
     wrap.innerHTML =
-        '<div style="font-weight:600; font-size:14px;">🐺 Proposed agent: <span id="aiprop-name" contenteditable="true" style="border-bottom:1px dashed var(--border); padding:1px 4px;">' + escapeHtml(name) + '</span></div>' +
+        '<div style="font-weight:600; font-size:14px;">Proposed agent: <span id="aiprop-name" contenteditable="true" style="border-bottom:1px dashed var(--border); padding:1px 4px;">' + escapeHtml(name) + '</span></div>' +
         '<div style="font-size:12px; color:var(--text-muted);">Access level: <strong style="color:var(--text);">' + escapeHtml(accessLevel) + '</strong></div>' +
         '<div>' +
             '<div style="font-size:11px; color:var(--text-muted); margin-bottom:2px;">System prompt</div>' +
@@ -22686,7 +22686,7 @@ async function sendAiMessage() {
     var typing = document.createElement('div');
     typing.id = 'ai-typing';
     typing.style.cssText = 'background:var(--bg-tertiary);border-radius:12px;padding:12px 16px;max-width:85%;align-self:flex-start;font-size:13px;color:var(--text-muted);';
-    typing.innerHTML = '<span style="animation:pulse 1s infinite;">🐺 Thinking...</span>';
+    typing.innerHTML = '<span style="animation:pulse 1s infinite;">Thinking...</span>';
     messages.appendChild(typing);
     messages.scrollTop = messages.scrollHeight;
 
@@ -25107,7 +25107,7 @@ async function saveIssueSchedule(value) {
         });
         if (!saveResp.ok) throw new Error('HTTP ' + saveResp.status);
         var labels = { off: 'Off', hourly: 'Every Hour', '6h': 'Every 6 Hours', '12h': 'Every 12 Hours', daily: 'Daily' };
-        showToast('🔔 Auto scan: ' + (labels[value] || value), 'success');
+        showToast('Auto scan: ' + (labels[value] || value), 'success');
     } catch (e) {
         console.error('Failed to save scan schedule:', e);
         showToast('Failed to save scan schedule: ' + e.message, 'error');
@@ -28058,7 +28058,12 @@ async function initIconTheme() {
     document.querySelectorAll('.icon-theme-card').forEach(card => {
         card.classList.toggle('active', card.getAttribute('data-icon-theme') === currentIconTheme);
     });
-    // Skip translation if icons are hidden
+    // Fill explicit [data-icon] placeholders regardless of theme — these
+    // are the post-emoji-purge source markup and should always render
+    // even when the user is on 'standard' (emoji) theme.
+    if (typeof fillDataIconPlaceholders === 'function') fillDataIconPlaceholders(document.body);
+    if (typeof observeForDataIcons === 'function') observeForDataIcons();
+    // Skip emoji-translation if icons are hidden
     if (localStorage.getItem('wolfstack-no-icons') === '1') return;
     if (currentIconTheme === 'standard') return;
 
@@ -31788,16 +31793,16 @@ async function executeWolfRunDeploy() {
     }
 
     const _wrTaskId = taskLogStart('WolfRun deploy: ' + name);
-    logStep('📋', `Validating service <b>${name}</b>...`, 'var(--info)');
+    logStep('<span class="ws-icon-clean-wrap" data-icon="clipboard"></span>', `Validating service <b>${name}</b>...`, 'var(--info)');
     await new Promise(r => setTimeout(r, 300));
 
-    logStep('📦', runtime === 'docker'
+    logStep('<span class="ws-icon-clean-wrap" data-icon="package"></span>', runtime === 'docker'
         ? `Image: <b>${payload.image}</b>`
         : `Template: <b>${payload.lxc_distribution}/${payload.lxc_release}</b>`, 'var(--accent-light)');
     logStep('🔢', `Replicas: <b>${replicas}</b> | Restart: <b>${restart}</b>`, 'var(--text-secondary)');
     await new Promise(r => setTimeout(r, 200));
 
-    logStep('📡', 'Sending deployment request to API...', 'var(--warning)');
+    logStep('<span class="ws-icon-clean-wrap" data-icon="satellite"></span>', 'Sending deployment request to API...', 'var(--warning)');
 
     try {
         const resp = await fetch(wolfrunApiUrl('/api/wolfrun/services'), {
@@ -31807,7 +31812,7 @@ async function executeWolfRunDeploy() {
         });
         const data = await resp.json();
         if (resp.ok) {
-            logStep('✅', `Service <b>"${name}"</b> created`, 'var(--success)');
+            logStep('<span class="ws-icon-clean-wrap" data-icon="check-circle"></span>', `Service <b>"${name}"</b> created`, 'var(--success)');
             logStep('⏳', `Scheduling ${replicas} replica(s) on available nodes...`, 'var(--info)');
 
             // Poll for instance status a few times
@@ -31822,10 +31827,10 @@ async function executeWolfRunDeploy() {
                         const running = instances.filter(inst => inst.status === 'running').length;
                         const total = instances.length;
                         if (total > 0) {
-                            logStep('🔄', `Instances: <b>${running}/${replicas}</b> running (${total} total)`, running > 0 ? 'var(--success)' : 'var(--warning)');
+                            logStep('<span class="ws-icon-clean-wrap" data-icon="refresh"></span>', `Instances: <b>${running}/${replicas}</b> running (${total} total)`, running > 0 ? 'var(--success)' : 'var(--warning)');
                         }
                         if (running >= replicas) {
-                            logStep('✅', `All <b>${replicas}</b> replica(s) running`, 'var(--success)');
+                            logStep('<span class="ws-icon-clean-wrap" data-icon="check-circle"></span>', `All <b>${replicas}</b> replica(s) running`, 'var(--success)');
                             break;
                         }
                         if (i === 5 && running < replicas) {
@@ -31835,7 +31840,7 @@ async function executeWolfRunDeploy() {
                 }
             }
 
-            logStep('✅', 'Deployment complete', 'var(--success)');
+            logStep('<span class="ws-icon-clean-wrap" data-icon="check-circle"></span>', 'Deployment complete', 'var(--success)');
             updateTaskLogEntry(_wrTaskId, { status: 'completed', description: 'WolfRun deploy: ' + name });
             loadWolfRunServices();
 
@@ -31845,12 +31850,12 @@ async function executeWolfRunDeploy() {
                 if (logBox) logBox.style.display = 'none';
             }, 3000);
         } else {
-            logStep('❌', `Error: ${data.error || 'Deploy failed'}`, 'var(--danger)');
+            logStep('<span class="ws-icon-clean-wrap" data-icon="x-circle"></span>', `Error: ${data.error || 'Deploy failed'}`, 'var(--danger)');
             showToast(data.error || 'Deploy failed', 'error');
             updateTaskLogEntry(_wrTaskId, { status: 'failed', description: 'WolfRun deploy: ' + name });
         }
     } catch (e) {
-        logStep('❌', `Connection failed: ${e.message}`, 'var(--danger)');
+        logStep('<span class="ws-icon-clean-wrap" data-icon="x-circle"></span>', `Connection failed: ${e.message}`, 'var(--danger)');
         showToast('Deploy failed: ' + e.message, 'error');
         updateTaskLogEntry(_wrTaskId, { status: 'failed', description: 'WolfRun deploy: ' + name });
     } finally {
@@ -32979,7 +32984,7 @@ function renderWolfDiskPage(data) {
     }
     if (data.length === 0) {
         html += '<div class="card" style="padding:40px; text-align:center; color:var(--text-muted);">' +
-            '<div style="font-size:48px; margin-bottom:12px;">🐺</div>' +
+            '<div style="font-size:48px; margin-bottom:12px;"></div>' +
             '<div style="font-size:15px; font-weight:600; margin-bottom:4px;">No nodes in this cluster</div>' +
             '<div style="font-size:12px;">Add nodes to your WolfStack cluster to get started with WolfDisk.</div></div>';
     }
@@ -33010,7 +33015,7 @@ function renderWolfDiskClusterSection(name, nodes) {
     var html = '<div class="card" style="margin-bottom:16px;">';
     // Section header
     html += '<div style="padding:16px 20px; border-bottom:1px solid var(--border); display:flex; align-items:center; gap:12px; flex-wrap:wrap;">';
-    html += '<span style="font-size:18px;">🐺</span>';
+    html += '<span style="font-size:18px;"></span>';
     html += '<span style="font-size:16px; font-weight:700; color:var(--text-primary);">' + (name === 'default' ? 'Default Cluster' : name) + '</span>';
     html += '<span style="font-size:12px; color:var(--text-muted); margin-left:4px;">' + topoParts.join(' \u00b7 ') + '</span>';
     html += '</div>';
@@ -42973,7 +42978,7 @@ async function wolfAgentsLoad() {
         const agents = await resp.json();
         if (!Array.isArray(agents) || agents.length === 0) {
             grid.innerHTML = `<div style="color:var(--text-muted); font-size:13px; padding:48px; text-align:center; grid-column:1/-1; border:1px dashed var(--border); border-radius:10px;">
-                <div style="font-size:36px; margin-bottom:8px;">🐺</div>
+                <div style="font-size:36px; margin-bottom:8px;"></div>
                 <div style="font-weight:600; color:var(--text); margin-bottom:6px;">No agents yet</div>
                 <div>Create your first agent — name it, give it a role, start chatting.</div>
                 <button class="btn btn-primary" style="margin-top:14px;" onclick="wolfAgentsOpenCreate()">+ New Agent</button>
@@ -51811,7 +51816,7 @@ const APP_DRAWER_TILES = [
         desc: 'Build and run automation flows across the cluster.',
     },
     {
-        id: 'wolfagents', icon: '🐺', name: 'WolfAgents',
+        id: 'wolfagents', icon: '', name: 'WolfAgents',
         desc: 'Named AI agents with persistent memory.',
     },
     {

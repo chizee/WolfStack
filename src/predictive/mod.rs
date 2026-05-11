@@ -62,6 +62,8 @@ pub mod osv;
 pub mod port_conflict;
 pub mod wolfnet_dhcp;
 pub mod wolfnet_reachability;
+pub mod docker_wolfnet_collision;
+pub mod missing_subnet_route;
 pub mod unused_packages;
 pub mod notify;
 pub mod cluster;

@@ -99,6 +99,16 @@ pub struct Node {
     /// `None` until the first poll succeeds (and forever for self).
     #[serde(default)]
     pub self_id: Option<String>,
+    /// Workload subnets (Docker / LXC / VM bridges) on this peer. Shipped
+    /// in every StatusReport so the cluster can detect when WolfRouter
+    /// subnet_routes are missing for a remote peer's workloads — that's
+    /// the "peers reachable but the VMs behind them aren't" symptom Klas
+    /// 2026-05-11 hit, and what the `missing_wolfnet_subnet_route`
+    /// analyzer scans for. Empty for self until populated by the agent
+    /// loop on first poll. Backward-compat: nodes from older versions
+    /// deserialize this as an empty Vec.
+    #[serde(default)]
+    pub workload_subnets: Vec<String>,
 }
 
 fn default_node_type() -> String { "wolfstack".to_string() }
@@ -280,6 +290,10 @@ impl ClusterState {
             // OTHER nodes' self_ids as observed via polling. Self has no
             // need to record one.
             self_id: None,
+            // Snapshot the current workload subnets — Docker / LXC / VM
+            // bridges live on this node. Other peers consume this via
+            // gossip to detect missing subnet_routes.
+            workload_subnets: crate::networking::collect_workload_subnets(),
         });
     }
 
@@ -404,6 +418,7 @@ impl ClusterState {
             update_script: None,
             // Filled in on first successful poll from the peer's status report.
             self_id: None,
+            workload_subnets: Vec::new(),
         });
         drop(nodes);
         self.save_nodes();
@@ -723,6 +738,12 @@ pub enum AgentMessage {
         has_lxc: bool,
         #[serde(default)]
         has_kvm: bool,
+        /// Workload subnets (CIDRs) on this peer — Docker / LXC / VM
+        /// bridges. Consumed by the missing-route analyzer so peers see
+        /// what subnet_routes need to point at this node. See
+        /// `networking::collect_workload_subnets`.
+        #[serde(default)]
+        workload_subnets: Vec<String>,
         /// Enterprise license key — propagated to cluster nodes that don't have one
         #[serde(default)]
         license_key: Option<String>,
@@ -798,7 +819,7 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
             {
                 Ok(resp) => {
                     if let Ok(msg) = resp.json::<AgentMessage>().await {
-                        if let AgentMessage::StatusReport { node_id: peer_self_id, hostname, metrics, components, docker_count, lxc_count, vm_count, public_ip, known_nodes, deleted_ids, wolfnet_ips, has_docker, has_lxc, has_kvm, license_key } = msg {
+                        if let AgentMessage::StatusReport { node_id: peer_self_id, hostname, metrics, components, docker_count, lxc_count, vm_count, public_ip, known_nodes, deleted_ids, wolfnet_ips, has_docker, has_lxc, has_kvm, workload_subnets: peer_workload_subnets, license_key } = msg {
                             let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                             // Detect TLS: HTTP on port+1 means TLS is on the main port,
                             // HTTPS on main port also means TLS. Only plain HTTP on the
@@ -848,6 +869,7 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
                                 } else {
                                     Some(peer_self_id)
                                 },
+                                workload_subnets: peer_workload_subnets,
                             });
 
                             // Reset fail count on success

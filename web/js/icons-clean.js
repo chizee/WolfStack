@@ -88,6 +88,17 @@ const CLEAN_ICONS = {
     refresh:     '<polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>',
     trash:       '<polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>',
     plug:        '<path d="M9 2v6"/><path d="M15 2v6"/><path d="M12 17v5"/><path d="M5 8h14a2 2 0 0 1 2 2v3a7 7 0 0 1-14 0v-3a2 2 0 0 1 2-2z"/>',
+    calendar:    '<rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>',
+    download:    '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>',
+    upload:      '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>',
+    menu:        '<line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/>',
+    fullscreen:  '<path d="M3 7V3h4"/><path d="M21 7V3h-4"/><path d="M3 17v4h4"/><path d="M21 17v4h-4"/>',
+    health:      '<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>',
+    compass:     '<circle cx="12" cy="12" r="10"/><polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76"/>',
+    broom:       '<path d="M19.36 2.72 20.78 4.14 15.06 9.85"/><path d="M5.93 17.57 4 21l3.43-1.93z"/><path d="m11.16 5.36 7.48 7.48a4 4 0 0 1 0 5.66l-1.42 1.42a4 4 0 0 1-5.66 0L4.08 12.4a4 4 0 0 1 0-5.66l1.42-1.42a4 4 0 0 1 5.66 0z"/>',
+    docker:      '<path d="M22 11h-3v3h3v-3z M19 11h-3v3h3v-3z M16 11h-3v3h3v-3z M13 11h-3v3h3v-3z M10 11h-3v3h3v-3z M13 8h-3v3h3V8z M10 8h-3v3h3V8z M13 5h-3v3h3V5z M2 17c3 2 9 2 16 0a8 8 0 0 1-4 4H6a4 4 0 0 1-4-4z"/>',
+    bookmark:    '<path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/>',
+    minus:       '<line x1="5" y1="12" x2="19" y2="12"/>',
 };
 
 // Status-pill colour overrides for the four filled circles. The dots inherit
@@ -125,6 +136,54 @@ const CLEAN_EXTRA_EMOJI_MAP = {
 
 function cleanIconAvailable(semantic) {
     return Object.prototype.hasOwnProperty.call(CLEAN_ICONS, semantic);
+}
+
+// Public helper for code that wants the wrapped icon (span + svg) as a
+// single HTML string — drop-in for use inside template literals so callers
+// can write `${wsIcon('refresh')} Refresh` instead of embedding emoji.
+function wsIcon(semantic) {
+    const body = cleanIconSvg(semantic);
+    if (!body) return '';
+    return `<span class="ws-icon-clean-wrap" data-icon="${semantic}">${body}</span>`;
+}
+
+// Walk `[data-icon]` placeholders in the static markup and populate them
+// with the resolved SVG. Runs once at boot AND on MutationObserver hits
+// so dynamically-injected placeholders fill themselves. Operates
+// independently of the emoji-translation path so it works even when
+// the active icon theme is `standard` (emoji).
+function fillDataIconPlaceholders(root) {
+    const scope = root || document.body;
+    scope.querySelectorAll('[data-icon]').forEach(el => {
+        // Already filled — skip. Idempotent.
+        if (el.querySelector('svg.ws-icon-clean')) return;
+        const semantic = el.getAttribute('data-icon');
+        if (!semantic) return;
+        if (!cleanIconAvailable(semantic)) return;
+        if (!el.classList.contains('ws-icon-clean-wrap')) {
+            el.classList.add('ws-icon-clean-wrap');
+        }
+        el.innerHTML = cleanIconSvg(semantic);
+    });
+}
+
+let _dataIconObserver = null;
+function observeForDataIcons() {
+    if (_dataIconObserver) return;
+    _dataIconObserver = new MutationObserver((mutations) => {
+        for (const m of mutations) {
+            for (const node of m.addedNodes) {
+                if (node.nodeType !== Node.ELEMENT_NODE) continue;
+                // Cheap fast-path: only descend when there's plausibly a
+                // placeholder inside. Avoids a querySelectorAll storm on
+                // every text-node insert.
+                if (node.matches?.('[data-icon]') || node.querySelector?.('[data-icon]')) {
+                    fillDataIconPlaceholders(node);
+                }
+            }
+        }
+    });
+    _dataIconObserver.observe(document.body, { childList: true, subtree: true });
 }
 
 function cleanIconSvg(semantic) {

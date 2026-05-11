@@ -3997,6 +3997,10 @@ pub async fn agent_status(req: HttpRequest, state: web::Data<AppState>) -> HttpR
         has_docker,
         has_lxc,
         has_kvm,
+        // Local Docker / LXC / VM bridge CIDRs. Remote peers consume
+        // this to decide whether their subnet_routes are complete — see
+        // predictive::missing_subnet_route for the analyzer.
+        workload_subnets: crate::networking::collect_workload_subnets(),
         license_key: if crate::compat::platform_ready() {
             std::fs::read_to_string(crate::compat::dm_path()).ok().map(|s| s.trim().to_string())
         } else { None },
@@ -6492,6 +6496,7 @@ async fn lxc_remote_clone(
                     tls: false,
                     update_script: None,
                     self_id: None,
+                    workload_subnets: Vec::new(),
                 }
             } else {
                 return HttpResponse::NotFound().json(serde_json::json!({"error": "Target node not found"}));
