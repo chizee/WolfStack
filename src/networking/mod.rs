@@ -2415,6 +2415,32 @@ pub fn detect_public_ips() -> Vec<String> {
 ///   • Interfaces with no addresses
 ///   • Duplicate CIDRs
 pub fn collect_workload_subnets() -> Vec<String> {
+    // Cache for 30s — workload subnets change only when a Docker / LXC /
+    // libvirt bridge is created or destroyed, not on the per-second
+    // cluster-poll cadence. Without this cache, a 14-node cluster polls
+    // each peer every ~10s, each `/api/agent/status` invokes
+    // `collect_workload_subnets`, each call shells out to `ip -j addr
+    // show` and parses JSON — ~15-30 ms per call × 18 calls/sec across
+    // the cluster = visibly degraded dashboard responsiveness on real
+    // clusters (klasSponsor / paulc 2026-05-11).
+    use std::sync::Mutex;
+    use std::time::Instant;
+    static CACHE: Mutex<Option<(Instant, Vec<String>)>> = Mutex::new(None);
+    if let Ok(guard) = CACHE.lock() {
+        if let Some((ts, ref cached)) = *guard {
+            if ts.elapsed().as_secs() < 30 {
+                return cached.clone();
+            }
+        }
+    }
+    let fresh = collect_workload_subnets_uncached();
+    if let Ok(mut guard) = CACHE.lock() {
+        *guard = Some((Instant::now(), fresh.clone()));
+    }
+    fresh
+}
+
+fn collect_workload_subnets_uncached() -> Vec<String> {
     use std::collections::BTreeSet;
     let mut out: BTreeSet<String> = BTreeSet::new();
     for iface in list_interfaces() {

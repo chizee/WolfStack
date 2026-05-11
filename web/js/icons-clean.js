@@ -196,11 +196,21 @@ function lucideNodeToSvg(node) {
     return '';
 }
 
+// Memoise the SVG-string lookups — Lucide tree walking is repeated
+// thousands of times per page on a 14-node dashboard otherwise.
+const _CLEAN_ICON_SVG_CACHE = Object.create(null);
+
 // Resolve a semantic name to an SVG string via Lucide. Returns '' if
 // Lucide hasn't loaded yet (boot-order safety) or the icon doesn't
 // exist — callers should treat empty as "leave the placeholder alone
 // this tick, fillDataIconPlaceholders will retry on the next mutation".
 function cleanIconSvg(semantic) {
+    if (semantic in _CLEAN_ICON_SVG_CACHE) {
+        const v = _CLEAN_ICON_SVG_CACHE[semantic];
+        if (v !== '') return v;
+        // Empty might be a "Lucide not loaded yet" miss — fall through
+        // and retry. Once we have a real SVG it sticks.
+    }
     const lucideName = LUCIDE_NAME_MAP[semantic];
     if (!lucideName) return '';
     const lib = (typeof window !== 'undefined' && window.lucide) ? window.lucide : null;
@@ -217,9 +227,11 @@ function cleanIconSvg(semantic) {
     if (!Array.isArray(children) || children.length === 0) return '';
     const colour = CLEAN_ICON_COLOURS[semantic];
     const style = colour ? ` style="color:${colour}"` : '';
-    return `<svg class="ws-icon-clean" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"${style}>${
+    const svg = `<svg class="ws-icon-clean" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"${style}>${
         children.map(lucideNodeToSvg).join('')
     }</svg>`;
+    _CLEAN_ICON_SVG_CACHE[semantic] = svg;
+    return svg;
 }
 
 function toPascal(kebab) {
@@ -314,6 +326,11 @@ let _cleanIconReplacing = false;
 function translateEmojisToCleanSvg(root) {
     if (_cleanIconReplacing) return;
     if (typeof EMOJI_TO_SEMANTIC === 'undefined') return;
+    // Cheap pre-check: if the subtree's textContent has no known emoji
+    // at all, skip the full TreeWalker. Saves an enormous amount of
+    // work on 14-node dashboards where most DOM updates carry no emoji.
+    buildEmojiRegex();
+    if (_emojiMatchRegex && root.textContent && !_emojiMatchRegex.test(root.textContent)) return;
     _cleanIconReplacing = true;
     try {
         const textNodes = [];
@@ -338,24 +355,47 @@ function translateEmojisToCleanSvg(root) {
     }
 }
 
+// Build a single regex that matches ANY known emoji, plus a fast
+// lookup from glyph → semantic. The pre-v22.14.5 path iterated
+// Object.entries(EMOJI_TO_SEMANTIC) (200+ keys) and called
+// `text.indexOf(emoji)` for each — 200× the work per text node, which
+// on a 14-node dashboard with frequent mutation observers added up to
+// observable lag. The regex test below short-circuits in one pass.
+let _emojiMatchRegex = null;
+let _emojiToSemanticCache = null;
+function buildEmojiRegex() {
+    if (_emojiMatchRegex && _emojiToSemanticCache) return;
+    if (typeof EMOJI_TO_SEMANTIC === 'undefined') return;
+    const glyphs = [];
+    const map = {};
+    for (const [emoji, semantic] of Object.entries(EMOJI_TO_SEMANTIC)) {
+        if (!cleanIconAvailable(semantic)) continue;
+        glyphs.push(emoji);
+        map[emoji] = semantic;
+    }
+    if (glyphs.length === 0) return;
+    // Longest-first ensures composite emojis (e.g. `⚙️` with VS16) match
+    // before their bare-codepoint prefix.
+    glyphs.sort((a, b) => b.length - a.length);
+    const pattern = glyphs.map(g => g.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+    _emojiMatchRegex = new RegExp(pattern);
+    _emojiToSemanticCache = map;
+}
+
 function replaceEmojiNodeWithCleanSvg(textNode) {
+    buildEmojiRegex();
+    if (!_emojiMatchRegex) return;
     let node = textNode;
     let safety = 50;
     while (node && node.parentNode && safety-- > 0) {
         const text = node.nodeValue;
         if (!text) return;
-        let foundAt = -1;
-        let foundEmoji = null;
-        let foundSemantic = null;
-        for (const [emoji, semantic] of Object.entries(EMOJI_TO_SEMANTIC)) {
-            if (!cleanIconAvailable(semantic)) continue;
-            const idx = text.indexOf(emoji);
-            if (idx === -1) continue;
-            if (foundAt === -1 || idx < foundAt) {
-                foundAt = idx; foundEmoji = emoji; foundSemantic = semantic;
-            }
-        }
-        if (foundAt === -1) return;
+        const m = _emojiMatchRegex.exec(text);
+        if (!m) return;
+        const foundAt = m.index;
+        const foundEmoji = m[0];
+        const foundSemantic = _emojiToSemanticCache[foundEmoji];
+        if (!foundSemantic) return;
 
         const parent = node.parentNode;
         const before = text.substring(0, foundAt);
