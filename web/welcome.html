@@ -166,7 +166,7 @@
                 const r = await fetch('/api/settings/login-disabled', {cache:'no-store'});
                 if (r.ok) {
                     dot.classList.add('ready');
-                    text.textContent = 'WolfStack is ready!';
+                    text.textContent = 'WolfStack is ready';
                     text.classList.add('ready');
                     btn.textContent = 'Open Dashboard';
                     btn.style.pointerEvents = '';

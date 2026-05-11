@@ -5,6 +5,24 @@
 /* WolfStack Dashboard — default theme tokens */
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
 
+/* Clean icon theme — inline-SVG replacements for emoji glyphs.
+   Match the baseline of surrounding text and inherit colour so themes
+   continue to drive the palette. */
+.ws-icon-clean-wrap {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1em;
+    height: 1em;
+    vertical-align: -0.125em;
+    line-height: 1;
+}
+.ws-icon-clean {
+    width: 1em;
+    height: 1em;
+    flex-shrink: 0;
+}
+
 :root {
     --bg-primary: #0a0e1a;
     --bg-secondary: #111827;

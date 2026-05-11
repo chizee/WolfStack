@@ -171,7 +171,8 @@ function applyMapCollapse() {
 // ─── Icon Theme System ───
 // Built-in themes (emoji-based)
 const BUILTIN_ICON_THEMES = {
-    standard:    { name: 'Standard',    description: 'Default system icons' },
+    clean:       { name: 'Clean',       description: 'Inline line-icons that inherit theme colour' },
+    standard:    { name: 'Standard',    description: 'Default emoji icons' },
     candy_emoji: { name: 'Candy Emoji', description: 'Candy-themed emoji icons' },
 };
 
@@ -215,14 +216,14 @@ const EMOJI_TO_SEMANTIC = {
     '📜': 'file-code', '🔵': 'file-code', '📖': 'book',
 };
 
-let currentIconTheme = localStorage.getItem('wolfstack-icon-theme') || 'standard';
+let currentIconTheme = localStorage.getItem('wolfstack-icon-theme') || 'clean';
 // Cache for icon pack icon URLs (pack_id → { semantic_name → url })
 let _iconPackCache = {};
 // Track available icons from active pack
 let _activePackAvailable = null;
 
 function isIconPackTheme() {
-    return currentIconTheme !== 'standard' && currentIconTheme !== 'candy_emoji';
+    return !(currentIconTheme in BUILTIN_ICON_THEMES);
 }
 
 function getIconThemeMap() {
@@ -359,9 +360,15 @@ async function renderIconPacksUI(packs) {
     // Built-in themes first
     for (const [id, theme] of Object.entries(BUILTIN_ICON_THEMES)) {
         const active = currentIconTheme === id ? ' active' : '';
-        const preview = id === 'standard'
-            ? '📦 🖥️ 🌐 💾 ⚙️'
-            : '🍬 🧁 🍩 🍪 🍭';
+        let preview;
+        if (id === 'clean' && typeof cleanIconSvg === 'function') {
+            const cleanSet = ['package', 'computer', 'globe', 'save', 'settings'];
+            preview = cleanSet.map(n => `<span class="ws-icon-clean-wrap" style="font-size:28px;color:var(--text-primary);">${cleanIconSvg(n)}</span>`).join(' ');
+        } else if (id === 'standard') {
+            preview = '📦 🖥️ 🌐 💾 ⚙️';
+        } else {
+            preview = '🍬 🧁 🍩 🍪 🍭';
+        }
         html += `
             <div class="icon-theme-card theme-card${active}" data-icon-theme="${id}" onclick="applyIconTheme('${id}')">
                 <div style="padding:12px;text-align:center;">
@@ -8967,7 +8974,7 @@ async function addCronJob() {
         });
         var data = await resp.json();
         if (data.status === 'saved') {
-            showToast('Cron job added!', 'success');
+            showToast('Cron job added', 'success');
             document.getElementById('cron-command').value = '';
             document.getElementById('cron-comment').value = '';
             if (document.getElementById('cron-custom-schedule')) document.getElementById('cron-custom-schedule').value = '';
@@ -9041,7 +9048,7 @@ async function addPremadeCron(type) {
         });
         var data = await resp.json();
         if (data.status === 'saved') {
-            showToast('Premade cron job added!', 'success');
+            showToast('Premade cron job added', 'success');
             loadCronJobs();
         } else {
             showToast('Error: ' + (data.error || 'Failed'), 'error');
@@ -18111,7 +18118,7 @@ async function generateTransferToken() {
                 </p>
                 <div style="background:var(--bg-primary,#111);border:1px solid var(--border,#444);border-radius:8px;padding:12px;font-family:monospace;font-size:13px;color:var(--text,#fff);word-break:break-all;margin-bottom:12px;">${data.token}</div>
                 <div style="display:flex;gap:8px;justify-content:flex-end;">
-                    <button class="btn" onclick="navigator.clipboard.writeText('${data.token}');showToast('Token copied!','success')">📋 Copy</button>
+                    <button class="btn" onclick="navigator.clipboard.writeText('${data.token}');showToast('Token copied','success')">📋 Copy</button>
                     <button class="btn" onclick="document.getElementById('transfer-token-modal')?.remove()">Close</button>
                 </div>
             </div>
@@ -28041,7 +28048,7 @@ function applyIconTheme(themeName) {
 }
 
 async function initIconTheme() {
-    currentIconTheme = localStorage.getItem('wolfstack-icon-theme') || 'standard';
+    currentIconTheme = localStorage.getItem('wolfstack-icon-theme') || 'clean';
     // Migrate old "candy" key to "candy_emoji"
     if (currentIconTheme === 'candy') {
         currentIconTheme = 'candy_emoji';
@@ -28055,6 +28062,14 @@ async function initIconTheme() {
     if (localStorage.getItem('wolfstack-no-icons') === '1') return;
     if (currentIconTheme === 'standard') return;
 
+    if (currentIconTheme === 'clean') {
+        if (typeof mergeCleanEmojiMappings === 'function') mergeCleanEmojiMappings();
+        if (typeof translateEmojisToCleanSvg === 'function') {
+            translateEmojisToCleanSvg(document.body);
+            observeForCleanIcons();
+        }
+        return;
+    }
     if (isIconPackTheme()) {
         // Load available icons for the active pack
         const preview = await loadIconPackPreview(currentIconTheme);
@@ -31792,7 +31807,7 @@ async function executeWolfRunDeploy() {
         });
         const data = await resp.json();
         if (resp.ok) {
-            logStep('✅', `Service <b>"${name}"</b> created successfully`, 'var(--success)');
+            logStep('✅', `Service <b>"${name}"</b> created`, 'var(--success)');
             logStep('⏳', `Scheduling ${replicas} replica(s) on available nodes...`, 'var(--info)');
 
             // Poll for instance status a few times
@@ -31810,7 +31825,7 @@ async function executeWolfRunDeploy() {
                             logStep('🔄', `Instances: <b>${running}/${replicas}</b> running (${total} total)`, running > 0 ? 'var(--success)' : 'var(--warning)');
                         }
                         if (running >= replicas) {
-                            logStep('🎉', `All <b>${replicas}</b> replica(s) running!`, 'var(--success)');
+                            logStep('✅', `All <b>${replicas}</b> replica(s) running`, 'var(--success)');
                             break;
                         }
                         if (i === 5 && running < replicas) {
@@ -48764,7 +48779,7 @@ function dbMgrRenderQueryTab(body) {
         <div style="display:flex; gap:6px; margin-top:8px; align-items:center; flex-wrap:wrap;">
             <button class="btn btn-primary btn-sm" onclick="dbRunQuery()">▶ Run</button>
             <button class="btn btn-sm" onclick="dbExplainQuery()" title="Prepend EXPLAIN and run">🔍 Explain</button>
-            <button class="btn btn-sm" onclick="dbFormatQuery()" title="Pretty-print SQL keywords">✨ Format</button>
+            <button class="btn btn-sm" onclick="dbFormatQuery()" title="Pretty-print SQL keywords">Format</button>
             <button class="btn btn-sm" onclick="dbSaveCurrentQuery()">💾 Save…</button>
             <select id="db-saved-select" onchange="dbLoadSavedSelected()" class="form-control" style="display:inline-block; width:auto; font-size:12px; padding:4px 8px;">
                 <option value="">— Saved queries —</option>
