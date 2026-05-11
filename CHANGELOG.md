@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v22.11.0: UI visual sweep — tighter radii/shadows, flat hover states, denser tables across all themes** _(2026-05-11 — [`68fd127`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/68fd127071bd46896d97b06085005ff4ad301c44))_
 - **v22.10.6: WolfNet auto-healing — periodic subnet-route reconciliation + peer-reachability analyzer (klasSponsor)** _(2026-05-10 — [`0e6b1d2`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/0e6b1d260149f45d14d37d8909cc49654d1ad36f))_
 - **v22.10.5: auto-route around Docker/WolfNet subnet collisions + clean duplicate IPs on passthrough slaves (PapaSchlumpf)** _(2026-05-10 — [`71a8577`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/71a8577c3698a0d8d75aaf4b9e30756697bb1bdf))_
 - **v22.10.4: IP-mapping reconciliation loop — silent startup failures recover automatically (PapaSchlumpf)** _(2026-05-09 — [`08c924b`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/08c924b1bc6d7540f5331d63ebc02e85430e57b0))_
