@@ -277,6 +277,21 @@ function semanticToEmoji(semantic) {
 function fillDataIconPlaceholders(root) {
     const scope = root || document.body;
     const theme = (typeof currentIconTheme !== 'undefined') ? currentIconTheme : 'clean';
+    // klasSponsor 2026-05-11: switching to an installed icon pack
+    // (BeautyLine) was a no-op because this function unconditionally
+    // filled every [data-icon] placeholder with Lucide for non-emoji
+    // themes — there was no icon-pack branch. The runtime emoji-
+    // translator (`replaceEmojisWithPackIcons`) only handles emoji
+    // glyphs in text nodes, not the empty [data-icon] spans that
+    // make up most of the chrome. Net effect: pack themes looked
+    // identical to `clean`. The new branch below renders each
+    // placeholder as <img src="/api/icon-packs/{pack}/icon/{semantic}">
+    // when the active pack lists that semantic in its `available`
+    // set, and falls back to Lucide on load error (so a
+    // pack-not-installed-on-this-cluster-node case still renders
+    // something rather than a broken-image icon).
+    const isPackTheme = !(theme in BUILTIN_ICON_THEMES);
+    const packAvailable = (typeof _activePackAvailable !== 'undefined') ? _activePackAvailable : null;
     scope.querySelectorAll('[data-icon]').forEach(el => {
         const semantic = el.getAttribute('data-icon');
         if (!semantic) return;
@@ -295,8 +310,39 @@ function fillDataIconPlaceholders(root) {
                 return;
             }
             // No emoji for this semantic — fall through to Lucide below.
+        } else if (isPackTheme && packAvailable && packAvailable.has(semantic)) {
+            // Pack-icon branch — see comment block above.
+            if (el.querySelector('img.ws-icon-pack-img')) return;
+            const url = `/api/icon-packs/${encodeURIComponent(theme)}/icon/${encodeURIComponent(semantic)}`;
+            const img = document.createElement('img');
+            img.className = 'ws-icon-pack-img';
+            img.src = url;
+            img.alt = semantic;
+            img.style.cssText = 'width:1em;height:1em;vertical-align:-0.125em;display:inline-block;';
+            img.onerror = function () {
+                // Pack file missing for this semantic (e.g. pack not
+                // installed on the node serving this request — cluster
+                // setups where icon-pack install is per-node). Fall
+                // back to Lucide rather than showing a broken-image.
+                if (cleanIconAvailable(semantic)) {
+                    el.innerHTML = cleanIconSvg(semantic);
+                    if (!el.classList.contains('ws-icon-clean-wrap')) el.classList.add('ws-icon-clean-wrap');
+                } else {
+                    el.innerHTML = '';
+                }
+            };
+            // Clear any prior Lucide content so the pack image replaces it.
+            el.innerHTML = '';
+            el.appendChild(img);
+            if (!el.classList.contains('ws-icon-clean-wrap')) el.classList.add('ws-icon-clean-wrap');
+            return;
         }
+        // Lucide fallback (clean theme, or pack theme where the pack
+        // doesn't have this semantic, or pack data hasn't loaded yet
+        // — `initIconTheme` re-runs this function after fetching the
+        // pack's available set, which is when packAvailable populates).
         if (el.querySelector('svg.ws-icon-clean')) return;
+        if (el.querySelector('img.ws-icon-pack-img')) return;
         if (!cleanIconAvailable(semantic)) return;
         if (!el.classList.contains('ws-icon-clean-wrap')) el.classList.add('ws-icon-clean-wrap');
         el.innerHTML = cleanIconSvg(semantic);

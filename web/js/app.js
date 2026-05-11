@@ -28134,10 +28134,20 @@ async function initIconTheme() {
         if (preview && preview.available && preview.available.length > 0) {
             _activePackAvailable = new Set(preview.available);
             console.log(`[WolfStack] Icon pack "${currentIconTheme}": ${preview.available.length}/${preview.total_semantic} icons available`);
+            // Re-fill the [data-icon] placeholders now that we know the
+            // pack's available-icons set. The earlier call (line ~28117)
+            // ran before this fetch resolved, so every placeholder got
+            // a Lucide fallback. Without this second pass on a pack
+            // theme, the chrome stays Lucide regardless of selection
+            // (klasSponsor 2026-05-11 — selecting BeautyLine appeared
+            // to do nothing).
+            if (typeof fillDataIconPlaceholders === 'function') {
+                fillDataIconPlaceholders(document.body);
+            }
             replaceEmojisWithPackIcons(document.body);
             observeForIconPack();
         } else {
-            console.warn(`[WolfStack] Icon pack "${currentIconTheme}": no matching icons found`);
+            console.warn(`[WolfStack] Icon pack "${currentIconTheme}": no matching icons found (pack may not be installed on this node)`);
         }
     } else {
         // Built-in emoji theme (candy)
