@@ -1197,6 +1197,195 @@ pub fn reconcile_local_wolfnet_endpoint_if_needed(
     }
 }
 
+/// A peer's identity from cluster gossip, fed to the batched reconciler
+/// to drive endpoint decisions.
+#[derive(Debug, Clone)]
+pub struct ReconcileTarget {
+    pub hostname: String,
+    /// `Node.address` — the peer's externally-known address (usually
+    /// LAN IP, but a public IP for internet-only peers).
+    pub lan_address: Option<String>,
+    /// `Node.public_ip` from gossip — what the peer detected as its own
+    /// public IP via outbound probe.
+    pub public_ip: Option<String>,
+}
+
+/// Reconcile ALL peers in one pass — read config once, apply every
+/// change in-memory, write once, reload/restart wolfnet ONCE.
+///
+/// Why this exists (klasSponsor 2026-05-11 incident analysis): in
+/// 22.14.8 each per-peer reconciler call independently invoked
+/// `add_wolfnet_peer`, which writes the config and either SIGHUPs or
+/// runs `systemctl restart wolfnet`. On a cluster with N peers needing
+/// a `Clear` (the behind-NAT case), Hook A's startup pass triggered N
+/// rapid systemctl restarts. systemd's default
+/// `StartLimitBurst=5/StartLimitIntervalSec=10` ate that cascade,
+/// refused further starts, and wolfnet stayed dead — wolfstack's
+/// auto-restart watchdog then logged "auto-restart failed" because the
+/// service was rate-limited. Batching collapses N restarts to 1.
+///
+/// In addition to the cluster-known peers passed in, this function
+/// scans the existing wolfnet config for ORPHAN peers — entries that
+/// AREN'T wolfstack cluster members but whose configured endpoint is
+/// inside our own wolfnet subnet (the klasSponsor unifios case: a
+/// UniFi router that runs wolfnet but not wolfstack, with a stale
+/// endpoint of `10.100.10.1:9634` pointed at its own WolfNet IP, which
+/// creates the kernel routing loop). Those are wiped to roaming-only
+/// so wolfnet stops sending self-encapsulated UDP into the void.
+///
+/// Returns the number of peer entries actually changed. `0` means no
+/// reload was triggered. Errors are returned only for unrecoverable
+/// I/O / parse failures — individual peer mismatches are skipped
+/// silently (no peer entry → nothing to update for that peer).
+pub fn reconcile_wolfnet_peers_batch(
+    self_lan_address: &str,
+    targets: &[ReconcileTarget],
+) -> Result<usize, String> {
+    let _guard = WOLFNET_CONFIG_WRITE_LOCK.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let config_path = "/etc/wolfnet/config.toml";
+    let content = std::fs::read_to_string(config_path)
+        .map_err(|e| format!("Failed to read config: {}", e))?;
+    let mut doc: toml::Value = toml::from_str(&content)
+        .map_err(|e| format!("Failed to parse config: {}", e))?;
+
+    let wn_subnet = get_local_wolfnet_subnet();
+    // Index targets by hostname for O(1) lookup as we walk the peers array.
+    let target_by_name: std::collections::HashMap<&str, &ReconcileTarget> =
+        targets.iter().map(|t| (t.hostname.as_str(), t)).collect();
+
+    let mut changes = 0usize;
+    let mut any_cleared = false;
+
+    {
+        let peers_arr = match doc.get_mut("peers").and_then(|v| v.as_array_mut()) {
+            Some(p) => p,
+            None => return Ok(0), // no peers section, nothing to do
+        };
+        for peer in peers_arr.iter_mut() {
+            let name = match peer.get("name").and_then(|v| v.as_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            let current_endpoint = peer.get("endpoint")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            // Reuse the existing port if any; otherwise default to wolfnet's 9600.
+            let port = current_endpoint.as_deref()
+                .and_then(|e| e.rsplit_once(':'))
+                .and_then(|(_, p)| p.parse::<u16>().ok())
+                .unwrap_or(9600);
+
+            // Decide what the endpoint SHOULD be. For cluster-known
+            // peers, drive the decision via `decide_peer_endpoint` (full
+            // 5-guard logic). For orphan peers (in wolfnet config but
+            // not in cluster gossip), only act if the current endpoint
+            // is loop-inducing — never "improve" an orphan beyond that.
+            let decision: Option<PeerEndpoint> = if let Some(target) = target_by_name.get(name.as_str()) {
+                let trigger_present = current_endpoint.as_deref()
+                    .and_then(endpoint_host)
+                    .and_then(|h| h.parse::<std::net::Ipv4Addr>().ok())
+                    .map(is_private_ip)
+                    .unwrap_or(false);
+                let self_priv = self_lan_address.parse::<std::net::Ipv4Addr>()
+                    .map(is_private_ip).unwrap_or(true);
+                // The 22.14.8 reconciler only fires for public-self + RFC1918-endpoint.
+                // Preserve that conservative gate here so LAN-only clusters aren't
+                // disturbed by the batched pass.
+                if !self_priv && trigger_present {
+                    Some(decide_peer_endpoint(
+                        self_lan_address, wn_subnet,
+                        target.lan_address.as_deref(),
+                        target.public_ip.as_deref(),
+                        port,
+                    ))
+                } else {
+                    None
+                }
+            } else if let Some(eps) = current_endpoint.as_deref() {
+                // Orphan peer — only act if its endpoint is inside our
+                // own wolfnet subnet (klasSponsor unifios case).
+                let loop_inducing = (|| {
+                    let host = endpoint_host(eps)?;
+                    let host_ip = host.parse::<std::net::Ipv4Addr>().ok()?;
+                    let (net_addr, prefix) = wn_subnet?;
+                    if is_in_subnet(host_ip, net_addr, prefix) { Some(()) } else { None }
+                })().is_some();
+                if loop_inducing {
+                    Some(PeerEndpoint::Clear)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let decision = match decision {
+                Some(d) => d,
+                None => continue,
+            };
+
+            match decision {
+                PeerEndpoint::Set(s) if !s.is_empty() => {
+                    if current_endpoint.as_deref() != Some(s.as_str()) {
+                        peer.as_table_mut().unwrap().insert(
+                            "endpoint".to_string(),
+                            toml::Value::String(s.clone()),
+                        );
+                        changes += 1;
+                        tracing::info!(
+                            "WolfNet endpoint batched reconcile: peer '{}' → {}",
+                            name, s
+                        );
+                    }
+                }
+                PeerEndpoint::Set(_) | PeerEndpoint::Preserve => {}
+                PeerEndpoint::Clear => {
+                    if peer.as_table_mut().unwrap().remove("endpoint").is_some() {
+                        changes += 1;
+                        any_cleared = true;
+                        tracing::warn!(
+                            "WolfNet endpoint batched reconcile: peer '{}' cleared \
+                             (was unreachable from this node; roaming-only)",
+                            name
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if changes == 0 {
+        return Ok(0);
+    }
+
+    // Write the whole updated config once.
+    let output = toml::to_string_pretty(&doc)
+        .map_err(|e| format!("Failed to serialize config: {}", e))?;
+    std::fs::write(config_path, &output)
+        .map_err(|e| format!("Failed to write config: {}", e))?;
+
+    // ONE reload/restart at the end. If any peer was cleared and we're
+    // running against a pre-0.5.22 wolfnet whose SIGHUP handler doesn't
+    // honour a vanished endpoint line, the restart belt is needed to
+    // re-read the file from scratch. Otherwise SIGHUP is enough and
+    // cheaper.
+    if any_cleared {
+        // Clear any cumulative systemd start-limit ban from prior
+        // versions' restart-storms (klasSponsor 2026-05-11 — by the
+        // time the operator upgrades, systemd may have refused
+        // further starts after the cascade). Best-effort; the
+        // restart below proceeds either way.
+        let _ = Command::new("systemctl").args(["reset-failed", "wolfnet"]).output();
+        restart_wolfnet();
+    } else {
+        reload_or_restart_wolfnet();
+    }
+
+    Ok(changes)
+}
+
 /// Remove a peer from WolfNet config by name
 pub fn remove_wolfnet_peer(name: &str) -> Result<String, String> {
     let config_path = "/etc/wolfnet/config.toml";

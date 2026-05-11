@@ -948,34 +948,51 @@ async fn main() -> std::io::Result<()> {
             });
         }
 
-        // Hook A for WolfNet endpoint self-healing — one-shot startup pass
-        // 30s after launch. By then the first cluster gossip cycle has
-        // run and we have public_ip for any peer that's online; offline
-        // peers stay roaming-only until they come back and hit Hook B
-        // (the gossip-arrival check in agent::mod). The pair fixes
-        // klasSponsor's "VPS upgraded but wolfnet config still pins LAN
-        // peers to 10.10.x.x" without ever needing the manual Sync
-        // button. Bails immediately on LAN-only clusters (the bad
-        // pattern requires self-public).
+        // Hook A for WolfNet endpoint self-healing — one-shot startup
+        // pass 30s after launch. By then the first cluster gossip cycle
+        // has run and we have public_ip for any peer that's online;
+        // offline peers stay roaming-only until they come back and hit
+        // Hook B (the gossip-arrival check in agent::mod).
+        //
+        // The pass is BATCHED in a single function call: one config
+        // read, all changes applied in-memory, one config write, one
+        // reload/restart. This is a critical behaviour change from
+        // 22.14.8 — that version called the per-peer reconciler in a
+        // loop, and each call independently restarted wolfnet via
+        // systemctl, which on klasSponsor's cluster (3+ NAT'd peers)
+        // immediately hit systemd's default `StartLimitBurst=5/10s`
+        // and left wolfnet permanently dead. Batching collapses N
+        // restarts to 1.
+        //
+        // The batched call also scans for ORPHAN peers — wolfnet
+        // config entries that aren't wolfstack cluster members but
+        // have loop-inducing endpoints (klasSponsor's unifios case,
+        // a UniFi router with a stale `10.100.10.1:9634` endpoint).
         {
             let cluster_for_wnfix = cluster.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 let self_addr = cluster_for_wnfix.self_address.clone();
-                let nodes_snapshot = cluster_for_wnfix.get_all_nodes();
-                for node in nodes_snapshot {
-                    if node.is_self { continue; }
-                    if node.node_type != "wolfstack" { continue; }
-                    let hn = node.hostname.clone();
-                    let plan = node.address.clone();
-                    let pip = node.public_ip.clone();
-                    let sa = self_addr.clone();
-                    tokio::task::spawn_blocking(move || {
-                        crate::networking::reconcile_local_wolfnet_endpoint_if_needed(
-                            &sa, &hn, Some(&plan), pip.as_deref(),
-                        );
-                    }).await.ok();
-                }
+                let targets: Vec<crate::networking::ReconcileTarget> = cluster_for_wnfix
+                    .get_all_nodes()
+                    .into_iter()
+                    .filter(|n| !n.is_self && n.node_type == "wolfstack")
+                    .map(|n| crate::networking::ReconcileTarget {
+                        hostname: n.hostname,
+                        lan_address: Some(n.address),
+                        public_ip: n.public_ip,
+                    })
+                    .collect();
+                tokio::task::spawn_blocking(move || {
+                    match crate::networking::reconcile_wolfnet_peers_batch(&self_addr, &targets) {
+                        Ok(0) => {}
+                        Ok(n) => tracing::info!(
+                            "WolfNet startup reconcile: {} peer entr{} updated",
+                            n, if n == 1 { "y" } else { "ies" }
+                        ),
+                        Err(e) => tracing::warn!("WolfNet startup reconcile failed: {}", e),
+                    }
+                }).await.ok();
             });
         }
 
