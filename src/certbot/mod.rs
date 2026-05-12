@@ -95,6 +95,28 @@ pub struct CertSummary {
     /// Days until expiry. Negative when already expired. Frontend uses
     /// this to colour the row (green > 30, amber 7–30, red < 7).
     pub days_remaining: i64,
+    /// Absolute path to `fullchain.pem`. Derived from `LE_LIVE_DIR` +
+    /// `name`. Filled in by `list_certs`; on serialisation it's stable
+    /// across builds because certbot's layout is well-known. UI uses
+    /// this to auto-fill the WolfProxy site form so operators don't
+    /// have to retype `/etc/letsencrypt/live/<zone>/fullchain.pem`.
+    #[serde(default)]
+    pub cert_path: String,
+    /// Absolute path to `privkey.pem`. See `cert_path` above.
+    #[serde(default)]
+    pub key_path: String,
+    /// True if at least one of `domains` is a wildcard (`*.zone.tld`).
+    /// Wildcards let one cert cover every host in the zone, so the
+    /// site-creation UI treats them differently — it offers a
+    /// "subdomain" input that synthesises `server_name`.
+    #[serde(default)]
+    pub is_wildcard: bool,
+    /// For wildcard certs, the zone the wildcard covers
+    /// (`*.wolf.uk.com` → `wolf.uk.com`). Empty for non-wildcard
+    /// certs. The UI shows this as a suffix chip next to the subdomain
+    /// input so the operator can see what the final hostname will be.
+    #[serde(default)]
+    pub base_zone: String,
 }
 
 pub fn is_installed() -> bool {
@@ -125,11 +147,24 @@ pub fn list_certs() -> Vec<CertSummary> {
         let cert_pem = path.join("cert.pem");
         if !cert_pem.exists() { continue; }
         let (domains, expires, days_remaining) = probe_cert(&cert_pem);
+        // Pick the first wildcard SAN for `base_zone`. A single
+        // multi-SAN cert can carry both `wolf.uk.com` and
+        // `*.wolf.uk.com`; the wildcard one is what makes it useful
+        // for "any host under this zone" proxying.
+        let wildcard = domains.iter().find(|d| d.starts_with("*."));
+        let is_wildcard = wildcard.is_some();
+        let base_zone = wildcard
+            .map(|d| d.trim_start_matches("*.").to_string())
+            .unwrap_or_default();
         out.push(CertSummary {
             name: name.to_string(),
             domains,
             expires,
             days_remaining,
+            cert_path: format!("{}/{}/fullchain.pem", LE_LIVE_DIR, name),
+            key_path: format!("{}/{}/privkey.pem", LE_LIVE_DIR, name),
+            is_wildcard,
+            base_zone,
         });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));

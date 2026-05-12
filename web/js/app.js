@@ -11803,6 +11803,21 @@ function nginxNewSiteForm() {
         </div>
         <p style="color:var(--text-muted); font-size:12px; margin-bottom:16px;">Create a new nginx server block. Fill in the details below and click Generate to preview the configuration before saving.</p>
         <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px; max-width:700px;">
+            <div class="form-group" style="grid-column:span 2;">
+                <label style="font-weight:600; margin-bottom:4px; display:block;">Use installed certificate <span style="color:var(--text-muted);font-weight:normal;font-size:12px;">— optional</span></label>
+                <select class="form-control" id="nginx-cert-picker" onchange="nginxApplyCertPick()">
+                    <option value="">— don't auto-fill (enter paths manually below) —</option>
+                </select>
+                <small style="color:var(--text-muted);">Pick a Let's Encrypt cert from <code>/etc/letsencrypt/live/</code> to auto-fill the cert paths and switch HTTPS on. Wildcards reveal a subdomain field so one cert can serve every host in the zone.</small>
+            </div>
+            <div class="form-group" id="nginx-subdomain-row" style="grid-column:span 2; display:none;">
+                <label style="font-weight:600; margin-bottom:4px; display:block;">Subdomain</label>
+                <div style="display:flex; align-items:stretch; gap:0;">
+                    <input type="text" class="form-control" id="nginx-subdomain" placeholder="myhost" oninput="nginxSyncServerNameFromSubdomain()" style="border-radius:6px 0 0 6px;">
+                    <span id="nginx-subdomain-suffix" style="padding:8px 12px;background:var(--bg-tertiary);border:1px solid var(--border);border-left:none;border-radius:0 6px 6px 0;color:var(--text-muted);font-size:13px;display:flex;align-items:center;font-family:monospace;"></span>
+                </div>
+                <small style="color:var(--text-muted);">Final hostname shown above. Leave blank to use the zone apex (e.g. just <code>wolf.uk.com</code>).</small>
+            </div>
             <div class="form-group">
                 <label style="font-weight:600; margin-bottom:4px; display:block;">Server Name</label>
                 <input type="text" class="form-control" id="nginx-server-name" placeholder="example.com">
@@ -11859,6 +11874,108 @@ function nginxNewSiteForm() {
             </div>
         </div>
     `;
+    nginxLoadAvailableCerts();
+}
+
+// Cached cert list for the "Use installed certificate" picker. Indexed
+// by cert `name` (matches /etc/letsencrypt/live/<name>/) so the change
+// handler can look up cert paths + base_zone without re-fetching.
+var nginxAvailableCerts = [];
+
+async function nginxLoadAvailableCerts() {
+    const sel = document.getElementById('nginx-cert-picker');
+    if (!sel) return;
+    try {
+        const resp = await fetch('/api/configurator/nginx/available-certs');
+        if (!resp.ok) return; // dropdown stays as just the "don't auto-fill" option
+        const data = await resp.json();
+        nginxAvailableCerts = data.certs || [];
+        const opts = ['<option value="">— don\'t auto-fill (enter paths manually below) —</option>'];
+        nginxAvailableCerts.forEach(function (c) {
+            const tag = c.is_wildcard ? ' (wildcard)' : '';
+            const sans = (c.domains || []).join(', ');
+            const label = c.name + tag + (sans ? ' — ' + sans : '');
+            opts.push('<option value="' + escapeAttr(c.name) + '">' + escapeHtml(label) + '</option>');
+        });
+        sel.innerHTML = opts.join('');
+    } catch (e) {
+        // Non-fatal — operator can still type cert paths manually.
+    }
+}
+
+// Apply the picked cert: flip ssl on, fill cert/key paths, set server_name
+// (or reveal the subdomain helper for wildcards).
+function nginxApplyCertPick() {
+    const sel = document.getElementById('nginx-cert-picker');
+    const name = sel ? sel.value : '';
+    const sslToggle = document.getElementById('nginx-ssl-toggle');
+    const sslFields = document.getElementById('nginx-ssl-fields');
+    const certPath = document.getElementById('nginx-ssl-cert');
+    const keyPath = document.getElementById('nginx-ssl-key');
+    const serverName = document.getElementById('nginx-server-name');
+    const port = document.getElementById('nginx-listen-port');
+    const subdomainRow = document.getElementById('nginx-subdomain-row');
+    const subdomainSuffix = document.getElementById('nginx-subdomain-suffix');
+
+    if (!name) {
+        // "don't auto-fill" — leave everything alone but hide the subdomain helper.
+        if (subdomainRow) subdomainRow.style.display = 'none';
+        return;
+    }
+    const cert = nginxAvailableCerts.find(function (c) { return c.name === name; });
+    if (!cert) return;
+
+    // Flip SSL on + reveal the fields the SSL toggle controls.
+    if (sslToggle) sslToggle.checked = true;
+    if (sslFields) sslFields.style.display = '';
+    // Default to 443 if the operator left the port at 80 — they almost
+    // certainly want HTTPS now. Don't overwrite a non-default value.
+    if (port && (!port.value || port.value === '80')) port.value = '443';
+    // Auto-fill the cert paths. Operator can still edit them after.
+    if (certPath) certPath.value = cert.cert_path || '';
+    if (keyPath) keyPath.value = cert.key_path || '';
+
+    if (cert.is_wildcard && cert.base_zone) {
+        // Wildcards: show the subdomain helper. server_name is computed
+        // from "<subdomain>.<base_zone>" by nginxSyncServerNameFromSubdomain.
+        if (subdomainRow) subdomainRow.style.display = '';
+        if (subdomainSuffix) subdomainSuffix.textContent = '.' + cert.base_zone;
+        const subdomain = document.getElementById('nginx-subdomain');
+        if (subdomain && !subdomain.value && serverName && serverName.value) {
+            // If the operator already typed something into server_name
+            // that's a subdomain of the picked zone, pre-fill the
+            // subdomain field with the prefix so they don't lose it.
+            const sn = serverName.value.trim();
+            const suffix = '.' + cert.base_zone;
+            if (sn.endsWith(suffix)) {
+                subdomain.value = sn.slice(0, -suffix.length);
+            }
+        }
+        nginxSyncServerNameFromSubdomain();
+    } else {
+        // Non-wildcard: use the cert's first domain as the server_name
+        // unless the operator's already typed something specific.
+        if (subdomainRow) subdomainRow.style.display = 'none';
+        if (serverName && !serverName.value.trim()) {
+            const firstDomain = (cert.domains || [])[0] || '';
+            if (firstDomain) serverName.value = firstDomain;
+        }
+    }
+}
+
+// Synthesise server_name from "<subdomain>.<zone>" for wildcard picks.
+// Called on every keystroke in the subdomain box.
+function nginxSyncServerNameFromSubdomain() {
+    const sel = document.getElementById('nginx-cert-picker');
+    const name = sel ? sel.value : '';
+    if (!name) return;
+    const cert = nginxAvailableCerts.find(function (c) { return c.name === name; });
+    if (!cert || !cert.is_wildcard || !cert.base_zone) return;
+    const subdomain = (document.getElementById('nginx-subdomain') || {}).value || '';
+    const serverName = document.getElementById('nginx-server-name');
+    if (!serverName) return;
+    const sub = subdomain.trim();
+    serverName.value = sub ? (sub + '.' + cert.base_zone) : cert.base_zone;
 }
 
 async function nginxGenerateAndPreview() {

@@ -20960,6 +20960,23 @@ pub async fn nginx_update_site(req: HttpRequest, state: web::Data<AppState>, pat
     }
 }
 
+/// GET /api/configurator/nginx/available-certs — list installed
+/// Let's Encrypt certs from /etc/letsencrypt/live/ so the WolfProxy
+/// site-creation form can offer them in a dropdown. Wildcards (`*.zone`)
+/// are tagged so the UI can swap the server-name textbox for a
+/// "subdomain + zone-chip" pair and synthesise the final hostname.
+///
+/// This deliberately reads from the management node's host filesystem
+/// rather than via the `configurator` ExecTarget — certs live host-side
+/// even when the nginx site being configured is inside a container,
+/// and the operator will bind-mount `/etc/letsencrypt` into the
+/// container if they want them visible inside it.
+pub async fn nginx_available_certs(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let certs = crate::certbot::list_certs();
+    HttpResponse::Ok().json(serde_json::json!({ "certs": certs }))
+}
+
 /// DELETE /api/configurator/nginx/sites/{name} — delete a site
 pub async fn nginx_delete_site(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>, query: web::Query<ConfiguratorTarget>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
@@ -26558,6 +26575,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/wolfrun/services/{id}/portforward/{rule_id}", web::delete().to(wolfrun_portforward_delete))
         // Configurators
         // Nginx (WolfProxy)
+        .route("/api/configurator/nginx/available-certs", web::get().to(nginx_available_certs))
         .route("/api/configurator/nginx/sites", web::get().to(nginx_list_sites))
         .route("/api/configurator/nginx/sites", web::post().to(nginx_create_site))
         .route("/api/configurator/nginx/sites/{name}", web::get().to(nginx_read_site))
