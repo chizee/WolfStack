@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v22.14.11: Peer tombstones — operator removals stay removed** _(2026-05-12 — [`f2a64a3`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/f2a64a3d445948008daaa1fc55b7a6c08c886245))_
 - **v22.14.10: Batch WolfNet endpoint reconcile + orphan peer scanner** _(2026-05-11 — [`3d4f993`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/3d4f9931db5e7e3d948e91579ad097062801a7f6))_
 - **v22.14.9: Icon packs actually apply to data-icon placeholders** _(2026-05-11 — [`613c945`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/613c945c340d442325d8f390b4fb5fbd2d5a0699))_
 - **v22.14.8: WolfNet endpoint safety guards — stop the kernel-loop flood** _(2026-05-11 — [`cd4bcb9`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/cd4bcb9c30b7f967e4ffb538aac62acdc9272396))_
