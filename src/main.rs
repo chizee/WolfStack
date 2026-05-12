@@ -133,6 +133,25 @@ struct Cli {
     /// effect in the running ruleset.
     #[arg(long, value_name = "PATH")]
     wolfrouter_restore: Option<String>,
+
+    /// Wipe this node's cluster membership state and exit. Deletes
+    /// `self_cluster.json`, `nodes.json`, `deleted_nodes.json`, and
+    /// `node_id` so that the daemon comes back up as a fresh
+    /// single-node cluster on its next start. Use this when a node is
+    /// stranded in a phantom old cluster (typically because the cluster
+    /// name was changed on another node while this one was offline) and
+    /// the management UI can't reach it cross-cluster to recover.
+    /// Refuses to run while the `wolfstack` systemd unit is active —
+    /// stop it first so file ops don't race the running daemon's saves.
+    #[arg(long)]
+    leave_cluster: bool,
+
+    /// Modifier for `--leave-cluster`: also rotate the cluster-secret
+    /// file (`/etc/wolfstack/custom-cluster-secret`) so old peers can
+    /// no longer authenticate inter-node calls to this server. Has no
+    /// effect without `--leave-cluster`.
+    #[arg(long)]
+    rotate_cluster_secret: bool,
 }
 
 /// Serve the login page for unauthenticated requests to /
@@ -287,6 +306,76 @@ async fn main() -> std::io::Result<()> {
                 std::process::exit(1);
             }
         }
+    }
+
+    // --leave-cluster: wipe this node's cluster membership state and exit.
+    // Refuses while the wolfstack service is active to avoid the running
+    // daemon's `save_nodes()` racing the file deletions back into existence.
+    if cli.leave_cluster {
+        match agent::leave_is_service_active() {
+            Some(true) => {
+                eprintln!("Refusing to wipe cluster state while wolfstack.service is active.");
+                eprintln!("Stop it first, then re-run this command:");
+                eprintln!();
+                eprintln!("    sudo systemctl stop wolfstack");
+                eprintln!("    sudo wolfstack --leave-cluster{}",
+                          if cli.rotate_cluster_secret { " --rotate-cluster-secret" } else { "" });
+                eprintln!("    sudo systemctl start wolfstack");
+                std::process::exit(1);
+            }
+            Some(false) => {}
+            None => {
+                eprintln!("warning: could not query systemctl — proceeding anyway. If the");
+                eprintln!("         daemon is running it may re-create the files we delete.");
+            }
+        }
+
+        let result = agent::leave_wipe_membership_files();
+        println!("Cluster leave: wiping local membership state.");
+        if let Some(prev) = &result.previous_cluster_name {
+            println!("  Previous cluster name: {}", prev);
+        }
+        for f in &result.files {
+            if f.cleared {
+                println!("  removed  {}", f.path);
+            } else if f.already_absent {
+                println!("  (absent) {}", f.path);
+            } else if let Some(err) = &f.error {
+                eprintln!("  FAILED   {}  ({})", f.path, err);
+            }
+        }
+        let any_failed = result.files.iter().any(|f| f.error.is_some());
+
+        if cli.rotate_cluster_secret {
+            let new_secret = auth::generate_cluster_secret();
+            match auth::save_cluster_secret(&new_secret) {
+                Ok(()) => println!("  rotated  {} (new secret written)",
+                                   paths::get().cluster_secret),
+                Err(e) => {
+                    eprintln!("  FAILED   rotate cluster secret: {}", e);
+                    std::process::exit(2);
+                }
+            }
+        }
+
+        println!();
+        if any_failed {
+            eprintln!("Done with errors — see above. The daemon may still come up");
+            eprintln!("partially cleared on next start; investigate the failed paths.");
+            std::process::exit(2);
+        }
+        println!("Done. Start the daemon to bring this node up as a fresh");
+        println!("single-node cluster:");
+        println!();
+        println!("    sudo systemctl start wolfstack");
+        return Ok(());
+    }
+
+    if cli.rotate_cluster_secret {
+        eprintln!("--rotate-cluster-secret has no effect without --leave-cluster.");
+        eprintln!("To rotate the cluster secret on a running cluster, use the");
+        eprintln!("management UI: Settings → Security → Generate New Cluster Secret.");
+        std::process::exit(1);
     }
 
     // Load persistent port config; CLI --port still overrides the API port

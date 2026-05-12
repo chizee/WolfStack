@@ -2235,6 +2235,144 @@ pub async fn cluster_secret_repush(req: HttpRequest, state: web::Data<AppState>)
     }))
 }
 
+// ─── Cluster Leave ────────────────────────────────────────────────────
+//
+// Used when a node ends up stranded in the wrong cluster — typically
+// because the cluster was renamed on another node while this one was
+// offline, and now every cross-cluster operation (route create, status
+// page, etc.) is rejected by the strict-cluster guard
+// (`networking::router::api` ~line 5690). The flow:
+//
+//   1. Best-effort broadcast `DELETE /api/nodes/{self_id}` to every
+//      online peer so they tombstone us instead of gossiping us back.
+//   2. Drop in-memory peer + tombstone state so any save fired during
+//      the shutdown gap writes empty.
+//   3. Unlink `self_cluster.json`, `nodes.json`, `deleted_nodes.json`,
+//      and `node_id` (see `agent::leave_wipe_membership_files`).
+//   4. Optionally rotate the cluster secret.
+//   5. Schedule `systemctl restart wolfstack` so the daemon comes back
+//      up with fresh state and a new `node_id`.
+
+#[derive(Deserialize, Default)]
+pub struct ClusterLeaveRequest {
+    /// When true, also generate a new `custom-cluster-secret`. Old peers
+    /// can then no longer authenticate inter-node calls to this server
+    /// even if they retain a stale entry for it.
+    #[serde(default)]
+    pub rotate_secret: bool,
+}
+
+#[derive(Serialize)]
+pub struct ClusterLeavePeerResult {
+    pub node_id: String,
+    pub hostname: String,
+    pub address: String,
+    pub success: bool,
+    pub error: String,
+}
+
+/// POST /api/cluster/leave — drop this node out of its cluster and
+/// restart so it comes back up as a fresh single-node cluster.
+pub async fn cluster_leave(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<ClusterLeaveRequest>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+
+    // Snapshot what we need before we start wiping state. self_id is the
+    // ID our peers know us by; the broadcast carries it as the path
+    // parameter so each peer can `remove_server` the right entry.
+    let self_id = state.cluster.self_id.clone();
+    let secret = state.cluster_secret.clone();
+    let previous_cluster_name = state.cluster.get_node(&self_id)
+        .and_then(|n| n.cluster_name.clone());
+
+    let peers: Vec<_> = state.cluster.get_all_nodes()
+        .into_iter()
+        .filter(|n| !n.is_self && n.online && n.node_type == "wolfstack")
+        .collect();
+
+    // Step 1: best-effort broadcast. Each peer gets the same 3-URL
+    // fallback ladder as the existing `remove_node` broadcast at
+    // api/mod.rs ~line 2503, so behaviour matches what they'd expect
+    // from a manual DELETE.
+    let client = &*API_HTTP_CLIENT;
+    let mut peer_results: Vec<ClusterLeavePeerResult> = Vec::with_capacity(peers.len());
+    for peer in &peers {
+        let urls = build_node_urls(&peer.address, peer.port, &format!("/api/nodes/{}", self_id));
+        let mut success = false;
+        let mut err = String::new();
+        for url in &urls {
+            match client.delete(url)
+                .timeout(std::time::Duration::from_secs(5))
+                .header("X-WolfStack-Secret", &secret)
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    success = true;
+                    let _ = resp.bytes().await;
+                    break;
+                }
+                Ok(resp) => { err = format!("HTTP {}", resp.status()); let _ = resp.bytes().await; }
+                Err(e) => { err = e.to_string(); }
+            }
+        }
+        peer_results.push(ClusterLeavePeerResult {
+            node_id: peer.id.clone(),
+            hostname: if peer.hostname.is_empty() { peer.address.clone() } else { peer.hostname.clone() },
+            address: peer.address.clone(),
+            success,
+            error: if success { String::new() } else { err },
+        });
+    }
+
+    // Step 2: drop in-memory peer state so any background `save_nodes()`
+    // in the next 1.5s writes an empty list rather than re-creating the
+    // file we're about to delete.
+    state.cluster.clear_membership_in_memory();
+
+    // Step 3: wipe the on-disk membership files.
+    let wipe = crate::agent::leave_wipe_membership_files();
+
+    // Step 4: optional secret rotation. Done last so the broadcast
+    // above (which used the *current* secret) can't be rejected.
+    let mut secret_rotated = false;
+    let mut secret_error: Option<String> = None;
+    if body.rotate_secret {
+        let new_secret = crate::auth::generate_cluster_secret();
+        match crate::auth::save_cluster_secret(&new_secret) {
+            Ok(()) => secret_rotated = true,
+            Err(e) => secret_error = Some(e),
+        }
+    }
+
+    // Step 5: schedule the restart. Use the same detached-thread +
+    // ~1.5s delay pattern as `installer::restart_cert_service` so the
+    // HTTP response below flushes back to the caller before systemd
+    // kills us. `Restart=on-failure` in the unit means we have to call
+    // `systemctl restart` explicitly — a plain `exit(0)` would NOT
+    // respawn us.
+    let restart_in_ms: u64 = 1500;
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(restart_in_ms));
+        let _ = std::process::Command::new("systemctl")
+            .args(["restart", "wolfstack"])
+            .output();
+    });
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "left": true,
+        "previous_cluster_name": previous_cluster_name.or(wipe.previous_cluster_name),
+        "peer_results": peer_results,
+        "files": wipe.files,
+        "secret_rotated": secret_rotated,
+        "secret_error": secret_error,
+        "restart_in_ms": restart_in_ms,
+    }))
+}
+
 /// POST /api/cluster/secret/receive — receive a new cluster secret from admin node
 pub async fn cluster_secret_receive(req: HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
     if let Err(resp) = require_cluster_auth(&req, &state) { return resp; }
@@ -25623,6 +25761,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/cluster/secret/generate", web::post().to(cluster_secret_generate))
         .route("/api/cluster/secret/repush", web::post().to(cluster_secret_repush))
         .route("/api/cluster/secret/receive", web::post().to(cluster_secret_receive))
+        .route("/api/cluster/leave", web::post().to(cluster_leave))
         .route("/api/cluster/wolfnet-sync", web::post().to(wolfnet_sync_cluster))
         .route("/api/cluster/diagnose", web::post().to(cluster_diagnose))
         .route("/api/nodes", web::get().to(get_nodes))

@@ -28484,6 +28484,7 @@ function switchSettingsTab(tabName) {
         loadAlertingConfig();
     } else if (tabName === 'security') {
         loadClusterSecretStatus();
+        loadLeaveClusterContext();
     } else if (tabName === 'passkeys') {
         loadPasskeys();
     } else if (tabName === 'paths') {
@@ -31376,6 +31377,144 @@ async function repushClusterSecret() {
         btn.innerHTML = origHtml;
         btn.disabled = false;
     }
+}
+
+// \u2500\u2500\u2500 Leave Cluster \u2500\u2500\u2500
+//
+// Forget all peers, wipe local cluster identity, restart the service.
+// Used to recover this node when it's stranded in the wrong cluster
+// (e.g. cluster renamed elsewhere while this node was offline).
+
+// Captured by loadLeaveClusterContext so the confirm prompt can show the
+// operator which cluster they're about to leave, and so we can compare
+// the typed confirmation string case-sensitively against the real name.
+var leaveClusterCurrentName = null;
+
+async function loadLeaveClusterContext() {
+    var el = document.getElementById('leave-cluster-current');
+    if (el) el.textContent = '';
+    leaveClusterCurrentName = null;
+    try {
+        var resp = await fetch('/api/nodes');
+        if (!resp.ok) return;
+        var nodes = await resp.json();
+        var self = (nodes || []).find(function (n) { return n.is_self; });
+        if (!self) return;
+        var name = self.cluster_name || 'WolfStack';
+        leaveClusterCurrentName = name;
+        if (el) el.textContent = 'Current cluster on this node: "' + name + '"';
+    } catch (e) {
+        // Non-fatal \u2014 the button still works, just without the current-cluster hint.
+    }
+}
+
+async function leaveCluster() {
+    if (leaveClusterCurrentName === null) {
+        // Try one more time in case the user opened the tab before /api/nodes settled.
+        await loadLeaveClusterContext();
+    }
+    var clusterLabel = leaveClusterCurrentName || 'this cluster';
+    var typed = await showPrompt(
+        'Type the cluster name "' + clusterLabel + '" exactly to confirm.\n\n' +
+        'This will:\n' +
+        '  \u2022 Tell every online peer to remove this node\n' +
+        '  \u2022 Wipe self_cluster.json, nodes.json, deleted_nodes.json, node_id\n' +
+        '  \u2022 Restart the WolfStack service\n\n' +
+        'This node will come back up as a fresh single-node cluster.',
+        'Leave Cluster \u2014 confirm');
+    if (typed === null) return;
+    if (leaveClusterCurrentName !== null && typed !== leaveClusterCurrentName) {
+        showToast('Leave cancelled \u2014 typed name did not match.', 'warning');
+        return;
+    }
+    if (leaveClusterCurrentName === null && typed.trim() === '') {
+        showToast('Leave cancelled \u2014 enter a confirmation value.', 'warning');
+        return;
+    }
+
+    var btn = document.getElementById('btn-leave-cluster');
+    var origHtml = btn ? btn.innerHTML : '';
+    if (btn) { btn.disabled = true; btn.innerHTML = 'Leaving cluster\u2026'; }
+    var rotate = !!(document.getElementById('leave-rotate-secret') || {}).checked;
+
+    try {
+        var resp = await fetch('/api/cluster/leave', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ rotate_secret: rotate })
+        });
+        var data = {};
+        try { data = await resp.json(); } catch (_) { /* HTML error body */ }
+        if (!resp.ok) {
+            showToast(data.error || ('Leave failed (HTTP ' + resp.status + ')'), 'error');
+            return;
+        }
+        renderLeaveClusterResults(data);
+        var restartSec = Math.round((data.restart_in_ms || 1500) / 1000);
+        showToast(
+            'Leave initiated. The WolfStack service will restart in ~' + restartSec + 's. ' +
+            'Reload the page after it comes back up.',
+            'success'
+        );
+    } catch (e) {
+        // Network errors are expected once the service restarts \u2014 surface that
+        // distinction so the user doesn't think the leave itself failed.
+        showToast('Connection dropped \u2014 likely the service restart. Reload the page in a few seconds.', 'warning');
+    } finally {
+        if (btn) { btn.disabled = false; btn.innerHTML = origHtml; }
+    }
+}
+
+function renderLeaveClusterResults(data) {
+    var container = document.getElementById('leave-cluster-results');
+    if (!container) return;
+    var html = '<div style="background:var(--bg-input);border-radius:12px;padding:16px;border:1px solid var(--border);max-width:600px;">';
+    html += '<h4 style="margin:0 0 10px;font-size:14px;">Leave summary</h4>';
+
+    if (data.previous_cluster_name) {
+        html += '<div style="font-size:13px;margin-bottom:8px;">Was in cluster: <code>' +
+                escapeHtml(data.previous_cluster_name) + '</code></div>';
+    }
+
+    var peers = data.peer_results || [];
+    if (peers.length > 0) {
+        html += '<div style="font-size:13px;font-weight:600;margin:8px 0 4px;">Peer notifications</div>';
+        peers.forEach(function (r) {
+            var icon = r.success
+                ? '<span style="color:var(--success)">OK</span>'
+                : '<span style="color:var(--danger)">FAILED' + (r.error ? ' \u2014 ' + escapeHtml(r.error) : '') + '</span>';
+            html += '<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;font-size:13px;border-bottom:1px solid var(--border);">';
+            html += '<span>' + escapeHtml(r.hostname || r.address) + '</span>' + icon;
+            html += '</div>';
+        });
+    } else {
+        html += '<div style="font-size:13px;color:var(--text-muted);margin:8px 0;">No online peers to notify.</div>';
+    }
+
+    var files = data.files || [];
+    if (files.length > 0) {
+        html += '<div style="font-size:13px;font-weight:600;margin:12px 0 4px;">Local files</div>';
+        files.forEach(function (f) {
+            var label;
+            if (f.cleared)            label = '<span style="color:var(--success)">removed</span>';
+            else if (f.already_absent) label = '<span style="color:var(--text-muted)">absent</span>';
+            else                       label = '<span style="color:var(--danger)">FAILED' + (f.error ? ' \u2014 ' + escapeHtml(f.error) : '') + '</span>';
+            html += '<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;font-size:13px;border-bottom:1px solid var(--border);">';
+            html += '<code style="font-size:12px;">' + escapeHtml(f.path) + '</code>' + label;
+            html += '</div>';
+        });
+    }
+
+    if (data.secret_rotated) {
+        html += '<div style="font-size:13px;color:var(--success);margin-top:10px;">Cluster secret rotated.</div>';
+    } else if (data.secret_error) {
+        html += '<div style="font-size:13px;color:var(--danger);margin-top:10px;">Secret rotation failed: ' +
+                escapeHtml(data.secret_error) + '</div>';
+    }
+
+    html += '</div>';
+    container.innerHTML = html;
+    container.style.display = 'block';
 }
 
 // \u2500\u2500\u2500 Alerting & Notifications \u2500\u2500\u2500

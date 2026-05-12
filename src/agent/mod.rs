@@ -18,6 +18,94 @@ use tracing::warn;
 use crate::monitoring::SystemMetrics;
 use crate::installer::ComponentStatus;
 
+/// Per-file result of `leave_wipe_membership_files`. A `cleared` of
+/// `false` either means the file was already absent (treat as success)
+/// or the unlink failed; `error` differentiates the two so the CLI can
+/// print a useful message and the HTTP handler can surface it to the UI.
+#[derive(Debug, Clone, Serialize)]
+pub struct LeaveWipeFile {
+    pub path: String,
+    pub cleared: bool,
+    pub already_absent: bool,
+    pub error: Option<String>,
+}
+
+/// Summary of the on-disk side of leaving the cluster. Returned by
+/// `leave_wipe_membership_files` and surfaced to both the CLI and the
+/// HTTP response. `previous_cluster_name` is captured before deletion
+/// so the operator can see which cluster they were just in.
+#[derive(Debug, Clone, Serialize)]
+pub struct LeaveWipeResult {
+    pub previous_cluster_name: Option<String>,
+    pub files: Vec<LeaveWipeFile>,
+}
+
+/// Delete the on-disk files that make this node a member of its cluster:
+///   • `self_cluster.json`  — this node's chosen cluster name
+///   • `nodes.json`         — every peer we know about
+///   • `deleted_nodes.json` — tombstones (stale once we're starting fresh)
+///   • `node_id`            — this node's stable identity; regenerated on
+///                            next start so any tombstones held by old peers
+///                            for our prior ID can't block a clean re-join
+///
+/// Does NOT touch `custom-cluster-secret` — secret rotation is a separate
+/// opt-in step so the operator can decide whether to lock old peers out.
+/// Caller is responsible for ensuring the running service won't immediately
+/// re-write these files (`ClusterState::clear_membership_in_memory` first,
+/// or stop the service for the CLI path).
+pub fn leave_wipe_membership_files() -> LeaveWipeResult {
+    let p = crate::paths::get();
+    let previous_cluster_name = std::fs::read_to_string(&p.self_cluster_config)
+        .ok()
+        .and_then(|s| serde_json::from_str::<String>(s.trim()).ok())
+        .filter(|s| !s.is_empty());
+
+    let targets = [
+        p.self_cluster_config.clone(),
+        p.nodes_config.clone(),
+        p.deleted_nodes_config.clone(),
+        p.node_id_file.clone(),
+    ];
+
+    let mut files = Vec::with_capacity(targets.len());
+    for path in &targets {
+        match std::fs::remove_file(path) {
+            Ok(()) => files.push(LeaveWipeFile {
+                path: path.clone(),
+                cleared: true,
+                already_absent: false,
+                error: None,
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => files.push(LeaveWipeFile {
+                path: path.clone(),
+                cleared: false,
+                already_absent: true,
+                error: None,
+            }),
+            Err(e) => files.push(LeaveWipeFile {
+                path: path.clone(),
+                cleared: false,
+                already_absent: false,
+                error: Some(e.to_string()),
+            }),
+        }
+    }
+    LeaveWipeResult { previous_cluster_name, files }
+}
+
+/// Check whether `wolfstack.service` is currently active. Used by the
+/// `--leave-cluster` CLI to refuse a wipe while the daemon is running
+/// (otherwise its in-memory copies would race-rewrite the files we just
+/// deleted). Returns `None` when systemctl isn't available — caller
+/// should treat that as "unknown, allow with warning".
+pub fn leave_is_service_active() -> Option<bool> {
+    let out = std::process::Command::new("systemctl")
+        .args(["is-active", "--quiet", "wolfstack"])
+        .status()
+        .ok()?;
+    Some(out.success())
+}
+
 /// Check if an address is on a private/local network (RFC1918 + loopback + link-local)
 /// This is used to restrict gossip auto-discovery to local networks only.
 fn is_private_address(addr: &str) -> bool {
@@ -483,6 +571,24 @@ impl ClusterState {
     /// Get the current tombstone set
     pub fn get_deleted_ids(&self) -> Vec<String> {
         self.deleted_ids.read().unwrap().iter().cloned().collect()
+    }
+
+    /// Drop every non-self peer and clear all tombstones in memory.
+    /// Used by POST /api/cluster/leave so that — during the short window
+    /// between the on-disk wipe and the scheduled service restart — any
+    /// gossip-triggered `save_nodes()` writes an empty list instead of
+    /// resurrecting the cluster we just left. Caller is responsible for
+    /// wiping the on-disk files (`leave_wipe_membership_files`).
+    pub fn clear_membership_in_memory(&self) {
+        let self_id = self.self_id.clone();
+        let mut nodes = self.nodes.write().unwrap();
+        let keep_self = nodes.remove(&self_id);
+        nodes.clear();
+        if let Some(s) = keep_self {
+            nodes.insert(self_id, s);
+        }
+        drop(nodes);
+        self.deleted_ids.write().unwrap().clear();
     }
 
     /// Load tombstoned node IDs from disk

@@ -5349,6 +5349,36 @@
                         </div>
                         <div id="cluster-secret-results" style="margin-top:16px;display:none;">
                         </div>
+
+                        <div style="background:var(--bg-input);border-radius:12px;padding:20px;border:1px solid var(--danger);max-width:600px;margin-top:24px;">
+                            <h4 style="margin:0 0 8px 0;font-size:15px;color:var(--danger);">Leave Cluster</h4>
+                            <p style="font-size:13px;color:var(--text-muted);margin:0 0 12px 0;">
+                                Tell every online peer to forget this node, wipe the local cluster identity
+                                (cluster name, peer list, tombstones, node ID), then restart so this server
+                                comes back up as a fresh single-node cluster.
+                            </p>
+                            <p style="font-size:13px;color:var(--text-muted);margin:0 0 16px 0;">
+                                Use this when this node is stranded in the wrong cluster &mdash; typically because
+                                the cluster was renamed on another node while this one was offline, and
+                                cross-cluster operations (subnet routes, status pages, etc.) are now being
+                                blocked. After it comes back up you can re-join from the right master via
+                                <em>Add Node</em>.
+                            </p>
+                            <div style="margin-bottom:14px;">
+                                <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;">
+                                    <input type="checkbox" id="leave-rotate-secret">
+                                    Also rotate the cluster secret (old peers will lose inter-node auth to this server)
+                                </label>
+                            </div>
+                            <div style="display:flex;align-items:center;gap:12px;">
+                                <button class="btn" id="btn-leave-cluster" onclick="leaveCluster()"
+                                        style="background:var(--danger);color:#fff;border:1px solid var(--danger);">
+                                    Leave Cluster
+                                </button>
+                                <span id="leave-cluster-current" style="font-size:13px;color:var(--text-muted);"></span>
+                            </div>
+                        </div>
+                        <div id="leave-cluster-results" style="margin-top:16px;display:none;"></div>
                     </div>
 
                     <!-- ─── Passkeys Tab ─── -->
