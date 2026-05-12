@@ -8896,10 +8896,58 @@ pub struct WolfNetRemovePeer {
 /// DELETE /api/networking/wolfnet/peers — remove a WolfNet peer
 pub async fn net_remove_wolfnet_peer(req: HttpRequest, state: web::Data<AppState>, body: web::Json<WolfNetRemovePeer>) -> HttpResponse {
     if let Err(e) = require_auth(&req, &state) { return e; }
+    // Capture the peer's wolfnet IP BEFORE removal so the subnet-route
+    // cleanup below has a gateway to match against. After remove_wolfnet_peer
+    // the entry is gone from the config and the lookup would return None.
+    let peer_wn_ip: Option<String> = networking::get_wolfnet_peers_list()
+        .into_iter()
+        .find(|p| p.name == body.name)
+        .map(|p| p.ip.split('/').next().unwrap_or(&p.ip).to_string());
     match networking::remove_wolfnet_peer(&body.name) {
-        Ok(msg) => HttpResponse::Ok().json(serde_json::json!({"message": msg})),
+        Ok(msg) => {
+            // Tear down any subnet_routes pointing through this peer.
+            // Auto-installed routes outlive the wolfnet peer entry
+            // otherwise, and the kernel keeps tunnelling packets to a
+            // dead gateway (klasSponsor 2026-05-12 — the 19 GB outbound
+            // burst was traffic following auto-applied routes whose
+            // gateways were peers he'd already removed).
+            let subnet_routes_disabled = match peer_wn_ip {
+                Some(ip) => crate::networking::router::disable_subnet_routes_via_gateway(&state.router, &ip),
+                None => 0,
+            };
+            HttpResponse::Ok().json(serde_json::json!({
+                "message": msg,
+                "subnet_routes_disabled": subnet_routes_disabled,
+            }))
+        }
         Err(e) => HttpResponse::BadRequest().json(serde_json::json!({"error": e})),
     }
+}
+
+/// GET /api/networking/wolfnet/tombstones — list operator-tombstoned peer hostnames
+pub async fn net_wolfnet_tombstones_list(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    HttpResponse::Ok().json(serde_json::json!({
+        "tombstones": networking::wolfnet_tombstone_list(),
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct WolfNetTombstoneTarget {
+    pub hostname: String,
+}
+
+/// DELETE /api/networking/wolfnet/tombstones — un-tombstone a hostname so
+/// the gossip / auto-apply / reconciler paths can re-add it normally on
+/// next tick. Use this when you want a previously-removed peer back in
+/// the cluster.
+pub async fn net_wolfnet_tombstone_remove(req: HttpRequest, state: web::Data<AppState>, body: web::Json<WolfNetTombstoneTarget>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let was_present = networking::wolfnet_tombstone_remove(&body.hostname);
+    HttpResponse::Ok().json(serde_json::json!({
+        "hostname": body.hostname,
+        "was_tombstoned": was_present,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -25835,6 +25883,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/networking/wolfnet/config", web::put().to(net_save_wolfnet_config))
         .route("/api/networking/wolfnet/peers", web::post().to(net_add_wolfnet_peer))
         .route("/api/networking/wolfnet/peers", web::delete().to(net_remove_wolfnet_peer))
+        .route("/api/networking/wolfnet/tombstones", web::get().to(net_wolfnet_tombstones_list))
+        .route("/api/networking/wolfnet/tombstones", web::delete().to(net_wolfnet_tombstone_remove))
         .route("/api/networking/wolfnet/local-info", web::get().to(net_get_wolfnet_local_info))
         .route("/api/networking/wolfnet/action", web::post().to(net_wolfnet_action))
         .route("/api/networking/wolfnet/invite", web::get().to(net_wolfnet_invite))

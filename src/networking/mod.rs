@@ -1126,6 +1126,13 @@ pub fn reconcile_local_wolfnet_endpoint_if_needed(
     peer_lan_address: Option<&str>,
     peer_public_ip: Option<&str>,
 ) -> Option<String> {
+    // 0. Tombstone gate — if the operator explicitly removed this peer,
+    //    don't touch its entry. Without this gate, the next Hook B
+    //    gossip arrival would re-inject the peer's endpoint into the
+    //    wolfnet config and override the operator's deliberate removal.
+    if wolfnet_tombstone_contains(peer_hostname) {
+        return None;
+    }
     // 1. Bail if self is private — the bug pattern requires self-public.
     //    (And keeps LAN-only clusters out of this code entirely.)
     let self_addr: std::net::Ipv4Addr = self_lan_address.parse().ok()?;
@@ -1251,9 +1258,15 @@ pub fn reconcile_wolfnet_peers_batch(
         .map_err(|e| format!("Failed to parse config: {}", e))?;
 
     let wn_subnet = get_local_wolfnet_subnet();
+    let tombstoned = load_wolfnet_tombstones();
     // Index targets by hostname for O(1) lookup as we walk the peers array.
+    // Filter out tombstoned targets up-front so they're never considered for
+    // (re-)application — operator removed = stay removed.
     let target_by_name: std::collections::HashMap<&str, &ReconcileTarget> =
-        targets.iter().map(|t| (t.hostname.as_str(), t)).collect();
+        targets.iter()
+            .filter(|t| !tombstoned.contains(&t.hostname))
+            .map(|t| (t.hostname.as_str(), t))
+            .collect();
 
     let mut changes = 0usize;
     let mut any_cleared = false;
@@ -1452,10 +1465,122 @@ pub fn remove_wolfnet_peer(name: &str) -> Result<String, String> {
 
 
 
+    // Mark this hostname as tombstoned so the gossip / auto-apply /
+    // reconciler paths don't immediately re-inject it. Without this,
+    // every 60s `auto_apply_missing_workload_routes` would re-create
+    // subnet_routes through this peer from cluster gossip, and the
+    // operator's "remove this peer" intent would be silently
+    // overridden — klasSponsor 2026-05-12 hit this exactly.
+    wolfnet_tombstone_add(name);
+
     // Apply config: try SIGHUP hot-reload, fall back to restart for older wolfnet
     reload_or_restart_wolfnet();
 
-    Ok(format!("Peer '{}' removed and WolfNet reloaded", name))
+    Ok(format!("Peer '{}' removed and tombstoned; WolfNet reloaded", name))
+}
+
+// ─── WolfNet peer tombstones ────────────────────────────────────────
+//
+// Persistent record of peer hostnames the operator has explicitly
+// removed. Any code path that auto-(re)injects peers — cluster-gossip
+// reconciler (Hook A/B), `auto_apply_missing_workload_routes`,
+// gossip-driven subnet-route auto-creation — consults this set and
+// skips tombstoned peers.
+//
+// Why this exists: klasSponsor 2026-05-12 — he manually removed peers
+// from `/etc/wolfnet/config.toml`, but every 60s `auto_apply_missing_
+// workload_routes` re-created subnet_routes through them from cluster
+// gossip, and packets continued to flow into a black hole at ~17 MB/s.
+// The operator's intent was being silently overridden. The tombstone
+// list is the operator's authoritative "no, really, stay removed"
+// signal, persisted across daemon restarts so it survives upgrades.
+//
+// The list is hostname-keyed because that's what's stable across the
+// wolfnet config (`name = "..."`), the cluster Node struct
+// (`hostname`), and the subnet_route metadata. Wolfnet IPs can change
+// after a rejoin; public keys aren't propagated to all paths.
+//
+// To un-tombstone (re-add a previously-removed peer) the operator
+// calls the DELETE endpoint or removes the entry from the file by
+// hand. The next gossip / auto-apply / sync will then re-add it
+// normally.
+
+const WOLFNET_TOMBSTONE_FILE: &str = "/etc/wolfstack/wolfnet-tombstones.json";
+
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
+struct WolfnetTombstones {
+    /// Hostnames the operator has removed. Sorted for stable diffs.
+    /// `#[serde(default)]` so an empty-ish file (e.g. `{}` from a
+    /// truncated write) deserializes to an empty list rather than an
+    /// error — we'd rather "no tombstones" than "couldn't read".
+    #[serde(default)]
+    hostnames: Vec<String>,
+}
+
+fn load_wolfnet_tombstones() -> std::collections::HashSet<String> {
+    match std::fs::read_to_string(WOLFNET_TOMBSTONE_FILE) {
+        Ok(s) => serde_json::from_str::<WolfnetTombstones>(&s)
+            .map(|t| t.hostnames.into_iter().collect())
+            .unwrap_or_default(),
+        Err(_) => std::collections::HashSet::new(),
+    }
+}
+
+fn save_wolfnet_tombstones(set: &std::collections::HashSet<String>) -> Result<(), String> {
+    let mut hostnames: Vec<String> = set.iter().cloned().collect();
+    hostnames.sort();
+    let t = WolfnetTombstones { hostnames };
+    let content = serde_json::to_string_pretty(&t)
+        .map_err(|e| format!("serialize tombstones: {}", e))?;
+    if let Some(parent) = std::path::Path::new(WOLFNET_TOMBSTONE_FILE).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(WOLFNET_TOMBSTONE_FILE, content)
+        .map_err(|e| format!("write tombstones: {}", e))
+}
+
+/// Mark `hostname` as removed. All future auto-(re)injection paths will
+/// skip this hostname until it's removed via `wolfnet_tombstone_remove`.
+pub fn wolfnet_tombstone_add(hostname: &str) {
+    if hostname.is_empty() { return; }
+    let mut set = load_wolfnet_tombstones();
+    if set.insert(hostname.to_string()) {
+        if let Err(e) = save_wolfnet_tombstones(&set) {
+            tracing::warn!("Failed to persist wolfnet tombstone for '{}': {}", hostname, e);
+        } else {
+            tracing::info!(
+                "WolfNet tombstone added: '{}' will be ignored by gossip / auto-apply / reconcilers",
+                hostname
+            );
+        }
+    }
+}
+
+/// Un-tombstone a hostname. Returns true if it was actually tombstoned
+/// (i.e. caller has effected a change).
+pub fn wolfnet_tombstone_remove(hostname: &str) -> bool {
+    let mut set = load_wolfnet_tombstones();
+    if set.remove(hostname) {
+        if let Err(e) = save_wolfnet_tombstones(&set) {
+            tracing::warn!("Failed to persist wolfnet tombstone removal for '{}': {}", hostname, e);
+        }
+        true
+    } else {
+        false
+    }
+}
+
+/// Check whether `hostname` is tombstoned. Cheap — load+lookup is one
+/// small file read. Auto-(re)injection paths call this per peer.
+pub fn wolfnet_tombstone_contains(hostname: &str) -> bool {
+    load_wolfnet_tombstones().contains(hostname)
+}
+
+/// List all tombstoned hostnames. Used by the inspect endpoint.
+pub fn wolfnet_tombstone_list() -> Vec<String> {
+    let mut v: Vec<String> = load_wolfnet_tombstones().into_iter().collect();
+    v.sort();
+    v
 }
 
 /// Try SIGHUP hot-reload first; if wolfnet dies (old version without handler),
@@ -3944,6 +4069,44 @@ mod tests {
             None, Some("10.100.10.5"), 9600,
         );
         assert!(matches!(r, PeerEndpoint::Clear));
+    }
+
+    // ─── tombstone semantics ───
+    // The tombstone helpers touch the real `/etc/wolfstack/...` path,
+    // which isn't writable in CI; we test the JSON-format round-trip
+    // directly to verify the on-disk shape is stable, plus the in-set
+    // semantics via `WolfnetTombstones`.
+    #[test]
+    fn tombstone_serializes_sorted_hostnames() {
+        let mut set = std::collections::HashSet::new();
+        set.insert("ninni".to_string());
+        set.insert("alpha".to_string());
+        set.insert("lillamy".to_string());
+        let mut hostnames: Vec<String> = set.iter().cloned().collect();
+        hostnames.sort();
+        let t = WolfnetTombstones { hostnames };
+        let json = serde_json::to_string(&t).unwrap();
+        // Order matters for stable diffs — alpha < lillamy < ninni.
+        assert_eq!(
+            json,
+            r#"{"hostnames":["alpha","lillamy","ninni"]}"#
+        );
+    }
+
+    #[test]
+    fn tombstone_deserializes_empty_when_missing_field() {
+        let t: WolfnetTombstones = serde_json::from_str("{}").unwrap();
+        assert!(t.hostnames.is_empty());
+    }
+
+    #[test]
+    fn tombstone_round_trip() {
+        let original = WolfnetTombstones {
+            hostnames: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let decoded: WolfnetTombstones = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.hostnames, original.hostnames);
     }
 
     #[test]

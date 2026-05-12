@@ -2332,9 +2332,40 @@ pub fn enable_subnet_route_forwarding(route: &SubnetRoute) -> Result<(), String>
 /// 60s indefinitely.
 pub fn reconcile_subnet_routes(state: &RouterState, self_node_id: &str) {
     let cfg = state.config.read().unwrap().clone();
+    // Snapshot the set of gateway IPs that correspond to current wolfnet
+    // peers — used below to skip orphan routes whose gateway peer was
+    // removed from `/etc/wolfnet/config.toml`. Without this skip,
+    // reconcile would keep refreshing kernel routes into dead peers and
+    // every packet routed via wolfnet0 would be dropped at the wolfnet
+    // daemon's TUN-read step (klasSponsor 2026-05-12 — VPS routes
+    // pointing to peers he had manually deleted, packets flowed in,
+    // black-holed, tx counter ticked up).
+    let current_wn_gateways: std::collections::HashSet<String> =
+        crate::networking::get_wolfnet_peers_list().iter()
+            .map(|p| p.ip.split('/').next().unwrap_or(&p.ip).to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
     for route in cfg.subnet_routes.iter()
         .filter(|r| r.enabled && node_handles_route(r, self_node_id))
     {
+        // Orphan guard — skip routes whose gateway IP no longer matches
+        // any wolfnet peer in the local config. We log a warning the
+        // first time we see this (the kernel-route may have been
+        // installed by a previous reconcile when the peer was present)
+        // but don't auto-delete: the operator's tombstone path
+        // (`remove_wolfnet_peer` → `disable_subnet_routes_via_gateway`)
+        // handles deliberate removals; the warning here catches the
+        // case where the peer vanished some other way (manual edit,
+        // crashed mid-update, etc.).
+        if !current_wn_gateways.contains(&route.gateway) {
+            tracing::warn!(
+                "WolfRouter watchdog: subnet route {} via {} skipped — \
+                 gateway is not a current wolfnet peer (orphan route; \
+                 delete via UI or `wolfnet_tombstone_add` the peer to clean up)",
+                route.subnet_cidr, route.gateway
+            );
+            continue;
+        }
         match apply_subnet_route(route, None) {
             Ok(()) => {} // Idempotent — silent in steady state.
             Err(e) => {
@@ -2345,6 +2376,56 @@ pub fn reconcile_subnet_routes(state: &RouterState, self_node_id: &str) {
             }
         }
     }
+}
+
+/// Disable every subnet_route whose gateway equals `gateway_ip`, and
+/// best-effort remove the corresponding kernel route. Called from
+/// `remove_wolfnet_peer` so that operator-removing a wolfnet peer also
+/// tears down the auto-installed routes pointing at it — without this,
+/// the kernel routes outlive the wolfnet peer entry and every packet
+/// routed via wolfnet0 to a dead gateway is dropped by the wolfnet
+/// daemon (klasSponsor 2026-05-12 traffic-flood symptom). Disabled
+/// rather than deleted from config so the operator can audit / re-enable.
+/// Returns the count of route entries actually disabled.
+pub fn disable_subnet_routes_via_gateway(state: &RouterState, gateway_ip: &str) -> usize {
+    if gateway_ip.is_empty() { return 0; }
+    let mut disabled: Vec<SubnetRoute> = Vec::new();
+    {
+        let mut cfg = state.config.write().unwrap();
+        for r in cfg.subnet_routes.iter_mut() {
+            if r.enabled && r.gateway == gateway_ip {
+                r.enabled = false;
+                r.description = if r.description.is_empty() {
+                    format!("auto-disabled: gateway peer removed")
+                } else {
+                    format!("{} (auto-disabled: gateway peer removed)", r.description)
+                };
+                disabled.push(r.clone());
+            }
+        }
+        if !disabled.is_empty() {
+            if let Err(e) = cfg.save() {
+                tracing::warn!("Failed to persist disabled-subnet-routes change: {}", e);
+            }
+        }
+    }
+    // Tear down kernel routes outside the config lock. `remove_subnet_route`
+    // is idempotent (treats "no such process" as success) so a route the
+    // kernel doesn't actually have is harmless.
+    for r in &disabled {
+        if let Err(e) = remove_subnet_route(r) {
+            tracing::warn!(
+                "Failed to remove kernel route for disabled subnet_route {} via {}: {}",
+                r.subnet_cidr, r.gateway, e
+            );
+        } else {
+            tracing::info!(
+                "Subnet route {} via {} disabled and kernel route removed (gateway peer no longer in wolfnet config)",
+                r.subnet_cidr, r.gateway
+            );
+        }
+    }
+    disabled.len()
 }
 
 /// Auto-create missing subnet_route entries for remote-peer workload
@@ -2385,6 +2466,16 @@ pub fn auto_apply_missing_workload_routes(state: &RouterState, self_node_id: &st
         }
     }
 
+    // Tombstone gate (klasSponsor 2026-05-12): if the operator has
+    // explicitly removed a peer via `remove_wolfnet_peer`, its hostname
+    // is in the persistent tombstone file and must NOT be re-injected
+    // by gossip-driven auto-apply. Without this gate, every 60s tick
+    // re-creates a subnet_route through the removed peer, the
+    // operator's intent is silently overridden, and packets continue
+    // flowing into a dead destination.
+    let tombstoned: std::collections::HashSet<String> =
+        crate::networking::wolfnet_tombstone_list().into_iter().collect();
+
     // Read persisted cluster state. We use the on-disk file directly
     // so this function can live in `networking::router` without taking
     // a circular dependency on `agent::ClusterState`.
@@ -2411,6 +2502,15 @@ pub fn auto_apply_missing_workload_routes(state: &RouterState, self_node_id: &st
     // Build the (subnet, gateway) target set from gossip.
     let mut wanted: Vec<(String, String, String)> = Vec::new(); // (cidr, gateway, peer_name)
     for node in &nodes {
+        // Tombstone gate — skip operator-removed peers entirely.
+        if tombstoned.contains(&node.hostname) {
+            tracing::debug!(
+                "WolfRouter auto-apply: skipping tombstoned peer '{}' — \
+                 operator removed; re-add via `wolfnet_tombstone_remove` to re-enable",
+                node.hostname,
+            );
+            continue;
+        }
         let gw = match hostname_to_ip.get(&node.hostname) {
             Some(g) => g.clone(),
             None => continue,
