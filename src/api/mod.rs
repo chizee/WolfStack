@@ -5670,6 +5670,275 @@ fn truncate(s: &str, max: usize) -> String {
     format!("{}…", cut)
 }
 
+// ─── Cloud Providers (for edge LB / tunnel automation) ─────────────────
+//
+// Sister surface to DNS Providers. Holds infrastructure-side tokens
+// (Cloudflare account/API token for now; Hetzner/DigitalOcean in
+// v23.3+). Consumed by the edge reconcile loop in `crate::edge`.
+
+#[derive(Deserialize)]
+pub struct CloudProviderCreate {
+    pub name: String,
+    pub kind: String,        // "cloudflare" — accepted set lives in edge::store
+    pub credentials: String, // JSON object as a string; shape is per-kind
+}
+
+#[derive(Deserialize)]
+pub struct CloudProviderUpdate {
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Optional new credentials. Empty string ⇒ leave alone.
+    #[serde(default)]
+    pub credentials: Option<String>,
+}
+
+/// GET /api/edge/cloud-providers — redacted list.
+pub async fn cloud_providers_list(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let store = crate::edge::CloudProviderStore::load();
+    HttpResponse::Ok().json(serde_json::json!({
+        "providers": store.list_redacted(),
+        // Keep the wire format symmetric with /api/dns-providers — UIs
+        // can render the list of supported kinds without hard-coding.
+        "supported_kinds": ["cloudflare"],
+    }))
+}
+
+/// POST /api/edge/cloud-providers — add new credentials.
+pub async fn cloud_providers_add(
+    req: HttpRequest, state: web::Data<AppState>,
+    body: web::Json<CloudProviderCreate>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let body = body.into_inner();
+    let kind = match crate::edge::CloudProviderKind::from_str(&body.kind) {
+        Some(k) => k,
+        None => return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": format!("unsupported kind '{}' — accepted: cloudflare", body.kind)
+        })),
+    };
+    let mut store = crate::edge::CloudProviderStore::load();
+    let id = match store.add(body.name, kind, &body.credentials) {
+        Ok(id) => id,
+        Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    };
+    if let Err(e) = store.save() {
+        return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }));
+    }
+    let provider = store.get(&id).map(|p| p.redacted());
+    HttpResponse::Ok().json(serde_json::json!({ "id": id, "provider": provider }))
+}
+
+/// PUT /api/edge/cloud-providers/{id} — update name / credentials.
+pub async fn cloud_providers_update(
+    req: HttpRequest, state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<CloudProviderUpdate>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let body = body.into_inner();
+    let mut store = crate::edge::CloudProviderStore::load();
+    if let Err(e) = store.update(&id, body.name, body.credentials.as_deref()) {
+        return HttpResponse::BadRequest().json(serde_json::json!({ "error": e }));
+    }
+    if let Err(e) = store.save() {
+        return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }));
+    }
+    HttpResponse::Ok().json(serde_json::json!({
+        "updated": true,
+        "provider": store.get(&id).map(|p| p.redacted()),
+    }))
+}
+
+/// DELETE /api/edge/cloud-providers/{id}.
+pub async fn cloud_providers_remove(
+    req: HttpRequest, state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let mut store = crate::edge::CloudProviderStore::load();
+    if !store.remove(&id) {
+        return HttpResponse::NotFound().json(serde_json::json!({
+            "error": format!("provider '{}' not found", id)
+        }));
+    }
+    if let Err(e) = store.save() {
+        return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }));
+    }
+    HttpResponse::Ok().json(serde_json::json!({ "removed": true }))
+}
+
+/// POST /api/edge/cloud-providers/{id}/test — verify credentials by
+/// hitting the provider's API. For Cloudflare this lists zones with
+/// per_page=1 — cheap, free, and proves the token has at least
+/// `Zone:Read`.
+pub async fn cloud_providers_test(
+    req: HttpRequest, state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let store = crate::edge::CloudProviderStore::load();
+    let provider = match store.get(&id) {
+        Some(p) => p,
+        None => return HttpResponse::NotFound().json(serde_json::json!({
+            "error": format!("provider '{}' not found", id)
+        })),
+    };
+    let kind = provider.kind;
+    let creds = match store.credentials_json(&id) {
+        Ok(v) => v,
+        Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    };
+
+    let (success, message) = match kind {
+        crate::edge::CloudProviderKind::Cloudflare => {
+            match crate::edge::cloudflare::CloudflareCreds::from_value(&creds) {
+                Ok(cf) => match crate::edge::cloudflare::ping(&cf).await {
+                    Ok(_) => (true, "ok".to_string()),
+                    Err(e) => (false, truncate(&e, 240)),
+                },
+                Err(e) => (false, e),
+            }
+        }
+        crate::edge::CloudProviderKind::Hetzner => {
+            // Hetzner cloud token — verify against the Cloud LB API
+            // (cheapest endpoint that proves the token is valid).
+            match crate::edge::hetzner_lb::HetznerCloudCreds::from_value(&creds) {
+                Ok(hc) => match crate::edge::hetzner_lb::ping(&hc).await {
+                    Ok(_) => (true, "ok".to_string()),
+                    Err(e) => (false, truncate(&e, 240)),
+                },
+                Err(e) => (false, e),
+            }
+        }
+        crate::edge::CloudProviderKind::DigitalOcean => {
+            // DO token works for both LB and DNS; we verify with the
+            // domains list since both surfaces require the same scope.
+            match crate::edge::digitalocean_dns::DigitalOceanCreds::from_value(&creds) {
+                Ok(d) => match crate::edge::digitalocean_dns::ping(&d).await {
+                    Ok(_) => (true, "ok".to_string()),
+                    Err(e) => (false, truncate(&e, 240)),
+                },
+                Err(e) => (false, e),
+            }
+        }
+    };
+
+    // Persist the result back onto the entry so the UI badge survives
+    // a page reload.
+    let mut store2 = crate::edge::CloudProviderStore::load();
+    if let Some(p) = store2.get_mut(&id) {
+        p.last_verified_at = chrono::Utc::now().to_rfc3339();
+        p.last_verify_result = if success { "ok".to_string() } else { message.clone() };
+        let _ = store2.save();
+    }
+
+    if success {
+        HttpResponse::Ok().json(serde_json::json!({ "ok": true, "log": message }))
+    } else {
+        HttpResponse::BadRequest().json(serde_json::json!({ "error": message }))
+    }
+}
+
+/// POST /api/edge/cloudflare-tunnel/install/{proxy_id} — install
+/// `cloudflared` as a systemd service on the LOCAL node using the
+/// connector token of the proxy's tunnel. Runs once per node — the
+/// frontend fans out across `proxy.targets` via the cluster proxy
+/// so each node ends up running cloudflared.
+///
+/// We look up the proxy via the router config rather than taking the
+/// tunnel name + creds from the URL — that way the tunnel-token
+/// fetch authenticates against the operator's cloud provider entry
+/// (already audited at save time), and there's no way for a caller
+/// to ask us to install cloudflared against an arbitrary token.
+pub async fn cloudflare_tunnel_install(
+    req: HttpRequest, state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let proxy_id = path.into_inner();
+
+    // Resolve proxy → tunnel name + cloud provider id.
+    let (tunnel_name, cloud_provider_id) = {
+        let cfg = state.router.config.read().unwrap();
+        let p = match cfg.http_proxies.iter().find(|p| p.id == proxy_id) {
+            Some(p) => p,
+            None => return HttpResponse::NotFound().json(serde_json::json!({
+                "error": format!("HTTP proxy '{}' not found", proxy_id)
+            })),
+        };
+        match &p.edge {
+            crate::edge::EdgeStrategy::CloudflareTunnel { cloud_provider_id, tunnel_name, .. } => {
+                (tunnel_name.clone(), cloud_provider_id.clone())
+            }
+            other => return HttpResponse::BadRequest().json(serde_json::json!({
+                "error": format!(
+                    "proxy '{}' edge is '{}', not cloudflare_tunnel — install only applies to tunnel proxies",
+                    proxy_id, other.kind()
+                )
+            })),
+        }
+    };
+
+    // Load creds, find the tunnel, fetch its connector token.
+    let providers = crate::edge::CloudProviderStore::load();
+    let provider = match providers.get(&cloud_provider_id) {
+        Some(p) => p,
+        None => return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": format!("cloud provider '{}' not found — re-pick it on the proxy", cloud_provider_id)
+        })),
+    };
+    if provider.kind != crate::edge::CloudProviderKind::Cloudflare {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": format!("cloud provider '{}' is kind {} — tunnel install needs a Cloudflare provider", provider.name, provider.kind.label())
+        }));
+    }
+    let creds_val = match providers.credentials_json(&cloud_provider_id) {
+        Ok(v) => v,
+        Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    };
+    let creds = match crate::edge::cloudflare_tunnel::CloudflareTunnelCreds::from_value(&creds_val) {
+        Ok(c) => c,
+        Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    };
+    let tunnel = match crate::edge::reconcile::find_tunnel_by_name(&creds, &tunnel_name).await {
+        Ok(Some(t)) => t,
+        Ok(None) => return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": format!("tunnel '{}' not found in Cloudflare account — save the proxy first to create it", tunnel_name)
+        })),
+        Err(e) => return HttpResponse::BadGateway().json(serde_json::json!({
+            "error": format!("lookup tunnel: {}", e)
+        })),
+    };
+    let token = match crate::edge::cloudflare_tunnel::get_tunnel_token(&creds, &tunnel.id).await {
+        Ok(t) => t,
+        Err(e) => return HttpResponse::BadGateway().json(serde_json::json!({
+            "error": format!("fetch tunnel token: {}", e)
+        })),
+    };
+
+    // Shell out to cloudflared on a blocking thread — token contains
+    // only base64url chars, but install_cloudflared_service re-validates
+    // before exec'ing.
+    let result = actix_web::web::block(move || {
+        crate::edge::cloudflare_tunnel::install_cloudflared_service(&token)
+    }).await;
+    match result {
+        Ok(Ok(log)) => HttpResponse::Ok().json(serde_json::json!({
+            "ok": true, "tunnel_id": tunnel.id, "log": log,
+        })),
+        Ok(Err(e)) => HttpResponse::BadRequest().json(serde_json::json!({
+            "ok": false, "tunnel_id": tunnel.id, "error": e,
+        })),
+        Err(join) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("install task failed: {}", join)
+        })),
+    }
+}
+
 // ─── GitHub Backup ──────────────────────────────────────────────────────
 
 /// GET /api/github-backup/config — returns the config with the token
@@ -26031,6 +26300,14 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/dns-providers/{id}", web::put().to(dns_providers_update))
         .route("/api/dns-providers/{id}", web::delete().to(dns_providers_remove))
         .route("/api/dns-providers/{id}/test", web::post().to(dns_providers_test))
+        // Cloud providers — Cloudflare account/API tokens for edge
+        // automation (LB / DNS proxying). See src/edge/.
+        .route("/api/edge/cloud-providers",            web::get().to(cloud_providers_list))
+        .route("/api/edge/cloud-providers",            web::post().to(cloud_providers_add))
+        .route("/api/edge/cloud-providers/{id}",       web::put().to(cloud_providers_update))
+        .route("/api/edge/cloud-providers/{id}",       web::delete().to(cloud_providers_remove))
+        .route("/api/edge/cloud-providers/{id}/test",  web::post().to(cloud_providers_test))
+        .route("/api/edge/cloudflare-tunnel/install/{proxy_id}", web::post().to(cloudflare_tunnel_install))
         .route("/api/cluster/wolfnet-sync", web::post().to(wolfnet_sync_cluster))
         .route("/api/cluster/diagnose", web::post().to(cluster_diagnose))
         .route("/api/nodes", web::get().to(get_nodes))

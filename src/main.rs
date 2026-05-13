@@ -67,6 +67,7 @@ mod sql_connections;
 mod netguard;
 mod certbot;
 mod dns_providers;
+mod edge;
 mod threat_intel;
 #[allow(dead_code)]
 mod integrations;
@@ -880,6 +881,44 @@ async fn main() -> std::io::Result<()> {
         // 30 s tick. No state shared with the rest of the daemon —
         // it operates entirely off /etc/wolfstack/pools.json.
         tokio::spawn(crate::pools::orchestrator::run_loop());
+
+        // HTTP-proxy edge reconciler — keeps DNS records (Cloudflare
+        // and friends) in sync with peer-health observations. Runs
+        // every 30s; only the elected leader actually pushes to
+        // provider APIs (others compute their view of "should I be
+        // leader" and short-circuit). See `edge::reconcile::run_pass`.
+        let cluster_for_edge = app_state.cluster.clone();
+        let router_for_edge = app_state.router.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            // Skip the first immediate fire — startup is busy enough
+            // without hammering Cloudflare in the boot path.
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                let snapshot = crate::edge::reconcile::ClusterSnapshot::from_cluster_state(&cluster_for_edge);
+                let am_leader = crate::edge::reconcile::am_i_leader(&snapshot);
+                if !am_leader { continue; }
+                let proxies = router_for_edge.config.read().unwrap().http_proxies.clone();
+                if proxies.iter().all(|p| !p.edge.manages_dns()) { continue; }
+                let providers = crate::edge::CloudProviderStore::load();
+                let dns_providers = crate::dns_providers::DnsProviderStore::load();
+                let reports = crate::edge::reconcile::run_pass(
+                    &proxies, &snapshot, &providers, &dns_providers, true,
+                ).await;
+                for r in &reports {
+                    if r.errors.is_empty() && (r.added > 0 || r.removed > 0) {
+                        tracing::info!(
+                            "edge reconcile: {} → {:?} (added {} removed {} kept {})",
+                            r.proxy_id, r.after, r.added, r.removed, r.unchanged
+                        );
+                    }
+                    for e in &r.errors {
+                        tracing::warn!("edge reconcile {}: {}", r.proxy_id, e);
+                    }
+                }
+            }
+        });
 
         // Start the WolfRouter safe-mode watcher — auto-reverts firewall
         // changes if the user doesn't confirm within the safe-mode window.

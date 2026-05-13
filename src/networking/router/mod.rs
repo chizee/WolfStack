@@ -31,6 +31,8 @@ pub mod api;
 pub mod wan;
 pub mod host_dns;
 pub mod proxy;
+pub mod proxy_runtime;
+pub mod http_proxy;
 pub mod health;
 
 use serde::{Deserialize, Serialize};
@@ -450,6 +452,13 @@ pub struct RouterConfig {
     /// Each entry defines a destination subnet and the gateway to reach it.
     #[serde(default)]
     pub subnet_routes: Vec<SubnetRoute>,
+    /// HTTP (L7) reverse-proxy entries — nginx server blocks. Each
+    /// carries 1+ targets so a single proxy can be replicated across
+    /// cluster nodes for HA. See `http_proxy::apply_for_node` for the
+    /// render + reload pipeline, and `crate::edge` for the public-
+    /// ingress / DNS / LB strategy that sits on top.
+    #[serde(default)]
+    pub http_proxies: Vec<http_proxy::HttpProxy>,
 }
 
 fn default_safe_mode_seconds() -> u32 { 30 }
@@ -1561,6 +1570,29 @@ pub fn apply_on_startup(state: std::sync::Arc<RouterState>, self_node_id: &str) 
             } else {
                 for w in &warnings {
                     tracing::warn!("WolfRouter startup: proxy apply: {}", w);
+                }
+            }
+        }
+
+        // L7 HTTP proxies — render every proxy whose target list
+        // includes this node. Single-target proxies behave as before;
+        // multi-target ones now render the same config on every
+        // listed node (HA case).
+        let touches_this_node = cfg.http_proxies.iter().any(|p| {
+            p.targets.iter().any(|t| t.node_id == self_node_id)
+        });
+        if touches_this_node {
+            let warnings = http_proxy::apply_for_node(&cfg.http_proxies, self_node_id);
+            if warnings.is_empty() {
+                tracing::info!(
+                    "WolfRouter startup: {} HTTP proxy/proxies rendered",
+                    cfg.http_proxies.iter()
+                        .filter(|p| p.targets.iter().any(|t| t.node_id == self_node_id))
+                        .count()
+                );
+            } else {
+                for w in &warnings {
+                    tracing::warn!("WolfRouter startup: http_proxy apply: {}", w);
                 }
             }
         }

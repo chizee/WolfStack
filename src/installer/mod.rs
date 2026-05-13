@@ -403,6 +403,45 @@ fn install_postgresql(distro: DistroFamily) -> Result<String, String> {
     }
 }
 
+/// Install nginx via the local distro's package manager and enable
+/// the service. Used by the WolfRouter HTTP proxies tab when the
+/// operator picks "nginx" from the install modal. Returns the package
+/// manager's stdout (or stderr on failure) so the modal can render it
+/// verbatim — the operator sees the actual install output, not a
+/// generic "install failed" toast.
+pub fn install_nginx_pkg() -> Result<String, String> {
+    let distro = detect_distro();
+    let (pkg_mgr, install_flag) = pkg_install_cmd(distro);
+    let output = Command::new("sudo")
+        .args([pkg_mgr])
+        .args(install_flag.split_whitespace())
+        .arg("nginx")
+        .output()
+        .map_err(|e| format!("Failed to run {}: {}", pkg_mgr, e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "{} {} nginx failed:\n{}",
+            pkg_mgr,
+            install_flag,
+            stderr.trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+
+    // Enable + start the unit so the operator doesn't have to
+    // remember to do it themselves. Failure is non-fatal here —
+    // some package post-install hooks already do this, and we want
+    // the install endpoint to succeed even if the service is in a
+    // weird state the operator should look at separately.
+    let _ = Command::new("sudo")
+        .args(["systemctl", "enable", "--now", "nginx"])
+        .output();
+
+    Ok(format!("nginx installed via {}.\n{}", pkg_mgr, stdout))
+}
+
 fn install_certbot(distro: DistroFamily) -> Result<String, String> {
     let (pkg_mgr, install_flag) = pkg_install_cmd(distro);
     let output = Command::new("sudo")
@@ -434,11 +473,24 @@ fn install_wolf_component(component: Component, _distro: DistroFamily) -> Result
         .output()
         .map_err(|e| format!("Failed to run install script: {}", e))?;
 
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     if output.status.success() {
-        Ok(format!("{} installed successfully", component.name()))
+        // Return the full transcript so the UI can render the live
+        // install log — operators want to see what happened, not
+        // just "installed". The stdout has every `info` / `success`
+        // line the setup script printed.
+        let log = if stdout.trim().is_empty() { stderr.into_owned() } else { stdout.into_owned() };
+        Ok(format!("{} installed.\n{}", component.name(), log))
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!("Install failed: {}", stderr))
+        // Wolf-* setup scripts print their `[ERROR]` lines to STDOUT
+        // (via `echo -e ...`, not `>&2`). A stderr-only error message
+        // surfaces an empty string to the operator and they can't tell
+        // why the install died. Concatenate both so whatever stream the
+        // script used is captured. Trim leading/trailing whitespace so
+        // the formatted error doesn't have a blank line.
+        let combined = format!("{}\n{}", stdout.trim_end(), stderr.trim_end());
+        Err(format!("Install failed:\n{}", combined.trim()))
     }
 }
 

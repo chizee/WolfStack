@@ -4414,6 +4414,7 @@
                         <button class="settings-tab-btn" onclick="switchSettingsTab('security')"><span class="ws-icon-clean-wrap" data-icon="lock"></span> Security</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('passkeys')"><span class="ws-icon-clean-wrap" data-icon="key"></span> Passkeys</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('dnsproviders')"><span class="ws-icon-clean-wrap" data-icon="globe"></span> DNS Providers</button>
+                        <button class="settings-tab-btn" onclick="switchSettingsTab('cloudproviders')"><span class="ws-icon-clean-wrap" data-icon="cloud"></span> Cloud Providers</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('systemcheck')"><span class="ws-icon-clean-wrap" data-icon="health"></span> System Check</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('paths')"><span class="ws-icon-clean-wrap" data-icon="folder-open"></span> File Locations</button>
                         <button class="settings-tab-btn" onclick="switchSettingsTab('reverseproxy')"><span class="ws-icon-clean-wrap" data-icon="globe"></span> Reverse Proxy</button>
@@ -5541,6 +5542,71 @@ dns_cloudflare_api_token = your_token_here"
                         </div>
 
                         <div id="dns-providers-list" style="max-width:760px;min-height:60px;">
+                            <div style="color:var(--text-muted);text-align:center;padding:20px;">Loading…</div>
+                        </div>
+                    </div>
+
+                    <!-- ─── Cloud Providers Tab ───
+                        Distinct from DNS Providers: cloud-provider tokens
+                        drive *infrastructure* APIs (Hetzner Cloud LBs,
+                        DigitalOcean LBs, Cloudflare Tunnels) rather than
+                        ACME DNS-01 challenges. The two stores stay
+                        separate because the scopes are different and many
+                        operators run DNS on one vendor and infrastructure
+                        on another.
+                    -->
+                    <div id="settings-tab-cloudproviders" class="settings-tab-panel">
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;max-width:760px;">
+                            <div>
+                                <h4 style="margin:0 0 4px 0;font-size:16px;font-weight:600;">Cloud Providers</h4>
+                                <p style="font-size:13px;color:var(--text-muted);margin:0;">
+                                    Infrastructure tokens for HTTP-proxy edge strategies — Hetzner Cloud LB,
+                                    DigitalOcean LB, Cloudflare Tunnel. Pick one of these in the
+                                    WolfRouter → HTTP Proxies → Edge dropdown to get automatic public-ingress
+                                    provisioning across cluster nodes.
+                                </p>
+                            </div>
+                            <button class="btn btn-primary btn-sm" onclick="cloudProviderShowAddForm()" id="btn-cloud-add">
+                                + Add Provider
+                            </button>
+                        </div>
+
+                        <div id="cloud-providers-add-form" style="display:none;background:var(--bg-input);border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:16px;max-width:760px;">
+                            <h5 style="margin:0 0 10px;font-size:14px;">Add Cloud Provider</h5>
+                            <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px;">
+                                <div>
+                                    <label style="display:block;font-size:12px;color:var(--text-muted);margin-bottom:4px;">Friendly name</label>
+                                    <input type="text" id="cloud-add-name" placeholder="e.g. Hetzner — project main"
+                                           style="width:100%;padding:8px 12px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-size:13px;box-sizing:border-box;">
+                                </div>
+                                <div>
+                                    <label style="display:block;font-size:12px;color:var(--text-muted);margin-bottom:4px;">Kind</label>
+                                    <select id="cloud-add-kind" onchange="cloudProviderRenderCredsHint()"
+                                            style="width:100%;padding:8px 12px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-size:13px;">
+                                        <option value="">— pick —</option>
+                                        <option value="cloudflare">Cloudflare (account_id + API token, for Tunnel)</option>
+                                        <option value="hetzner">Hetzner Cloud (API token)</option>
+                                        <option value="digitalocean">DigitalOcean (API token, both LB &amp; DNS)</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div style="margin-bottom:10px;">
+                                <label style="display:block;font-size:12px;color:var(--text-muted);margin-bottom:4px;">
+                                    Credentials JSON <span id="cloud-add-hint" style="color:var(--text-muted);"></span>
+                                </label>
+                                <textarea id="cloud-add-creds" rows="6" autocomplete="off" spellcheck="false"
+                                          placeholder='{"api_token": "your_token_here"}'
+                                          style="width:100%;padding:10px 12px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-size:12px;font-family:monospace;box-sizing:border-box;resize:vertical;"></textarea>
+                                <small style="color:var(--text-muted);">Stored at <code>/etc/wolfstack/cloud-providers.json</code> (mode 0600), XOR-obfuscated.</small>
+                            </div>
+                            <div style="display:flex;gap:8px;">
+                                <button class="btn btn-primary btn-sm" onclick="cloudProviderAdd()">Save Provider</button>
+                                <button class="btn btn-sm" onclick="document.getElementById('cloud-providers-add-form').style.display='none'"
+                                        style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);">Cancel</button>
+                            </div>
+                        </div>
+
+                        <div id="cloud-providers-list" style="max-width:760px;min-height:60px;">
                             <div style="color:var(--text-muted);text-align:center;padding:20px;">Loading…</div>
                         </div>
                     </div>
@@ -6747,7 +6813,8 @@ dns_cloudflare_api_token = your_token_here"
                         <button class="wr-tab" data-tab="zones" onclick="wrSelectTab('zones')"><span class="ws-icon-clean-wrap" data-icon="target"></span> Zones</button>
                         <button class="wr-tab" data-tab="policy" onclick="wrSelectTab('policy')">🕸 Policy map</button>
                         <button class="wr-tab" data-tab="wan" onclick="wrSelectTab('wan')"><span class="ws-icon-clean-wrap" data-icon="globe"></span> WAN / PPPoE</button>
-                        <button class="wr-tab" data-tab="proxy" onclick="wrSelectTab('proxy')"><span class="ws-icon-clean-wrap" data-icon="link"></span> Reverse proxy</button>
+                        <button class="wr-tab" data-tab="proxy" onclick="wrSelectTab('proxy')" title="L4 — iptables whole-IP forwarder. Every port + protocol on a public IP goes to one backend."><span class="ws-icon-clean-wrap" data-icon="link"></span> Domain forwards</button>
+                        <button class="wr-tab" data-tab="http-proxies" onclick="wrSelectTab('http-proxies')" title="L7 reverse proxies served by WolfProxy or nginx. TLS, headers, multi-node HA."><span class="ws-icon-clean-wrap" data-icon="lock"></span> HTTP proxies</button>
                         <button class="wr-tab" data-tab="subnet-routes" onclick="wrSelectTab('subnet-routes')">🛣 Subnet Routes</button>
                         <button class="wr-tab" data-tab="connections" onclick="wrSelectTab('connections')"><span class="ws-icon-clean-wrap" data-icon="link"></span> Connections</button>
                         <button class="wr-tab" data-tab="packets" onclick="wrSelectTab('packets')"><span class="ws-icon-clean-wrap" data-icon="satellite"></span> Packets</button>
@@ -6950,6 +7017,27 @@ dns_cloudflare_api_token = your_token_here"
                         </div>
                         <div id="wr-proxy-warnings" style="display:none; margin-bottom:12px; padding:10px 12px; background:rgba(234,179,8,0.1); border:1px solid rgba(234,179,8,0.4); border-radius:6px; font-size:12px; white-space:pre-wrap;"></div>
                         <div id="wr-proxy-list" style="display:grid; gap:12px;"></div>
+                    </div>
+
+                    <!--
+                        L7 HTTP proxies — nginx-format server blocks, served
+                        by WolfProxy or nginx. Multi-target proxies render
+                        the same config on every chosen node; the optional
+                        Edge strategy keeps DNS in sync with peer-health
+                        observations for resilience. JS-driven body so the
+                        editor + cards re-render on every API change.
+                    -->
+                    <div id="wr-tab-http-proxies" class="wr-tab-panel" style="padding:16px; display:none;">
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px;">
+                            <div style="font-size:12px;color:var(--text-muted);max-width:760px;">
+                                <strong>L7 reverse proxies</strong> served by WolfProxy or nginx (both consume identical config files).
+                                Multi-node proxies replicate config across the selected cluster nodes and an optional Edge strategy
+                                (Cloudflare, DNS round-robin) keeps DNS in sync with peer-health observations for sub-minute failover.
+                            </div>
+                            <button class="btn btn-sm btn-primary" id="btn-hp-new" onclick="hpOpenEditor(null)">+ HTTP proxy</button>
+                        </div>
+                        <div id="hp-runtime-banner"></div>
+                        <div id="hp-list" style="min-height:60px;"></div>
                     </div>
 
                     <div id="wr-tab-subnet-routes" class="wr-tab-panel" style="padding:16px; display:none;">

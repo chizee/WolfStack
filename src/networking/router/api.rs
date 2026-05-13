@@ -397,6 +397,16 @@ pub async fn config_receive(
         tracing::warn!("router config-receive: proxy apply: {}", w);
     }
 
+    // L7 HTTP proxies — render every multi-target proxy whose target
+    // list includes this node. `apply_for_node` already filters by
+    // target node_id, so this is a fanout-receiver call: one node
+    // pushes the new config to peers, each peer renders only what
+    // touches it.
+    let hwarn = crate::networking::router::http_proxy::apply_for_node(&new_cfg.http_proxies, &self_id);
+    for w in &hwarn {
+        tracing::warn!("router config-receive: http_proxy apply: {}", w);
+    }
+
     // Reconcile subnet routes against the kernel.
     //
     // Bug fix v20.11.2 (sponsor report): previously this handler applied
@@ -4216,6 +4226,395 @@ pub async fn delete_proxy(req: HttpRequest, state: S, path: web::Path<String>, q
     }))
 }
 
+// ─── HTTP (L7) Reverse Proxies ───────────────────────────────────────
+//
+// Multi-target proxy CRUD. Sister to the L4 ProxyEntry surface above:
+// same `node_id`-per-entry cluster-scoping discipline, same auto-
+// replication pattern via `replicate_config_to_cluster`. Render lives
+// in `crate::networking::router::http_proxy`; the public-ingress /
+// DNS / LB story (Cloudflare etc.) lives in `crate::edge`.
+
+use crate::networking::router::http_proxy::HttpProxy;
+
+/// GET /api/router/http-proxies — filtered by `?cluster=`. A multi-
+/// target proxy is included if ANY of its targets is in the current
+/// cluster's node set — operators editing a 3-node HA proxy from any
+/// one cluster's view should see it.
+pub async fn list_http_proxies(
+    req: HttpRequest, state: S, query: web::Query<TopologyQuery>,
+) -> HttpResponse {
+    auth_or_return!(req, state);
+    let proxies = state.router.config.read().unwrap().http_proxies.clone();
+    let filtered: Vec<&HttpProxy> = match cluster_node_id_set(&state, &query) {
+        None => proxies.iter().collect(),
+        Some(set) => proxies.iter()
+            .filter(|p| p.targets.iter().any(|t| set.contains(&t.node_id)))
+            .collect(),
+    };
+    HttpResponse::Ok().json(filtered)
+}
+
+/// GET /api/router/http-proxies/runtime — local nginx/wolfproxy
+/// detection. Used by the UI's install-picker banner.
+pub async fn http_proxy_runtime(req: HttpRequest, state: S) -> HttpResponse {
+    auth_or_return!(req, state);
+    let status = crate::networking::router::proxy_runtime::detect_runtime();
+    let active = status.active_runtime().unwrap_or("");
+    HttpResponse::Ok().json(serde_json::json!({
+        "nginx_installed":     status.nginx_installed,
+        "nginx_active":        status.nginx_active,
+        "wolfproxy_installed": status.wolfproxy_installed,
+        "wolfproxy_active":    status.wolfproxy_active,
+        "active":              active,
+        "any_installed":       status.any_installed(),
+    }))
+}
+
+/// POST /api/router/http-proxies/install/{which} — install nginx or
+/// wolfproxy on this node via the local distro's package manager
+/// (nginx) or the official setup.sh (wolfproxy).
+pub async fn http_proxy_install_runtime(
+    req: HttpRequest, state: S, path: web::Path<String>,
+) -> HttpResponse {
+    auth_or_return!(req, state);
+    let which = path.into_inner();
+    let result = match which.as_str() {
+        "nginx" => actix_web::web::block(crate::installer::install_nginx_pkg).await,
+        "wolfproxy" => actix_web::web::block(|| {
+            crate::installer::install_component(crate::installer::Component::WolfProxy)
+        }).await,
+        other => {
+            return HttpResponse::BadRequest().json(serde_json::json!({
+                "error": format!("unsupported runtime '{}' — use 'wolfproxy' or 'nginx'", other)
+            }));
+        }
+    };
+    match result {
+        Ok(Ok(log)) => HttpResponse::Ok().json(serde_json::json!({
+            "ok": true, "which": which, "log": log,
+        })),
+        Ok(Err(e)) => HttpResponse::BadRequest().json(serde_json::json!({
+            "ok": false, "which": which, "error": e,
+        })),
+        Err(join) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("install task failed: {}", join)
+        })),
+    }
+}
+
+/// Validate the proxy's edge strategy references stores that actually
+/// exist and have the right plugin / kind. Runs at save time so the
+/// operator sees a clear error immediately instead of discovering
+/// the misconfiguration via a cryptic reconcile failure 30s later.
+///
+/// We don't make API calls here (no token-validation round-trip) —
+/// that work belongs to the existing "Test connection" buttons.
+/// Only schema integrity.
+fn validate_edge_against_stores(proxy: &HttpProxy) -> Result<(), String> {
+    use crate::edge::EdgeStrategy as E;
+    let cloud = crate::edge::CloudProviderStore::load();
+    let dns = crate::dns_providers::DnsProviderStore::load();
+
+    let check_dns = |id: &str, want_plugins: &[&str]| -> Result<(), String> {
+        let p = dns.get(id).ok_or_else(|| format!(
+            "DNS provider '{}' not found — add one in Settings → DNS Providers", id
+        ))?;
+        if !want_plugins.iter().any(|w| *w == p.plugin) {
+            return Err(format!(
+                "DNS provider '{}' uses plugin '{}' — this edge strategy requires one of: {}",
+                p.name, p.plugin, want_plugins.join(", ")
+            ));
+        }
+        Ok(())
+    };
+    let check_cloud = |id: &str, want_kind: crate::edge::CloudProviderKind| -> Result<(), String> {
+        let p = cloud.get(id).ok_or_else(|| format!(
+            "cloud provider '{}' not found — add one in Settings → Cloud Providers", id
+        ))?;
+        if p.kind != want_kind {
+            return Err(format!(
+                "cloud provider '{}' is kind '{}' — this edge strategy requires kind '{}'",
+                p.name, p.kind.label(), want_kind.label()
+            ));
+        }
+        Ok(())
+    };
+
+    match &proxy.edge {
+        E::Local => Ok(()),
+        E::DnsRoundRobin { dns_provider_id, .. } => {
+            check_dns(dns_provider_id, &["cloudflare", "hetzner", "digitalocean"])
+        }
+        E::CloudflareDns { dns_provider_id, .. } => {
+            check_dns(dns_provider_id, &["cloudflare"])
+        }
+        E::HetznerLb { cloud_provider_id, lb_name, .. } => {
+            if lb_name.trim().is_empty() {
+                return Err("HetznerLb: lb_name is required".into());
+            }
+            check_cloud(cloud_provider_id, crate::edge::CloudProviderKind::Hetzner)
+        }
+        E::DigitalOceanLb { cloud_provider_id, lb_name, .. } => {
+            if lb_name.trim().is_empty() {
+                return Err("DigitalOceanLb: lb_name is required".into());
+            }
+            check_cloud(cloud_provider_id, crate::edge::CloudProviderKind::DigitalOcean)
+        }
+        E::CloudflareTunnel { cloud_provider_id, dns_provider_id, tunnel_name } => {
+            if tunnel_name.trim().is_empty() {
+                return Err("CloudflareTunnel: tunnel_name is required".into());
+            }
+            check_cloud(cloud_provider_id, crate::edge::CloudProviderKind::Cloudflare)?;
+            check_dns(dns_provider_id, &["cloudflare"])
+        }
+    }
+}
+
+fn guard_targets_against_cluster(
+    state: &S, query: &web::Query<TopologyQuery>, proxy: &HttpProxy,
+) -> Option<HttpResponse> {
+    for t in &proxy.targets {
+        if let Some(resp) = cluster_guard_node_id(state, query, Some(t.node_id.as_str())) {
+            return Some(resp);
+        }
+    }
+    None
+}
+
+/// POST /api/router/http-proxies — create.
+pub async fn create_http_proxy(
+    req: HttpRequest, state: S,
+    body: web::Json<HttpProxy>,
+    query: web::Query<TopologyQuery>,
+) -> HttpResponse {
+    auth_or_return!(req, state);
+    let proxy = body.into_inner();
+    if let Err(e) = crate::networking::router::http_proxy::validate_id(&proxy.id) {
+        return HttpResponse::BadRequest().json(serde_json::json!({ "error": e }));
+    }
+    if proxy.server_names.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "at least one server_name is required"
+        }));
+    }
+    if proxy.targets.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "at least one target is required — pick one cluster node, or check 'replicate to all'"
+        }));
+    }
+    if let Err(e) = validate_edge_against_stores(&proxy) {
+        return HttpResponse::BadRequest().json(serde_json::json!({ "error": e }));
+    }
+    if let Some(resp) = guard_targets_against_cluster(&state, &query, &proxy) { return resp; }
+    {
+        let cur = state.router.config.read().unwrap();
+        if cur.http_proxies.iter().any(|p| p.id == proxy.id) {
+            return HttpResponse::Conflict().json(serde_json::json!({
+                "error": format!("HTTP proxy '{}' already exists — use PUT to update", proxy.id)
+            }));
+        }
+    }
+    {
+        let mut cur = state.router.config.write().unwrap();
+        cur.http_proxies.push(proxy.clone());
+        if let Err(e) = cur.save() {
+            return HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": format!("save router config: {}", e)
+            }));
+        }
+    }
+    let cfg_snapshot = state.router.config.read().unwrap().http_proxies.clone();
+    let self_id = crate::agent::self_node_id();
+    let warnings = crate::networking::router::http_proxy::apply_for_node(&cfg_snapshot, &self_id);
+    replicate_config_to_cluster(state);
+    HttpResponse::Ok().json(serde_json::json!({
+        "ok": true, "proxy": proxy, "apply_warnings": warnings,
+    }))
+}
+
+/// PUT /api/router/http-proxies/{id} — update.
+pub async fn update_http_proxy(
+    req: HttpRequest, state: S,
+    path: web::Path<String>,
+    body: web::Json<HttpProxy>,
+    query: web::Query<TopologyQuery>,
+) -> HttpResponse {
+    auth_or_return!(req, state);
+    let id = path.into_inner();
+    let new_proxy = body.into_inner();
+    if id != new_proxy.id {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": format!("URL id '{}' must match body id '{}'", id, new_proxy.id)
+        }));
+    }
+    if new_proxy.targets.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "at least one target is required"
+        }));
+    }
+    if let Err(e) = validate_edge_against_stores(&new_proxy) {
+        return HttpResponse::BadRequest().json(serde_json::json!({ "error": e }));
+    }
+    if let Some(resp) = guard_targets_against_cluster(&state, &query, &new_proxy) { return resp; }
+    // Snapshot the *old* edge so we can tear down resources that the
+    // update is leaving behind. Cases that need teardown:
+    //   1. edge kind changed (e.g. HetznerLb → Local) — the old LB is
+    //      orphaned, delete it.
+    //   2. edge kind matches but the resource identity changed (LB
+    //      renamed, tunnel renamed) — the old resource is orphaned.
+    //   3. server_names were removed — the records / CNAMEs for the
+    //      removed names are orphaned.
+    // We compute the cleanup edge here and pass to teardown after the
+    // local config has been persisted (so a crash mid-teardown leaves
+    // the config consistent — the operator can retry).
+    let old_proxy: Option<crate::networking::router::http_proxy::HttpProxy> = {
+        let cur = state.router.config.read().unwrap();
+        let existing = cur.http_proxies.iter().find(|p| p.id == id);
+        match existing {
+            None => return HttpResponse::NotFound().json(serde_json::json!({
+                "error": format!("HTTP proxy '{}' not found", id)
+            })),
+            Some(old) => {
+                for t in &old.targets {
+                    if let Some(resp) = cluster_guard_node_id(&state, &query, Some(t.node_id.as_str())) {
+                        return resp;
+                    }
+                }
+                Some(old.clone())
+            }
+        }
+    };
+    {
+        let mut cur = state.router.config.write().unwrap();
+        match cur.http_proxies.iter_mut().find(|p| p.id == id) {
+            Some(slot) => *slot = new_proxy.clone(),
+            None => return HttpResponse::NotFound().json(serde_json::json!({
+                "error": format!("HTTP proxy '{}' was deleted concurrently", id)
+            })),
+        }
+        if let Err(e) = cur.save() {
+            return HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": format!("save router config: {}", e)
+            }));
+        }
+    }
+    // Run teardown for whatever the *old* config provisioned but the
+    // *new* config doesn't keep.
+    let mut edge_warnings = Vec::new();
+    if let Some(old) = old_proxy {
+        // 1. Edge kind changed → tear down the old edge entirely
+        //    against the OLD server_names.
+        // 2. Kind same but identity differs (lb_name / tunnel_name)
+        //    → same teardown applies.
+        if !edge_state_matches(&old, &new_proxy) {
+            edge_warnings.extend(crate::edge::teardown::teardown_proxy(&old).await);
+        } else {
+            // 3. Same edge, same resource identity — clean up records
+            //    for server_names that were dropped from this update.
+            let new_names: std::collections::HashSet<&str> =
+                new_proxy.server_names.iter().map(|s| s.as_str()).collect();
+            let removed: Vec<String> = old.server_names.iter()
+                .filter(|n| !new_names.contains(n.as_str()))
+                .cloned()
+                .collect();
+            if !removed.is_empty() {
+                edge_warnings.extend(
+                    crate::edge::teardown::teardown_edge(&old.edge, &removed).await
+                );
+            }
+        }
+    }
+    let cfg_snapshot = state.router.config.read().unwrap().http_proxies.clone();
+    let self_id = crate::agent::self_node_id();
+    let mut warnings = crate::networking::router::http_proxy::apply_for_node(&cfg_snapshot, &self_id);
+    warnings.extend(edge_warnings);
+    replicate_config_to_cluster(state);
+    HttpResponse::Ok().json(serde_json::json!({
+        "ok": true, "proxy": new_proxy, "apply_warnings": warnings,
+    }))
+}
+
+/// Two proxies share an "edge state identity" when their edge strategy
+/// is the same kind AND the resource name within that strategy is
+/// unchanged. If either differs, the old resource is orphaned and
+/// needs teardown. Server-name diff is handled separately by the
+/// caller — this only covers the LB / tunnel name itself.
+fn edge_state_matches(
+    a: &crate::networking::router::http_proxy::HttpProxy,
+    b: &crate::networking::router::http_proxy::HttpProxy,
+) -> bool {
+    use crate::edge::EdgeStrategy as E;
+    match (&a.edge, &b.edge) {
+        (E::Local, E::Local) => true,
+        (E::DnsRoundRobin { dns_provider_id: a1, .. },
+         E::DnsRoundRobin { dns_provider_id: b1, .. }) => a1 == b1,
+        (E::CloudflareDns { dns_provider_id: a1, .. },
+         E::CloudflareDns { dns_provider_id: b1, .. }) => a1 == b1,
+        (E::HetznerLb { cloud_provider_id: a1, lb_name: a2, .. },
+         E::HetznerLb { cloud_provider_id: b1, lb_name: b2, .. }) => a1 == b1 && a2 == b2,
+        (E::DigitalOceanLb { cloud_provider_id: a1, lb_name: a2, .. },
+         E::DigitalOceanLb { cloud_provider_id: b1, lb_name: b2, .. }) => a1 == b1 && a2 == b2,
+        (E::CloudflareTunnel { cloud_provider_id: a1, tunnel_name: a2, .. },
+         E::CloudflareTunnel { cloud_provider_id: b1, tunnel_name: b2, .. }) => a1 == b1 && a2 == b2,
+        _ => false,
+    }
+}
+
+/// DELETE /api/router/http-proxies/{id} — remove. If the proxy has a
+/// non-Local edge strategy we also tear down the cloud resources
+/// (Hetzner/DigitalOcean LB, Cloudflare Tunnel, DNS records) so the
+/// operator doesn't keep paying for orphaned infrastructure. Teardown
+/// is best-effort: any provider errors come back as warnings, the
+/// local delete still succeeds.
+pub async fn delete_http_proxy(
+    req: HttpRequest, state: S,
+    path: web::Path<String>,
+    query: web::Query<TopologyQuery>,
+) -> HttpResponse {
+    auth_or_return!(req, state);
+    let id = path.into_inner();
+    // Capture the proxy we're about to delete so we can run edge
+    // teardown against it after dropping the read lock.
+    let to_delete = {
+        let cur = state.router.config.read().unwrap();
+        let existing = cur.http_proxies.iter().find(|p| p.id == id);
+        match existing {
+            None => return HttpResponse::NotFound().json(serde_json::json!({
+                "error": format!("HTTP proxy '{}' not found", id)
+            })),
+            Some(old) => {
+                for t in &old.targets {
+                    if let Some(resp) = cluster_guard_node_id(&state, &query, Some(t.node_id.as_str())) {
+                        return resp;
+                    }
+                }
+                old.clone()
+            }
+        }
+    };
+    // Tear down cloud resources before removing the config — if
+    // teardown fails we still proceed with the local delete (the
+    // warnings list is surfaced to the operator).
+    let edge_warnings = crate::edge::teardown::teardown_proxy(&to_delete).await;
+    {
+        let mut cur = state.router.config.write().unwrap();
+        cur.http_proxies.retain(|p| p.id != id);
+        if let Err(e) = cur.save() {
+            return HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": format!("save router config: {}", e)
+            }));
+        }
+    }
+    let cfg_snapshot = state.router.config.read().unwrap().http_proxies.clone();
+    let self_id = crate::agent::self_node_id();
+    let mut warnings = crate::networking::router::http_proxy::apply_for_node(&cfg_snapshot, &self_id);
+    warnings.extend(edge_warnings);
+    replicate_config_to_cluster(state);
+    HttpResponse::Ok().json(serde_json::json!({
+        "ok": true, "removed": id, "apply_warnings": warnings,
+    }))
+}
+
 // ─── Subnet Routing ───
 
 pub async fn list_subnet_routes(req: HttpRequest, state: S, query: web::Query<TopologyQuery>) -> HttpResponse {
@@ -5817,6 +6216,15 @@ pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
         .route("/api/router/wan",          web::post().to(create_wan))
         .route("/api/router/wan/{id}",     web::put().to(update_wan))
         .route("/api/router/wan/{id}",     web::delete().to(delete_wan))
+        // HTTP (L7) reverse-proxy CRUD + runtime detection + install.
+        // Multi-target shape: each entry carries Vec<ProxyTarget> so
+        // operators can replicate a proxy across cluster nodes for HA.
+        .route("/api/router/http-proxies",                  web::get().to(list_http_proxies))
+        .route("/api/router/http-proxies",                  web::post().to(create_http_proxy))
+        .route("/api/router/http-proxies/runtime",          web::get().to(http_proxy_runtime))
+        .route("/api/router/http-proxies/install/{which}",  web::post().to(http_proxy_install_runtime))
+        .route("/api/router/http-proxies/{id}",             web::put().to(update_http_proxy))
+        .route("/api/router/http-proxies/{id}",             web::delete().to(delete_http_proxy))
         .route("/api/router/wan-status",   web::get().to(wan_status))
         .route("/api/router/interface-up", web::post().to(interface_up))
         .route("/api/router/host-dns",              web::get().to(get_host_dns))

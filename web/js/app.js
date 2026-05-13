@@ -28724,6 +28724,8 @@ function switchSettingsTab(tabName) {
         loadLeaveClusterContext();
     } else if (tabName === 'dnsproviders') {
         loadDnsProviders();
+    } else if (tabName === 'cloudproviders') {
+        loadCloudProviders();
     } else if (tabName === 'passkeys') {
         loadPasskeys();
     } else if (tabName === 'paths') {
@@ -31883,7 +31885,179 @@ async function dnsProviderRemove(id, name) {
     }
 }
 
-// \u2500\u2500\u2500 Leave Cluster \u2500\u2500\u2500
+// \u2500\u2500\u2500 Cloud Providers (Settings \u2192 Cloud Providers) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+// Manages infrastructure-side credentials (Hetzner Cloud, DigitalOcean,
+// Cloudflare account) used by WolfRouter HTTP-proxy edge strategies.
+// Distinct from the DNS Providers tab \u2014 those tokens are scoped to
+// ACME DNS-01 challenges only.
+
+var cloudProvidersCache = [];
+
+async function loadCloudProviders() {
+    var listEl = document.getElementById('cloud-providers-list');
+    if (!listEl) return;
+    try {
+        var r = await fetch('/api/edge/cloud-providers');
+        var d = r.ok ? await r.json() : { providers: [] };
+        cloudProvidersCache = d.providers || [];
+        renderCloudProviderList();
+    } catch (e) {
+        listEl.innerHTML = '<div style="color:var(--danger);padding:12px;">Failed to load: ' + escapeHtml(e.message) + '</div>';
+    }
+}
+
+function renderCloudProviderList() {
+    var el = document.getElementById('cloud-providers-list');
+    if (!el) return;
+    if (!cloudProvidersCache.length) {
+        el.innerHTML = '<div style="color:var(--text-muted);padding:14px;border:1px dashed var(--border);border-radius:8px;text-align:center;">No cloud providers yet. Add one above to enable Hetzner LB, DigitalOcean LB, or Cloudflare Tunnel as HTTP-proxy edge strategies.</div>';
+        return;
+    }
+    var rows = cloudProvidersCache.map(function (p) {
+        var verifiedAt = p.last_verified_at ? formatRelativeTime(p.last_verified_at) : 'never';
+        var badge = p.last_verify_result === 'ok'
+            ? '<span style="background:rgba(34,197,94,0.15);color:#22c55e;padding:2px 8px;border-radius:10px;font-size:11px;">\u2713 ok</span>'
+            : p.last_verify_result
+                ? '<span style="background:rgba(239,68,68,0.15);color:#ef4444;padding:2px 8px;border-radius:10px;font-size:11px;" title="' + escapeHtml(p.last_verify_result) + '">\u2715 failed</span>'
+                : '<span style="background:rgba(148,163,184,0.15);color:#94a3b8;padding:2px 8px;border-radius:10px;font-size:11px;">untested</span>';
+        return '<div style="display:flex;align-items:center;justify-content:space-between;background:var(--bg-input);border:1px solid var(--border);border-radius:8px;padding:10px 14px;margin-bottom:8px;">' +
+            '<div>' +
+                '<div style="font-weight:600;">' + escapeHtml(p.name) + ' <span style="color:var(--text-muted);font-weight:normal;font-size:12px;">(' + escapeHtml(p.kind) + ')</span></div>' +
+                '<div style="font-size:11px;color:var(--text-muted);margin-top:2px;">' + badge + ' &middot; tested ' + verifiedAt + '</div>' +
+            '</div>' +
+            '<div style="display:flex;gap:6px;">' +
+                '<button class="btn btn-sm" onclick="cloudProviderTest(\'' + escapeHtml(p.id) + '\')">Test</button>' +
+                '<button class="btn btn-sm" onclick="cloudProviderShowUpdateForm(\'' + escapeHtml(p.id) + '\')">Update creds</button>' +
+                '<button class="btn btn-sm" onclick="cloudProviderRemove(\'' + escapeHtml(p.id) + '\', \'' + escapeHtml(p.name) + '\')" style="background:var(--danger);color:#fff;border:1px solid var(--danger);">Delete</button>' +
+            '</div>' +
+        '</div>';
+    }).join('');
+    el.innerHTML = rows;
+}
+
+function cloudProviderShowAddForm() {
+    var form = document.getElementById('cloud-providers-add-form');
+    if (!form) return;
+    document.getElementById('cloud-add-name').value = '';
+    document.getElementById('cloud-add-kind').value = '';
+    document.getElementById('cloud-add-creds').value = '';
+    cloudProviderRenderCredsHint();
+    form.style.display = '';
+    form.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function cloudProviderRenderCredsHint() {
+    var kind = document.getElementById('cloud-add-kind');
+    var hint = document.getElementById('cloud-add-hint');
+    var ta = document.getElementById('cloud-add-creds');
+    if (!kind || !hint || !ta) return;
+    var k = kind.value;
+    if (k === 'cloudflare') {
+        hint.textContent = '\u2014 {"account_id":"\u2026","api_token":"\u2026"} (Tunnel:Edit + DNS:Edit)';
+        ta.placeholder = '{"account_id":"abc123","api_token":"xyz789"}';
+    } else if (k === 'hetzner') {
+        hint.textContent = '\u2014 {"api_token":"\u2026"} (Hetzner Cloud Console \u2192 Security \u2192 API tokens)';
+        ta.placeholder = '{"api_token":"hetzner-token-here"}';
+    } else if (k === 'digitalocean') {
+        hint.textContent = '\u2014 {"api_token":"\u2026"} (DO control panel \u2192 API \u2192 Personal access tokens)';
+        ta.placeholder = '{"api_token":"dop_v1_..."}';
+    } else {
+        hint.textContent = '';
+        ta.placeholder = '{"api_token":"..."}';
+    }
+}
+
+async function cloudProviderAdd() {
+    var name = document.getElementById('cloud-add-name').value.trim();
+    var kind = document.getElementById('cloud-add-kind').value;
+    var creds = document.getElementById('cloud-add-creds').value.trim();
+    if (!name) { showToast('Enter a name', 'warning'); return; }
+    if (!kind) { showToast('Pick a kind', 'warning'); return; }
+    if (!creds) { showToast('Paste the credentials JSON', 'warning'); return; }
+    try { JSON.parse(creds); } catch (_) {
+        showToast('Credentials must be valid JSON', 'error'); return;
+    }
+    var btn = document.getElementById('btn-cloud-add');
+    var orig = btn ? btn.innerHTML : '';
+    if (btn) { btn.disabled = true; btn.innerHTML = 'Saving\u2026'; }
+    try {
+        var resp = await fetch('/api/edge/cloud-providers', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: name, kind: kind, credentials: creds })
+        });
+        var data = await resp.json();
+        if (!resp.ok) { showToast(data.error || 'Failed', 'error'); return; }
+        showToast('Cloud provider saved.', 'success');
+        document.getElementById('cloud-providers-add-form').style.display = 'none';
+        document.getElementById('cloud-add-creds').value = '';
+        await loadCloudProviders();
+    } catch (e) {
+        showToast('Failed: ' + e.message, 'error');
+    } finally {
+        if (btn) { btn.disabled = false; btn.innerHTML = orig; }
+    }
+}
+
+async function cloudProviderShowUpdateForm(id) {
+    var p = cloudProvidersCache.find(function (x) { return x.id === id; });
+    if (!p) return;
+    var newCreds = await showPrompt(
+        'Paste the new credentials JSON for "' + p.name + '".\n\nLeave blank to cancel.',
+        'Update Cloud Provider Credentials'
+    );
+    if (newCreds === null) return;
+    if (!newCreds.trim()) { showToast('Cancelled (no creds entered)', 'warning'); return; }
+    try { JSON.parse(newCreds); } catch (_) { showToast('Credentials must be valid JSON', 'error'); return; }
+    try {
+        var resp = await fetch('/api/edge/cloud-providers/' + encodeURIComponent(id), {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ credentials: newCreds })
+        });
+        var data = await resp.json();
+        if (!resp.ok) { showToast(data.error || 'Failed', 'error'); return; }
+        showToast('Credentials updated.', 'success');
+        await loadCloudProviders();
+    } catch (e) {
+        showToast('Failed: ' + e.message, 'error');
+    }
+}
+
+async function cloudProviderTest(id) {
+    var p = cloudProvidersCache.find(function (x) { return x.id === id; });
+    if (!p) return;
+    showToast('Testing ' + p.name + '\u2026', 'info');
+    try {
+        var resp = await fetch('/api/edge/cloud-providers/' + encodeURIComponent(id) + '/test', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}'
+        });
+        var data = await resp.json();
+        if (resp.ok) {
+            showToast('OK \u2014 ' + p.name + ' credentials accepted.', 'success');
+        } else {
+            showToast('Failed: ' + (data.error || 'unknown'), 'error');
+        }
+        await loadCloudProviders();
+    } catch (e) {
+        showToast('Failed: ' + e.message, 'error');
+    }
+}
+
+async function cloudProviderRemove(id, name) {
+    if (!(await showConfirm('Delete cloud provider "' + name + '"?\n\nHTTP proxies that reference this provider will start failing reconcile on the next tick.', 'Delete Cloud Provider'))) return;
+    try {
+        var resp = await fetch('/api/edge/cloud-providers/' + encodeURIComponent(id), { method: 'DELETE' });
+        var data = await resp.json();
+        if (!resp.ok) { showToast(data.error || 'Failed', 'error'); return; }
+        showToast('Removed.', 'success');
+        await loadCloudProviders();
+    } catch (e) {
+        showToast('Failed: ' + e.message, 'error');
+    }
+}
+
+// \u2500\u2500\u2500 Leave Cluster \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 //
 // Forget all peers, wipe local cluster identity, restart the service.
 // Used to recover this node when it's stranded in the wrong cluster

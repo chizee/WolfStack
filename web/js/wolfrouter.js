@@ -911,6 +911,7 @@
         if (tab === 'policy')       wrRenderPolicyMap();
         if (tab === 'wan')          wrRenderWan();
         if (tab === 'proxy')        wrRenderProxies();
+        if (tab === 'http-proxies') hpLoad();
         if (tab === 'subnet-routes') wrRenderSubnetRoutes();
         if (tab === 'connections')  wrRenderConnections();
         if (tab === 'packets')      wrRenderPackets();
@@ -8573,5 +8574,738 @@
     window.wrToggleSubnetRoute = wrToggleSubnetRoute;
     window.wrRunSubnetRouteDiagnostics = wrRunSubnetRouteDiagnostics;
     window.wrRemoveOrphanRoute = wrRemoveOrphanRoute;
+
+    // ─── HTTP (L7) proxies — v23.2 multi-target + edge ─────────────────
+    //
+    // The list view + editor for the new HTTP proxies tab. Render is
+    // driven by `hpState`; every save round-trips through the backend
+    // CRUD + apply pipeline, and the response carries any per-target
+    // render warnings (e.g. "nginx not installed on node-c") so the
+    // operator sees what actually went out to disk.
+
+    let hpState = {
+        proxies: [],
+        topology: [],        // cluster nodes for the targets picker
+        availableCerts: [],  // local-node Let's Encrypt certs (DNS-01 cluster-wide flow lives later)
+        cloudProviders: [],  // CloudProvider entries for the Edge dropdown
+        dnsProviders: [],    // DnsProvider entries — both Cloudflare and others
+        runtime: null,       // detect_runtime() snapshot for the install banner
+        editing: null,
+        draft: null,
+    };
+
+    async function hpLoad() {
+        const listEl = document.getElementById('hp-list');
+        if (listEl) listEl.innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:20px;">Loading…</div>';
+        try {
+            const [proxiesR, topoR, certsR, runtimeR, cloudR, dnsR] = await Promise.all([
+                fetch(wrUrl('/api/router/http-proxies')),
+                fetch(wrUrl('/api/router/topology')),
+                fetch('/api/configurator/nginx/available-certs'),
+                fetch('/api/router/http-proxies/runtime'),
+                fetch('/api/edge/cloud-providers'),
+                fetch('/api/dns-providers'),
+            ]);
+            hpState.proxies = proxiesR.ok ? await proxiesR.json() : [];
+            const topoJson = topoR.ok ? await topoR.json() : {};
+            hpState.topology = (topoJson && topoJson.nodes) || [];
+            const certsJson = certsR.ok ? await certsR.json() : {};
+            hpState.availableCerts = certsJson.certs || [];
+            hpState.runtime = runtimeR.ok ? await runtimeR.json() : null;
+            const cloudJson = cloudR.ok ? await cloudR.json() : {};
+            hpState.cloudProviders = cloudJson.providers || [];
+            const dnsJson = dnsR.ok ? await dnsR.json() : {};
+            hpState.dnsProviders = dnsJson.providers || [];
+            hpRenderRuntimeBanner();
+            hpRenderList();
+        } catch (e) {
+            if (listEl) listEl.innerHTML = '<div style="color:var(--danger);padding:12px;">Load failed: ' + escHtml(e.message) + '</div>';
+        }
+    }
+
+    function hpRenderRuntimeBanner() {
+        const el = document.getElementById('hp-runtime-banner');
+        if (!el) return;
+        const r = hpState.runtime;
+        if (!r) { el.innerHTML = ''; return; }
+        if (!r.any_installed) {
+            el.innerHTML =
+                '<div style="background:rgba(234,179,8,0.10);border:1px solid rgba(234,179,8,0.4);border-radius:8px;padding:12px 14px;margin-bottom:12px;">' +
+                    '<div style="font-weight:600;margin-bottom:6px;">No reverse-proxy software installed on this node.</div>' +
+                    '<div style="font-size:12px;color:var(--text-secondary);margin-bottom:10px;">' +
+                        'Saving an HTTP proxy renders the config to <code>/etc/nginx/conf.d/</code>, but nothing will serve it until you install a reverse proxy. Both choices consume the same files.' +
+                    '</div>' +
+                    '<button class="btn btn-primary btn-sm" onclick="hpOpenInstallPicker()">Install a reverse proxy…</button>' +
+                '</div>';
+            return;
+        }
+        const colour = r.active ? 'rgba(34,197,94,0.10)' : 'rgba(234,179,8,0.10)';
+        const border = r.active ? 'rgba(34,197,94,0.4)' : 'rgba(234,179,8,0.4)';
+        const statusLine = r.active
+            ? 'Active runtime on this node: <strong>' + escHtml(r.active) + '</strong>'
+            : 'Installed but not running. Start with <code>sudo systemctl start ' + (r.wolfproxy_installed ? 'wolfproxy' : 'nginx') + '</code>.';
+        el.innerHTML =
+            '<div style="background:' + colour + ';border:1px solid ' + border + ';border-radius:6px;padding:6px 12px;margin-bottom:12px;font-size:12px;">' +
+                statusLine +
+            '</div>';
+    }
+
+    function hpRenderList() {
+        const el = document.getElementById('hp-list');
+        if (!el) return;
+        if (!hpState.proxies.length) {
+            el.innerHTML = '<div style="background:var(--bg-input);border:1px dashed var(--border);border-radius:10px;padding:24px;text-align:center;color:var(--text-muted);font-size:13px;">' +
+                'No HTTP proxies yet. Click <strong>+ HTTP proxy</strong> to add one. Tick "Replicate to every node" on the editor for resilient multi-node setups.' +
+                '</div>';
+            return;
+        }
+        const nodeName = (id) => {
+            const n = hpState.topology.find(t => t.node_id === id);
+            return n ? (n.node_name || n.node_id) : id;
+        };
+        let html = '<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-size:13px;">';
+        html += '<thead><tr style="text-align:left;border-bottom:1px solid var(--border);color:var(--text-muted);font-size:11px;text-transform:uppercase;letter-spacing:.5px;">' +
+            '<th style="padding:8px 12px;">ID</th>' +
+            '<th style="padding:8px 12px;">Domains</th>' +
+            '<th style="padding:8px 12px;">Targets</th>' +
+            '<th style="padding:8px 12px;">Edge</th>' +
+            '<th style="padding:8px 12px;">TLS</th>' +
+            '<th style="padding:8px 12px;text-align:right;">Actions</th></tr></thead><tbody>';
+        hpState.proxies.forEach(p => {
+            const targets = (p.targets || []).map(t => {
+                const n = nodeName(t.node_id);
+                const r = t.runtime && t.runtime.kind !== 'host' ? ' (' + t.runtime.kind + ')' : '';
+                return escHtml(n + r);
+            }).join(', ') || '— none —';
+            const edgeKind = (p.edge && p.edge.kind) || 'local';
+            const edgeLabel = edgeKind === 'local' ? 'local (manual DNS)'
+                            : edgeKind === 'dns_round_robin' ? 'DNS round-robin'
+                            : edgeKind === 'cloudflare_dns' ? 'Cloudflare DNS'
+                            : edgeKind === 'hetzner_lb' ? 'Hetzner LB'
+                            : edgeKind === 'digitalocean_lb' ? 'DigitalOcean LB'
+                            : edgeKind === 'cloudflare_tunnel' ? 'Cloudflare Tunnel'
+                            : edgeKind;
+            // Tunnel proxies get an extra "Install cloudflared" button
+            // — without it the tunnel exists in Cloudflare but no
+            // connector is running, so requests would hang at the edge.
+            const tunnelInstallBtn = edgeKind === 'cloudflare_tunnel'
+                ? '<button class="btn btn-sm" onclick="hpInstallCloudflared(\'' + escHtml(p.id) + '\')" title="Install cloudflared on every target node" style="background:rgba(244,128,32,0.15);border:1px solid rgba(244,128,32,0.5);color:#f48020;">Install cloudflared</button> '
+                : '';
+            html += '<tr style="border-bottom:1px solid var(--border);">' +
+                '<td style="padding:10px 12px;"><strong>' + escHtml(p.id) + '</strong></td>' +
+                '<td style="padding:10px 12px;color:var(--text-muted);">' + escHtml((p.server_names || []).join(', ')) + '</td>' +
+                '<td style="padding:10px 12px;color:var(--text-muted);">' + targets + '</td>' +
+                '<td style="padding:10px 12px;color:var(--text-muted);">' + escHtml(edgeLabel) + '</td>' +
+                '<td style="padding:10px 12px;text-align:center;">' + (p.tls ? '✓' : '—') + '</td>' +
+                '<td style="padding:10px 12px;text-align:right;">' +
+                    tunnelInstallBtn +
+                    '<button class="btn btn-sm" onclick="hpOpenEditor(\'' + escHtml(p.id) + '\')">Edit</button> ' +
+                    '<button class="btn btn-sm" onclick="hpDelete(\'' + escHtml(p.id) + '\')" style="background:var(--danger);color:#fff;border:1px solid var(--danger);">Delete</button>' +
+                '</td></tr>';
+        });
+        html += '</tbody></table></div>';
+        el.innerHTML = html;
+    }
+
+    function hpDefaultDraft() {
+        // Default: replicate to every wolfstack node visible in
+        // topology. Single-host is one click ("uncheck Replicate" or
+        // remove targets in the picker).
+        const targets = hpState.topology
+            .filter(n => n.node_id)
+            .map(n => ({ node_id: n.node_id, runtime: { kind: 'host' } }));
+        // If we have ≥1 Cloudflare DNS provider, default the Edge
+        // strategy to CloudflareDns proxied. Otherwise Local.
+        const cfDns = (hpState.dnsProviders || []).find(p => p.plugin === 'cloudflare');
+        const edge = cfDns ? { kind: 'cloudflare_dns', dns_provider_id: cfDns.id, ttl_seconds: 60 }
+                           : { kind: 'local' };
+        return {
+            id: '',
+            server_names: [],
+            enabled: true,
+            listen_ports: [],
+            targets: targets.length ? targets : [],
+            edge: edge,
+            upstreams: [],
+            lb_strategy: 'round_robin',
+            tls: null,
+            force_https: false,
+            hsts: false,
+            http2: false,
+            websocket: false,
+            upstream_headers: [],
+            response_headers: [],
+            connect_timeout_s: 0,
+            send_timeout_s: 0,
+            read_timeout_s: 0,
+            error_pages: [],
+            access: { rules: [], basic_auth_file: '', basic_auth_realm: '', rate_limit_rps: 0, rate_limit_burst: 0, conn_limit_per_ip: 0, block_threat_intel: false, country_block: [] },
+            description: '',
+            updated_at: '',
+        };
+    }
+
+    async function hpOpenEditor(id) {
+        await hpLoad();
+        if (id) {
+            const found = hpState.proxies.find(p => p.id === id);
+            if (!found) { alert('Proxy not found'); return; }
+            hpState.editing = found;
+            hpState.draft = JSON.parse(JSON.stringify(found));
+        } else {
+            hpState.editing = null;
+            hpState.draft = hpDefaultDraft();
+        }
+        hpRenderEditor();
+    }
+
+    function hpCloseEditor() {
+        hpState.editing = null;
+        hpState.draft = null;
+        const m = document.getElementById('hp-editor-mount');
+        if (m) m.remove();
+    }
+
+    function hpRenderEditor() {
+        let mount = document.getElementById('hp-editor-mount');
+        if (!mount) {
+            mount = document.createElement('div');
+            mount.id = 'hp-editor-mount';
+            document.body.appendChild(mount);
+        }
+        const d = hpState.draft;
+        if (!d) { mount.innerHTML = ''; return; }
+
+        // Single-form editor (skipping tabs for v23.2 — minimum
+        // viable; tabs can come back when there's a real need). Each
+        // section is collapsible-looking via h4 headers + spacing.
+
+        const nodeOpts = hpState.topology.map(n =>
+            '<label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;padding:4px 0;">' +
+                '<input type="checkbox" data-hp-target value="' + escHtml(n.node_id) + '" ' +
+                    (d.targets.some(t => t.node_id === n.node_id) ? 'checked' : '') + '> ' +
+                '<span>' + escHtml(n.node_name || n.node_id) + ' ' +
+                    '<span style="color:var(--text-muted);font-size:11px;">(' + escHtml(n.node_id) + ')</span>' +
+                '</span>' +
+            '</label>'
+        ).join('');
+
+        const certOpts = ['<option value="">— enter paths manually —</option>'].concat(
+            hpState.availableCerts.map(c => {
+                const tag = c.is_wildcard ? ' (wildcard)' : '';
+                return '<option value="' + escHtml(c.cert_path) + '|' + escHtml(c.key_path) + '">' +
+                    escHtml(c.name + tag) + '</option>';
+            })
+        ).join('');
+
+        // Edge strategy options + which provider field(s) to render
+        // based on the current draft. Each strategy has its own field
+        // shape — DNS strategies want a DNS-provider id; LB/tunnel
+        // strategies want a cloud-provider id + an LB/tunnel name.
+        const edgeKind = (d.edge && d.edge.kind) || 'local';
+
+        const dnsOptsForPlugin = (plugin) =>
+            hpState.dnsProviders.filter(p => p.plugin === plugin).map(p =>
+                '<option value="' + escHtml(p.id) + '" ' +
+                ((d.edge && d.edge.dns_provider_id === p.id) ? 'selected' : '') + '>' +
+                escHtml(p.name) + ' (' + escHtml(plugin) + ')</option>'
+            ).join('');
+        const dnsOptsForRoundRobin = ['cloudflare','hetzner','digitalocean'].map(plugin =>
+            hpState.dnsProviders.filter(p => p.plugin === plugin).map(p =>
+                '<option value="' + escHtml(p.id) + '" ' +
+                ((d.edge && d.edge.dns_provider_id === p.id) ? 'selected' : '') + '>' +
+                escHtml(p.name) + ' (' + escHtml(plugin) + ')</option>'
+            ).join('')
+        ).join('');
+        const cloudOptsForKind = (kind) =>
+            hpState.cloudProviders.filter(p => p.kind === kind).map(p =>
+                '<option value="' + escHtml(p.id) + '" ' +
+                ((d.edge && d.edge.cloud_provider_id === p.id) ? 'selected' : '') + '>' +
+                escHtml(p.name) + '</option>'
+            ).join('');
+
+        const noProviderWarn = (text) =>
+            '<div style="background:rgba(234,179,8,0.10);border:1px solid rgba(234,179,8,0.4);border-radius:6px;padding:8px 12px;font-size:12px;">' +
+            text + '</div>';
+
+        const edgeFields = (() => {
+            if (edgeKind === 'local') {
+                return '<div style="font-size:12px;color:var(--text-muted);">No automation — point DNS at your target nodes manually.</div>';
+            }
+            if (edgeKind === 'dns_round_robin') {
+                if (!dnsOptsForRoundRobin) {
+                    return noProviderWarn('No DNS provider configured. Add one (Cloudflare/Hetzner/DigitalOcean) in <a href="#" onclick="selectView(\'settings\'); switchSettingsTab(\'dnsproviders\'); return false;">Settings → DNS Providers</a>.');
+                }
+                return '<div class="form-group" style="margin-top:8px;"><label>DNS provider</label>' +
+                    '<select id="hp-edge-dnspid" class="form-control" style="max-width:380px;">' + dnsOptsForRoundRobin + '</select></div>' +
+                    '<div class="form-group" style="margin-top:8px;"><label>TTL (seconds)</label>' +
+                    '<input id="hp-edge-ttl" type="number" min="30" class="form-control" style="max-width:140px;" value="' + ((d.edge && d.edge.ttl_seconds) || 60) + '"></div>';
+            }
+            if (edgeKind === 'cloudflare_dns') {
+                const opts = dnsOptsForPlugin('cloudflare');
+                if (!opts) return noProviderWarn('No Cloudflare DNS provider configured.');
+                return '<div class="form-group" style="margin-top:8px;"><label>Cloudflare DNS provider</label>' +
+                    '<select id="hp-edge-dnspid" class="form-control" style="max-width:380px;">' + opts + '</select></div>' +
+                    '<div class="form-group" style="margin-top:8px;"><label>TTL (seconds)</label>' +
+                    '<input id="hp-edge-ttl" type="number" min="30" class="form-control" style="max-width:140px;" value="' + ((d.edge && d.edge.ttl_seconds) || 60) + '"></div>';
+            }
+            if (edgeKind === 'hetzner_lb') {
+                const opts = cloudOptsForKind('hetzner');
+                if (!opts) return noProviderWarn('No Hetzner cloud provider configured. Add one in Settings → Cloud Providers.');
+                return '<div class="form-group" style="margin-top:8px;"><label>Hetzner cloud provider</label>' +
+                    '<select id="hp-edge-cloudpid" class="form-control" style="max-width:380px;">' + opts + '</select></div>' +
+                    '<div class="form-group" style="margin-top:8px;"><label>Load balancer name</label>' +
+                    '<input id="hp-edge-lbname" class="form-control" style="max-width:380px;" value="' + escHtml((d.edge && d.edge.lb_name) || 'wolfstack-lb') + '"></div>' +
+                    '<div class="form-group" style="margin-top:8px;"><label>Location</label>' +
+                    '<select id="hp-edge-location" class="form-control" style="max-width:240px;">' +
+                    ['fsn1','nbg1','hel1','ash','hil'].map(l =>
+                        '<option value="' + l + '"' + (((d.edge && d.edge.location) || 'fsn1') === l ? ' selected' : '') + '>' + l + '</option>'
+                    ).join('') + '</select></div>' +
+                    '<div class="form-group" style="margin-top:6px;"><label style="display:flex;gap:8px;align-items:center;cursor:pointer;"><input id="hp-edge-https" type="checkbox" ' + (!(d.edge && d.edge.https_passthrough === false) ? 'checked' : '') + '> <span>HTTPS pass-through (TLS terminates on origin)</span></label></div>';
+            }
+            if (edgeKind === 'digitalocean_lb') {
+                const opts = cloudOptsForKind('digitalocean');
+                if (!opts) return noProviderWarn('No DigitalOcean cloud provider configured. Add one in Settings → Cloud Providers.');
+                return '<div class="form-group" style="margin-top:8px;"><label>DigitalOcean cloud provider</label>' +
+                    '<select id="hp-edge-cloudpid" class="form-control" style="max-width:380px;">' + opts + '</select></div>' +
+                    '<div class="form-group" style="margin-top:8px;"><label>Load balancer name</label>' +
+                    '<input id="hp-edge-lbname" class="form-control" style="max-width:380px;" value="' + escHtml((d.edge && d.edge.lb_name) || 'wolfstack-lb') + '"></div>' +
+                    '<div class="form-group" style="margin-top:8px;"><label>Region</label>' +
+                    '<select id="hp-edge-region" class="form-control" style="max-width:240px;">' +
+                    ['nyc1','nyc3','sfo3','ams3','sgp1','lon1','fra1','tor1','blr1','syd1'].map(r =>
+                        '<option value="' + r + '"' + (((d.edge && d.edge.region) || 'nyc3') === r ? ' selected' : '') + '>' + r + '</option>'
+                    ).join('') + '</select></div>' +
+                    '<div class="form-group" style="margin-top:6px;"><label style="display:flex;gap:8px;align-items:center;cursor:pointer;"><input id="hp-edge-https" type="checkbox" ' + (!(d.edge && d.edge.https_passthrough === false) ? 'checked' : '') + '> <span>HTTPS pass-through</span></label></div>' +
+                    '<div style="font-size:11px;color:var(--text-muted);margin-top:6px;">Note: DigitalOcean LBs target droplets only. Each WolfStack node must be a droplet in this DO account or it can\'t be added.</div>';
+            }
+            if (edgeKind === 'cloudflare_tunnel') {
+                const cloudOpts = cloudOptsForKind('cloudflare');
+                const dnsOpts = dnsOptsForPlugin('cloudflare');
+                if (!cloudOpts) return noProviderWarn('No Cloudflare cloud provider configured. Add one (account_id + tunnel API token) in Settings → Cloud Providers.');
+                if (!dnsOpts) return noProviderWarn('No Cloudflare DNS provider configured for the CNAME.');
+                return '<div class="form-group" style="margin-top:8px;"><label>Cloudflare cloud provider</label>' +
+                    '<select id="hp-edge-cloudpid" class="form-control" style="max-width:380px;">' + cloudOpts + '</select></div>' +
+                    '<div class="form-group" style="margin-top:8px;"><label>Cloudflare DNS provider (for the CNAME)</label>' +
+                    '<select id="hp-edge-dnspid" class="form-control" style="max-width:380px;">' + dnsOpts + '</select></div>' +
+                    '<div class="form-group" style="margin-top:8px;"><label>Tunnel name</label>' +
+                    '<input id="hp-edge-tunnel" class="form-control" style="max-width:380px;" value="' + escHtml((d.edge && d.edge.tunnel_name) || 'wolfstack-tunnel') + '"></div>' +
+                    '<div style="font-size:11px;color:var(--text-muted);margin-top:6px;">After saving, install <code>cloudflared</code> on each target node using the connector token (returned by the tunnel API).</div>';
+            }
+            return '';
+        })();
+
+        mount.innerHTML =
+            '<div style="position:fixed;top:0;right:0;bottom:0;width:min(820px,100vw);background:var(--bg-card,#1e2028);border-left:1px solid var(--border);z-index:10000;display:flex;flex-direction:column;box-shadow:-8px 0 24px rgba(0,0,0,0.3);">' +
+                '<div style="padding:16px 20px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;">' +
+                    '<h3 style="margin:0;font-size:16px;">' + escHtml(hpState.editing ? 'Edit HTTP proxy: ' + d.id : 'New HTTP proxy') + '</h3>' +
+                    '<button class="btn btn-sm" onclick="hpCloseEditor()">Close</button>' +
+                '</div>' +
+                '<div style="flex:1;overflow:auto;padding:20px;">' +
+
+                  '<h4 style="margin:0 0 8px;font-size:13px;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-muted);">General</h4>' +
+                  '<div class="form-group"><label>ID</label>' +
+                  '<input id="hp-id" class="form-control" value="' + escHtml(d.id || '') + '" placeholder="mysite" ' + (hpState.editing ? 'readonly style="opacity:0.6;"' : '') + '>' +
+                  '<small style="color:var(--text-muted);">Used as the nginx config filename. Lowercase a-z, 0-9, dot, dash, underscore. Cannot be renamed.</small></div>' +
+                  '<div class="form-group" style="margin-top:10px;"><label>Server names</label>' +
+                  '<input id="hp-snames" class="form-control" value="' + escHtml((d.server_names || []).join(' ')) + '" placeholder="app.example.com www.app.example.com">' +
+                  '<small style="color:var(--text-muted);">Space or comma separated. First is canonical for redirect.</small></div>' +
+                  '<div class="form-group" style="margin-top:10px;"><label style="display:flex;gap:8px;align-items:center;cursor:pointer;"><input id="hp-enabled" type="checkbox" ' + (d.enabled !== false ? 'checked' : '') + '> <span>Enabled</span></label></div>' +
+
+                  '<h4 style="margin:20px 0 8px;font-size:13px;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-muted);">Targets (where it runs)</h4>' +
+                  '<div style="background:var(--bg-input);border:1px solid var(--border);border-radius:6px;padding:10px 14px;max-width:560px;">' + (nodeOpts || '<div style="color:var(--text-muted);font-size:12px;">No nodes visible in topology.</div>') + '</div>' +
+                  '<small style="color:var(--text-muted);">Pick one for single-node, or multiple to replicate across the cluster for HA. Each picked node renders identical nginx config. v23.2 supports Host runtime only — Docker/LXC per target coming in v23.3.</small>' +
+
+                  '<h4 style="margin:20px 0 8px;font-size:13px;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-muted);">Edge (public ingress)</h4>' +
+                  '<div class="form-group"><label>Resilience strategy</label>' +
+                  '<select id="hp-edge-kind" class="form-control" style="max-width:380px;" onchange="hpOnEdgeKindChange()">' +
+                    '<option value="local"' + (edgeKind === 'local' ? ' selected' : '') + '>Local — operator manages DNS</option>' +
+                    '<option value="dns_round_robin"' + (edgeKind === 'dns_round_robin' ? ' selected' : '') + '>DNS round-robin (Cloudflare / Hetzner / DigitalOcean)</option>' +
+                    '<option value="cloudflare_dns"' + (edgeKind === 'cloudflare_dns' ? ' selected' : '') + '>Cloudflare DNS (orange cloud) — recommended, free</option>' +
+                    '<option value="hetzner_lb"' + (edgeKind === 'hetzner_lb' ? ' selected' : '') + '>Hetzner Cloud Load Balancer (~€5/mo)</option>' +
+                    '<option value="digitalocean_lb"' + (edgeKind === 'digitalocean_lb' ? ' selected' : '') + '>DigitalOcean Load Balancer (droplets only)</option>' +
+                    '<option value="cloudflare_tunnel"' + (edgeKind === 'cloudflare_tunnel' ? ' selected' : '') + '>Cloudflare Tunnel — CGNAT-friendly, no public IP needed</option>' +
+                  '</select></div>' +
+                  edgeFields +
+
+                  '<h4 style="margin:20px 0 8px;font-size:13px;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-muted);">Backends</h4>' +
+                  '<div id="hp-upstreams">' + hpUpstreamsHtml(d.upstreams || []) + '</div>' +
+                  '<button class="btn btn-sm" onclick="hpAddUpstream()" style="margin-top:6px;">+ Backend</button>' +
+                  '<div class="form-group" style="margin-top:10px;"><label>Load balancing</label>' +
+                  '<select id="hp-lb" class="form-control" style="max-width:240px;">' +
+                    '<option value="round_robin"' + (d.lb_strategy === 'round_robin' ? ' selected' : '') + '>Round robin</option>' +
+                    '<option value="least_conn"' + (d.lb_strategy === 'least_conn' ? ' selected' : '') + '>Least connections</option>' +
+                    '<option value="ip_hash"' + (d.lb_strategy === 'ip_hash' ? ' selected' : '') + '>IP hash (sticky)</option>' +
+                  '</select></div>' +
+                  '<div class="form-group" style="margin-top:6px;"><label style="display:flex;gap:8px;align-items:center;cursor:pointer;"><input id="hp-ws" type="checkbox" ' + (d.websocket ? 'checked' : '') + '> <span>WebSocket support</span></label></div>' +
+
+                  '<h4 style="margin:20px 0 8px;font-size:13px;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-muted);">TLS</h4>' +
+                  '<div class="form-group"><label>Cert dropdown</label>' +
+                  '<select id="hp-cert-picker" class="form-control" onchange="hpApplyCertPick()" style="max-width:380px;">' + certOpts + '</select>' +
+                  '<small style="color:var(--text-muted);">Local-node certs only — cluster-wide cert distribution lands in v23.2.x.</small></div>' +
+                  '<div class="form-group" style="margin-top:8px;"><label>Cert path</label>' +
+                  '<input id="hp-tls-cert" class="form-control" value="' + escHtml((d.tls && d.tls.cert_path) || '') + '" placeholder="/etc/letsencrypt/live/zone/fullchain.pem"></div>' +
+                  '<div class="form-group" style="margin-top:8px;"><label>Key path</label>' +
+                  '<input id="hp-tls-key" class="form-control" value="' + escHtml((d.tls && d.tls.key_path) || '') + '" placeholder="/etc/letsencrypt/live/zone/privkey.pem">' +
+                  '<small style="color:var(--text-muted);">Both blank = HTTP only. With Cloudflare orange-cloud, origin certs can be self-signed.</small></div>' +
+                  '<div class="form-group" style="margin-top:8px;"><label style="display:flex;gap:8px;align-items:center;cursor:pointer;"><input id="hp-force-https" type="checkbox" ' + (d.force_https ? 'checked' : '') + '> <span>Force HTTPS (301 from :80)</span></label></div>' +
+                  '<div class="form-group" style="margin-top:6px;"><label style="display:flex;gap:8px;align-items:center;cursor:pointer;"><input id="hp-hsts" type="checkbox" ' + (d.hsts ? 'checked' : '') + '> <span>HSTS</span></label></div>' +
+                  '<div class="form-group" style="margin-top:6px;"><label style="display:flex;gap:8px;align-items:center;cursor:pointer;"><input id="hp-http2" type="checkbox" ' + (d.http2 ? 'checked' : '') + '> <span>HTTP/2</span></label></div>' +
+
+                '</div>' +
+                '<div style="padding:14px 20px;border-top:1px solid var(--border);display:flex;justify-content:flex-end;gap:8px;">' +
+                    '<button class="btn" onclick="hpCloseEditor()">Cancel</button>' +
+                    '<button class="btn btn-primary" onclick="hpSaveDraft()">Save &amp; apply</button>' +
+                '</div>' +
+            '</div>';
+    }
+
+    function hpUpstreamsHtml(ups) {
+        if (!ups || !ups.length) {
+            return hpUpstreamRowHtml({ url: '', weight: 1, max_conns: 0 });
+        }
+        return ups.map(hpUpstreamRowHtml).join('');
+    }
+    function hpUpstreamRowHtml(u) {
+        return '<div data-hp-upstream style="display:grid;grid-template-columns:1fr 80px 100px auto;gap:8px;margin-bottom:6px;align-items:center;">' +
+            '<input data-hp-up-url class="form-control" value="' + escHtml(u.url || '') + '" placeholder="http://10.0.0.5:3000">' +
+            '<input data-hp-up-weight type="number" min="1" class="form-control" value="' + (u.weight || 1) + '" title="Weight">' +
+            '<input data-hp-up-maxconns type="number" min="0" class="form-control" value="' + (u.max_conns || 0) + '" title="Max conns">' +
+            '<button class="btn btn-sm" onclick="this.parentElement.remove()" style="background:var(--danger);color:#fff;border:1px solid var(--danger);">−</button>' +
+            '</div>';
+    }
+    function hpAddUpstream() {
+        const c = document.getElementById('hp-upstreams');
+        if (c) c.insertAdjacentHTML('beforeend', hpUpstreamRowHtml({ url: '', weight: 1, max_conns: 0 }));
+    }
+    // Edge-strategy dropdown changed — reset d.edge to a sensible
+    // default for the new kind so stale fields from the previous
+    // strategy don't bleed through, then re-render so the per-strategy
+    // fields appear. Doesn't read the rest of the form first — the user
+    // can change kind back-and-forth without losing their server_names,
+    // targets, etc. (those live elsewhere in the DOM).
+    function hpOnEdgeKindChange() {
+        const e = document.getElementById('hp-edge-kind');
+        if (!e || !hpState.draft) return;
+        const k = e.value;
+        if (k === 'local') {
+            hpState.draft.edge = { kind: 'local' };
+        } else if (k === 'dns_round_robin' || k === 'cloudflare_dns') {
+            const wantPlugin = k === 'cloudflare_dns' ? 'cloudflare' : null;
+            const dp = (hpState.dnsProviders || []).find(p => !wantPlugin || p.plugin === wantPlugin);
+            hpState.draft.edge = { kind: k, dns_provider_id: dp ? dp.id : '', ttl_seconds: 60 };
+        } else if (k === 'hetzner_lb') {
+            const cp = (hpState.cloudProviders || []).find(p => p.kind === 'hetzner');
+            hpState.draft.edge = { kind: 'hetzner_lb', cloud_provider_id: cp ? cp.id : '', lb_name: 'wolfstack-lb', location: 'fsn1', https_passthrough: true };
+        } else if (k === 'digitalocean_lb') {
+            const cp = (hpState.cloudProviders || []).find(p => p.kind === 'digitalocean');
+            hpState.draft.edge = { kind: 'digitalocean_lb', cloud_provider_id: cp ? cp.id : '', lb_name: 'wolfstack-lb', region: 'nyc3', https_passthrough: true };
+        } else if (k === 'cloudflare_tunnel') {
+            const cp = (hpState.cloudProviders || []).find(p => p.kind === 'cloudflare');
+            const dp = (hpState.dnsProviders || []).find(p => p.plugin === 'cloudflare');
+            hpState.draft.edge = { kind: 'cloudflare_tunnel', cloud_provider_id: cp ? cp.id : '', dns_provider_id: dp ? dp.id : '', tunnel_name: 'wolfstack-tunnel' };
+        }
+        hpRenderEditor();
+    }
+    window.hpOnEdgeKindChange = hpOnEdgeKindChange;
+    function hpApplyCertPick() {
+        const sel = document.getElementById('hp-cert-picker');
+        if (!sel || !sel.value) return;
+        const parts = sel.value.split('|');
+        if (parts.length >= 2) {
+            const ce = document.getElementById('hp-tls-cert');
+            const ke = document.getElementById('hp-tls-key');
+            if (ce) ce.value = parts[0];
+            if (ke) ke.value = parts[1];
+        }
+    }
+
+    function hpReadDraftFromForm() {
+        const d = hpState.draft;
+        if (!d) return;
+        const gv = (id) => { const e = document.getElementById(id); return e ? e.value : null; };
+        const gc = (id) => { const e = document.getElementById(id); return e ? !!e.checked : null; };
+
+        if (gv('hp-id') !== null && !hpState.editing) d.id = gv('hp-id').trim();
+        if (gv('hp-snames') !== null) d.server_names = gv('hp-snames').split(/[\s,]+/).filter(Boolean);
+        if (gc('hp-enabled') !== null) d.enabled = gc('hp-enabled');
+
+        // Targets — picked from checkboxes. Runtime is Host for v23.2.
+        const checks = document.querySelectorAll('[data-hp-target]:checked');
+        if (checks.length || document.querySelectorAll('[data-hp-target]').length) {
+            d.targets = Array.from(checks).map(c => ({
+                node_id: c.value,
+                runtime: { kind: 'host' },
+            }));
+        }
+
+        // Edge.
+        const ek = gv('hp-edge-kind') || 'local';
+        if (ek === 'local') {
+            d.edge = { kind: 'local' };
+        } else if (ek === 'dns_round_robin' || ek === 'cloudflare_dns') {
+            const pid = gv('hp-edge-dnspid') || '';
+            const ttl = parseInt(gv('hp-edge-ttl') || '60', 10) || 60;
+            d.edge = { kind: ek, dns_provider_id: pid, ttl_seconds: ttl };
+        } else if (ek === 'hetzner_lb') {
+            d.edge = {
+                kind: 'hetzner_lb',
+                cloud_provider_id: gv('hp-edge-cloudpid') || '',
+                lb_name: (gv('hp-edge-lbname') || 'wolfstack-lb').trim(),
+                location: gv('hp-edge-location') || 'fsn1',
+                https_passthrough: gc('hp-edge-https') !== false,
+            };
+        } else if (ek === 'digitalocean_lb') {
+            d.edge = {
+                kind: 'digitalocean_lb',
+                cloud_provider_id: gv('hp-edge-cloudpid') || '',
+                lb_name: (gv('hp-edge-lbname') || 'wolfstack-lb').trim(),
+                region: gv('hp-edge-region') || 'nyc3',
+                https_passthrough: gc('hp-edge-https') !== false,
+            };
+        } else if (ek === 'cloudflare_tunnel') {
+            d.edge = {
+                kind: 'cloudflare_tunnel',
+                cloud_provider_id: gv('hp-edge-cloudpid') || '',
+                dns_provider_id: gv('hp-edge-dnspid') || '',
+                tunnel_name: (gv('hp-edge-tunnel') || 'wolfstack-tunnel').trim(),
+            };
+        }
+
+        // Upstreams.
+        const upRows = document.querySelectorAll('[data-hp-upstream]');
+        if (upRows.length) {
+            d.upstreams = [];
+            upRows.forEach(r => {
+                const u = r.querySelector('[data-hp-up-url]');
+                const w = r.querySelector('[data-hp-up-weight]');
+                const m = r.querySelector('[data-hp-up-maxconns]');
+                if (u && u.value.trim()) {
+                    d.upstreams.push({
+                        url: u.value.trim(),
+                        weight: parseInt((w && w.value) || '1', 10) || 1,
+                        max_conns: parseInt((m && m.value) || '0', 10) || 0,
+                    });
+                }
+            });
+        }
+        if (gv('hp-lb')) d.lb_strategy = gv('hp-lb');
+        if (gc('hp-ws') !== null) d.websocket = gc('hp-ws');
+
+        // TLS.
+        const cert = gv('hp-tls-cert');
+        const key = gv('hp-tls-key');
+        if (cert !== null && key !== null) {
+            if (cert.trim() && key.trim()) {
+                d.tls = { cert_path: cert.trim(), key_path: key.trim(), cert_name: d.tls ? (d.tls.cert_name || '') : '' };
+            } else {
+                d.tls = null;
+            }
+        }
+        if (gc('hp-force-https') !== null) d.force_https = gc('hp-force-https');
+        if (gc('hp-hsts') !== null) d.hsts = gc('hp-hsts');
+        if (gc('hp-http2') !== null) d.http2 = gc('hp-http2');
+    }
+
+    async function hpSaveDraft() {
+        hpReadDraftFromForm();
+        const d = hpState.draft;
+        if (!d) return;
+        if (!d.id) { alert('ID is required'); return; }
+        if (!d.server_names || !d.server_names.length) { alert('At least one server name'); return; }
+        if (!d.targets || !d.targets.length) { alert('Pick at least one target node'); return; }
+        const isEdit = !!hpState.editing;
+        const url = isEdit
+            ? wrUrl('/api/router/http-proxies/' + encodeURIComponent(d.id))
+            : wrUrl('/api/router/http-proxies');
+        try {
+            const resp = await fetch(url, {
+                method: isEdit ? 'PUT' : 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(d),
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (resp.ok) {
+                if (typeof showToast === 'function') {
+                    showToast('Saved & applied' + ((data.apply_warnings || []).length ? ' (with warnings)' : ''), 'success');
+                }
+                if ((data.apply_warnings || []).length) {
+                    // Show warnings in an alert so the operator can't
+                    // miss them — covers things like "nginx not
+                    // installed on node-c".
+                    alert('Apply warnings:\n\n' + data.apply_warnings.join('\n'));
+                }
+                hpCloseEditor();
+                hpLoad();
+            } else {
+                alert('Save failed: ' + (data.error || ('HTTP ' + resp.status)));
+            }
+        } catch (e) {
+            alert('Save failed: ' + e.message);
+        }
+    }
+
+    async function hpDelete(id) {
+        if (!confirm('Delete HTTP proxy "' + id + '"?\n\nThe nginx config on every target node will be removed and the runtime reloaded. If the proxy uses a Hetzner/DigitalOcean Load Balancer or a Cloudflare Tunnel, those cloud resources will also be torn down.')) return;
+        try {
+            const resp = await fetch(wrUrl('/api/router/http-proxies/' + encodeURIComponent(id)), { method: 'DELETE' });
+            const data = await resp.json().catch(() => ({}));
+            if (resp.ok) {
+                if (typeof showToast === 'function') showToast('Deleted & applied', 'success');
+                if (data.apply_warnings && data.apply_warnings.length) {
+                    // Surface any teardown warnings so the operator knows
+                    // exactly what (if anything) was left dangling.
+                    alert('Deleted, but with warnings:\n\n' + data.apply_warnings.join('\n'));
+                }
+                hpLoad();
+            } else {
+                alert('Delete failed: ' + (data.error || ('HTTP ' + resp.status)));
+            }
+        } catch (e) {
+            alert('Delete failed: ' + e.message);
+        }
+    }
+
+    // Fan out cloudflared install across every Host target of a tunnel
+    // proxy. Each per-node install routes through the cluster proxy so
+    // the master node makes one API call per target and serialises
+    // the transcripts back to the operator.
+    async function hpInstallCloudflared(proxyId) {
+        const proxy = hpState.proxies.find(p => p.id === proxyId);
+        if (!proxy) { alert('Proxy not found'); return; }
+        if (!proxy.edge || proxy.edge.kind !== 'cloudflare_tunnel') {
+            alert('Proxy is not a Cloudflare Tunnel.'); return;
+        }
+        const hostTargets = (proxy.targets || []).filter(t => !t.runtime || t.runtime.kind === 'host');
+        if (!hostTargets.length) {
+            alert('No Host-runtime targets — cloudflared install is host-level only for v23.2.');
+            return;
+        }
+        // Identify self via the global `allNodes` array (every node row
+        // has an `is_self` flag set by the master). Falls back to null
+        // — in that case every target goes through the cluster proxy
+        // (the master will 400 on self, so we always have at least one
+        // route that works).
+        const selfNode = (typeof allNodes !== 'undefined' && allNodes)
+            ? allNodes.find(n => n.is_self) : null;
+        const selfId = selfNode ? selfNode.id : null;
+        const lines = ['Installing cloudflared on ' + hostTargets.length + ' node(s)…\n'];
+        if (typeof showToast === 'function') showToast('Installing cloudflared on ' + hostTargets.length + ' node(s)…', 'info');
+        for (const t of hostTargets) {
+            // For the local node hit the endpoint directly; remote nodes
+            // go through the cluster proxy.
+            const isSelf = selfId && t.node_id === selfId;
+            const url = isSelf
+                ? '/api/edge/cloudflare-tunnel/install/' + encodeURIComponent(proxyId)
+                : '/api/nodes/' + encodeURIComponent(t.node_id) + '/proxy/api/edge/cloudflare-tunnel/install/' + encodeURIComponent(proxyId);
+            try {
+                const resp = await fetch(url, { method: 'POST' });
+                const data = await resp.json().catch(() => ({}));
+                if (resp.ok) {
+                    lines.push('✓ ' + t.node_id + ': ok');
+                } else {
+                    lines.push('✕ ' + t.node_id + ': ' + (data.error || ('HTTP ' + resp.status)));
+                }
+            } catch (e) {
+                lines.push('✕ ' + t.node_id + ': ' + e.message);
+            }
+        }
+        alert(lines.join('\n'));
+    }
+    window.hpInstallCloudflared = hpInstallCloudflared;
+
+    // ─── Install picker ───────────────────────────────────────────────
+    //
+    // Styled modal — replaces the v23.1 browser confirm/alert pair.
+    // Offers WolfProxy + nginx side-by-side; install runs synchronously
+    // and the live stdout/stderr lands in the modal so the operator
+    // sees what package manager actually said.
+
+    function hpOpenInstallPicker() {
+        const existing = document.getElementById('hp-install-picker');
+        if (existing) existing.remove();
+        const overlay = document.createElement('div');
+        overlay.id = 'hp-install-picker';
+        overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);z-index:100000;display:flex;align-items:center;justify-content:center;padding:20px;';
+        const modal = document.createElement('div');
+        modal.style.cssText = 'background:var(--bg-card,#1e2028);border:1px solid var(--border);border-radius:12px;padding:24px;max-width:760px;width:100%;max-height:90vh;overflow:auto;box-shadow:0 20px 60px rgba(0,0,0,0.5);';
+        modal.innerHTML =
+            '<div style="display:flex;justify-content:space-between;align-items:start;margin-bottom:6px;">' +
+                '<h3 style="margin:0;font-size:18px;">Install a reverse proxy</h3>' +
+                '<button class="btn btn-sm" onclick="hpCloseInstallPicker()">Close</button>' +
+            '</div>' +
+            '<p style="font-size:13px;color:var(--text-muted);margin:0 0 16px;">Both consume identical nginx-format configs — pick on operational grounds.</p>' +
+            '<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;">' +
+                hpInstallCard({ which: 'wolfproxy', name: 'WolfProxy', tagline: 'Wolf Software\'s Rust-based reverse proxy.',
+                    bullets: ['Drop-in nginx replacement.', 'Built-in TLS-abuse firewall.', 'Monitoring dashboard on :5001.'],
+                    install_note: 'Downloads precompiled binary from github.com/wolfsoftwaresystemsltd/wolfproxy.' }) +
+                hpInstallCard({ which: 'nginx', name: 'nginx', tagline: 'The reference reverse proxy.',
+                    bullets: ['Industry-standard, well-documented.', 'From your distro\'s package manager.', 'Mature ecosystem.'],
+                    install_note: 'Installs via apt / dnf / pacman / zypper.' }) +
+            '</div>' +
+            '<div id="hp-install-output" style="display:none;margin-top:18px;"></div>';
+        overlay.appendChild(modal);
+        overlay.onclick = (e) => { if (e.target === overlay) hpCloseInstallPicker(); };
+        document.body.appendChild(overlay);
+    }
+    function hpInstallCard(c) {
+        const bullets = c.bullets.map(b => '<li>' + escHtml(b) + '</li>').join('');
+        return '<div data-hp-install-card="' + escHtml(c.which) + '" style="background:var(--bg-input);border:1px solid var(--border);border-radius:10px;padding:16px;display:flex;flex-direction:column;">' +
+            '<div style="font-weight:600;font-size:15px;margin-bottom:4px;">' + escHtml(c.name) + '</div>' +
+            '<div style="font-size:12px;color:var(--text-muted);margin-bottom:10px;">' + escHtml(c.tagline) + '</div>' +
+            '<ul style="font-size:12px;color:var(--text-secondary);margin:0 0 12px 18px;padding:0;line-height:1.6;">' + bullets + '</ul>' +
+            '<div style="font-size:11px;color:var(--text-muted);margin-bottom:12px;flex:1;">' + escHtml(c.install_note) + '</div>' +
+            '<button class="btn btn-primary btn-sm" onclick="hpInstallRuntime(\'' + escHtml(c.which) + '\', this)">Install ' + escHtml(c.name) + '</button>' +
+        '</div>';
+    }
+    function hpCloseInstallPicker() {
+        const m = document.getElementById('hp-install-picker');
+        if (m) m.remove();
+    }
+    async function hpInstallRuntime(which, btn) {
+        document.querySelectorAll('[data-hp-install-card] button').forEach(b => { b.disabled = true; });
+        const origText = btn ? btn.textContent : '';
+        if (btn) btn.textContent = 'Installing… (a few minutes)';
+        const out = document.getElementById('hp-install-output');
+        if (out) {
+            out.style.display = 'block';
+            out.innerHTML = '<div style="background:var(--bg-input);border:1px solid var(--border);border-radius:6px;padding:10px 12px;font-size:12px;color:var(--text-muted);">Running install for <code>' + escHtml(which) + '</code>…</div>';
+        }
+        try {
+            const resp = await fetch('/api/router/http-proxies/install/' + encodeURIComponent(which), { method: 'POST' });
+            const data = await resp.json().catch(() => ({}));
+            if (resp.ok && data.ok) {
+                if (out) out.innerHTML =
+                    '<div style="background:rgba(34,197,94,0.10);border:1px solid rgba(34,197,94,0.4);border-radius:6px;padding:10px 12px;font-size:12px;margin-bottom:8px;">✓ ' + escHtml(which) + ' installed.</div>' +
+                    '<pre style="background:var(--bg-input);border:1px solid var(--border);border-radius:6px;padding:10px;font-family:monospace;font-size:11px;white-space:pre-wrap;max-height:240px;overflow:auto;margin:0;">' + escHtml(data.log || '(no log)') + '</pre>' +
+                    '<div style="margin-top:10px;"><button class="btn btn-primary btn-sm" onclick="hpCloseInstallPicker(); hpLoad();">Done</button></div>';
+            } else {
+                if (out) out.innerHTML =
+                    '<div style="background:rgba(239,68,68,0.10);border:1px solid var(--danger);border-radius:6px;padding:10px 12px;font-size:12px;color:var(--danger);font-weight:600;margin-bottom:8px;">Install failed.</div>' +
+                    '<pre style="background:var(--bg-input);border:1px solid var(--border);border-radius:6px;padding:10px;font-family:monospace;font-size:11px;white-space:pre-wrap;max-height:240px;overflow:auto;margin:0;">' + escHtml(data.error || ('HTTP ' + resp.status)) + '</pre>' +
+                    '<div style="margin-top:10px;display:flex;gap:8px;">' +
+                        '<button class="btn btn-sm" onclick="hpCloseInstallPicker();">Close</button>' +
+                        (which === 'nginx' ? '' : '<button class="btn btn-sm" onclick="hpInstallRuntime(\'nginx\', null);">Try nginx instead</button>') +
+                    '</div>';
+                document.querySelectorAll('[data-hp-install-card] button').forEach(b => { b.disabled = false; });
+                if (btn) btn.textContent = origText;
+            }
+        } catch (e) {
+            if (out) out.innerHTML = '<div style="color:var(--danger);">' + escHtml(e.message) + '</div>';
+            document.querySelectorAll('[data-hp-install-card] button').forEach(b => { b.disabled = false; });
+            if (btn) btn.textContent = origText;
+        }
+    }
+
+    window.hpLoad = hpLoad;
+    window.hpOpenEditor = hpOpenEditor;
+    window.hpCloseEditor = hpCloseEditor;
+    window.hpSaveDraft = hpSaveDraft;
+    window.hpDelete = hpDelete;
+    window.hpAddUpstream = hpAddUpstream;
+    window.hpApplyCertPick = hpApplyCertPick;
+    window.hpRenderEditor = hpRenderEditor;
+    window.hpOpenInstallPicker = hpOpenInstallPicker;
+    window.hpCloseInstallPicker = hpCloseInstallPicker;
+    window.hpInstallRuntime = hpInstallRuntime;
 
 })();
