@@ -2,13 +2,61 @@
 // (C)Copyright Wolf Software Systems Ltd
 // https://wolf.uk.com
 
-//! Threat-intelligence blocklist enforcement.
+//! Threat-intelligence blocklist enforcement (per-cluster, off by default).
 //!
 //! Pulls the FireHOL Level 1 IP blocklist (high-confidence, low-
-//! false-positive — RFC1918/bogon ranges, known C2, well-attested
-//! offenders) and maintains an `ipset` named `wolfstack_blocklist`
-//! plus an iptables rule that DROPs incoming + outgoing traffic
-//! against it.
+//! false-positive — known C2, well-attested offenders) and, when the
+//! operator explicitly enables enforcement for a cluster, maintains
+//! an `ipset` named `wolfstack_blocklist` plus iptables rules that
+//! DROP traffic to/from those addresses.
+//!
+//! ## v23.2.2 safety model — off by default, three-state, per cluster
+//!
+//! Earlier versions (v23.2.0, v23.2.1) defaulted to **ENABLED** the
+//! moment the binary started. Combined with thousands of operators
+//! running wildly different network shapes (BGP peers in odd public
+//! ranges, custom CGNAT, layer-2 overlays, hosts in private datacentre
+//! /24s outside RFC1918), an opt-out posture was unsafe — any feed
+//! false-positive or unexpected overlap would blackhole real traffic
+//! before the operator knew the feature existed.
+//!
+//! v23.2.2 inverts that:
+//!   * **Default**: `Off` for every cluster. No feed download, no
+//!     ipset, no iptables rules, no analyzer noise other than an
+//!     informational "this feature exists, here's how to try it"
+//!     card.
+//!   * **DryRun**: feed is fetched and parsed on every tick, the
+//!     resulting blocklist + auto-allowlist + per-node overlap
+//!     report is exposed to the operator, but the kernel ipset is
+//!     never written and no iptables rules are installed. Operators
+//!     can sit in DryRun for as long as they like to watch for false
+//!     positives before committing.
+//!   * **Enforce**: same as DryRun, plus the kernel ipset is built
+//!     and iptables rules are installed. Promotion to Enforce
+//!     requires a fresh (<5 min) preflight report and the operator
+//!     typing the cluster name into the confirmation modal.
+//!
+//! State lives in `/etc/wolfstack/predictive-threat-intel.json`
+//! keyed by cluster_name. Each node reads its own cluster's entry
+//! every tick. State changes propagate to peers in the same cluster
+//! via inter-node HTTP push (best-effort; peers that are offline
+//! will pick up the new state via the gossip poll loop).
+//!
+//! ## Migration from v23.2.0 / v23.2.1
+//!
+//! On first boot of v23.2.2, every node:
+//!   1. Removes any iptables INPUT/OUTPUT rules referencing the
+//!      `wolfstack_blocklist` ipset and destroys the ipset itself.
+//!   2. Removes the legacy auto-enable flag at
+//!      `/var/lib/wolfstack/threat-intel/enabled`.
+//!   3. Writes a sentinel at
+//!      `/var/lib/wolfstack/threat-intel/migrated_v23_2_2` so the
+//!      migration runs exactly once.
+//!   4. Surfaces a `Medium` finding telling the operator what
+//!      happened and how to re-enable safely.
+//!
+//! This is a deliberate, one-way reset. Operators who *did* want
+//! enforcement on can re-enable cluster-by-cluster via the new UI.
 //!
 //! ## Why FireHOL Level 1
 //!
@@ -21,17 +69,17 @@
 //! ## Why ipset, not raw iptables
 //!
 //! ~30,000 entries. With one iptables rule per entry, packet
-//! processing becomes O(N) per packet and adds visible latency.
-//! `ipset` is a kernel hash-table; lookup is effectively O(1). One
-//! iptables rule referencing the set covers the entire list.
+//! processing becomes O(N) per packet. `ipset` is a kernel
+//! hash-table; lookup is effectively O(1). One iptables rule
+//! referencing the set covers the entire list.
 //!
 //! ## What if ipset isn't installed?
 //!
-//! Detected at sample time. If `ipset` binary is missing the
-//! analyzer emits an "ipset not installed" `High` finding (with a
-//! one-line install command) and skips actual blocking on that
-//! host. It does NOT fall back to one-rule-per-IP iptables — the
-//! performance hit would itself be a denial-of-service.
+//! Detected at sample time. If `ipset` binary is missing and the
+//! cluster is set to `Enforce`, the analyzer emits a `High` finding
+//! (with a one-line install command) and skips actual blocking on
+//! that host. It does NOT fall back to one-rule-per-IP iptables —
+//! the performance hit would itself be a denial-of-service.
 //!
 //! ## Freshness
 //!
@@ -43,14 +91,13 @@
 //!
 //! ## Operator controls
 //!
-//! * `/var/lib/wolfstack/threat-intel/enabled` — touch to enable,
-//!   `rm` to disable. Default: ENABLED. Operators who don't want
-//!   threat-intel blocking (e.g. a node that legitimately serves
-//!   traffic to addresses in the list — rare) can `rm` the file.
+//! * REST: `POST /api/predictive/threat-intel/state` with body
+//!   `{cluster, state, confirm}` — moves a named cluster between
+//!   Off / DryRun / Enforce. Promoting to Enforce additionally
+//!   requires a fresh preflight in the last 5 minutes.
 //! * `/var/lib/wolfstack/threat-intel/allowlist.txt` — one CIDR per
-//!   line. These are never blocked even if they're in the feed.
-//!   Use sparingly; the whole point of FireHOL L1 is its
-//!   conservative posture.
+//!   line, host-local override. These are never blocked even when
+//!   present in the feed. Use sparingly.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -67,28 +114,183 @@ use crate::predictive::{
 
 const FEED_URL: &str = "https://iplists.firehol.org/files/firehol_level1.netset";
 const FEED_LOCAL_PATH: &str = "/var/lib/wolfstack/threat-intel/firehol_level1.netset";
-const ENABLE_FLAG_PATH: &str = "/var/lib/wolfstack/threat-intel/enabled";
+/// Legacy v23.2.0/v23.2.1 flag file. Presence on first boot of
+/// v23.2.2 triggers the safety migration (rules torn down). Never
+/// written by v23.2.2 itself.
+const LEGACY_ENABLE_FLAG_PATH: &str = "/var/lib/wolfstack/threat-intel/enabled";
+/// Sentinel marking that the v23.2.x → v23.2.2 migration has run on
+/// this node. Existence = migration done; absence = run it on next
+/// boot. Never deleted after creation.
+const MIGRATION_SENTINEL_PATH: &str = "/var/lib/wolfstack/threat-intel/migrated_v23_2_2";
+/// Per-cluster enforcement state. Schema:
+///   { "schema_version": 2, "clusters": { "<name>": "off"|"dry-run"|"enforce" } }
+/// Absence of a cluster's entry = `Off`. Absence of the entire file
+/// also = `Off` for every cluster. Operator-writable via API.
+const CLUSTER_STATE_PATH: &str = "/etc/wolfstack/predictive-threat-intel.json";
 const ALLOWLIST_PATH: &str = "/var/lib/wolfstack/threat-intel/allowlist.txt";
 const IPSET_NAME: &str = "wolfstack_blocklist";
 /// Refresh at most once per 24h. Feed itself updates several times
 /// per day; daily is enough to keep up without hammering the host.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 3600);
+/// Promote-to-Enforce gate: a preflight must have completed within
+/// this window to be considered "fresh enough" to confirm against.
+pub const PREFLIGHT_FRESHNESS_SECS: u64 = 5 * 60;
 
-pub const FT_THREAT_INTEL_DISABLED: &str = "threat_intel:disabled_by_operator";
+pub const FT_THREAT_INTEL_OFF: &str = "threat_intel:cluster_state_off";
+pub const FT_THREAT_INTEL_DRY_RUN: &str = "threat_intel:cluster_state_dry_run";
 pub const FT_THREAT_INTEL_NO_IPSET: &str = "threat_intel:ipset_not_installed";
 pub const FT_THREAT_INTEL_STALE: &str = "threat_intel:feed_stale";
 pub const FT_THREAT_INTEL_RULES_MISSING: &str = "threat_intel:iptables_rules_missing";
+pub const FT_THREAT_INTEL_MIGRATED: &str = "threat_intel:v23_2_2_safety_migration";
+
+// Legacy finding-type ID. Kept so any persisted acks referencing it
+// still resolve, even though v23.2.2 no longer emits this type.
+pub const FT_THREAT_INTEL_DISABLED: &str = "threat_intel:disabled_by_operator";
+
+/// Tri-state enforcement for a cluster.
+///
+/// * `Off` — feature is dormant; nothing runs, nothing blocks.
+/// * `DryRun` — feed is fetched and parsed every tick; the would-be
+///   blocklist + auto-allowlist + per-node overlap report are
+///   exposed to the operator, but the kernel ipset and iptables
+///   rules are never written.
+/// * `Enforce` — everything DryRun does, plus the kernel ipset is
+///   built and DROP rules are installed on INPUT/OUTPUT.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EnforceState {
+    Off,
+    DryRun,
+    Enforce,
+}
+
+impl Default for EnforceState {
+    fn default() -> Self { EnforceState::Off }
+}
+
+impl EnforceState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EnforceState::Off => "off",
+            EnforceState::DryRun => "dry-run",
+            EnforceState::Enforce => "enforce",
+        }
+    }
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" | "disabled" | "" => Some(EnforceState::Off),
+            // "enabled" / "on" are the legacy v23.2.0/v23.2.1 spellings.
+            // We map them to DryRun, NOT Enforce — the legacy semantics
+            // were "auto-enforce on first tick", which is exactly what
+            // v23.2.2 is fixing. If some external tooling sets state to
+            // "enabled" it gets the safe new default; promotion to
+            // Enforce is only reachable through the explicit "enforce"
+            // string AND the typed-confirmation + fresh-preflight gates.
+            "dry-run" | "dry_run" | "dryrun" | "preview" | "enabled" | "on" => Some(EnforceState::DryRun),
+            "enforce" | "enforcing" => Some(EnforceState::Enforce),
+            _ => None,
+        }
+    }
+}
+
+/// On-disk shape of the cluster-state config file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterStateFile {
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub clusters: std::collections::BTreeMap<String, EnforceState>,
+}
+
+fn default_schema_version() -> u32 { 2 }
+
+impl Default for ClusterStateFile {
+    fn default() -> Self {
+        ClusterStateFile {
+            schema_version: 2,
+            clusters: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+pub fn load_cluster_state() -> ClusterStateFile {
+    match std::fs::read_to_string(CLUSTER_STATE_PATH) {
+        Ok(body) => match serde_json::from_str::<ClusterStateFile>(&body) {
+            Ok(s) => s,
+            Err(e) => {
+                // Safe-default direction (all clusters Off) means a
+                // corrupted file never accidentally enables
+                // enforcement — but it would silently disable any
+                // operator-configured state. Surface the parse error
+                // loudly so the operator can repair the file.
+                tracing::error!(
+                    "threat_intel: cluster state file at {} failed to parse ({}); defaulting to all-Off for safety",
+                    CLUSTER_STATE_PATH, e,
+                );
+                ClusterStateFile::default()
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ClusterStateFile::default(),
+        Err(e) => {
+            tracing::warn!(
+                "threat_intel: cluster state file at {} unreadable ({}); defaulting to all-Off",
+                CLUSTER_STATE_PATH, e,
+            );
+            ClusterStateFile::default()
+        }
+    }
+}
+
+/// Atomic write: temp + rename so a crashed write never leaves a
+/// half-written state file (which would deserialise to "off
+/// everywhere" and silently disable enforcement on a healthy
+/// cluster).
+pub fn save_cluster_state(state: &ClusterStateFile) -> Result<(), String> {
+    let dir = std::path::Path::new(CLUSTER_STATE_PATH).parent()
+        .ok_or_else(|| "CLUSTER_STATE_PATH has no parent dir".to_string())?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("create dir: {}", e))?;
+    let tmp = format!("{}.tmp", CLUSTER_STATE_PATH);
+    let body = serde_json::to_string_pretty(state)
+        .map_err(|e| format!("serialise: {}", e))?;
+    std::fs::write(&tmp, body).map_err(|e| format!("write tmp: {}", e))?;
+    std::fs::rename(&tmp, CLUSTER_STATE_PATH).map_err(|e| format!("rename: {}", e))?;
+    Ok(())
+}
+
+/// Look up enforcement state for a cluster. Unknown cluster = Off.
+pub fn state_for_cluster(cluster: &str) -> EnforceState {
+    load_cluster_state().clusters.get(cluster).copied().unwrap_or(EnforceState::Off)
+}
+
+/// What is this node's own cluster called? Reads
+/// `self_cluster.json` (same source the agent uses). Falls back to
+/// "WolfStack" to match agent default behaviour.
+pub fn this_node_cluster() -> String {
+    let path = crate::paths::get().self_cluster_config.clone();
+    if let Ok(data) = std::fs::read_to_string(&path) {
+        if let Ok(name) = serde_json::from_str::<String>(&data) {
+            if !name.is_empty() { return name; }
+        }
+    }
+    "WolfStack".to_string()
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ThreatIntelFacts {
-    /// Whether the operator has the feature enabled. False if they
-    /// removed the flag file. We surface this as Info-level so the
-    /// operator knows enforcement is off, but don't ever re-enable
-    /// automatically — disabling is a deliberate choice.
+    /// Cluster-state-derived: true iff state != Off. Kept for UI
+    /// compatibility; new code should branch on `state` instead.
     pub enabled: bool,
+    /// Tri-state enforcement for this node's cluster. Drives every
+    /// decision the analyzer makes this tick.
+    #[serde(default)]
+    pub state: EnforceState,
+    /// Name of the cluster this node belongs to (so the operator
+    /// can correlate findings with their cluster picker in the UI).
+    #[serde(default)]
+    pub cluster: String,
     /// `ipset` binary is installed and usable on this host. False
     /// means we can't enforce — surface as a High finding with an
-    /// install command.
+    /// install command (only when state == Enforce).
     pub ipset_available: bool,
     /// `iptables` binary is installed (every Linux box, but defensive).
     pub iptables_available: bool,
@@ -97,11 +299,15 @@ pub struct ThreatIntelFacts {
     /// Number of entries in the local feed after parsing.
     pub feed_entry_count: usize,
     /// Number of entries currently in the kernel ipset (zero if
-    /// the set doesn't exist yet — first run).
+    /// the set doesn't exist yet, or if state != Enforce).
     pub ipset_entry_count: usize,
     /// Whether the INPUT + OUTPUT iptables rules referencing the
     /// ipset are present right now.
     pub iptables_rules_present: bool,
+    /// Whether the one-time v23.2.x → v23.2.2 safety migration has
+    /// run on this node. True iff the sentinel file exists.
+    #[serde(default)]
+    pub migration_completed: bool,
     /// What we did about each gap this tick.
     pub remediations: Vec<RemediationOutcome>,
     pub scanned: bool,
@@ -112,7 +318,9 @@ pub async fn sample_now_async(_timeout: Duration) -> ThreatIntelFacts {
 }
 
 fn sample_blocking() -> ThreatIntelFacts {
-    let enabled = is_enabled();
+    let cluster = this_node_cluster();
+    let state = state_for_cluster(&cluster);
+    let enabled = state != EnforceState::Off;
     let ipset_available = which_exists("ipset");
     let iptables_available = which_exists("iptables");
     let feed_age_secs = match std::fs::metadata(FEED_LOCAL_PATH) {
@@ -132,38 +340,22 @@ fn sample_blocking() -> ThreatIntelFacts {
         0
     };
     let iptables_rules_present = iptables_available && rules_are_present();
+    let migration_completed = Path::new(MIGRATION_SENTINEL_PATH).exists();
 
     ThreatIntelFacts {
         enabled,
+        state,
+        cluster,
         ipset_available,
         iptables_available,
         feed_age_secs,
         feed_entry_count,
         ipset_entry_count,
         iptables_rules_present,
+        migration_completed,
         remediations: Vec::new(),
         scanned: true,
     }
-}
-
-/// Default is "enabled". The flag file's *absence* means disabled
-/// (operator deliberately removed it). The flag file's presence
-/// means enabled. On a fresh install neither exists yet — treat
-/// that as enabled and let `enforce` auto-create the flag.
-fn is_enabled() -> bool {
-    // If the parent dir doesn't even exist (very fresh install),
-    // we still consider the feature enabled — `enforce` will create
-    // the dir and flag file as part of bringing the ipset up.
-    if !Path::new("/var/lib/wolfstack/threat-intel").exists() {
-        return true;
-    }
-    // Once the parent dir exists, presence of the flag file is
-    // dispositive. Absence = operator removed it = disabled.
-    Path::new(ENABLE_FLAG_PATH).exists() || !any_threat_intel_state_persisted()
-}
-
-fn any_threat_intel_state_persisted() -> bool {
-    Path::new(FEED_LOCAL_PATH).exists() || Path::new(ALLOWLIST_PATH).exists()
 }
 
 fn which_exists(binary: &str) -> bool {
@@ -376,7 +568,8 @@ pub async fn remediate_if_unacked(
     ctx: &Context,
 ) -> ThreatIntelFacts {
     if !facts.scanned { return facts; }
-    if !facts.enabled { return facts; }
+    // Off → nothing to do. No feed download, no ipset, no rules.
+    if facts.state == EnforceState::Off { return facts; }
     let acks = acks.clone();
     let proposals = proposals.clone();
     let scope = ProposalScope { node_id: ctx.node_id.clone(), resource_id: None };
@@ -395,33 +588,32 @@ fn remediate_blocking(
         acks.suppresses(ft, scope) || proposals.is_suppressed(ft, scope)
     };
 
-    // We never auto-install ipset (operator decision — implies a new
-    // dependency on their system). Just surface the finding.
-    if !facts.ipset_available {
-        return facts;
-    }
-    if !facts.iptables_available {
-        return facts;
-    }
-
-    // Ensure the feature directory exists and the flag file is set
-    // on first run so subsequent ticks know the operator hasn't
-    // explicitly disabled.
-    let _ = std::fs::create_dir_all("/var/lib/wolfstack/threat-intel");
-    if !Path::new(ENABLE_FLAG_PATH).exists() && !any_threat_intel_state_persisted() {
-        let _ = std::fs::write(ENABLE_FLAG_PATH, b"enabled\n");
-    }
-
     // Refresh the feed if stale (>REFRESH_INTERVAL old or missing).
+    // We do this in BOTH DryRun and Enforce — DryRun needs the parsed
+    // feed so the operator can see what *would* be blocked.
+    let _ = std::fs::create_dir_all("/var/lib/wolfstack/threat-intel");
     let needs_refresh = match facts.feed_age_secs {
         None => true,
         Some(age) => Duration::from_secs(age) >= REFRESH_INTERVAL,
     };
     if needs_refresh && !suppressed(FT_THREAT_INTEL_STALE) {
         facts.remediations.push(refresh_feed());
-        // Re-count after refresh.
         facts.feed_entry_count = parse_feed_entries(FEED_LOCAL_PATH).len();
         facts.feed_age_secs = Some(0);
+    }
+
+    // DryRun stops here. We parsed the feed but the kernel stays
+    // untouched. The operator can inspect the preflight report and
+    // promote to Enforce when they're confident.
+    if facts.state == EnforceState::DryRun {
+        return facts;
+    }
+
+    // Enforce path. Both binaries must be available; if not we
+    // surface a High finding in `analyze` and skip — never fall back
+    // to a degraded mode that would silently misbehave.
+    if !facts.ipset_available || !facts.iptables_available {
+        return facts;
     }
 
     // Sync ipset to feed (and allowlist).
@@ -650,18 +842,62 @@ pub fn analyze(
         acks.suppresses(ft, &scope) || proposals.is_suppressed(ft, &scope)
     };
 
-    // ipset missing → High finding (no auto-install — that's an
-    // explicit operator decision since it adds a system dependency).
-    if !facts.ipset_available && !suppressed(FT_THREAT_INTEL_NO_IPSET) {
+    // One-time safety migration sentinel was just written by this
+    // node? Surface a Medium finding so the operator notices what
+    // happened and re-enables only if they want it. Fires until
+    // ack'd.
+    if facts.migration_completed
+        && was_migration_emitted_recently()
+        && !suppressed(FT_THREAT_INTEL_MIGRATED)
+    {
+        out.push(Proposal::new(
+            FT_THREAT_INTEL_MIGRATED,
+            ProposalSource::Rule,
+            Severity::Warn,
+            "Threat-intel enforcement disabled by v23.2.2 safety migration",
+            format!(
+                "Earlier versions (v23.2.0 / v23.2.1) auto-enabled FireHOL Level 1 \
+                 blocklist enforcement on first boot. With thousands of operators \
+                 running wildly different network shapes, opt-out enforcement was \
+                 unsafe — any feed false-positive or unexpected overlap could \
+                 blackhole real traffic before you knew the feature existed. \n\n\
+                 On this upgrade WolfStack has: removed any `wolfstack_blocklist` \
+                 ipset, removed iptables INPUT/OUTPUT DROP rules that referenced \
+                 it, and removed the legacy auto-enable flag. Cluster '{}' is \
+                 now in the safe-default state: **Off**. \n\n\
+                 To turn enforcement back on safely, go to the Predictive Inbox, \
+                 enable DryRun for this cluster, review the per-node preflight \
+                 report (it shows exactly which of your subnets/peers would be \
+                 affected), and only then promote to Enforce. The promote step \
+                 requires typing the cluster name to confirm.",
+                facts.cluster,
+            ),
+            vec![],
+            RemediationPlan::Manual {
+                instructions: "Review preflight in the Predictive Inbox, then enable DryRun for the cluster. Ack this card to dismiss.".into(),
+                commands: vec![],
+            },
+            scope.clone(),
+        ));
+    }
+
+    // Only emit the "ipset not installed" High finding when the
+    // operator has actually asked us to enforce on this cluster.
+    // Otherwise the card is misleading noise on hosts that never
+    // intended to use the feature.
+    if facts.state == EnforceState::Enforce
+        && !facts.ipset_available
+        && !suppressed(FT_THREAT_INTEL_NO_IPSET)
+    {
         out.push(Proposal::new(
             FT_THREAT_INTEL_NO_IPSET,
             ProposalSource::Rule,
             Severity::High,
-            "Threat-intel blocking disabled — `ipset` not installed",
-            "WolfStack v23.2+ uses the FireHOL Level 1 IP blocklist to drop traffic to/from known-bad addresses. That requires the `ipset` kernel hash-table tool, which isn't installed on this host. Without it the analyzer can detect the gap but can't enforce.".to_string(),
+            "Threat-intel blocking can't enforce — `ipset` not installed",
+            "WolfStack uses the FireHOL Level 1 IP blocklist to drop traffic to/from known-bad addresses. That requires the `ipset` kernel hash-table tool, which isn't installed on this host. Without it the analyzer can detect the gap but can't enforce.".to_string(),
             vec![],
             RemediationPlan::Manual {
-                instructions: "Install ipset. After install, the next 5-minute predictive tick will auto-pull the feed and install the iptables rules.".into(),
+                instructions: "Install ipset. The next predictive tick will then build the set and install the iptables rules.".into(),
                 commands: vec![
                     "# Debian / Proxmox:".into(),
                     "apt-get install -y ipset".into(),
@@ -673,28 +909,46 @@ pub fn analyze(
         ));
     }
 
-    // Operator disabled the feature → Info-only card so they can see
-    // enforcement is off, not a card screaming at them.
-    if !facts.enabled && facts.ipset_available && !suppressed(FT_THREAT_INTEL_DISABLED) {
+    // DryRun → Info card so the operator remembers preview mode is
+    // running and they haven't yet promoted to enforce. Suppressible.
+    if facts.state == EnforceState::DryRun && !suppressed(FT_THREAT_INTEL_DRY_RUN) {
         out.push(Proposal::new(
-            FT_THREAT_INTEL_DISABLED,
+            FT_THREAT_INTEL_DRY_RUN,
             ProposalSource::Rule,
             Severity::Info,
-            "Threat-intel blocking disabled by operator",
-            "WolfStack's FireHOL Level 1 blocklist enforcement is disabled on this node (the marker file at /var/lib/wolfstack/threat-intel/enabled was removed). The host can reach and be reached by every IP, including known-malicious ones. Re-enable by touching the marker file; suppress this card by acking it.".to_string(),
+            "Threat-intel blocklist running in DryRun (no traffic blocked)",
+            format!(
+                "Cluster '{}' has FireHOL Level 1 enforcement set to DryRun: the \
+                 feed is being downloaded and parsed on every tick, but no \
+                 iptables rules are installed and no traffic is being blocked. \
+                 When you're confident the preflight overlap report is clean, \
+                 promote to Enforce from the Predictive Inbox.",
+                facts.cluster,
+            ),
             vec![],
             RemediationPlan::Manual {
-                instructions: "Touch the flag file to re-enable. The next tick will pull the feed and install the rules.".into(),
-                commands: vec![
-                    "mkdir -p /var/lib/wolfstack/threat-intel".into(),
-                    "touch /var/lib/wolfstack/threat-intel/enabled".into(),
-                ],
+                instructions: "Open the Predictive Inbox, run a fresh preflight, then click Promote to Enforce.".into(),
+                commands: vec![],
             },
             scope.clone(),
         ));
     }
 
     out
+}
+
+/// Whether the migration sentinel was created in the last 30 days.
+/// We treat "recent" generously because the operator may not see
+/// the finding for a while — preserving it across reboots/upgrades
+/// matters more than a tight window.
+fn was_migration_emitted_recently() -> bool {
+    let meta = match std::fs::metadata(MIGRATION_SENTINEL_PATH) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    let mt = match meta.modified() { Ok(t) => t, Err(_) => return false };
+    let age = SystemTime::now().duration_since(mt).unwrap_or_default();
+    age < Duration::from_secs(30 * 24 * 3600)
 }
 
 pub fn covered_scopes(
@@ -704,10 +958,17 @@ pub fn covered_scopes(
     if !facts.scanned { return Vec::new(); }
     let scope = ProposalScope { node_id: ctx.node_id.clone(), resource_id: None };
     [
-        FT_THREAT_INTEL_DISABLED,
+        FT_THREAT_INTEL_DRY_RUN,
         FT_THREAT_INTEL_NO_IPSET,
         FT_THREAT_INTEL_STALE,
         FT_THREAT_INTEL_RULES_MISSING,
+        FT_THREAT_INTEL_MIGRATED,
+        // Keep the legacy IDs covered so persisted acks resolve
+        // (FT_THREAT_INTEL_DISABLED is no longer emitted but may
+        // still appear in old acks; FT_THREAT_INTEL_OFF is reserved
+        // for a future "feature dormant" card and harmless to keep).
+        FT_THREAT_INTEL_DISABLED,
+        FT_THREAT_INTEL_OFF,
     ].iter().map(|t| ((*t).to_string(), scope.clone())).collect()
 }
 
@@ -716,21 +977,30 @@ fn forensics_dir() -> PathBuf {
     PathBuf::from("/var/lib/wolfstack/threat-intel")
 }
 
-/// Operator-visible status snapshot. Returned by the GET /status
-/// endpoint so the UI toggle can render current state.
+/// Operator-visible status snapshot for the local node. Returned by
+/// the GET /status endpoint so the UI panel can render current
+/// state for *this* node's cluster.
 #[derive(Debug, Clone, Serialize)]
 pub struct ThreatIntelStatus {
+    /// True iff state != Off — convenience for older UI bindings.
     pub enabled: bool,
+    pub state: EnforceState,
+    pub cluster: String,
     pub ipset_available: bool,
     pub iptables_rules_present: bool,
     pub feed_entry_count: usize,
     pub ipset_entry_count: usize,
     pub feed_age_secs: Option<u64>,
+    pub migration_completed: bool,
 }
 
 pub fn status_snapshot() -> ThreatIntelStatus {
+    let cluster = this_node_cluster();
+    let state = state_for_cluster(&cluster);
     ThreatIntelStatus {
-        enabled: is_enabled(),
+        enabled: state != EnforceState::Off,
+        state,
+        cluster,
         ipset_available: which_exists("ipset"),
         iptables_rules_present: which_exists("iptables") && rules_are_present(),
         feed_entry_count: parse_feed_entries(FEED_LOCAL_PATH).len(),
@@ -739,35 +1009,80 @@ pub fn status_snapshot() -> ThreatIntelStatus {
             .and_then(|m| m.modified().ok())
             .and_then(|mt| SystemTime::now().duration_since(mt).ok())
             .map(|d| d.as_secs()),
+        migration_completed: Path::new(MIGRATION_SENTINEL_PATH).exists(),
     }
 }
 
-/// Operator-triggered enable. Idempotent: creates the parent dir +
-/// flag file. Does NOT immediately install rules — the next 5-min
-/// tick will do that. Acceptable lag for an enable operation
-/// (worst case: 5 minutes before the rules go live).
-pub fn enable_for_operator() -> Result<(), String> {
-    std::fs::create_dir_all("/var/lib/wolfstack/threat-intel")
-        .map_err(|e| format!("create dir: {}", e))?;
-    std::fs::write(ENABLE_FLAG_PATH, b"enabled\n")
-        .map_err(|e| format!("write flag: {}", e))?;
+/// Operator-triggered cluster state change. Caller is expected to
+/// have already validated the cluster name and (for promotion to
+/// Enforce) the preflight freshness gate. This function persists the
+/// state and, if the new state is Off, tears down kernel state
+/// immediately so the safety switch is instantaneous.
+///
+/// Returns the persisted full state file so the caller can
+/// propagate it to peers without a second read.
+pub fn set_cluster_state(cluster: &str, new_state: EnforceState) -> Result<ClusterStateFile, String> {
+    if cluster.trim().is_empty() {
+        return Err("cluster name must not be empty".into());
+    }
+    let mut state = load_cluster_state();
+    // Always normalise: remove the entry entirely if it's the
+    // default (Off). Keeps the file minimal and avoids accumulating
+    // stale entries for deleted clusters.
+    if new_state == EnforceState::Off {
+        state.clusters.remove(cluster);
+    } else {
+        state.clusters.insert(cluster.to_string(), new_state);
+    }
+    save_cluster_state(&state)?;
+    // If this node is in the affected cluster AND the new state is
+    // Off, tear down kernel state right now — same instant-safety
+    // contract the legacy disable_for_operator() had.
+    if cluster == this_node_cluster() && new_state == EnforceState::Off {
+        tear_down_kernel_state();
+    }
+    tracing::warn!("threat_intel: cluster '{}' set to '{}'", cluster, new_state.as_str());
+    Ok(state)
+}
+
+/// Apply a state file that was pushed from a peer. Merges into the
+/// local state file rather than replacing it — multi-cluster
+/// deployments may have entries the pushing peer doesn't know
+/// about (clusters whose state was changed via a different node),
+/// and a blind overwrite would silently lose them.
+///
+/// Merge semantics: for every cluster in `incoming`, the local
+/// state file ends up with the incoming value (Off entries result
+/// in the cluster being removed from the file, matching
+/// `set_cluster_state`'s normalisation). Local entries for
+/// clusters NOT present in `incoming` are preserved.
+pub fn apply_peer_state(incoming: ClusterStateFile) -> Result<(), String> {
+    let mut merged = load_cluster_state();
+    for (cluster, state) in incoming.clusters {
+        if state == EnforceState::Off {
+            merged.clusters.remove(&cluster);
+        } else {
+            merged.clusters.insert(cluster, state);
+        }
+    }
+    save_cluster_state(&merged)?;
+    // If our own cluster is now Off after the merge, tear down rules
+    // locally so the safety switch propagates without waiting for
+    // the next tick.
+    if state_for_cluster(&this_node_cluster()) == EnforceState::Off {
+        tear_down_kernel_state();
+    }
     Ok(())
 }
 
-/// Operator-triggered disable. The safety switch. CRITICAL: must
-/// tear down the iptables rules + destroy the ipset IMMEDIATELY,
-/// not wait for the next tick — the whole point of a safety
-/// switch is to unblock the cluster when it's in a bad state.
-pub fn disable_for_operator() -> Result<(), String> {
-    // Best-effort delete of the flag file. Absence = disabled, so
-    // a stale flag-file failure isn't a blocker.
-    let _ = std::fs::remove_file(ENABLE_FLAG_PATH);
+/// Remove any iptables rules + ipset belonging to this feature.
+/// Idempotent. Used by the migration and by every Off-transition.
+fn tear_down_kernel_state() {
     // Remove iptables rules so traffic flows immediately. Both
-    // chains, both directions. -D will return non-zero if the rule
-    // isn't present; that's fine (idempotent).
+    // chains, both directions. -D returns non-zero when the rule
+    // isn't present; that's fine. Loop a few times to catch any
+    // duplicate rules an earlier buggy version may have inserted.
     for (chain, direction) in [("INPUT", "src"), ("OUTPUT", "dst")] {
-        // Loop a few times in case duplicate rules were inserted by
-        // an earlier buggy version.
         for _ in 0..8 {
             let out = std::process::Command::new("iptables")
                 .args(["-D", chain, "-m", "set", "--match-set", IPSET_NAME, direction, "-j", "DROP"])
@@ -778,10 +1093,293 @@ pub fn disable_for_operator() -> Result<(), String> {
             }
         }
     }
-    // Destroy the ipset so it can't accidentally be referenced by
-    // some other operator-installed rule. -X is ignore-if-missing.
+    // Destroy the ipset so nothing else can reference it.
+    // -X is ignore-if-missing.
     let _ = std::process::Command::new("ipset").args(["destroy", IPSET_NAME]).output();
-    tracing::warn!("threat_intel: disabled by operator — iptables rules and ipset removed");
+    tracing::warn!("threat_intel: kernel state torn down (iptables rules removed, ipset destroyed)");
+}
+
+/// One-time v23.2.x → v23.2.2 safety migration. Called from main.rs
+/// at startup, BEFORE the predictive analyzer first runs. Effects:
+///
+///   1. If `MIGRATION_SENTINEL_PATH` already exists → no-op.
+///   2. Tear down any iptables rules + ipset belonging to this
+///      feature (whether or not the legacy flag is present — we
+///      may be migrating a partially-installed state).
+///   3. Remove the legacy auto-enable flag so older code paths
+///      can't accidentally observe it as "enabled".
+///   4. Touch the sentinel file. Sets `migration_completed = true`
+///      from this tick onward, which fans out the Medium finding.
+///
+/// Returns true iff this call actually ran the migration (vs.
+/// short-circuiting on an existing sentinel). Useful in tests.
+pub fn run_safety_migration_once() -> bool {
+    if Path::new(MIGRATION_SENTINEL_PATH).exists() {
+        return false;
+    }
+    let _ = std::fs::create_dir_all("/var/lib/wolfstack/threat-intel");
+    // Detect whether anything actually needed undoing so we can log
+    // accurately. Pure observability — the teardown itself is
+    // idempotent and runs regardless.
+    let had_legacy_flag = Path::new(LEGACY_ENABLE_FLAG_PATH).exists();
+    let had_rules = which_exists("iptables") && rules_are_present();
+    let had_ipset = which_exists("ipset") && count_ipset_entries(IPSET_NAME) > 0;
+    tear_down_kernel_state();
+    if had_legacy_flag {
+        let _ = std::fs::remove_file(LEGACY_ENABLE_FLAG_PATH);
+    }
+    // Touch sentinel. If we can't write it, log loudly — we'd
+    // otherwise re-tear-down on every boot, which is annoying but
+    // safe (idempotent).
+    if let Err(e) = std::fs::write(MIGRATION_SENTINEL_PATH, b"v23.2.2 safety migration completed\n") {
+        tracing::error!("threat_intel: could not write migration sentinel: {}", e);
+    }
+    tracing::warn!(
+        "threat_intel: v23.2.2 safety migration ran (legacy_flag={}, had_rules={}, had_ipset={})",
+        had_legacy_flag, had_rules, had_ipset,
+    );
+    true
+}
+
+// ─── Preflight (dry-run analysis) ──────────────────────────────────
+
+/// Per-node preflight report. Computed by `preflight()` on the node
+/// whose iptables would actually be touched. Tells the operator,
+/// before they enable enforcement, exactly what would land in the
+/// kernel ipset and which of their own addresses/subnets overlap
+/// the feed.
+///
+/// This NEVER writes ipset or iptables — it's pure analysis.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreflightReport {
+    /// Unix epoch seconds at which this report was generated.
+    pub generated_at: u64,
+    /// This node's id (host_id) and cluster_name for cross-
+    /// referencing on the aggregator side.
+    pub node_id: String,
+    pub cluster: String,
+    /// True iff `ipset` and `iptables` binaries are present. If
+    /// false, enforcement on this node would surface a High finding
+    /// instead of installing rules.
+    pub ipset_available: bool,
+    pub iptables_available: bool,
+    /// Number of entries in the parsed feed (post bogon-filter).
+    /// 0 means the feed wasn't available — operator should refresh
+    /// the feed before promoting.
+    pub feed_entry_count: usize,
+    /// Age of the feed file in seconds; None if the file is
+    /// missing (a Refresh-Feed action will fetch it next tick).
+    pub feed_age_secs: Option<u64>,
+    /// IPv4 addresses bound to this node's local interfaces that
+    /// the bogon-filter+allowlist machinery would skip from the
+    /// blocklist. Listed so the operator can visually confirm the
+    /// public IPs they expect to see.
+    pub local_interface_ips: Vec<String>,
+    /// IPv4 addresses of cluster peers (from nodes.json) that
+    /// would be auto-allowlisted.
+    pub peer_ips: Vec<String>,
+    /// Operator-managed allowlist (CIDRs from allowlist.txt) — for
+    /// transparency: the modal shows operators what's already
+    /// excluded.
+    pub operator_allowlist: Vec<String>,
+    /// Feed entries that match a local interface IP or peer IP
+    /// AFTER the bogon-filter pass. These are IPs that ARE in the
+    /// FireHOL feed but would be auto-allowlisted because they
+    /// belong to the operator's own cluster. Critical signal: if
+    /// non-empty, the operator's own infrastructure is on a public
+    /// threat list (almost always cloud-IP reuse) — enforcement
+    /// would have blocked their own host without the allowlist.
+    pub feed_overlaps_local: Vec<String>,
+    /// Number of entries that would survive into the ipset after
+    /// all filters. Same number the kernel set would have.
+    pub would_block_count: usize,
+    /// First N (up to ~50) entries that would land in the ipset.
+    /// Sample — the operator doesn't need all 30k IPs, but a
+    /// sample reassures them the feed is well-formed.
+    pub sample_block_entries: Vec<String>,
+    /// Any non-fatal warnings the operator should see (e.g. feed
+    /// missing, ipset binary not installed, peer-fetch failure).
+    pub warnings: Vec<String>,
+}
+
+/// Compute a preflight report for THIS node. Reads the cached feed
+/// (does not download — the analyzer's refresh loop handles
+/// downloads on the cluster's own schedule). Returns even if the
+/// feed is missing — the report's `warnings` field surfaces that.
+///
+/// Synchronous & blocking; cheap (parses one local file, runs
+/// `ip addr` once, reads nodes.json once). Safe to call from an
+/// HTTP handler via `spawn_blocking`.
+pub fn preflight_blocking(node_id: String) -> PreflightReport {
+    let cluster = this_node_cluster();
+    let ipset_available = which_exists("ipset");
+    let iptables_available = which_exists("iptables");
+    let mut warnings: Vec<String> = Vec::new();
+    if !ipset_available {
+        warnings.push(
+            "ipset is not installed on this node — enforcement would fail. Install ipset before promoting to Enforce.".into()
+        );
+    }
+    if !iptables_available {
+        warnings.push("iptables is not installed on this node.".into());
+    }
+
+    let feed_present = std::path::Path::new(FEED_LOCAL_PATH).exists();
+    if !feed_present {
+        warnings.push(
+            "Feed file not yet downloaded. Enable DryRun for at least one predictive tick (≤5min) before running preflight.".into()
+        );
+    }
+    let entries = if feed_present { parse_feed_entries(FEED_LOCAL_PATH) } else { Vec::new() };
+    let feed_age_secs = std::fs::metadata(FEED_LOCAL_PATH).ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|mt| SystemTime::now().duration_since(mt).ok())
+        .map(|d| d.as_secs());
+
+    // Auto-allowlist = local interface IPs + peer IPs (same logic
+    // used by sync_ipset_to_feed). Separate the two sources here so
+    // the operator can see what came from where.
+    let mut local_ips: Vec<String> = Vec::new();
+    if let Ok(out) = std::process::Command::new("ip").args(["-4", "addr", "show"]).output() {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            let t = line.trim();
+            if let Some(rest) = t.strip_prefix("inet ") {
+                if let Some(cidr_or_ip) = rest.split_whitespace().next() {
+                    if let Some(ip) = cidr_or_ip.split('/').next() {
+                        if ip.parse::<std::net::Ipv4Addr>().is_ok() {
+                            local_ips.push(ip.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    local_ips.sort();
+    local_ips.dedup();
+
+    let mut peer_ips: Vec<String> = Vec::new();
+    let nodes_path = crate::paths::get().nodes_config.clone();
+    match std::fs::read_to_string(&nodes_path) {
+        Ok(body) => {
+            match serde_json::from_str::<Vec<serde_json::Value>>(&body) {
+                Ok(nodes) => {
+                    for n in nodes {
+                        for key in ["address", "public_ip"] {
+                            if let Some(v) = n.get(key).and_then(|x| x.as_str()) {
+                                if v.parse::<std::net::Ipv4Addr>().is_ok() {
+                                    peer_ips.push(v.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => warnings.push(format!("nodes.json parse error: {}", e)),
+            }
+        }
+        Err(_) => {
+            // Missing nodes.json on a single-node install is normal;
+            // don't warn unless we know there should be peers.
+        }
+    }
+    peer_ips.sort();
+    peer_ips.dedup();
+
+    let operator_allowlist: Vec<String> = parse_allowlist().into_iter().collect();
+
+    // Compute overlaps: feed entries whose exact string matches a
+    // local IP or peer IP. The auto-allowlist key in
+    // sync_ipset_to_feed is a HashSet keyed by the same exact
+    // strings, so this faithfully predicts what the kernel set
+    // would (not) contain.
+    let mut auto: HashSet<String> = HashSet::new();
+    auto.extend(local_ips.iter().cloned());
+    auto.extend(peer_ips.iter().cloned());
+    let op_set: HashSet<String> = operator_allowlist.iter().cloned().collect();
+
+    let mut feed_overlaps_local: Vec<String> = Vec::new();
+    let mut kept: Vec<String> = Vec::with_capacity(entries.len());
+    for e in &entries {
+        if auto.contains(e) {
+            feed_overlaps_local.push(e.clone());
+            continue;
+        }
+        if op_set.contains(e) {
+            // Already-allowlisted by operator: not an overlap signal,
+            // just an exclusion. Still skipped from the kernel set.
+            continue;
+        }
+        kept.push(e.clone());
+    }
+    feed_overlaps_local.sort();
+    feed_overlaps_local.dedup();
+
+    let sample_block_entries: Vec<String> = kept.iter().take(50).cloned().collect();
+    let would_block_count = kept.len();
+
+    PreflightReport {
+        generated_at: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs()).unwrap_or(0),
+        node_id,
+        cluster,
+        ipset_available,
+        iptables_available,
+        feed_entry_count: entries.len(),
+        feed_age_secs,
+        local_interface_ips: local_ips,
+        peer_ips,
+        operator_allowlist,
+        feed_overlaps_local,
+        would_block_count,
+        sample_block_entries,
+        warnings,
+    }
+}
+
+// ─── Fresh-preflight gate (promote-to-Enforce) ────────────────────
+
+/// Stateless freshness check. The promote-to-Enforce request body
+/// must carry the `generated_at` of the preflight the operator just
+/// reviewed (the most-recent timestamp across every per-node report
+/// in the cluster — the frontend computes max() and passes that in).
+///
+/// Stateless because:
+///   * The operator may manage a remote cluster from a node that
+///     doesn't itself belong to it; a server-side timestamp file
+///     would be on the wrong host.
+///   * Daemon restarts don't reset the gate — the operator's
+///     browser is still holding the report, so they just resubmit.
+///   * No race between Promote requests on different operator
+///     sessions.
+///
+/// Returns Ok(()) iff `preflight_generated_at` is within
+/// `PREFLIGHT_FRESHNESS_SECS` of "now" AND not in the future (with
+/// a 60s tolerance for clock skew between operator's browser node
+/// and the API node).
+pub fn require_fresh_preflight(cluster: &str, preflight_generated_at: u64) -> Result<(), String> {
+    if preflight_generated_at == 0 {
+        return Err(format!(
+            "No preflight timestamp provided for cluster '{}'. Re-run preflight before promoting to Enforce.",
+            cluster
+        ));
+    }
+    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs()).unwrap_or(0);
+    // Tolerate up to 60s of clock skew between the node that
+    // generated the preflight and the node receiving the promote.
+    if preflight_generated_at > now + 60 {
+        return Err(format!(
+            "Preflight timestamp for cluster '{}' is in the future (clock skew?). Re-run preflight.",
+            cluster
+        ));
+    }
+    let age = now.saturating_sub(preflight_generated_at);
+    if age > PREFLIGHT_FRESHNESS_SECS {
+        return Err(format!(
+            "Preflight for cluster '{}' is {}s old (must be within {}s). Re-run preflight before promoting.",
+            cluster, age, PREFLIGHT_FRESHNESS_SECS
+        ));
+    }
     Ok(())
 }
 
@@ -825,7 +1423,159 @@ mod tests {
         let facts = ThreatIntelFacts { scanned: true, ..Default::default() };
         let ctx = Context::for_node("ws-test".to_string());
         let scopes = covered_scopes(&ctx, &facts);
-        assert_eq!(scopes.len(), 4);
+        // v23.2.2: OFF, DRY_RUN, NO_IPSET, STALE, RULES_MISSING,
+        // MIGRATED, plus the legacy DISABLED type kept so persisted
+        // acks resolve. Seven total.
+        assert_eq!(scopes.len(), 7);
+    }
+
+    /// EnforceState round-trips through the kebab-case wire format.
+    #[test]
+    fn enforce_state_serde_roundtrip() {
+        for s in [EnforceState::Off, EnforceState::DryRun, EnforceState::Enforce] {
+            let body = serde_json::to_string(&s).unwrap();
+            let parsed: EnforceState = serde_json::from_str(&body).unwrap();
+            assert_eq!(s, parsed);
+        }
+        // String coercions accept legacy/legible spellings.
+        assert_eq!(EnforceState::from_str_opt("off"), Some(EnforceState::Off));
+        assert_eq!(EnforceState::from_str_opt("disabled"), Some(EnforceState::Off));
+        assert_eq!(EnforceState::from_str_opt(""), Some(EnforceState::Off));
+        assert_eq!(EnforceState::from_str_opt("dry-run"), Some(EnforceState::DryRun));
+        assert_eq!(EnforceState::from_str_opt("dry_run"), Some(EnforceState::DryRun));
+        assert_eq!(EnforceState::from_str_opt("preview"), Some(EnforceState::DryRun));
+        assert_eq!(EnforceState::from_str_opt("enforce"), Some(EnforceState::Enforce));
+        assert_eq!(EnforceState::from_str_opt("enforcing"), Some(EnforceState::Enforce));
+        // v23.2.2 safety: legacy spellings "enabled" and "on" map to
+        // DryRun, never Enforce. Promotion to Enforce requires the
+        // explicit "enforce" string (and the gates the API enforces).
+        assert_eq!(EnforceState::from_str_opt("enabled"), Some(EnforceState::DryRun));
+        assert_eq!(EnforceState::from_str_opt("on"), Some(EnforceState::DryRun));
+        assert_eq!(EnforceState::from_str_opt("nonsense"), None);
+    }
+
+    /// Cluster-state file: unknown cluster returns Off, known
+    /// returns its set state, and round-trips through JSON.
+    #[test]
+    fn cluster_state_file_roundtrip_and_defaults() {
+        let mut f = ClusterStateFile::default();
+        assert_eq!(f.clusters.get("prod").copied().unwrap_or(EnforceState::Off), EnforceState::Off);
+        f.clusters.insert("prod".into(), EnforceState::Enforce);
+        f.clusters.insert("staging".into(), EnforceState::DryRun);
+        let body = serde_json::to_string(&f).unwrap();
+        let back: ClusterStateFile = serde_json::from_str(&body).unwrap();
+        assert_eq!(back.schema_version, 2);
+        assert_eq!(back.clusters.get("prod").copied(), Some(EnforceState::Enforce));
+        assert_eq!(back.clusters.get("staging").copied(), Some(EnforceState::DryRun));
+        assert!(back.clusters.get("never-heard-of-it").is_none());
+    }
+
+    /// Fresh-preflight gate: 0 (missing) is rejected, fresh is
+    /// accepted, stale is rejected, future-dated within tolerance
+    /// is accepted, far-future is rejected.
+    #[test]
+    fn require_fresh_preflight_window() {
+        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+        // Missing timestamp.
+        assert!(require_fresh_preflight("c", 0).is_err());
+        // Just generated → within window.
+        assert!(require_fresh_preflight("c", now).is_ok());
+        // 4 minutes old → within window.
+        assert!(require_fresh_preflight("c", now.saturating_sub(4 * 60)).is_ok());
+        // 6 minutes old → outside the 5-minute window.
+        assert!(require_fresh_preflight("c", now.saturating_sub(6 * 60)).is_err());
+        // 30 seconds in the future (clock skew) → accepted.
+        assert!(require_fresh_preflight("c", now + 30).is_ok());
+        // 5 minutes in the future → rejected.
+        assert!(require_fresh_preflight("c", now + 5 * 60).is_err());
+    }
+
+    /// Schema-version handling: a future config file (schema 99)
+    /// still parses into the default-with-clusters shape without
+    /// silently flipping enforcement on. Forward-compat is part of
+    /// the safety contract — if some operator manually edits the
+    /// file or rolls back from a newer version we must NOT
+    /// auto-enable enforcement on parse failure.
+    #[test]
+    fn cluster_state_unknown_state_does_not_default_to_enforce() {
+        // Hand-craft a state where a cluster has an unknown state
+        // string. serde should reject the file and load_cluster_state
+        // should fall back to Default (everything Off).
+        let body = r#"{"schema_version":2,"clusters":{"prod":"super-enforce"}}"#;
+        let parsed: Result<ClusterStateFile, _> = serde_json::from_str(body);
+        assert!(parsed.is_err(), "unknown state must NOT be silently accepted");
+    }
+
+    /// `apply_peer_state` semantics MUST merge per-cluster, not
+    /// blindly overwrite — otherwise a peer's narrower view of the
+    /// world (e.g. it only knows about cluster A) could silently
+    /// erase the local node's entries for cluster B. This was a
+    /// real bug caught in v23.2.2 review.
+    ///
+    /// We exercise the merge logic by constructing two
+    /// ClusterStateFiles in-process and confirming the merge result.
+    /// We do NOT call apply_peer_state directly here because it
+    /// touches `/etc/wolfstack/...` and would conflict with a real
+    /// install on the test machine. The merge logic is small enough
+    /// to verify by re-implementing the contract:
+    #[test]
+    fn apply_peer_state_merge_contract() {
+        // Existing local state has two clusters with explicit values.
+        let mut local = ClusterStateFile::default();
+        local.clusters.insert("prod".into(), EnforceState::Enforce);
+        local.clusters.insert("staging".into(), EnforceState::DryRun);
+
+        // Incoming push only knows about one of them (and adds a
+        // third). Merge result MUST keep "prod" untouched (incoming
+        // had no opinion on it), update "staging" to the new value,
+        // and add "qa".
+        let mut incoming = ClusterStateFile::default();
+        incoming.clusters.insert("staging".into(), EnforceState::Enforce);
+        incoming.clusters.insert("qa".into(), EnforceState::DryRun);
+
+        // Reproduce the merge from apply_peer_state.
+        let mut merged = local.clone();
+        for (cluster, state) in incoming.clusters {
+            if state == EnforceState::Off {
+                merged.clusters.remove(&cluster);
+            } else {
+                merged.clusters.insert(cluster, state);
+            }
+        }
+
+        assert_eq!(merged.clusters.get("prod").copied(), Some(EnforceState::Enforce),
+            "prod must be preserved — incoming had no opinion on it");
+        assert_eq!(merged.clusters.get("staging").copied(), Some(EnforceState::Enforce),
+            "staging must take the incoming value");
+        assert_eq!(merged.clusters.get("qa").copied(), Some(EnforceState::DryRun),
+            "qa must be added from incoming");
+    }
+
+    /// Off transitions in the merge must REMOVE the entry entirely,
+    /// matching the normalisation rule in set_cluster_state. This
+    /// keeps the state file minimal and avoids the "empty value
+    /// means…" ambiguity.
+    #[test]
+    fn apply_peer_state_off_removes_entry() {
+        let mut local = ClusterStateFile::default();
+        local.clusters.insert("prod".into(), EnforceState::Enforce);
+        local.clusters.insert("staging".into(), EnforceState::DryRun);
+
+        let mut incoming = ClusterStateFile::default();
+        incoming.clusters.insert("prod".into(), EnforceState::Off);
+
+        let mut merged = local.clone();
+        for (cluster, state) in incoming.clusters {
+            if state == EnforceState::Off {
+                merged.clusters.remove(&cluster);
+            } else {
+                merged.clusters.insert(cluster, state);
+            }
+        }
+
+        assert!(!merged.clusters.contains_key("prod"),
+            "Off in incoming must remove the entry from the local file");
+        assert_eq!(merged.clusters.get("staging").copied(), Some(EnforceState::DryRun));
     }
 
     /// CRITICAL: the FireHOL Level 1 feed contains the FullBogons

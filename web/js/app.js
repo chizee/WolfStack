@@ -50351,7 +50351,7 @@ function renderPredictiveInbox() {
                         <span id="threat-intel-toggle-wrap" style="display:none;align-items:center;gap:8px;padding:6px 10px;background:rgba(96,165,250,0.08);border:1px solid rgba(96,165,250,0.25);border-radius:6px;font-size:12px;color:var(--text-secondary);">
                             <span id="threat-intel-status-label" style="font-weight:600;">Threat-intel blocklist</span>
                             <span id="threat-intel-status-detail" style="color:var(--text-muted);"></span>
-                            <button class="btn btn-sm" id="threat-intel-toggle-btn" onclick="threatIntelToggle()" style="margin-left:4px;">Loading…</button>
+                            <button class="btn btn-sm" id="threat-intel-toggle-btn" onclick="threatIntelOpenPanel()" style="margin-left:4px;">Loading…</button>
                         </span>
                     </div>
                 </div>
@@ -52657,84 +52657,546 @@ function predictiveStartBadgePoll() {
     predictiveBadgeTimer = setInterval(tick, 60000);
 }
 
-/// Threat-intel blocklist UI toggle. Lives on the Predictive Inbox
-/// header. CRITICAL: this is the safety switch — if the blocklist
-/// ever wrongly blocks legitimate traffic (a Hetzner-recycled IP, an
-/// upstream feed false-positive), the operator clicks Disable and
-/// the iptables rules + ipset are torn down immediately, not at the
-/// next 5-minute tick.
+// ─── Threat-intel blocklist UI (v23.2.2 per-cluster) ──────────────
+//
+// v23.2.2 inverts the v23.2.0/v23.2.1 default of "auto-enable on
+// first boot" to "off everywhere unless the operator explicitly
+// enables per cluster". The chip in the Predictive Inbox header
+// summarises aggregate state across every cluster this dashboard
+// can see; clicking it opens a panel for per-cluster management.
+// The panel guides the operator through a three-step flow:
+//   1. Off → Enable in DryRun (safe: no traffic blocked).
+//   2. DryRun → Run preflight (fans out to every node in cluster,
+//      shows feed counts + auto-allowlist + overlap report).
+//   3. DryRun → Promote to Enforce (requires typed cluster name AND
+//      a fresh <5min preflight). Server enforces both gates.
+// Disable is one-click and tears down kernel state immediately.
+
+const threatIntelState = {
+    // Map<cluster_name, { state, nodes:[{node_id, hostname, is_self, status?, error?}], preflight:{ generatedAt, perNode:[{node_id, hostname, report?, error?}] } | null }>
+    clusters: new Map(),
+    panelOpen: false,
+    // The node hostname the operator is currently typing into the
+    // promote-confirmation field, keyed by cluster name. We track it
+    // here so React-style re-renders don't lose what they typed.
+    confirmInput: new Map(),
+};
+
 async function threatIntelRefreshStatus() {
     const wrap = document.getElementById('threat-intel-toggle-wrap');
     const detail = document.getElementById('threat-intel-status-detail');
     const btn = document.getElementById('threat-intel-toggle-btn');
     if (!wrap || !btn) return;
     try {
+        // Local node's status — gives us this node's own cluster's
+        // state cheaply and also tells us whether the chip is
+        // worth surfacing at all (predictive endpoints must be
+        // reachable).
         const resp = await fetch('/api/predictive/threat-intel/status');
         if (!resp.ok) {
             wrap.style.display = 'none';
             return;
         }
-        const s = await resp.json();
-        wrap.style.display = 'inline-flex';
-        // Build a concise status string for the chip.
-        if (!s.ipset_available) {
-            detail.textContent = 'ipset not installed';
-            btn.textContent = 'How to install';
-            btn.onclick = () => alert('Run on the affected host:\n\n  apt-get install -y ipset\n\n(or `dnf install -y ipset` on Rocky/RHEL). The next predictive tick (≤5min) will pull the feed and install the iptables rules.');
-            return;
+        const localStatus = await resp.json();
+        // Seed the per-cluster map with what we know about THIS
+        // node's cluster. Other clusters are discovered when the
+        // operator opens the panel (lazy fan-out — no point
+        // hammering every remote node for the chip).
+        if (localStatus.cluster) {
+            const existing = threatIntelState.clusters.get(localStatus.cluster) || {};
+            existing.state = localStatus.state || 'off';
+            existing.localNodeStatus = localStatus;
+            threatIntelState.clusters.set(localStatus.cluster, existing);
         }
-        if (s.enabled && s.iptables_rules_present) {
-            detail.textContent = `enforcing · ${s.ipset_entry_count.toLocaleString()} IPs`;
-            btn.textContent = 'Disable';
+        wrap.style.display = 'inline-flex';
+        // Aggregate label across all clusters we currently know
+        // about. The panel will list everything; the chip is just a
+        // glance summary.
+        const counts = { off: 0, 'dry-run': 0, enforce: 0 };
+        for (const [, c] of threatIntelState.clusters) {
+            counts[c.state] = (counts[c.state] || 0) + 1;
+        }
+        const enforcing = counts.enforce || 0;
+        const dryRun = counts['dry-run'] || 0;
+        if (enforcing > 0) {
+            detail.textContent = `${enforcing} enforcing · ${dryRun} dry-run`;
             btn.style.background = 'rgba(239,68,68,0.15)';
             btn.style.color = '#fca5a5';
-            btn.onclick = threatIntelToggle;
-        } else if (s.enabled) {
-            detail.textContent = `enabled but rules missing · ${s.ipset_entry_count.toLocaleString()} IPs ready`;
-            btn.textContent = 'Disable';
+        } else if (dryRun > 0) {
+            detail.textContent = `${dryRun} dry-run · 0 enforcing`;
+            btn.style.background = 'rgba(251,191,36,0.15)';
+            btn.style.color = '#fde047';
+        } else {
+            detail.textContent = 'off everywhere';
             btn.style.background = '';
             btn.style.color = '';
-            btn.onclick = threatIntelToggle;
-        } else {
-            detail.textContent = 'disabled';
-            btn.textContent = 'Enable';
-            btn.style.background = 'rgba(34,197,94,0.15)';
-            btn.style.color = '#86efac';
-            btn.onclick = threatIntelToggle;
         }
+        btn.textContent = 'Manage…';
+        btn.onclick = threatIntelOpenPanel;
     } catch (e) {
         wrap.style.display = 'none';
     }
 }
 
-async function threatIntelToggle() {
-    const btn = document.getElementById('threat-intel-toggle-btn');
-    if (!btn) return;
-    const wasEnabled = btn.textContent === 'Disable';
-    const verb = wasEnabled ? 'disable' : 'enable';
-    if (!confirm(
-        wasEnabled
-            ? 'Disable threat-intel blocklist enforcement on THIS node?\n\nThe iptables DROP rules and the wolfstack_blocklist ipset will be removed immediately. Use this if the blocklist is wrongly blocking legitimate traffic.'
-            : 'Enable threat-intel blocklist enforcement on this node?\n\nThe next predictive tick (≤5 minutes) will pull the FireHOL Level 1 feed and install iptables DROP rules. Local interface IPs, cluster peer IPs, RFC1918 ranges, and Tailscale 100.64.0.0/10 are all auto-allowlisted.'
-    )) return;
-    btn.disabled = true;
-    btn.textContent = wasEnabled ? 'Disabling…' : 'Enabling…';
-    try {
-        const resp = await fetch(`/api/predictive/threat-intel/${verb}`, { method: 'POST' });
-        const j = await resp.json().catch(() => ({}));
-        if (!resp.ok) {
-            alert((j.error || `HTTP ${resp.status}`));
+/// Aggregate-state escape helper for the chip and modal labels.
+/// Centralised so a future state addition doesn't drift between
+/// callers.
+function threatIntelStateLabel(s) {
+    if (s === 'enforce') return 'Enforcing';
+    if (s === 'dry-run') return 'DryRun (no traffic blocked)';
+    return 'Off';
+}
+
+function threatIntelStateColor(s) {
+    if (s === 'enforce') return '#f87171';
+    if (s === 'dry-run') return '#fbbf24';
+    return '#9ca3af';
+}
+
+/// Open the per-cluster management modal. Lazily fetches status
+/// from every node in every cluster the Predictive Inbox knows
+/// about; renders progressively.
+async function threatIntelOpenPanel() {
+    threatIntelState.panelOpen = true;
+    threatIntelRenderPanel(); // initial frame with spinners
+    // Build the list of (cluster, node) pairs we need to query.
+    const nodes = (typeof predictiveState !== 'undefined' && predictiveState.nodes) || [];
+    if (nodes.length === 0) {
+        // No predictive nodes yet — fall back to single-node mode.
+        // The local /status call we already did in
+        // threatIntelRefreshStatus has populated the local cluster.
+        threatIntelRenderPanel();
+        return;
+    }
+    // Group nodes by cluster.
+    const byCluster = new Map();
+    for (const n of nodes) {
+        const c = n.cluster_name || 'WolfStack';
+        if (!byCluster.has(c)) byCluster.set(c, []);
+        byCluster.get(c).push(n);
+    }
+    // For each cluster, fetch status from every node (in parallel
+    // per-cluster, sequential across clusters to avoid hammering
+    // when there are many).
+    for (const [cluster, clusterNodes] of byCluster) {
+        const entry = threatIntelState.clusters.get(cluster) || { state: 'off' };
+        entry.nodes = clusterNodes.map(n => ({
+            node_id: n.node_id, hostname: n.hostname, is_self: !!n.is_self, status: null, error: null
+        }));
+        threatIntelState.clusters.set(cluster, entry);
+        threatIntelRenderPanel();
+        const results = await Promise.all(clusterNodes.map(async (n) => {
+            const url = n.is_self
+                ? '/api/predictive/threat-intel/status'
+                : `/api/nodes/${encodeURIComponent(n.node_id)}/proxy/api/predictive/threat-intel/status`;
+            try {
+                const r = await fetch(url);
+                if (!r.ok) return { node_id: n.node_id, error: `HTTP ${r.status}` };
+                const j = await r.json();
+                return { node_id: n.node_id, status: j };
+            } catch (e) {
+                return { node_id: n.node_id, error: (e && e.message) || String(e) };
+            }
+        }));
+        const map = new Map(results.map(r => [r.node_id, r]));
+        entry.nodes = entry.nodes.map(n => {
+            const r = map.get(n.node_id);
+            if (!r) return n;
+            return { ...n, status: r.status || null, error: r.error || null };
+        });
+        // Update cluster-level state from whichever node reported one.
+        // All nodes in the same cluster should agree; if they don't,
+        // we surface the disagreement in the per-node rows but treat
+        // the loudest state (enforce > dry-run > off) as the cluster
+        // state for action-button purposes.
+        const seen = entry.nodes.map(n => n.status?.state).filter(Boolean);
+        if (seen.includes('enforce')) entry.state = 'enforce';
+        else if (seen.includes('dry-run')) entry.state = 'dry-run';
+        else if (seen.length > 0) entry.state = 'off';
+        threatIntelState.clusters.set(cluster, entry);
+        threatIntelRenderPanel();
+    }
+}
+
+function threatIntelClosePanel() {
+    threatIntelState.panelOpen = false;
+    const m = document.getElementById('threat-intel-panel-modal');
+    if (m) m.remove();
+    // Refresh the chip so any state changes the operator made are
+    // reflected immediately.
+    threatIntelRefreshStatus();
+}
+
+function threatIntelRenderPanel() {
+    if (!threatIntelState.panelOpen) return;
+    let modal = document.getElementById('threat-intel-panel-modal');
+    if (!modal) {
+        modal = document.createElement('div');
+        modal.id = 'threat-intel-panel-modal';
+        modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.65);z-index:10000;display:flex;align-items:flex-start;justify-content:center;overflow-y:auto;padding:40px 20px;';
+        modal.addEventListener('click', (e) => { if (e.target === modal) threatIntelClosePanel(); });
+        document.body.appendChild(modal);
+    }
+
+    const clusters = Array.from(threatIntelState.clusters.entries())
+        .sort(([a], [b]) => a.localeCompare(b));
+
+    let body = '';
+    if (clusters.length === 0) {
+        body = `<div style="color:var(--text-muted);padding:24px;text-align:center;">Loading clusters…</div>`;
+    } else {
+        body = clusters.map(([name, c]) => threatIntelRenderClusterCard(name, c)).join('');
+    }
+
+    modal.innerHTML = `
+        <div style="background:var(--bg-card,#1e2028);border:1px solid var(--border-color,#2d2f3a);border-radius:12px;max-width:960px;width:100%;color:var(--text-primary);box-shadow:0 25px 70px rgba(0,0,0,0.5);">
+            <div style="padding:20px 24px;border-bottom:1px solid var(--border-color,#2d2f3a);display:flex;align-items:center;gap:12px;">
+                <div style="flex:1;">
+                    <h2 style="margin:0 0 4px 0;font-size:18px;">FireHOL Level 1 threat-intel blocklist</h2>
+                    <div style="font-size:12px;color:var(--text-muted);line-height:1.5;">
+                        Per-cluster enforcement. Default <strong>Off</strong>. Move a cluster to <strong>DryRun</strong> to download the feed and review what would be blocked, then <strong>Promote to Enforce</strong> after reviewing the per-node preflight.
+                    </div>
+                </div>
+                <button class="btn btn-sm" onclick="threatIntelClosePanel()" style="flex-shrink:0;">Close</button>
+            </div>
+            <div style="padding:18px 24px;">
+                ${body}
+            </div>
+        </div>
+    `;
+}
+
+function threatIntelRenderClusterCard(name, c) {
+    const color = threatIntelStateColor(c.state || 'off');
+    const stateLabel = threatIntelStateLabel(c.state || 'off');
+    const nodes = c.nodes || [];
+    const nodesHtml = nodes.length === 0
+        ? `<div style="color:var(--text-muted);padding:8px 0;font-size:12px;">Loading nodes…</div>`
+        : nodes.map(n => threatIntelRenderNodeRow(n)).join('');
+
+    const actions = threatIntelRenderClusterActions(name, c);
+    const preflight = c.preflight ? threatIntelRenderPreflight(name, c) : '';
+    const confirmRow = c.state === 'dry-run' ? threatIntelRenderPromoteRow(name, c) : '';
+
+    return `
+        <div style="background:var(--bg-secondary,#16181f);border:1px solid var(--border-color,#2d2f3a);border-radius:10px;padding:14px 16px;margin-bottom:14px;">
+            <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px;flex-wrap:wrap;">
+                <div style="flex:1;min-width:200px;">
+                    <div style="font-weight:600;font-size:14px;">Cluster <code style="background:var(--bg-tertiary,#2d2f3a);padding:1px 6px;border-radius:4px;font-size:12px;">${escapeHtml(name)}</code></div>
+                    <div style="font-size:12px;color:${color};margin-top:2px;">${escapeHtml(stateLabel)}</div>
+                </div>
+                ${actions}
+            </div>
+            <div style="border-top:1px solid var(--border-color,#2d2f3a);padding-top:10px;">
+                ${nodesHtml}
+            </div>
+            ${preflight}
+            ${confirmRow}
+        </div>
+    `;
+}
+
+function threatIntelRenderNodeRow(n) {
+    if (n.error) {
+        return `<div style="display:flex;gap:8px;align-items:center;font-size:12px;padding:4px 0;">
+            <span style="color:#f87171;">⚠</span>
+            <span style="font-family:monospace;">${escapeHtml(n.hostname || n.node_id)}</span>
+            <span style="color:#fca5a5;">unreachable: ${escapeHtml(n.error)}</span>
+        </div>`;
+    }
+    if (!n.status) {
+        return `<div style="display:flex;gap:8px;align-items:center;font-size:12px;padding:4px 0;color:var(--text-muted);">
+            <span>·</span>
+            <span style="font-family:monospace;">${escapeHtml(n.hostname || n.node_id)}</span>
+            <span>loading…</span>
+        </div>`;
+    }
+    const s = n.status;
+    const parts = [];
+    parts.push(threatIntelStateLabel(s.state || 'off'));
+    if (s.state === 'enforce') {
+        parts.push(`${(s.ipset_entry_count || 0).toLocaleString()} IPs in ipset`);
+        if (!s.iptables_rules_present) parts.push('rules MISSING');
+    } else if (s.state === 'dry-run') {
+        parts.push(`feed: ${(s.feed_entry_count || 0).toLocaleString()} entries`);
+    }
+    if (!s.ipset_available) parts.push('ipset not installed');
+    if (s.migration_completed) parts.push('v23.2.2 migrated');
+    return `<div style="display:flex;gap:8px;align-items:center;font-size:12px;padding:4px 0;flex-wrap:wrap;">
+        <span style="font-family:monospace;color:var(--text-primary);">${escapeHtml(n.hostname || n.node_id)}</span>
+        <span style="color:var(--text-muted);">·</span>
+        <span style="color:${threatIntelStateColor(s.state || 'off')};">${escapeHtml(parts.join(' · '))}</span>
+    </div>`;
+}
+
+function threatIntelRenderClusterActions(name, c) {
+    const buttons = [];
+    const state = c.state || 'off';
+    // Cluster names are operator-controlled. We pass them through
+    // JSON.stringify so any special characters (', ", \, newline)
+    // become valid JS-literal escapes, then escapeAttr for the
+    // HTML-attribute layer. Without this, a cluster named e.g.
+    // `prod'X` would break out of the onclick="...('...')" pattern.
+    const jsName = escapeAttr(JSON.stringify(name));
+    // Common: preflight is always available (runs the dry analysis
+    // even on Off clusters so the operator can preview before
+    // committing to DryRun).
+    buttons.push(`<button class="btn btn-sm" onclick="threatIntelRunPreflight(${jsName})">Run preflight</button>`);
+    if (state === 'off') {
+        buttons.push(`<button class="btn btn-sm" style="background:rgba(34,197,94,0.18);color:#86efac;" onclick="threatIntelSetState(${jsName}, 'dry-run')">Enable in DryRun</button>`);
+    } else if (state === 'dry-run') {
+        buttons.push(`<button class="btn btn-sm" onclick="threatIntelSetState(${jsName}, 'off')">Disable</button>`);
+    } else if (state === 'enforce') {
+        buttons.push(`<button class="btn btn-sm" style="background:rgba(239,68,68,0.18);color:#fca5a5;" onclick="threatIntelSetState(${jsName}, 'off')">Disable enforcement</button>`);
+    }
+    return `<div style="display:flex;gap:6px;flex-wrap:wrap;">${buttons.join('')}</div>`;
+}
+
+function threatIntelRenderPreflight(name, c) {
+    const pf = c.preflight;
+    if (!pf) return '';
+    if (pf.loading) {
+        return `<div style="margin-top:12px;padding:10px 12px;background:rgba(96,165,250,0.06);border:1px solid rgba(96,165,250,0.25);border-radius:8px;font-size:12px;color:var(--text-secondary);">
+            Running preflight across cluster nodes…
+        </div>`;
+    }
+    if (pf.error) {
+        return `<div style="margin-top:12px;padding:10px 12px;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.3);border-radius:8px;font-size:12px;color:#fca5a5;">
+            Preflight failed: ${escapeHtml(pf.error)}
+        </div>`;
+    }
+    const rows = (pf.perNode || []).map(r => {
+        if (r.error) {
+            return `<div style="padding:6px 0;font-size:12px;color:#fca5a5;">
+                ⚠ <code>${escapeHtml(r.hostname || r.node_id)}</code> — ${escapeHtml(r.error)}
+            </div>`;
         }
+        const rep = r.report || {};
+        const ageStr = rep.feed_age_secs == null ? 'no feed' : `${Math.round((rep.feed_age_secs || 0) / 60)} min`;
+        const warningsHtml = (rep.warnings || []).map(w => `<li style="color:#fde047;">${escapeHtml(w)}</li>`).join('');
+        const overlapHtml = (rep.feed_overlaps_local || []).length === 0
+            ? '<li style="color:#86efac;">no overlap between feed and your cluster IPs (clean)</li>'
+            : (rep.feed_overlaps_local || []).map(ip => `<li style="color:#fde047;">${escapeHtml(ip)} — IN the feed, auto-allowlisted (likely cloud-IP reuse)</li>`).join('');
+        const allowlistHtml = (rep.local_interface_ips || []).slice(0, 8).map(escapeHtml).join(', ');
+        const moreLocal = Math.max(0, (rep.local_interface_ips || []).length - 8);
+        const peerHtml = (rep.peer_ips || []).slice(0, 8).map(escapeHtml).join(', ');
+        const morePeer = Math.max(0, (rep.peer_ips || []).length - 8);
+        const sampleHtml = (rep.sample_block_entries || []).slice(0, 6).map(escapeHtml).join(', ');
+        return `<details style="margin:6px 0;background:var(--bg-tertiary,#11131a);border:1px solid var(--border-color,#2d2f3a);border-radius:6px;">
+            <summary style="padding:6px 10px;cursor:pointer;font-size:12px;">
+                <code>${escapeHtml(r.hostname || r.node_id)}</code> — would block <strong>${(rep.would_block_count || 0).toLocaleString()}</strong> IPs · feed ${ageStr} · ${(rep.feed_overlaps_local || []).length} overlap${(rep.feed_overlaps_local || []).length === 1 ? '' : 's'}
+            </summary>
+            <div style="padding:8px 12px;font-size:12px;color:var(--text-secondary);line-height:1.6;">
+                <div><strong>Local interface IPs</strong> (auto-allowlisted): ${allowlistHtml || '(none)'}${moreLocal > 0 ? ` <em>+ ${moreLocal} more</em>` : ''}</div>
+                <div><strong>Peer IPs</strong> (auto-allowlisted): ${peerHtml || '(none)'}${morePeer > 0 ? ` <em>+ ${morePeer} more</em>` : ''}</div>
+                <div><strong>Feed overlaps with your IPs:</strong>
+                    <ul style="margin:4px 0 0 18px;padding:0;">${overlapHtml}</ul>
+                </div>
+                <div><strong>Sample of would-be-blocked IPs</strong>: ${sampleHtml || '(none)'}</div>
+                ${warningsHtml ? `<div><strong>Warnings:</strong><ul style="margin:4px 0 0 18px;padding:0;">${warningsHtml}</ul></div>` : ''}
+            </div>
+        </details>`;
+    }).join('');
+    const ageSecs = Math.max(0, Math.round(Date.now() / 1000) - (pf.generatedAt || 0));
+    const freshness = ageSecs <= 300
+        ? `<span style="color:#86efac;">fresh (${ageSecs}s old)</span>`
+        : `<span style="color:#fde047;">stale (${ageSecs}s — re-run before promoting)</span>`;
+    return `<div style="margin-top:12px;padding:10px 12px;background:rgba(96,165,250,0.05);border:1px solid rgba(96,165,250,0.2);border-radius:8px;">
+        <div style="font-size:12px;color:var(--text-secondary);margin-bottom:8px;">
+            <strong>Preflight</strong> · ${freshness}
+        </div>
+        ${rows}
+    </div>`;
+}
+
+function threatIntelRenderPromoteRow(name, c) {
+    const typed = threatIntelState.confirmInput.get(name) || '';
+    const matches = typed === name;
+    const pf = c.preflight;
+    const ageSecs = pf ? Math.max(0, Math.round(Date.now() / 1000) - (pf.generatedAt || 0)) : null;
+    const fresh = pf && !pf.loading && !pf.error && ageSecs !== null && ageSecs <= 300;
+    const canPromote = matches && fresh;
+    const hint = !pf
+        ? 'Run preflight first.'
+        : pf.loading ? 'Preflight running…'
+        : pf.error ? 'Preflight failed — fix the errors above then re-run.'
+        : !fresh ? 'Preflight is stale (>5 min) — re-run.'
+        : !matches ? `Type the exact cluster name to confirm.`
+        : 'Ready. Promoting will install iptables DROP rules on every node in this cluster.';
+    return `<div style="margin-top:12px;padding:10px 12px;background:rgba(239,68,68,0.06);border:1px solid rgba(239,68,68,0.25);border-radius:8px;">
+        <div style="font-size:12px;color:var(--text-secondary);margin-bottom:6px;line-height:1.5;">
+            <strong style="color:#fca5a5;">Promote to Enforce</strong> — installs DROP rules cluster-wide.
+            Requires a fresh (≤5 min) preflight AND typing the exact cluster name.
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+            <input type="text" placeholder="${escapeAttr(name)}"
+                   value="${escapeAttr(typed)}"
+                   data-threat-intel-cluster="${escapeAttr(name)}"
+                   oninput="threatIntelConfirmInput(${escapeAttr(JSON.stringify(name))}, this.value)"
+                   style="background:var(--bg-tertiary,#2d2f3a);color:var(--text-primary);border:1px solid var(--border-color);border-radius:6px;padding:6px 10px;font-size:12px;font-family:monospace;min-width:200px;">
+            <button class="btn btn-sm" ${canPromote ? '' : 'disabled'}
+                    style="${canPromote ? 'background:rgba(239,68,68,0.25);color:#fecaca;' : 'opacity:0.5;cursor:not-allowed;'}"
+                    onclick="threatIntelPromote(${escapeAttr(JSON.stringify(name))})">Promote to Enforce</button>
+            <span style="font-size:11px;color:var(--text-muted);">${escapeHtml(hint)}</span>
+        </div>
+    </div>`;
+}
+
+function threatIntelConfirmInput(cluster, value) {
+    threatIntelState.confirmInput.set(cluster, value);
+    threatIntelRenderPanel();
+    // Refocus the input that the user was typing into so re-render
+    // doesn't steal their cursor mid-word. Match by the dedicated
+    // data attribute, not placeholder text — robust against any
+    // other field happening to share a placeholder.
+    const modal = document.getElementById('threat-intel-panel-modal');
+    if (!modal) return;
+    // CSS.escape handles every CSS-selector metacharacter (`]`, `[`,
+    // `\`, etc.) — naive quote-escaping would throw SyntaxError on a
+    // cluster name like `prod[eu-west]`. CSS.escape is widely
+    // supported (every browser we target); the catch is defensive.
+    try {
+        const sel = `input[data-threat-intel-cluster="${CSS.escape(cluster)}"]`;
+        const target = modal.querySelector(sel);
+        if (target) {
+            target.focus();
+            try { target.setSelectionRange(value.length, value.length); } catch (_) {}
+        }
+    } catch (_) {
+        // Selector or DOM API failure — focus restoration is a
+        // nice-to-have, not load-bearing for the promote flow.
+    }
+}
+
+/// Fan out the preflight call to every node in the cluster, in
+/// parallel. Updates threatIntelState.clusters[cluster].preflight
+/// incrementally so the modal renders partial results as nodes
+/// respond.
+async function threatIntelRunPreflight(cluster) {
+    const entry = threatIntelState.clusters.get(cluster) || {};
+    entry.preflight = { loading: true, perNode: [] };
+    threatIntelState.clusters.set(cluster, entry);
+    threatIntelRenderPanel();
+    const nodes = entry.nodes || [];
+    if (nodes.length === 0) {
+        entry.preflight = { loading: false, error: 'No nodes available for this cluster.', perNode: [] };
+        threatIntelState.clusters.set(cluster, entry);
+        threatIntelRenderPanel();
+        return;
+    }
+    const results = await Promise.all(nodes.map(async (n) => {
+        const url = n.is_self
+            ? '/api/predictive/threat-intel/preflight'
+            : `/api/nodes/${encodeURIComponent(n.node_id)}/proxy/api/predictive/threat-intel/preflight`;
+        try {
+            const r = await fetch(url, { method: 'POST' });
+            if (!r.ok) {
+                let detail = `HTTP ${r.status}`;
+                try { const j = await r.json(); if (j.error) detail = j.error; } catch (_) {}
+                return { node_id: n.node_id, hostname: n.hostname, error: detail };
+            }
+            const j = await r.json();
+            return { node_id: n.node_id, hostname: n.hostname, report: j };
+        } catch (e) {
+            return { node_id: n.node_id, hostname: n.hostname, error: (e && e.message) || String(e) };
+        }
+    }));
+    // Compute the freshness anchor as the MAX generated_at across
+    // all successful per-node reports. Server-side gate uses the
+    // value we pass in; we pick the most-recent so it's most likely
+    // to stay within the 5-minute window.
+    const generatedAt = results
+        .map(r => r.report?.generated_at || 0)
+        .reduce((a, b) => Math.max(a, b), 0);
+    entry.preflight = { loading: false, perNode: results, generatedAt };
+    threatIntelState.clusters.set(cluster, entry);
+    threatIntelRenderPanel();
+    showToast(`Preflight complete for cluster "${cluster}"`, 'success', 3000);
+}
+
+/// Move a cluster between states. For Off / DryRun this is a
+/// one-click action; for Enforce see threatIntelPromote which adds
+/// the typed-confirmation + fresh-preflight gates.
+async function threatIntelSetState(cluster, target) {
+    if (target === 'enforce') {
+        // Should never reach here — the UI never wires "Enforce"
+        // to this function; promote is via threatIntelPromote.
+        showToast('Use the Promote button (typed confirmation required).', 'error');
+        return;
+    }
+    const verbed = target === 'off' ? 'Disabling' : 'Enabling DryRun on';
+    showToast(`${verbed} cluster "${cluster}"…`, 'info', 2000);
+    try {
+        const r = await fetch('/api/predictive/threat-intel/state', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ cluster, state: target }),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) {
+            showToast(`Failed: ${j.error || r.statusText}`, 'error');
+            return;
+        }
+        showToast(`Cluster "${cluster}" set to ${threatIntelStateLabel(target)}.`, 'success', 4000);
+        // Optimistically update local state, then re-fetch.
+        const entry = threatIntelState.clusters.get(cluster) || {};
+        entry.state = target;
+        threatIntelState.clusters.set(cluster, entry);
+        threatIntelRenderPanel();
+        // Re-fetch status across the cluster to confirm propagation
+        // landed on remote peers.
+        setTimeout(() => threatIntelOpenPanel(), 1500);
     } catch (e) {
-        alert('Request failed: ' + ((e && e.message) || String(e)));
-    } finally {
-        btn.disabled = false;
-        threatIntelRefreshStatus();
+        showToast(`Request failed: ${(e && e.message) || String(e)}`, 'error');
+    }
+}
+
+async function threatIntelPromote(cluster) {
+    const entry = threatIntelState.clusters.get(cluster);
+    if (!entry || !entry.preflight || entry.preflight.loading || entry.preflight.error) {
+        showToast('Preflight required before promoting.', 'error');
+        return;
+    }
+    const typed = threatIntelState.confirmInput.get(cluster) || '';
+    if (typed !== cluster) {
+        showToast(`Type "${cluster}" exactly to confirm.`, 'error');
+        return;
+    }
+    const generatedAt = entry.preflight.generatedAt || 0;
+    try {
+        const r = await fetch('/api/predictive/threat-intel/state', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                cluster,
+                state: 'enforce',
+                confirm_cluster_name: cluster,
+                preflight_generated_at: generatedAt,
+            }),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) {
+            showToast(`Promote failed: ${j.error || r.statusText}`, 'error', 8000);
+            return;
+        }
+        showToast(`Cluster "${cluster}" promoted to Enforce. iptables rules will install on the next tick (≤5 min).`, 'success', 6000);
+        threatIntelState.confirmInput.delete(cluster);
+        entry.state = 'enforce';
+        threatIntelState.clusters.set(cluster, entry);
+        threatIntelRenderPanel();
+        setTimeout(() => threatIntelOpenPanel(), 1500);
+    } catch (e) {
+        showToast(`Request failed: ${(e && e.message) || String(e)}`, 'error');
     }
 }
 
 window.threatIntelRefreshStatus = threatIntelRefreshStatus;
-window.threatIntelToggle = threatIntelToggle;
+window.threatIntelOpenPanel = threatIntelOpenPanel;
+window.threatIntelClosePanel = threatIntelClosePanel;
+window.threatIntelRunPreflight = threatIntelRunPreflight;
+window.threatIntelSetState = threatIntelSetState;
+window.threatIntelPromote = threatIntelPromote;
+window.threatIntelConfirmInput = threatIntelConfirmInput;
 
 window.renderPredictiveInbox = renderPredictiveInbox;
 window.predictiveRunNow = predictiveRunNow;

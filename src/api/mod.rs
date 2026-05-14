@@ -19495,49 +19495,232 @@ pub async fn predictive_baselines_reseed(
     }
 }
 
-// ─── Threat-intel safety switch ───────────────────────────────────
+// ─── Threat-intel safety switch (per-cluster, off by default) ──────
 //
-// The threat-intel blocklist installs iptables DROP rules. If
-// something breaks (we got the bogon filter wrong, an upstream feed
-// false-positive, a Hetzner-recycled IP that's also our cluster's
-// IP), the operator needs a one-click way to turn the blocklist
-// off WITHOUT waiting for the next 5-minute predictive tick. These
-// three endpoints are the safety switch the UI button calls.
+// v23.2.2: enforcement is per-cluster (Off / DryRun / Enforce), default
+// Off everywhere. The legacy /enable + /disable endpoints are kept as
+// backward-compatible shortcuts that operate on the receiving node's
+// own cluster, but /enable now sets DryRun (never Enforce) — promotion
+// to Enforce goes through the explicit /state endpoint with a fresh
+// preflight gate.
+
+use crate::predictive::threat_intel as ti;
 
 pub async fn predictive_threat_intel_status(
     req: HttpRequest,
     state: web::Data<AppState>,
 ) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
-    HttpResponse::Ok().json(crate::predictive::threat_intel::status_snapshot())
+    // status_snapshot() runs `which`, `iptables -C`, `ipset list`,
+    // and parses the local feed file — all blocking. Defer to a
+    // blocking worker so we don't stall the Tokio reactor.
+    match tokio::task::spawn_blocking(ti::status_snapshot).await {
+        Ok(s) => HttpResponse::Ok().json(s),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("status task: {}", e),
+        })),
+    }
 }
 
+/// Legacy enable shortcut — now equivalent to "set this node's
+/// cluster to DryRun". Will never install iptables rules on its own;
+/// the operator must explicitly Promote afterwards.
 pub async fn predictive_threat_intel_enable(
     req: HttpRequest,
     state: web::Data<AppState>,
 ) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
-    match crate::predictive::threat_intel::enable_for_operator() {
-        Ok(()) => HttpResponse::Ok().json(serde_json::json!({
-            "success": true,
-            "note": "threat-intel enabled — the next predictive tick (≤5min) will pull the feed and install iptables rules",
-        })),
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
-    }
+    let cluster = ti::this_node_cluster();
+    let new_state = match ti::set_cluster_state(&cluster, ti::EnforceState::DryRun) {
+        Ok(s) => s,
+        Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+    };
+    propagate_threat_intel_state(&state, &new_state);
+    HttpResponse::Ok().json(serde_json::json!({
+        "success": true,
+        "cluster": cluster,
+        "state": "dry-run",
+        "note": "Cluster set to DryRun. The next predictive tick will fetch the feed and compute a preflight, but no traffic will be blocked. Promote to Enforce from the Predictive Inbox after reviewing the preflight.",
+    }))
 }
 
+/// Disable shortcut — sets this node's cluster to Off and tears
+/// down any kernel state immediately. Same instant-safety contract
+/// the v23.2.1 disable button had.
 pub async fn predictive_threat_intel_disable(
     req: HttpRequest,
     state: web::Data<AppState>,
 ) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
-    match crate::predictive::threat_intel::disable_for_operator() {
-        Ok(()) => HttpResponse::Ok().json(serde_json::json!({
-            "success": true,
-            "note": "threat-intel disabled — iptables DROP rules removed and ipset destroyed; cluster traffic should flow normally",
+    let cluster = ti::this_node_cluster();
+    let new_state = match ti::set_cluster_state(&cluster, ti::EnforceState::Off) {
+        Ok(s) => s,
+        Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+    };
+    propagate_threat_intel_state(&state, &new_state);
+    HttpResponse::Ok().json(serde_json::json!({
+        "success": true,
+        "cluster": cluster,
+        "state": "off",
+        "note": "Cluster set to Off — iptables DROP rules removed, ipset destroyed, peers notified. Traffic should flow normally.",
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ThreatIntelStateRequest {
+    /// Cluster to change. Required.
+    pub cluster: String,
+    /// New state: "off" | "dry-run" | "enforce".
+    pub state: String,
+    /// Anti-fat-finger: when promoting to Enforce the operator must
+    /// re-type the cluster name. Ignored for Off / DryRun.
+    #[serde(default)]
+    pub confirm_cluster_name: Option<String>,
+    /// Stateless freshness gate: when promoting to Enforce, the
+    /// frontend must include the `generated_at` epoch-seconds of the
+    /// preflight report the operator just reviewed (max across all
+    /// per-node reports). Ignored for Off / DryRun.
+    #[serde(default)]
+    pub preflight_generated_at: u64,
+}
+
+/// POST /api/predictive/threat-intel/state — explicit cluster state
+/// change. The only path that can reach Enforce.
+pub async fn predictive_threat_intel_set_state(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<ThreatIntelStateRequest>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let cluster = body.cluster.trim().to_string();
+    if cluster.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "cluster name is required",
+        }));
+    }
+    let target = match ti::EnforceState::from_str_opt(&body.state) {
+        Some(s) => s,
+        None => return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": format!("unknown state '{}'; expected one of: off, dry-run, enforce", body.state),
         })),
+    };
+    // Promote-to-Enforce gate: typed confirmation + fresh preflight.
+    if target == ti::EnforceState::Enforce {
+        match body.confirm_cluster_name.as_deref().map(str::trim) {
+            Some(name) if name == cluster => {}
+            _ => return HttpResponse::BadRequest().json(serde_json::json!({
+                "error": format!("confirm_cluster_name must equal '{}' to promote to Enforce", cluster),
+            })),
+        }
+        if let Err(e) = ti::require_fresh_preflight(&cluster, body.preflight_generated_at) {
+            return HttpResponse::BadRequest().json(serde_json::json!({ "error": e }));
+        }
+    }
+    let new_state = match ti::set_cluster_state(&cluster, target) {
+        Ok(s) => s,
+        Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+    };
+    propagate_threat_intel_state(&state, &new_state);
+    HttpResponse::Ok().json(serde_json::json!({
+        "success": true,
+        "cluster": cluster,
+        "state": target.as_str(),
+    }))
+}
+
+/// POST /api/predictive/threat-intel/preflight — compute a dry-run
+/// preflight report on THIS node. Caller may fan out to other nodes
+/// in the cluster via the node-proxy and aggregate results. Stamps
+/// the preflight timestamp for this node's cluster so the promote
+/// gate has a fresh marker (the aggregator endpoint also stamps,
+/// for the cluster-wide case).
+pub async fn predictive_threat_intel_preflight(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let node_id = state.cluster.self_id.clone();
+    let report = match tokio::task::spawn_blocking(move || ti::preflight_blocking(node_id)).await {
+        Ok(r) => r,
+        Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("preflight task: {}", e),
+        })),
+    };
+    HttpResponse::Ok().json(report)
+}
+
+/// POST /api/predictive/threat-intel/peer-state-push — inter-node
+/// endpoint authenticated by X-WolfStack-Secret. Receives a state
+/// file pushed from a peer and applies it locally. Idempotent.
+pub async fn predictive_threat_intel_peer_state_push(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<ti::ClusterStateFile>,
+) -> HttpResponse {
+    if let Err(resp) = require_cluster_auth(&req, &state) { return resp; }
+    match ti::apply_peer_state(body.into_inner()) {
+        Ok(()) => HttpResponse::Ok().json(serde_json::json!({ "success": true })),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
     }
+}
+
+/// Best-effort fan-out of an updated cluster-state file to every
+/// peer in *this node's* cluster. Failures are logged but never
+/// surface to the operator — peers that are offline will catch up
+/// on the next gossip cycle.
+fn propagate_threat_intel_state(state: &web::Data<AppState>, payload: &ti::ClusterStateFile) {
+    let payload = payload.clone();
+    let cluster_handle = state.cluster.clone();
+    let secret = state.cluster_secret.clone();
+    tokio::spawn(async move {
+        let self_cluster = cluster_handle.get_self_cluster_name();
+        let self_id = cluster_handle.self_id.clone();
+        let peers: Vec<(String, String, u16)> = cluster_handle.get_all_nodes()
+            .into_iter()
+            .filter(|n| n.id != self_id)
+            .filter(|n| n.cluster_name.as_deref() == Some(self_cluster.as_str()))
+            .map(|n| (n.hostname.clone(), n.address.clone(), n.port))
+            .collect();
+        if peers.is_empty() { return; }
+        let client = &*API_HTTP_CLIENT;
+        for (hostname, address, port) in &peers {
+            let urls = build_node_urls(address, *port, "/api/predictive/threat-intel/peer-state-push");
+            let mut delivered = false;
+            let mut last_status: Option<u16> = None;
+            for url in &urls {
+                match client.post(url)
+                    .timeout(std::time::Duration::from_secs(30))
+                    .header("X-WolfStack-Secret", &secret)
+                    .json(&payload)
+                    .send()
+                    .await
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        let _ = resp.bytes().await;
+                        tracing::info!("threat_intel: state propagated to peer '{}' ({})", hostname, address);
+                        delivered = true;
+                        break;
+                    }
+                    Ok(resp) => {
+                        // Non-success on this URL — record the
+                        // status and try the next URL (HTTPS may be
+                        // misconfigured but the HTTP fallback could
+                        // succeed).
+                        last_status = Some(resp.status().as_u16());
+                        let _ = resp.bytes().await;
+                        continue;
+                    }
+                    Err(_) => continue,
+                }
+            }
+            if !delivered {
+                match last_status {
+                    Some(st) => tracing::warn!("threat_intel: state push to peer '{}' ({}) returned HTTP {} on every attempted URL", hostname, address, st),
+                    None => tracing::warn!("threat_intel: could not reach peer '{}' ({}) for state propagation", hostname, address),
+                }
+            }
+        }
+    });
 }
 
 // ─── OSV scanner config ───────────────────────────────────────────
@@ -26945,6 +27128,9 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/predictive/threat-intel/status", web::get().to(predictive_threat_intel_status))
         .route("/api/predictive/threat-intel/enable", web::post().to(predictive_threat_intel_enable))
         .route("/api/predictive/threat-intel/disable", web::post().to(predictive_threat_intel_disable))
+        .route("/api/predictive/threat-intel/state", web::post().to(predictive_threat_intel_set_state))
+        .route("/api/predictive/threat-intel/preflight", web::post().to(predictive_threat_intel_preflight))
+        .route("/api/predictive/threat-intel/peer-state-push", web::post().to(predictive_threat_intel_peer_state_push))
         // WolfAgents — named AI agents with persistent memory.
         .route("/api/agents", web::get().to(agents_list))
         .route("/api/agents", web::post().to(agents_create))

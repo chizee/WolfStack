@@ -859,6 +859,16 @@ async fn main() -> std::io::Result<()> {
             });
         }
 
+        // v23.2.2 safety migration: tear down any FireHOL Level 1
+        // iptables/ipset state left over from v23.2.0/v23.2.1's
+        // auto-enable behaviour. Idempotent; the second-run check
+        // (sentinel file) short-circuits in under a millisecond.
+        // Runs BEFORE the predictive orchestrator first ticks so the
+        // analyzer never observes a stale "enabled" state and tries
+        // to re-install rules. Synchronous (blocking iptables calls)
+        // but cheap.
+        let _ = crate::predictive::threat_intel::run_safety_migration_once();
+
         // Predictive ops orchestrator — 5-min loop that samples
         // disks, records into history, runs analyzers, and upserts
         // proposals into the inbox. Ack/snooze/dismiss are honoured
