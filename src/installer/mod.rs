@@ -592,7 +592,7 @@ pub fn request_certificate(domain: &str, email: &str) -> Result<String, String> 
     // silently fail with "command not found" even when the operator's
     // login shell could run `certbot --version` fine.
     let certbot_bin = crate::certbot::certbot_path()
-        .ok_or_else(|| "certbot is not installed on this node".to_string())?;
+        .ok_or_else(crate::certbot::missing_certbot_error)?;
     let output = Command::new("sudo")
         .args([
             certbot_bin.as_str(), "certonly", "--standalone",

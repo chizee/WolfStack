@@ -135,94 +135,231 @@ pub struct CertSummary {
 /// (`/usr/local/bin`), snap (`/snap/bin`), and the EFF-maintained
 /// virtualenv path (`/opt/certbot/bin`).
 pub fn certbot_path() -> Option<String> {
-    // 1. systemd PATH probe — cheapest, works for distro packages
-    //    (apt/dnf/pacman install to /usr/bin which is in systemd's PATH).
-    if let Ok(out) = Command::new("certbot").arg("--version").output() {
-        if out.status.success() {
-            return Some("certbot".to_string());
+    certbot_probe().0
+}
+
+/// Run the certbot detection chain and return both the found path
+/// (if any) and a verbose trace of what each probe did. The trace is
+/// surfaced in the "certbot is not installed" error so the operator
+/// can immediately see WHY we couldn't find their binary — no support
+/// round-trip needed. Each probe line is human-readable, e.g.:
+///     "PATH lookup: certbot --version failed (errno 2 - not in PATH)"
+///     "bash -lc command -v: returned '/snap/bin/certbot' but binary doesn't run"
+///     "whereis -b: found /usr/bin/certbot — using it"
+pub fn certbot_probe() -> (Option<String>, Vec<String>) {
+    let mut trace: Vec<String> = Vec::new();
+
+    // Helper: try a candidate path. Records the outcome in the trace
+    // and returns Some(path) if the binary actually executes.
+    let try_path = |path: &str, label: &str, trace: &mut Vec<String>| -> Option<String> {
+        if !std::path::Path::new(path).exists() {
+            trace.push(format!("{}: '{}' does not exist", label, path));
+            return None;
+        }
+        match Command::new(path).arg("--version").output() {
+            Ok(o) if o.status.success() => {
+                trace.push(format!("{}: '{}' — works, using it", label, path));
+                Some(path.to_string())
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                trace.push(format!("{}: '{}' exists but --version failed: {}", label, path, stderr));
+                None
+            }
+            Err(e) => {
+                trace.push(format!("{}: '{}' exists but spawn failed: {}", label, path, e));
+                None
+            }
+        }
+    };
+
+    // 1. systemd PATH probe — distro packages, anything in the
+    //    process's PATH at the time WolfStack started.
+    match Command::new("certbot").arg("--version").output() {
+        Ok(o) if o.status.success() => {
+            trace.push("PATH lookup: 'certbot' in service PATH — using it".to_string());
+            return (Some("certbot".to_string()), trace);
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            trace.push(format!("PATH lookup: certbot found but --version failed: {}", stderr));
+        }
+        Err(e) => {
+            trace.push(format!("PATH lookup: certbot not in service PATH ({})", e));
         }
     }
-    // 2. Ask a login shell where certbot is — picks up /etc/environment,
-    //    /etc/profile.d/*, snap wrappers, pyenv, asdf, pipx, nix, and any
-    //    operator-defined PATH addition. systemd unlike interactive
-    //    shells doesn't source these, so without this we miss many real
-    //    installs in the wild (snap on Ubuntu, pipx on Fedora, /opt on
-    //    Arch derivatives, etc.). We try bash → sh so the call works on
-    //    minimal Alpine/Debian-slim hosts that don't have bash.
+
+    // 2. `which certbot` — same as Step 1 effectively, but useful as
+    //    a sanity-check trace line for operators who already ran it
+    //    in their shell and want to see what the SERVICE sees vs them.
+    if let Ok(out) = Command::new("which").arg("certbot").output() {
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if out.status.success() && !s.is_empty() {
+            if let Some(found) = try_path(&s, "which certbot", &mut trace) {
+                return (Some(found), trace);
+            }
+        } else {
+            trace.push("which certbot: no match in service PATH".to_string());
+        }
+    } else {
+        trace.push("which certbot: command not available".to_string());
+    }
+
+    // 3. `whereis -b certbot` — uses a built-in list of standard
+    //    binary locations, INDEPENDENT of PATH. Catches /usr/bin /
+    //    /usr/local/bin / /opt installs even when systemd's PATH is
+    //    restricted. Output is "certbot: /path1 /path2 ...".
+    if let Ok(out) = Command::new("whereis").args(["-b", "certbot"]).output() {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).to_string();
+            // Skip the "certbot:" prefix, take whitespace-separated paths.
+            let paths: Vec<&str> = s.split_whitespace().filter(|p| p.starts_with('/')).collect();
+            if paths.is_empty() {
+                trace.push("whereis -b: no match".to_string());
+            } else {
+                for p in paths {
+                    if let Some(found) = try_path(p, "whereis -b", &mut trace) {
+                        return (Some(found), trace);
+                    }
+                }
+            }
+        }
+    } else {
+        trace.push("whereis: command not available".to_string());
+    }
+
+    // 4. Login-shell probe — picks up /etc/environment,
+    //    /etc/profile.d/*, snap wrappers, pyenv, asdf, pipx, nix, and
+    //    any operator-defined PATH addition. systemd doesn't source
+    //    these. bash → sh fallback for minimal hosts without bash.
     for shell in &["/bin/bash", "/bin/sh"] {
-        if !std::path::Path::new(shell).exists() { continue; }
-        if let Ok(out) = Command::new(shell)
+        if !std::path::Path::new(shell).exists() {
+            trace.push(format!("{}: shell missing, skipped", shell));
+            continue;
+        }
+        match Command::new(shell)
             .args(["-lc", "command -v certbot"])
             .output()
         {
-            if out.status.success() {
+            Ok(out) if out.status.success() => {
                 let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !path.is_empty() && std::path::Path::new(&path).exists() {
-                    // Sanity-check the binary actually runs.
-                    if let Ok(v) = Command::new(&path).arg("--version").output() {
-                        if v.status.success() {
-                            return Some(path);
-                        }
-                    }
+                if path.is_empty() {
+                    trace.push(format!("{} -lc command -v: empty result", shell));
+                } else if let Some(found) = try_path(&path, &format!("{} -lc", shell), &mut trace) {
+                    return (Some(found), trace);
                 }
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                trace.push(format!("{} -lc: failed: {}", shell, stderr));
+            }
+            Err(e) => {
+                trace.push(format!("{} -lc: spawn failed: {}", shell, e));
             }
         }
     }
-    // 3. Known install locations across distros, package managers, and
+
+    // 5. Known install locations across distros, package managers, and
     //    deployment styles. Order matters: distro packages first (most
-    //    common), then snap (EFF's Ubuntu recommendation), then EFF's
-    //    own virtualenv install, then user-local pip / pipx prefixes.
-    //    /root/* covers `sudo pip install` and `pipx --global` on hosts
-    //    where the WolfStack service runs as root.
-    for cand in &[
-        "/usr/bin/certbot",
-        "/usr/sbin/certbot",
-        "/usr/local/bin/certbot",
-        "/usr/local/sbin/certbot",
-        "/snap/bin/certbot",
-        "/var/lib/snapd/snap/bin/certbot",
-        "/opt/certbot/bin/certbot",
-        "/opt/letsencrypt/certbot",
-        "/opt/eff.org/certbot/venv/bin/certbot",
-        "/root/.local/bin/certbot",
-        "/root/.local/pipx/venvs/certbot/bin/certbot",
-    ] {
-        if std::path::Path::new(cand).exists() {
-            if let Ok(out) = Command::new(cand).arg("--version").output() {
-                if out.status.success() {
-                    return Some((*cand).to_string());
-                }
+    //    common), then snap, then EFF's venv, then user-local pipx.
+    //    /root/* covers sudo pip install on hosts where the WolfStack
+    //    service runs as root. /home/*/.local/bin covers pipx
+    //    installs done as a regular user — we glob through home dirs
+    //    rather than hardcoding usernames.
+    let mut candidates: Vec<String> = vec![
+        "/usr/bin/certbot".to_string(),
+        "/usr/sbin/certbot".to_string(),
+        "/usr/local/bin/certbot".to_string(),
+        "/usr/local/sbin/certbot".to_string(),
+        "/snap/bin/certbot".to_string(),
+        "/var/lib/snapd/snap/bin/certbot".to_string(),
+        "/opt/certbot/bin/certbot".to_string(),
+        "/opt/letsencrypt/certbot".to_string(),
+        "/opt/eff.org/certbot/venv/bin/certbot".to_string(),
+        "/root/.local/bin/certbot".to_string(),
+        "/root/.local/pipx/venvs/certbot/bin/certbot".to_string(),
+    ];
+    // Glob every user's ~/.local/bin/certbot — pipx + pip --user installs
+    // for non-root users. Cheap directory scan, only reads /home entries.
+    if let Ok(entries) = std::fs::read_dir("/home") {
+        for entry in entries.flatten() {
+            let user_path = entry.path().join(".local/bin/certbot");
+            if let Some(s) = user_path.to_str() {
+                candidates.push(s.to_string());
+            }
+            let pipx_path = entry.path().join(".local/pipx/venvs/certbot/bin/certbot");
+            if let Some(s) = pipx_path.to_str() {
+                candidates.push(s.to_string());
             }
         }
     }
-    // 4. Last resort — walk common install roots looking for any
-    //    executable called `certbot`. Bounded depth so we don't trawl
-    //    the whole filesystem on hosts with deep home dirs. Stop on
-    //    the first hit that runs `--version` successfully.
-    for root in &["/usr/local", "/opt", "/snap"] {
+    for cand in &candidates {
+        if std::path::Path::new(cand).exists() {
+            if let Some(found) = try_path(cand, "explicit-list", &mut trace) {
+                return (Some(found), trace);
+            }
+        }
+    }
+    trace.push(format!("explicit-list: none of {} known paths existed", candidates.len()));
+
+    // 6. Last resort — walk common install roots. Bounded depth so we
+    //    don't trawl deep home trees. Includes /home so pipx installs
+    //    in non-standard usernames are still found.
+    for root in &["/usr/local", "/opt", "/snap", "/home"] {
         if !std::path::Path::new(root).exists() { continue; }
         if let Ok(out) = Command::new("find")
-            .args([root, "-maxdepth", "5", "-name", "certbot", "-type", "f", "-executable"])
+            .args([root, "-maxdepth", "6", "-name", "certbot", "-type", "f", "-executable"])
             .output()
         {
             if out.status.success() {
-                for line in String::from_utf8_lossy(&out.stdout).lines() {
+                let s = String::from_utf8_lossy(&out.stdout);
+                let mut any = false;
+                for line in s.lines() {
                     let p = line.trim();
                     if p.is_empty() { continue; }
-                    if let Ok(v) = Command::new(p).arg("--version").output() {
-                        if v.status.success() {
-                            return Some(p.to_string());
-                        }
+                    any = true;
+                    if let Some(found) = try_path(p, &format!("find {}", root), &mut trace) {
+                        return (Some(found), trace);
                     }
+                }
+                if !any {
+                    trace.push(format!("find {}: no matches", root));
                 }
             }
         }
     }
-    None
+
+    (None, trace)
 }
 
 pub fn is_installed() -> bool {
     certbot_path().is_some()
+}
+
+/// Format a verbose "certbot not installed" error including a trace of
+/// every probe that ran. The operator sees exactly which paths were
+/// tried and why each one failed — no need for back-and-forth support
+/// to figure out where their certbot install actually lives.
+pub fn missing_certbot_error() -> String {
+    let (_, trace) = certbot_probe();
+    let mut msg = String::from(
+        "certbot is not installed on this node — the WolfStack service couldn't find it. \
+         If certbot works in your shell but not here, the service runs under systemd with a \
+         restricted environment and may need an explicit path. Probe trace:\n"
+    );
+    for line in trace {
+        msg.push_str("  • ");
+        msg.push_str(&line);
+        msg.push('\n');
+    }
+    msg.push_str(
+        "\nTo install: `apt install certbot` (Debian/Ubuntu), \
+         `dnf install certbot` (Fedora/RHEL), \
+         `pacman -S certbot` (Arch), or follow https://certbot.eff.org/instructions. \
+         If certbot IS installed but in an unusual location, the trace above shows what \
+         WolfStack checked — please report it as a bug so we can add your path to the probe list."
+    );
+    msg
 }
 
 pub fn ensure_webroot(cfg: &CertbotConfig) -> Result<(), String> {
@@ -446,7 +583,7 @@ pub fn issue(
     dry_run: bool,
 ) -> Result<String, String> {
     if !is_installed() {
-        return Err("certbot is not installed on this node".to_string());
+        return Err(missing_certbot_error());
     }
     if domains.is_empty() {
         return Err("at least one domain is required".to_string());
@@ -462,7 +599,7 @@ pub fn issue(
     // where someone uninstalled certbot in the last microseconds, in
     // which case "certbot is not installed" is the right thing to say.
     let certbot_bin = certbot_path()
-        .ok_or_else(|| "certbot is not installed on this node".to_string())?;
+        .ok_or_else(missing_certbot_error)?;
     let mut cmd = Command::new(&certbot_bin);
     cmd.arg("certonly").arg("--non-interactive").arg("--agree-tos");
 
@@ -536,7 +673,7 @@ pub fn issue_via_provider(
     dry_run: bool,
 ) -> Result<String, String> {
     if !is_installed() {
-        return Err("certbot is not installed on this node".to_string());
+        return Err(missing_certbot_error());
     }
     if domains.is_empty() {
         return Err("at least one domain is required".to_string());
@@ -570,7 +707,7 @@ pub fn issue_via_provider(
     // are found — systemd's default PATH doesn't include /snap/bin and
     // pre-fix `Command::new("certbot")` silently failed there.
     let certbot_bin = certbot_path()
-        .ok_or_else(|| "certbot is not installed on this node".to_string())?;
+        .ok_or_else(missing_certbot_error)?;
     let mut cmd = Command::new(&certbot_bin);
     cmd.arg("certonly").arg("--non-interactive").arg("--agree-tos");
     cmd.arg("--email").arg(&resolved_email);
@@ -606,7 +743,7 @@ pub fn issue_via_provider(
 /// window — used when the admin wants to rotate the cert early (e.g.
 /// after changing SANs).
 pub fn renew(name: &str) -> Result<String, String> {
-    let certbot_bin = certbot_path().ok_or_else(|| "certbot is not installed".to_string())?;
+    let certbot_bin = certbot_path().ok_or_else(missing_certbot_error)?;
     let out = Command::new(&certbot_bin)
         .args(["renew", "--non-interactive", "--force-renewal", "--cert-name", name])
         .output()
@@ -624,7 +761,7 @@ pub fn renew(name: &str) -> Result<String, String> {
 /// `/etc/letsencrypt/{live,archive}/<name>` leaves dangling renewal
 /// config in `/etc/letsencrypt/renewal/<name>.conf`.
 pub fn delete(name: &str) -> Result<String, String> {
-    let certbot_bin = certbot_path().ok_or_else(|| "certbot is not installed".to_string())?;
+    let certbot_bin = certbot_path().ok_or_else(missing_certbot_error)?;
     let out = Command::new(&certbot_bin)
         .args(["delete", "--non-interactive", "--cert-name", name])
         .output()
