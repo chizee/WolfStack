@@ -86,14 +86,29 @@ const KNOWN_C2_IP: &str = "83.168.95.185";
 /// from the captured `.bash_history` line.
 const LOCKER_BINARY_PATH: &str = "/usr/local/sbin/locker";
 
-/// Proxmox-stack services the attack masks. Checked individually so
-/// we can name in the finding which units are masked.
-const PROXMOX_MASKED_UNITS: &[&str] = &[
+/// Services the attack typically masks defensively before locking
+/// the GUI. WolfStack and the SSH daemon are included alongside the
+/// Proxmox stack so a host with NO Proxmox installed (a WolfStack
+/// native) still gets equal protection — masking wolfstack.service
+/// would blind the operator's own management plane, masking sshd
+/// would lock them out entirely.
+///
+/// `fail2ban.service` is also here because the attacker's most likely
+/// next move after a successful break-in is to disable the brute-
+/// force watcher so they (and others) can keep hammering SSH.
+const CRITICAL_MASKED_UNITS: &[&str] = &[
+    // Proxmox VE stack
     "pveproxy.service",
     "pvedaemon.service",
     "pve-cluster.service",
     "corosync.service",
     "pvestatd.service",
+    // WolfStack itself — defending the defender
+    "wolfstack.service",
+    // SSH + brute-force protection
+    "ssh.service",
+    "sshd.service",
+    "fail2ban.service",
 ];
 
 /// String fingerprints to grep for in root's `.bash_history`. Each
@@ -145,7 +160,7 @@ pub struct ComprIndicatorFacts {
     /// scan. May have been auto-deleted by the time the analyzer
     /// runs — check `remediations` for the capture+delete outcome.
     pub locker_binary_present: bool,
-    /// Subset of `PROXMOX_MASKED_UNITS` that were masked at scan time.
+    /// Subset of `CRITICAL_MASKED_UNITS` that were masked at scan time.
     /// Auto-unmask is attempted; check `remediations`.
     pub masked_proxmox_units: Vec<String>,
     /// Local sockets currently in any state with KNOWN_C2_IP as the
@@ -363,6 +378,16 @@ fn remediate_locker_binary() -> RemediationOutcome {
     if let Err(e) = append_file(&iocs_path, &iocs_line) {
         tracing::warn!("compromise_indicators: failed to append to {}: {}", iocs_path, e);
     }
+    // Kill any process currently executing the binary BEFORE we
+    // unlink it. On Linux an `unlink()` does not stop a running
+    // process — the kernel keeps the inode alive while it's mapped,
+    // so the attacker's payload continues to do its work until the
+    // process actually exits. `pkill -KILL -f <path>` matches the
+    // full command-line, catching processes that exec'd the binary
+    // by path (the common case here).
+    let _ = std::process::Command::new("pkill")
+        .args(["-KILL", "-f", LOCKER_BINARY_PATH])
+        .output();
     if let Err(e) = std::fs::remove_file(src) {
         return RemediationOutcome {
             action: "capture-and-remove attacker payload".into(),
@@ -371,13 +396,13 @@ fn remediate_locker_binary() -> RemediationOutcome {
         };
     }
     tracing::warn!(
-        "compromise_indicators: captured {} → {} (sha256={}), removed live binary",
+        "compromise_indicators: captured {} → {} (sha256={}), killed running processes, removed live binary",
         LOCKER_BINARY_PATH, dest, sha,
     );
     RemediationOutcome {
         action: "capture-and-remove attacker payload".into(),
         ok: true,
-        detail: format!("captured to {} (sha256 prefix {}) then removed {}", dest, &sha[..16], LOCKER_BINARY_PATH),
+        detail: format!("captured to {} (sha256 prefix {}), killed running processes, then removed {}", dest, &sha[..16], LOCKER_BINARY_PATH),
     }
 }
 
@@ -423,15 +448,22 @@ fn remediate_masked_units(units: &[String]) -> RemediationOutcome {
     // /dev/null symlinks. Without this the service still appears
     // masked to the unit cache.
     let _ = std::process::Command::new("systemctl").arg("daemon-reload").output();
-    // Start in dependency-safe order: pve-cluster (and corosync)
-    // need to be up before pveproxy/pvedaemon. systemctl figures out
-    // dependencies, but listing them in this order doesn't hurt.
-    let start_order: [&str; 5] = [
+    // Start in dependency-safe order: SSH first (so the operator
+    // doesn't get locked out even if a later service fails), then
+    // fail2ban (so the next brute-force attempt is rate-limited),
+    // then the Proxmox cluster filesystem chain, then the GUI, then
+    // WolfStack itself last (it's the watchdog — keeping it up means
+    // future ticks can keep healing other services).
+    let start_order: [&str; 9] = [
+        "ssh.service",
+        "sshd.service",
+        "fail2ban.service",
         "corosync.service",
         "pve-cluster.service",
         "pvedaemon.service",
         "pveproxy.service",
         "pvestatd.service",
+        "wolfstack.service",
     ];
     let mut started: Vec<&str> = Vec::new();
     for unit in start_order.iter().filter(|u| unmasked.iter().any(|um| um == *u)) {
@@ -637,7 +669,7 @@ fn rewrite_root_shell_to_bash(passwd_body: &str) -> String {
     out
 }
 
-/// Iterate `PROXMOX_MASKED_UNITS` and return the ones whose systemd
+/// Iterate `CRITICAL_MASKED_UNITS` and return the ones whose systemd
 /// state is "masked". We check the on-disk symlink directly rather
 /// than shelling out to `systemctl is-enabled`, because (a) it's
 /// faster, (b) a wedged dbus can hang `systemctl`, (c) we want this
@@ -645,7 +677,7 @@ fn rewrite_root_shell_to_bash(passwd_body: &str) -> String {
 /// by the attacker.
 fn inspect_masked_units() -> Vec<String> {
     let mut out = Vec::new();
-    for unit in PROXMOX_MASKED_UNITS {
+    for unit in CRITICAL_MASKED_UNITS {
         if is_unit_masked(unit) {
             out.push((*unit).to_string());
         }
@@ -653,7 +685,7 @@ fn inspect_masked_units() -> Vec<String> {
     out
 }
 
-fn is_unit_masked(unit: &str) -> bool {
+pub fn is_unit_masked(unit: &str) -> bool {
     // The `masked` state on systemd is a symlink to /dev/null, in
     // either /etc/systemd/system/<unit> or /run/systemd/system/<unit>.
     // The first one is what `systemctl mask` writes; the second is
@@ -976,12 +1008,13 @@ fn build_masked_units_proposal(units: &[String], rem: Option<&RemediationOutcome
         FT_PROXMOX_MASKED,
         ProposalSource::Rule,
         Severity::Critical,
-        format!("Proxmox core service(s) masked: {}", unit_list),
+        format!("Critical service(s) masked: {}", unit_list),
         format!(
-            "{} symlinked to /dev/null — this stops Proxmox from starting its web GUI and cluster filesystem. \
-             A normal apt upgrade does NOT mask these units. This is either a deliberate operator action OR \
-             the BootingWorld attack's defensive masking step (which runs before the ransom banner so you \
-             can't `systemctl restart pveproxy` your way out).",
+            "{} symlinked to /dev/null — masked services cannot be started, which blocks the host's \
+             management plane (Proxmox GUI, WolfStack itself, SSH) or its brute-force protection (fail2ban). \
+             A normal apt/dnf upgrade does NOT mask these units. This is either a deliberate operator \
+             action OR the BootingWorld-style attack's defensive masking step (which runs before the ransom \
+             banner so the operator can't `systemctl restart` their way out).",
             unit_list
         ),
         evidence,

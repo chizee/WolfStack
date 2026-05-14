@@ -19439,6 +19439,62 @@ pub async fn predictive_acks_remove(
     }
 }
 
+// ─── Tamper-detection baselines ───────────────────────────────────
+
+/// POST /api/predictive/baselines/reseed/{slug} — operator hook to
+/// re-anchor a tamper-detection baseline after an intentional change
+/// to a security-critical file. Without this, the next tick would
+/// auto-revert the operator's legitimate edit.
+///
+/// Slug shape: `<path>` with leading slash stripped and `/` → `__`.
+/// E.g. `etc__ssh__sshd_config` for `/etc/ssh/sshd_config`. The
+/// operator usually doesn't type slugs by hand — they hit the
+/// "Reseed baseline" button on the proposal card which carries the
+/// slug as part of the URL.
+///
+/// Body: optional `{ "reason": "..." }`. Reason is appended to the
+/// baseline metadata so the audit trail records WHY the reseed
+/// happened and WHO triggered it.
+#[derive(serde::Deserialize, Default)]
+pub struct ReseedBaselineBody {
+    #[serde(default)]
+    pub reason: String,
+}
+
+pub async fn predictive_baselines_reseed(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: Option<web::Json<ReseedBaselineBody>>,
+) -> HttpResponse {
+    let user = match require_auth(&req, &state) {
+        Ok(u) => u,
+        Err(resp) => return resp,
+    };
+    let slug = path.into_inner();
+    // Slug → absolute path. Reject anything that doesn't look like a
+    // baselined system file — defensive against directory-traversal.
+    if slug.contains("..") || slug.starts_with('/') || slug.contains('\0') {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "invalid slug — must be the slug form `etc__ssh__sshd_config`"
+        }));
+    }
+    let file_path = format!("/{}", slug.replace("__", "/"));
+    let reason = body.map(|b| b.into_inner().reason).unwrap_or_default();
+    match crate::predictive::baselines::reseed(&file_path, &user, &reason) {
+        Ok(b) => HttpResponse::Ok().json(serde_json::json!({
+            "success": true,
+            "path": b.path,
+            "sha256": b.sha256,
+            "seeded_at": b.seeded_at,
+            "seeded_by": b.seeded_by,
+        })),
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({
+            "error": format!("reseed {} failed: {}", file_path, e)
+        })),
+    }
+}
+
 // ─── OSV scanner config ───────────────────────────────────────────
 
 /// GET /api/predictive/osv-config — return the current OSV scanner
@@ -26840,6 +26896,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/proposal-acks/{id}", web::delete().to(predictive_acks_remove))
         .route("/api/predictive/osv-config", web::get().to(predictive_osv_config_get))
         .route("/api/predictive/osv-config", web::put().to(predictive_osv_config_put))
+        .route("/api/predictive/baselines/reseed/{slug}", web::post().to(predictive_baselines_reseed))
         // WolfAgents — named AI agents with persistent memory.
         .route("/api/agents", web::get().to(agents_list))
         .route("/api/agents", web::post().to(agents_create))

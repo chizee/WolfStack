@@ -31,6 +31,7 @@ use crate::predictive::{
     threshold, cert_expiry, backup_freshness, vm_disk, security_posture,
     vulnerability, osv, port_conflict, wolfnet_dhcp, wolfnet_reachability,
     docker_wolfnet_collision, missing_subnet_route, compromise_indicators,
+    tamper_detection, threat_intel,
     unused_packages, notify,
 };
 
@@ -121,7 +122,7 @@ pub async fn tick(
     // 1. Sample data sources concurrently with hard timeouts. Each
     //    sampler kills its child process on timeout — stuck NFS or
     //    a wedged docker daemon can no longer hang the orchestrator.
-    let (host_facts, container_facts, restart_facts, failed_units, cert_facts, mem_facts, backup_facts, vm_facts, sshd_cfg, vuln_facts, osv_facts, port_facts, wolfnet_dhcp_facts, wolfnet_reach_facts, docker_wn_collision_facts, missing_route_facts, compromise_facts, unused_pkg_facts) = tokio::join!(
+    let (host_facts, container_facts, restart_facts, failed_units, cert_facts, mem_facts, backup_facts, vm_facts, sshd_cfg, vuln_facts, osv_facts, port_facts, wolfnet_dhcp_facts, wolfnet_reach_facts, docker_wn_collision_facts, missing_route_facts, compromise_facts, tamper_facts, threat_intel_facts, unused_pkg_facts) = tokio::join!(
         disk_fill::sample_disks_now_async(DF_TIMEOUT),
         container_disk::sample_containers_now_async(CONTAINER_SAMPLE_TIMEOUT),
         container_restart::sample_docker_restarts_now_async(CONTAINER_SAMPLE_TIMEOUT),
@@ -139,6 +140,8 @@ pub async fn tick(
         docker_wolfnet_collision::sample_now_async(CONTAINER_SAMPLE_TIMEOUT),
         missing_subnet_route::sample_now_async(SYSTEMD_TIMEOUT),
         compromise_indicators::sample_now_async(SYSTEMD_TIMEOUT),
+        tamper_detection::sample_now_async(SYSTEMD_TIMEOUT),
+        threat_intel::sample_now_async(VULN_SAMPLE_TIMEOUT),
         unused_packages::sample_now_async(VULN_SAMPLE_TIMEOUT),
     );
     // Sample current SystemMetrics off the shared monitor — same
@@ -258,6 +261,12 @@ pub async fn tick(
     let compromise_facts = compromise_indicators::remediate_if_unacked(
         compromise_facts, &acks_snap, &proposals_snap, &ctx,
     ).await;
+    let tamper_facts = tamper_detection::remediate_if_unacked(
+        tamper_facts, &acks_snap, &proposals_snap, &ctx,
+    ).await;
+    let threat_intel_facts = threat_intel::remediate_if_unacked(
+        threat_intel_facts, &acks_snap, &proposals_snap, &ctx,
+    ).await;
 
     // 5. Run every analyzer against the snapshots. No locks held.
     //    Each analyzer is independent — extending the list adds a
@@ -316,6 +325,12 @@ pub async fn tick(
     new_proposals.extend(compromise_indicators::analyze(
         &ctx, &compromise_facts, &acks_snap, &proposals_snap,
     ));
+    new_proposals.extend(tamper_detection::analyze(
+        &ctx, &tamper_facts, &acks_snap, &proposals_snap,
+    ));
+    new_proposals.extend(threat_intel::analyze(
+        &ctx, &threat_intel_facts, &acks_snap, &proposals_snap,
+    ));
     new_proposals.extend(unused_packages::analyze(
         &ctx, &unused_pkg_facts, &vuln_facts, &osv_facts, &acks_snap, &proposals_snap,
     ));
@@ -342,6 +357,8 @@ pub async fn tick(
     covered.extend(docker_wolfnet_collision::covered_scopes(&ctx, &docker_wn_collision_facts));
     covered.extend(missing_subnet_route::covered_scopes(&ctx, &missing_route_facts));
     covered.extend(compromise_indicators::covered_scopes(&ctx, &compromise_facts));
+    covered.extend(tamper_detection::covered_scopes(&ctx, &tamper_facts));
+    covered.extend(threat_intel::covered_scopes(&ctx, &threat_intel_facts));
     covered.extend(unused_packages::covered_scopes(&ctx, &unused_pkg_facts));
     covered.extend(osv::covered_scopes(&ctx, &osv_facts));
     // Mark every PRIOR pending OSV proposal whose target was scanned
