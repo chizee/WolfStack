@@ -7138,8 +7138,14 @@ dns_cloudflare_api_token = your_token_here"
                     <!-- ═══ Threat Intel ═══ -->
                     <div id="wr-tab-threat-intel" class="wr-tab-panel" style="padding:16px; display:none;">
 
-                        <!-- Self-blacklist banner — populated by tiLoadStatus when one or more cluster IPs appear on a feed. Hidden by default. -->
+                        <!-- Self-blacklist banner — populated by tiRenderClusterSelfBanner aggregating all reachable nodes. Hidden by default. -->
                         <div id="ti-self-banner" style="display:none; margin-bottom:16px; padding:14px 16px; background:rgba(220,38,38,0.10); border:1px solid rgba(220,38,38,0.35); border-radius:10px;"></div>
+
+                        <!-- Propagation banner — populated by tiRenderPropagationBanner after a toggle/pause/resume when one or more peers failed to apply the change. -->
+                        <div id="ti-propagation-banner" style="display:none;"></div>
+
+                        <!-- Divergence banner — populated by tiRenderDivergenceBanner whenever the cluster status reveals nodes off-pattern from the majority, regardless of recent operator action. -->
+                        <div id="ti-divergence-banner" style="display:none;"></div>
 
                         <!-- Cluster-wide status table — shows every cluster node's threat-intel state in one place. -->
                         <div style="background:var(--bg-input); border:1px solid var(--border); border-radius:10px; padding:14px 16px; margin-bottom:16px;">

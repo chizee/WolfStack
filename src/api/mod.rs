@@ -910,16 +910,32 @@ fn ti_request_client_ip(req: &HttpRequest) -> Vec<String> {
     if ip.is_empty() { Vec::new() } else { vec![ip] }
 }
 
-/// Fan out an `ipset` install request to every online WolfStack peer
-/// in the cluster, in the background. Used when the local admin flips
-/// Threat Intel to enforce mode — peers will need ipset present when
-/// their own admin (or our future cluster-wide propagation) enables
-/// enforcement there too. Best effort: per-peer 90-second timeout,
-/// failures logged but never propagated to the user.
+/// Per-peer outcome for a cluster-wide threat-intel operation (config
+/// propagation, ipset install, pause/resume). Surfaced back to the
+/// frontend so the operator sees exactly which nodes diverged from the
+/// requested state instead of trusting a fire-and-forget warning log.
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct TiPeerOpResult {
+    pub hostname: String,
+    pub address: String,
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+/// Fan out an `ipset` install request to every online WolfStack peer in
+/// parallel and await the results. Used when the local admin flips
+/// Threat Intel to enforce mode — peers need ipset present before they
+/// can apply kernel rules. Per-peer timeout is 90 seconds (apt/dnf can
+/// genuinely take that long); each peer runs concurrently so total wait
+/// is bounded by the slowest peer, not the sum.
 ///
 /// Skips: this node, offline nodes, non-wolfstack nodes (Proxmox-only
 /// entries can't install packages).
-fn ti_install_ipset_on_peers(state: &web::Data<AppState>) {
+///
+/// Returns one [`TiPeerOpResult`] per attempted peer. The caller — the
+/// HTTP handler that triggered the enforcement change — includes these
+/// in its response so the UI can name the failing nodes.
+async fn ti_install_ipset_on_peers(state: &web::Data<AppState>) -> Vec<TiPeerOpResult> {
     let nodes = state.cluster.get_all_nodes();
     let secret = state.cluster_secret.clone();
     let self_id = state.cluster.self_id.clone();
@@ -927,14 +943,17 @@ fn ti_install_ipset_on_peers(state: &web::Data<AppState>) {
         .filter(|n| !n.is_self && n.id != self_id && n.online && n.node_type == "wolfstack")
         .map(|n| (n.hostname.clone(), n.address.clone(), n.port))
         .collect();
-    if peers.is_empty() { return; }
+    if peers.is_empty() { return Vec::new(); }
 
-    tokio::spawn(async move {
-        let client = &*API_HTTP_CLIENT;
-        let body = serde_json::json!({ "package": "ipset" });
-        for (hostname, address, port) in &peers {
-            let urls = build_node_urls(address, *port, "/api/system/install-package");
-            let mut delivered = false;
+    let client = &*API_HTTP_CLIENT;
+    let body = serde_json::json!({ "package": "ipset" });
+    let mut futures = Vec::with_capacity(peers.len());
+    for (hostname, address, port) in peers {
+        let secret = secret.clone();
+        let client = client.clone();
+        let body = body.clone();
+        futures.push(async move {
+            let urls = build_node_urls(&address, port, "/api/system/install-package");
             for url in &urls {
                 match client.post(url)
                     .timeout(std::time::Duration::from_secs(90))
@@ -944,45 +963,62 @@ fn ti_install_ipset_on_peers(state: &web::Data<AppState>) {
                     .await
                 {
                     Ok(resp) if resp.status().is_success() => {
-                        if let Ok(data) = resp.json::<serde_json::Value>().await {
-                            let ok = data.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
-                            let msg = data.get("message").and_then(|v| v.as_str())
-                                .or_else(|| data.get("error").and_then(|v| v.as_str()))
-                                .unwrap_or("(no message)").to_string();
-                            if ok {
-                                tracing::info!("threat-intel: ipset installed on peer '{}' ({}): {}", hostname, address, msg);
-                            } else {
+                        match resp.json::<serde_json::Value>().await {
+                            Ok(data) => {
+                                let ok = data.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+                                let msg = data.get("message").and_then(|v| v.as_str())
+                                    .or_else(|| data.get("error").and_then(|v| v.as_str()))
+                                    .unwrap_or("(no message)").to_string();
+                                if ok {
+                                    tracing::info!("threat-intel: ipset installed on peer '{}' ({}): {}", hostname, address, msg);
+                                    return TiPeerOpResult { hostname, address, ok: true, error: None };
+                                }
                                 tracing::warn!("threat-intel: ipset install on peer '{}' ({}) reported failure: {}", hostname, address, msg);
+                                return TiPeerOpResult { hostname, address, ok: false, error: Some(msg) };
+                            }
+                            Err(e) => {
+                                return TiPeerOpResult {
+                                    hostname, address, ok: false,
+                                    error: Some(format!("install response unparseable: {}", e)),
+                                };
                             }
                         }
-                        delivered = true;
-                        break;
                     }
                     Ok(resp) => {
                         let status = resp.status();
                         let _ = resp.bytes().await;
                         tracing::warn!("threat-intel: ipset install on peer '{}' ({}) returned HTTP {}", hostname, address, status);
-                        delivered = true;
-                        break;
+                        return TiPeerOpResult {
+                            hostname, address, ok: false,
+                            error: Some(format!("HTTP {}", status)),
+                        };
                     }
                     Err(_) => continue,
                 }
             }
-            if !delivered {
-                tracing::warn!("threat-intel: could not reach peer '{}' ({}) for ipset install — try manually or wait until next enable", hostname, address);
+            tracing::warn!("threat-intel: could not reach peer '{}' ({}) for ipset install", hostname, address);
+            TiPeerOpResult {
+                hostname, address, ok: false,
+                error: Some("unreachable".into()),
             }
-        }
-    });
+        });
+    }
+    futures::future::join_all(futures).await
 }
 
 /// Push the local Threat Intel config to every online WolfStack peer
-/// in the cluster, in the background. Peers receive the unmasked config
+/// in parallel and await the results. Peers receive the unmasked config
 /// (real API keys, not "***") so their own scheduler can actually fetch
-/// feeds. Best effort: per-peer 30s timeout; failures logged.
+/// feeds. Per-peer timeout 30s; nodes run concurrently so the call
+/// completes as soon as the slowest peer responds.
 ///
 /// Cycle-breaker: peers that receive this call have caller == "cluster-node"
 /// in their PATCH handler, which skips the re-propagation step.
-fn ti_propagate_config_to_peers(state: &web::Data<AppState>) {
+///
+/// Returns one [`TiPeerOpResult`] per peer attempted. The caller surfaces
+/// these so the UI can name nodes that didn't apply the change — without
+/// this, a peer in a divergent state was invisible to the operator.
+async fn ti_propagate_config_to_peers(state: &web::Data<AppState>) -> Vec<TiPeerOpResult> {
     let nodes = state.cluster.get_all_nodes();
     let secret = state.cluster_secret.clone();
     let self_id = state.cluster.self_id.clone();
@@ -990,7 +1026,7 @@ fn ti_propagate_config_to_peers(state: &web::Data<AppState>) {
         .filter(|n| !n.is_self && n.id != self_id && n.online && n.node_type == "wolfstack")
         .map(|n| (n.hostname.clone(), n.address.clone(), n.port))
         .collect();
-    if peers.is_empty() { return; }
+    if peers.is_empty() { return Vec::new(); }
 
     // Read the unmasked on-disk config and serialise the full struct.
     // The receiving peer's PATCH handler will use its own ProviderConfig
@@ -1006,11 +1042,14 @@ fn ti_propagate_config_to_peers(state: &web::Data<AppState>) {
         "allowlist": cfg.allowlist,
     });
 
-    tokio::spawn(async move {
-        let client = &*API_HTTP_CLIENT;
-        for (hostname, address, port) in &peers {
-            let urls = build_node_urls(address, *port, "/api/threat-intel/config");
-            let mut delivered = false;
+    let client = &*API_HTTP_CLIENT;
+    let mut futures = Vec::with_capacity(peers.len());
+    for (hostname, address, port) in peers {
+        let secret = secret.clone();
+        let client = client.clone();
+        let payload = payload.clone();
+        futures.push(async move {
+            let urls = build_node_urls(&address, port, "/api/threat-intel/config");
             for url in &urls {
                 match client.patch(url)
                     .timeout(std::time::Duration::from_secs(30))
@@ -1022,24 +1061,33 @@ fn ti_propagate_config_to_peers(state: &web::Data<AppState>) {
                     Ok(resp) if resp.status().is_success() => {
                         let _ = resp.bytes().await;
                         tracing::info!("threat-intel: config propagated to peer '{}' ({})", hostname, address);
-                        delivered = true;
-                        break;
+                        return TiPeerOpResult { hostname, address, ok: true, error: None };
                     }
                     Ok(resp) => {
                         let status = resp.status();
-                        let _ = resp.bytes().await;
-                        tracing::warn!("threat-intel: config push to peer '{}' ({}) returned HTTP {}", hostname, address, status);
-                        delivered = true;
-                        break;
+                        let body = resp.text().await.unwrap_or_default();
+                        // Try to extract a structured error from the JSON body.
+                        let err_msg = serde_json::from_str::<serde_json::Value>(&body)
+                            .ok()
+                            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(|s| s.to_string()))
+                            .unwrap_or_else(|| format!("HTTP {}", status));
+                        tracing::warn!("threat-intel: config push to peer '{}' ({}) failed: {}", hostname, address, err_msg);
+                        return TiPeerOpResult {
+                            hostname, address, ok: false,
+                            error: Some(err_msg),
+                        };
                     }
                     Err(_) => continue,
                 }
             }
-            if !delivered {
-                tracing::warn!("threat-intel: could not reach peer '{}' ({}) for config propagation", hostname, address);
+            tracing::warn!("threat-intel: could not reach peer '{}' ({}) for config propagation", hostname, address);
+            TiPeerOpResult {
+                hostname, address, ok: false,
+                error: Some("unreachable".into()),
             }
-        }
-    });
+        });
+    }
+    futures::future::join_all(futures).await
 }
 
 /// Mask API keys before returning a config to the frontend. Empty fields
@@ -1120,18 +1168,21 @@ pub async fn threat_intel_patch_config(
 
     let new_enforcement = crate::threat_intel::enforcement_active(&cfg);
     let mut apply_error: Option<String> = None;
+    let mut ipset_install_results: Vec<TiPeerOpResult> = Vec::new();
     if new_enforcement != prev_enforcement {
         // The kernel state needs to catch up. Run on a blocking thread —
         // apply_state_change shells out to ipset/iptables-restore.
         match tokio::task::spawn_blocking(crate::threat_intel::apply_state_change).await {
             Ok(Ok(())) => {
                 // Local enforcement just activated — fan out an ipset
-                // install to every online WolfStack peer in the cluster
-                // so they're ready when their own admin enables it. Runs
-                // in the background; we don't block the user's API call
-                // on per-peer install timing.
+                // install to every online WolfStack peer and AWAIT the
+                // results. Previously this was tokio::spawn'd and the
+                // outcome was only logged, so a peer where ipset failed
+                // to install would silently stay in dry-run while the
+                // bastion reported success. Awaiting per-peer (in
+                // parallel) lets us surface the divergence to the UI.
                 if new_enforcement && !from_peer {
-                    ti_install_ipset_on_peers(&state);
+                    ipset_install_results = ti_install_ipset_on_peers(&state).await;
                 }
             }
             Ok(Err(e)) => apply_error = Some(e),
@@ -1140,16 +1191,8 @@ pub async fn threat_intel_patch_config(
         // If the apply failed, roll the config back so on-disk state matches kernel state.
         if apply_error.is_some() {
             let mut rolled = crate::threat_intel::ThreatIntelConfig::load();
-            // Easiest rollback: flip the enable/dry_run/paused fields back.
-            // We do NOT touch other fields the user changed (allowlist, providers) —
-            // only the enforcement transition that just failed.
-            rolled.enabled = if prev_enforcement { true } else { rolled.enabled && false };
-            // Simpler: just restore the prior enforcement triplet by inverting our last change.
-            // Reload and undo via the prev value.
-            // To keep this readable: load latest, then set the three flags to whatever
-            // produced prev_enforcement. We don't know the exact prev triplet without
-            // re-reading earlier state — so just clear `enabled` and `paused`, set
-            // `dry_run = true`. This is the conservative "off" state.
+            // Conservative rollback to the "off" state — preserves user's
+            // allowlist/provider changes but disables enforcement.
             rolled.enabled = false;
             rolled.dry_run = true;
             rolled.paused = false;
@@ -1163,14 +1206,20 @@ pub async fn threat_intel_patch_config(
         }));
     }
 
-    // Cluster-wide propagation. Fire-and-forget — peers process the same
-    // PATCH (with caller=cluster-node) which short-circuits their own
-    // re-propagation, so we won't loop.
+    // Cluster-wide propagation. Peers process the same PATCH (with
+    // caller=cluster-node) which short-circuits their own re-propagation
+    // so we won't loop. Awaited so the response can name peers that
+    // failed to apply the change — see comment on ti_propagate_config_to_peers.
+    let mut propagation_results: Vec<TiPeerOpResult> = Vec::new();
     if !from_peer {
-        ti_propagate_config_to_peers(&state);
+        propagation_results = ti_propagate_config_to_peers(&state).await;
     }
 
-    HttpResponse::Ok().json(ti_mask_keys(crate::threat_intel::ThreatIntelConfig::load()))
+    HttpResponse::Ok().json(serde_json::json!({
+        "config": ti_mask_keys(crate::threat_intel::ThreatIntelConfig::load()),
+        "peers": propagation_results,
+        "ipset_install": ipset_install_results,
+    }))
 }
 
 /// POST /api/threat-intel/refresh — trigger an immediate refresh.
@@ -1190,7 +1239,7 @@ pub async fn threat_intel_pause(req: HttpRequest, state: web::Data<AppState>) ->
     let from_peer = caller == "cluster-node";
     let mut cfg = crate::threat_intel::ThreatIntelConfig::load();
     if cfg.paused {
-        return HttpResponse::Ok().json(serde_json::json!({ "paused": true, "no_op": true }));
+        return HttpResponse::Ok().json(serde_json::json!({ "paused": true, "no_op": true, "peers": [] }));
     }
     cfg.paused = true;
     if let Err(e) = cfg.save() {
@@ -1198,8 +1247,15 @@ pub async fn threat_intel_pause(req: HttpRequest, state: web::Data<AppState>) ->
     }
     match tokio::task::spawn_blocking(crate::threat_intel::apply_state_change).await {
         Ok(Ok(())) => {
-            if !from_peer { ti_propagate_config_to_peers(&state); }
-            HttpResponse::Ok().json(serde_json::json!({ "paused": true }))
+            // Pause is the operator's "emergency off" — awaiting peer
+            // propagation makes "paused" actually mean cluster-wide
+            // paused. Without this, a peer that briefly couldn't be
+            // reached would keep enforcing while the bastion reported
+            // the pause as complete — the worst kind of false
+            // confidence for an emergency control.
+            let mut peers: Vec<TiPeerOpResult> = Vec::new();
+            if !from_peer { peers = ti_propagate_config_to_peers(&state).await; }
+            HttpResponse::Ok().json(serde_json::json!({ "paused": true, "peers": peers }))
         }
         Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("apply task panicked: {}", e) })),
@@ -1212,7 +1268,7 @@ pub async fn threat_intel_resume(req: HttpRequest, state: web::Data<AppState>) -
     let from_peer = caller == "cluster-node";
     let mut cfg = crate::threat_intel::ThreatIntelConfig::load();
     if !cfg.paused {
-        return HttpResponse::Ok().json(serde_json::json!({ "paused": false, "no_op": true }));
+        return HttpResponse::Ok().json(serde_json::json!({ "paused": false, "no_op": true, "peers": [], "ipset_install": [] }));
     }
     cfg.paused = false;
     if let Err(e) = cfg.save() {
@@ -1222,14 +1278,21 @@ pub async fn threat_intel_resume(req: HttpRequest, state: web::Data<AppState>) -
         Ok(Ok(())) => {
             // If unpausing actually re-activated enforcement (the common
             // case — pause was the only thing turning it off), make sure
-            // peers have ipset and the same config.
+            // peers have ipset and the same config. Await both so the
+            // response can name peers where re-activation failed.
+            let mut ipset_install: Vec<TiPeerOpResult> = Vec::new();
+            let mut peers: Vec<TiPeerOpResult> = Vec::new();
             if !from_peer
                 && crate::threat_intel::enforcement_active(&crate::threat_intel::ThreatIntelConfig::load())
             {
-                ti_install_ipset_on_peers(&state);
-                ti_propagate_config_to_peers(&state);
+                ipset_install = ti_install_ipset_on_peers(&state).await;
+                peers = ti_propagate_config_to_peers(&state).await;
             }
-            HttpResponse::Ok().json(serde_json::json!({ "paused": false }))
+            HttpResponse::Ok().json(serde_json::json!({
+                "paused": false,
+                "peers": peers,
+                "ipset_install": ipset_install,
+            }))
         }
         Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("apply task panicked: {}", e) })),

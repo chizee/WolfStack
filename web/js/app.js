@@ -31067,8 +31067,12 @@ const TI_DELISTING = {
 
 function tiRenderTab() {
     tiLoadConfig();
-    tiLoadStatus();
+    // Cluster status drives the big badge, self-blacklist banner, and
+    // divergence banner — kick it off first so those render with
+    // accurate (cluster-wide) values rather than briefly flashing the
+    // bastion-local view that tiLoadStatus would otherwise paint.
     tiLoadClusterStatus();
+    tiLoadStatus();
     tiStartClusterPolling();
 }
 
@@ -31158,10 +31162,149 @@ async function tiLoadClusterStatus() {
         const resp = await fetch(url);
         if (!resp.ok) throw new Error('HTTP ' + resp.status);
         const data = await resp.json();
-        tiRenderClusterStatusTable(data.nodes || []);
+        const rows = data.nodes || [];
+        tiRenderClusterStatusTable(rows);
+        // Re-derive the top-level badge from cluster data so it reflects
+        // the cluster as a whole, not just the bastion the browser hit.
+        tiRenderClusterAwareBadge(rows);
+        // Aggregate self-blacklisted IPs across every reachable node so
+        // the operator sees listings on any node, not just the local one.
+        tiRenderClusterSelfBanner(rows);
+        // Surface lingering divergence (any nodes off-pattern from the
+        // cluster majority) even when the operator didn't just hit a
+        // toggle — e.g. cluster fell out of sync since the last refresh.
+        tiRenderDivergenceBanner(rows);
     } catch (e) {
         target.innerHTML = `<div style="color:var(--danger); font-size:12px;">Failed to load cluster status: ${tiEsc(e.message || e)}</div>`;
     }
+}
+
+// Compute a canonical (enabled, dry_run, paused, applied) tuple for each
+// reachable node and report nodes that diverge from the modal value.
+// Returns { modal: {tuple}, divergent: [rows] }. Unreachable rows are
+// excluded from both — we can't tell what state they're in.
+function tiClusterStateProfile(rows) {
+    const reachable = (rows || []).filter(r => r.status && r.reachable !== false);
+    if (reachable.length === 0) return { modal: null, divergent: [] };
+    const key = s => `${!!s.enabled}|${!!s.dry_run}|${!!s.paused}|${!!s.applied}`;
+    const counts = new Map();
+    for (const r of reachable) {
+        const k = key(r.status);
+        counts.set(k, (counts.get(k) || 0) + 1);
+    }
+    // The "modal" state is whichever tuple the most reachable nodes
+    // report. Ties go to the lexicographically smaller tuple (stable).
+    let modalKey = null, modalCount = -1;
+    for (const [k, c] of counts) {
+        if (c > modalCount || (c === modalCount && (!modalKey || k < modalKey))) {
+            modalKey = k; modalCount = c;
+        }
+    }
+    const divergent = reachable.filter(r => key(r.status) !== modalKey);
+    const [enabled, dry_run, paused, applied] = modalKey.split('|').map(v => v === 'true');
+    return {
+        modal: { enabled, dry_run, paused, applied },
+        divergent,
+    };
+}
+
+// Replace the local-only status badge with a cluster-aware reading.
+// MIXED is shown when any reachable node diverges from the majority —
+// previously the badge showed only the bastion's state, which is
+// misleading when even one node is out of sync.
+function tiRenderClusterAwareBadge(rows) {
+    const badge = document.getElementById('ti-status-badge');
+    if (!badge) return;
+    const profile = tiClusterStateProfile(rows);
+    let label, bg, fg, title;
+    if (!profile.modal) {
+        label = 'UNKNOWN'; bg = 'var(--bg-tertiary)'; fg = 'var(--text-muted)';
+        title = 'No reachable nodes — cannot determine cluster state.';
+    } else if (profile.divergent.length > 0) {
+        label = 'MIXED'; bg = 'rgba(234,179,8,0.18)'; fg = '#fde68a';
+        title = `Cluster state divergent: ${profile.divergent.length} node(s) off-pattern. See divergence banner.`;
+    } else {
+        const m = profile.modal;
+        if (m.paused)                    { label = 'PAUSED';    bg = 'rgba(220,38,38,0.18)';   fg = '#fca5a5'; }
+        else if (m.enabled && !m.dry_run && m.applied) { label = 'ENFORCING'; bg = 'rgba(16,185,129,0.18)';  fg = '#6ee7b7'; }
+        else if (m.enabled && m.dry_run) { label = 'DRY-RUN';   bg = 'rgba(234,179,8,0.18)';   fg = '#fde68a'; }
+        else if (m.enabled)              { label = 'ENABLED';   bg = 'rgba(99,102,241,0.18)';  fg = '#a5b4fc'; }
+        else                             { label = 'OFF';       bg = 'var(--bg-tertiary)';     fg = 'var(--text-muted)'; }
+        title = 'All reachable nodes agree on this state.';
+    }
+    badge.textContent = label;
+    badge.style.background = bg;
+    badge.style.color = fg;
+    badge.title = title;
+}
+
+// Show divergence warning banner above the cluster status table when
+// any reachable node is in a different state than the cluster majority.
+// This catches drift even when the operator hasn't just toggled
+// something — e.g. a node that came back online with stale config.
+function tiRenderDivergenceBanner(rows) {
+    const banner = document.getElementById('ti-divergence-banner');
+    if (!banner) return;
+    const profile = tiClusterStateProfile(rows);
+    if (!profile.divergent.length) {
+        banner.style.display = 'none';
+        banner.innerHTML = '';
+        return;
+    }
+    const stateLabel = (s) => {
+        if (s.paused) return 'PAUSED';
+        if (s.enabled && !s.dry_run && s.applied) return 'ENFORCING';
+        if (s.enabled && s.dry_run) return 'DRY-RUN';
+        if (s.enabled) return 'ENABLED (not applied)';
+        return 'OFF';
+    };
+    const modalLabel = stateLabel(profile.modal);
+    const rowsHtml = profile.divergent.map(r =>
+        `<tr>
+            <td style="padding:4px 8px; font-weight:600;">${tiEsc(r.hostname || r.address)}</td>
+            <td style="padding:4px 8px; color:var(--text-muted); font-family:var(--font-mono); font-size:11px;">${tiEsc(r.address)}</td>
+            <td style="padding:4px 8px; color:#fde68a;">${tiEsc(stateLabel(r.status))}</td>
+        </tr>`).join('');
+    banner.innerHTML = `<div style="padding:12px 14px; background:rgba(234,179,8,0.10); border:1px solid rgba(234,179,8,0.35); border-radius:8px; margin-bottom:12px;">
+        <div style="font-weight:700; font-size:14px; color:#fde68a; margin-bottom:6px;">Cluster state is divergent</div>
+        <div style="font-size:12px; color:var(--text-secondary); margin-bottom:8px; line-height:1.5;">
+            Most reachable nodes report <strong>${modalLabel}</strong>, but the following ${profile.divergent.length} node(s) are off-pattern. Re-apply the most recent state change, or investigate each node directly.
+        </div>
+        <table style="width:100%; border-collapse:collapse; font-size:12px;">
+            <thead><tr style="text-align:left; border-bottom:1px solid var(--border);">
+                <th style="padding:4px 8px;">Node</th>
+                <th style="padding:4px 8px;">Address</th>
+                <th style="padding:4px 8px;">Reported state</th>
+            </tr></thead>
+            <tbody>${rowsHtml}</tbody>
+        </table>
+    </div>`;
+    banner.style.display = '';
+}
+
+// Aggregate self-blacklisted IPs from every reachable node so the
+// operator sees listings on any of their nodes, not only the bastion
+// they happen to be logged into.
+function tiRenderClusterSelfBanner(rows) {
+    const merged = new Map(); // ip -> { ip, hostname?, listed_by: Set }
+    for (const r of rows || []) {
+        const s = r.status;
+        if (!s || !s.self_blacklisted) continue;
+        // /status returns either an array (already-shaped) or a map
+        // (raw ThreatIntelState). Normalise both.
+        const entries = Array.isArray(s.self_blacklisted)
+            ? s.self_blacklisted
+            : Object.entries(s.self_blacklisted).map(([ip, listed_by]) => ({ ip, listed_by }));
+        for (const e of entries) {
+            const key = e.ip;
+            if (!merged.has(key)) merged.set(key, { ip: key, hostname: r.hostname, listed_by: new Set() });
+            for (const pid of (e.listed_by || [])) merged.get(key).listed_by.add(pid);
+        }
+    }
+    const aggregated = Array.from(merged.values()).map(v => ({
+        ip: v.ip, hostname: v.hostname, listed_by: Array.from(v.listed_by),
+    }));
+    tiRenderSelfBanner(aggregated);
 }
 
 function tiBadgeForNode(s) {
@@ -31188,12 +31331,17 @@ function tiRenderClusterStatusTable(rows) {
         if (b.is_self && !a.is_self) return 1;
         return String(a.hostname || '').localeCompare(String(b.hostname || ''));
     });
+    // ipset state is per-node — give it a dedicated column so the user
+    // can see at a glance which nodes need it. Without this the message
+    // got buried in Notes (and was hidden entirely when feed errors were
+    // also present), which was misleading in multi-node clusters.
     const html = `<table style="width:100%; border-collapse:collapse; font-size:12px;">
         <thead>
             <tr style="border-bottom:1px solid var(--border); text-align:left;">
                 <th style="padding:6px 8px; font-weight:600; color:var(--text-secondary);">Node</th>
                 <th style="padding:6px 8px; font-weight:600; color:var(--text-secondary);">Status</th>
                 <th style="padding:6px 8px; font-weight:600; color:var(--text-secondary);">Blocklist</th>
+                <th style="padding:6px 8px; font-weight:600; color:var(--text-secondary);">ipset</th>
                 <th style="padding:6px 8px; font-weight:600; color:var(--text-secondary);">Last refresh</th>
                 <th style="padding:6px 8px; font-weight:600; color:var(--text-secondary);">Notes</th>
             </tr>
@@ -31208,8 +31356,19 @@ function tiRenderClusterStatusTable(rows) {
             const lastCell = s && s.last_refresh_secs
                 ? new Date(s.last_refresh_secs * 1000).toLocaleString()
                 : '<span style="color:var(--text-muted);">never</span>';
-            // Notes column: explicit error from aggregator (offline / unreachable),
-            // or per-provider error counts when reachable.
+            // Dedicated ipset cell: green check if installed, amber warning
+            // if missing, dash when status couldn't be fetched. Tooltip
+            // explains the consequence.
+            let ipsetCell;
+            if (!s) {
+                ipsetCell = '<span style="color:var(--text-muted);">—</span>';
+            } else if (s.ipset_available) {
+                ipsetCell = '<span style="font-size:11px; padding:2px 7px; border-radius:4px; background:rgba(16,185,129,0.18); color:#6ee7b7;" title="ipset is installed; kernel rules can be applied on this node.">installed</span>';
+            } else {
+                ipsetCell = '<span style="font-size:11px; padding:2px 7px; border-radius:4px; background:rgba(234,179,8,0.18); color:#fde68a;" title="ipset is not installed on this node. WolfStack will install it automatically when enforcement is enabled. To install manually: apt install ipset (or your distro\'s equivalent).">missing</span>';
+            }
+            // Notes column: aggregator errors and per-feed errors. ipset
+            // has its own column now so it isn't duplicated here.
             let notes = '';
             if (row.error) {
                 notes = `<span style="color:var(--warning);">${tiEsc(row.error)}</span>`;
@@ -31217,8 +31376,6 @@ function tiRenderClusterStatusTable(rows) {
                 const providerErrors = Object.entries(s.providers || {}).filter(([_, p]) => p && p.last_error);
                 if (providerErrors.length > 0) {
                     notes = `<span style="color:var(--warning);" title="${providerErrors.map(([id, p]) => tiEsc(id + ': ' + p.last_error)).join('\n')}">${providerErrors.length} feed error(s)</span>`;
-                } else if (s.ipset_available === false) {
-                    notes = '<span style="color:var(--warning);">ipset not installed</span>';
                 } else {
                     notes = '<span style="color:var(--text-muted);">—</span>';
                 }
@@ -31227,6 +31384,7 @@ function tiRenderClusterStatusTable(rows) {
                 <td style="padding:6px 8px;">${dot}<strong>${tiEsc(row.hostname || row.address)}</strong>${selfTag}<br><span style="font-size:10px;color:var(--text-muted);font-family:var(--font-mono);">${tiEsc(row.address)}</span></td>
                 <td style="padding:6px 8px;">${tiBadgeForNode(s)}</td>
                 <td style="padding:6px 8px;">${blocklistCell}</td>
+                <td style="padding:6px 8px;">${ipsetCell}</td>
                 <td style="padding:6px 8px;">${lastCell}</td>
                 <td style="padding:6px 8px;">${notes}</td>
             </tr>`;
@@ -31314,28 +31472,26 @@ async function tiLoadStatus() {
         if (!resp.ok) throw new Error('Failed to load status');
         const s = await resp.json();
         _tiCachedStatus = s;
-        tiRenderSelfBanner(s.self_blacklisted);
-        // Status badge
-        const badge = document.getElementById('ti-status-badge');
-        if (badge) {
-            let label, bg, fg;
-            if (s.paused) { label = 'PAUSED'; bg = 'rgba(220,38,38,0.18)'; fg = '#fca5a5'; }
-            else if (s.enforcement_active && s.applied) { label = 'ENFORCING'; bg = 'rgba(16,185,129,0.18)'; fg = '#6ee7b7'; }
-            else if (s.enabled && s.dry_run) { label = 'DRY-RUN'; bg = 'rgba(234,179,8,0.18)'; fg = '#fde68a'; }
-            else if (s.enabled) { label = 'ENABLED'; bg = 'rgba(99,102,241,0.18)'; fg = '#a5b4fc'; }
-            else { label = 'OFF'; bg = 'var(--bg-tertiary)'; fg = 'var(--text-muted)'; }
-            badge.textContent = label;
-            badge.style.background = bg;
-            badge.style.color = fg;
-        }
-        // Status summary text
+        // The big status badge and self-blacklisted banner are now
+        // cluster-aware — they're set by tiLoadClusterStatus's renderers
+        // (tiRenderClusterAwareBadge / tiRenderClusterSelfBanner). We
+        // leave them alone here so a slow cluster-status fetch can't be
+        // overwritten by the local fetch with a less-accurate value.
+        // Status summary text — uses local stats (blocklist size / last
+        // refresh on THIS node only). That's fine; it's labelled implicitly
+        // by being the only summary line, and the per-node table below
+        // shows the same numbers per-node for the cluster view.
         const last = s.last_refresh_secs ? new Date(s.last_refresh_secs * 1000).toLocaleString() : 'never';
         const summary = document.getElementById('ti-status-summary');
         if (summary) {
-            const ipsetMsg = s.ipset_available ? '' : ' <span style="color:var(--warning);"><code>ipset</code> isn\'t installed yet — WolfStack will try to install it automatically the first time you flip to enforce mode.</span>';
+            // No cluster-wide ipset message here — `ipset_available` is
+            // per-node and the local /status call only reflects the bastion
+            // this browser is talking to. A "1 of 6 missing" warning that
+            // looks cluster-wide would be more confusing than helpful.
+            // The cluster status table below shows ipset state per node.
             summary.innerHTML = `Blocklist size: <strong>${s.blocklist_size.toLocaleString()}</strong> entries
                 (${s.blocklist_v4_count.toLocaleString()} IPv4 / ${s.blocklist_v6_count.toLocaleString()} IPv6).
-                Last refresh: <strong>${last}</strong>.${ipsetMsg}`;
+                Last refresh: <strong>${last}</strong>.`;
         }
         // Pause / resume button visibility
         const pauseBtn = document.getElementById('ti-pause-btn');
@@ -31385,6 +31541,56 @@ async function tiLoadStatus() {
     }
 }
 
+// Render the propagation banner above the cluster status table when any
+// peer failed to apply the most recent state change (toggle / pause /
+// resume / refresh). The backend now returns { config, peers, ipset_install }
+// where each peer entry is { hostname, address, ok, error }. Without this
+// banner a peer that silently failed would stay in the divergent state
+// forever — the operator wouldn't know to retry.
+function tiRenderPropagationBanner(peerOps, ipsetOps, operation) {
+    const banner = document.getElementById('ti-propagation-banner');
+    if (!banner) return;
+    const failedPeers = (peerOps || []).filter(p => !p.ok);
+    const failedIpset = (ipsetOps || []).filter(p => !p.ok);
+    if (failedPeers.length === 0 && failedIpset.length === 0) {
+        banner.style.display = 'none';
+        banner.innerHTML = '';
+        return;
+    }
+    let rows = '';
+    failedPeers.forEach(p => {
+        rows += `<tr><td style="padding:4px 8px; font-weight:600;">${tiEsc(p.hostname)}</td>
+            <td style="padding:4px 8px; color:var(--text-muted); font-family:var(--font-mono); font-size:11px;">${tiEsc(p.address)}</td>
+            <td style="padding:4px 8px;">Config propagation</td>
+            <td style="padding:4px 8px; color:#fca5a5;">${tiEsc(p.error || 'unknown error')}</td></tr>`;
+    });
+    failedIpset.forEach(p => {
+        rows += `<tr><td style="padding:4px 8px; font-weight:600;">${tiEsc(p.hostname)}</td>
+            <td style="padding:4px 8px; color:var(--text-muted); font-family:var(--font-mono); font-size:11px;">${tiEsc(p.address)}</td>
+            <td style="padding:4px 8px;">ipset install</td>
+            <td style="padding:4px 8px; color:#fca5a5;">${tiEsc(p.error || 'unknown error')}</td></tr>`;
+    });
+    banner.innerHTML = `<div style="padding:12px 14px; background:rgba(220,38,38,0.08); border:1px solid rgba(220,38,38,0.3); border-radius:8px; margin-bottom:12px;">
+        <div style="font-weight:700; font-size:14px; color:#fca5a5; margin-bottom:6px;">${tiEsc(operation)} — some nodes are in a divergent state</div>
+        <div style="font-size:12px; color:var(--text-secondary); margin-bottom:8px; line-height:1.5;">
+            The change was applied on this node but the listed peers did not converge. They may be running with stale config or out-of-date enforcement. Check each node, then retry the operation.
+        </div>
+        <table style="width:100%; border-collapse:collapse; font-size:12px;">
+            <thead><tr style="text-align:left; border-bottom:1px solid var(--border);">
+                <th style="padding:4px 8px;">Node</th>
+                <th style="padding:4px 8px;">Address</th>
+                <th style="padding:4px 8px;">Stage</th>
+                <th style="padding:4px 8px;">Error</th>
+            </tr></thead>
+            <tbody>${rows}</tbody>
+        </table>
+        <div style="margin-top:8px; display:flex; gap:8px;">
+            <button class="btn btn-sm" onclick="document.getElementById('ti-propagation-banner').style.display='none'">Dismiss</button>
+        </div>
+    </div>`;
+    banner.style.display = '';
+}
+
 async function tiPatchEnableTriple() {
     // Called when the user toggles "Enabled" or "Dry-run" — both go in
     // a single PATCH so the backend's apply_state_change runs at most
@@ -31403,36 +31609,59 @@ async function tiPatchEnableTriple() {
             tiLoadConfig();
             return;
         }
-        showToast('Threat intel updated', 'success');
-        _tiCachedConfig = data;
+        // Backend now returns { config, peers, ipset_install } — render
+        // divergence banner if any peer didn't accept the change.
+        const failedCount = ((data.peers || []).filter(p => !p.ok).length)
+                          + ((data.ipset_install || []).filter(p => !p.ok).length);
+        if (failedCount > 0) {
+            showToast(`Updated on this node, but ${failedCount} peer(s) failed to apply — see banner`, 'warning');
+        } else {
+            showToast('Threat intel updated cluster-wide', 'success');
+        }
+        tiRenderPropagationBanner(data.peers, data.ipset_install, 'Config update');
+        _tiCachedConfig = data.config || data;
         tiLoadStatus();
+        tiLoadClusterStatus();
     } catch (e) {
         showToast('Update failed: ' + e.message, 'error');
         tiLoadConfig();
     }
 }
 
+// Small helper: PATCH /api/threat-intel/config with the given partial
+// body, then surface any peer-propagation failures via the divergence
+// banner. Used by every save-* function so an allowlist or provider
+// change that didn't reach a peer becomes visible instead of silently
+// leaving the cluster split-brained on policy.
+async function tiPatchAndReport(body, opName) {
+    const resp = await fetch('/api/threat-intel/config', {
+        method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data.error || 'Server error');
+    const failed = (data.peers || []).filter(p => !p.ok).length
+                 + (data.ipset_install || []).filter(p => !p.ok).length;
+    if (failed > 0) {
+        showToast(`${opName} saved locally, but ${failed} peer(s) failed to apply — see banner`, 'warning');
+    } else {
+        showToast(`${opName} saved`, 'success');
+    }
+    tiRenderPropagationBanner(data.peers, data.ipset_install, opName);
+    tiLoadClusterStatus();
+    return data;
+}
+
 async function tiSaveRefreshHours() {
     const v = parseInt(document.getElementById('ti-cfg-refresh-hours').value, 10);
     if (isNaN(v) || v < 1 || v > 168) { showToast('Refresh hours must be 1–168', 'error'); return; }
-    try {
-        const resp = await fetch('/api/threat-intel/config', {
-            method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ refresh_hours: v }),
-        });
-        if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).error || 'Server error');
-        showToast('Refresh interval saved', 'success');
-    } catch (e) { showToast(e.message, 'error'); }
+    try { await tiPatchAndReport({ refresh_hours: v }, 'Refresh interval'); }
+    catch (e) { showToast(e.message, 'error'); }
 }
 
 async function tiSaveAllowlist() {
     const lines = document.getElementById('ti-cfg-allowlist').value.split('\n').map(s => s.trim()).filter(Boolean);
-    try {
-        const resp = await fetch('/api/threat-intel/config', {
-            method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ allowlist: lines }),
-        });
-        if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).error || 'Server error');
-        showToast('Allowlist saved', 'success');
-    } catch (e) { showToast(e.message, 'error'); }
+    try { await tiPatchAndReport({ allowlist: lines }, 'Allowlist'); }
+    catch (e) { showToast(e.message, 'error'); }
 }
 
 async function tiSaveProvider(id, needsKey) {
@@ -31453,11 +31682,7 @@ async function tiSaveProvider(id, needsKey) {
     }
     const body = { providers: { [id]: { enabled, api_key: useKey, url_override: '' } } };
     try {
-        const resp = await fetch('/api/threat-intel/config', {
-            method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body),
-        });
-        if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).error || 'Server error');
-        showToast('Provider saved', 'success');
+        await tiPatchAndReport(body, 'Provider config');
         tiLoadConfig();
     } catch (e) { showToast(e.message, 'error'); }
 }
@@ -31481,20 +31706,40 @@ async function tiPause() {
     if (!await wolfConfirm('Pause threat-intel enforcement? The kernel rule will be removed immediately. Configuration is preserved — click Resume to re-activate.', 'Pause enforcement')) return;
     try {
         const resp = await fetch('/api/threat-intel/pause', { method: 'POST' });
-        if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).error || 'Server error');
-        showToast('Enforcement paused', 'success');
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || 'Server error');
+        // Emergency-off must NOT silently leave peers enforcing. Surface
+        // any peer where the pause didn't land so the operator knows
+        // which nodes still need attention.
+        const failed = (data.peers || []).filter(p => !p.ok);
+        if (failed.length > 0) {
+            showToast(`Paused locally, but ${failed.length} peer(s) did not confirm pause — see banner`, 'warning');
+        } else {
+            showToast('Enforcement paused cluster-wide', 'success');
+        }
+        tiRenderPropagationBanner(data.peers, [], 'Pause');
         tiLoadStatus();
         tiLoadConfig();
+        tiLoadClusterStatus();
     } catch (e) { showToast(e.message, 'error'); }
 }
 
 async function tiResume() {
     try {
         const resp = await fetch('/api/threat-intel/resume', { method: 'POST' });
-        if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).error || 'Server error');
-        showToast('Enforcement resumed', 'success');
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || 'Server error');
+        const failedCount = ((data.peers || []).filter(p => !p.ok).length)
+                          + ((data.ipset_install || []).filter(p => !p.ok).length);
+        if (failedCount > 0) {
+            showToast(`Resumed locally, but ${failedCount} peer(s) failed to apply — see banner`, 'warning');
+        } else {
+            showToast('Enforcement resumed cluster-wide', 'success');
+        }
+        tiRenderPropagationBanner(data.peers, data.ipset_install, 'Resume');
         tiLoadStatus();
         tiLoadConfig();
+        tiLoadClusterStatus();
     } catch (e) { showToast(e.message, 'error'); }
 }
 
