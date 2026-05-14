@@ -50346,8 +50346,13 @@ function renderPredictiveInbox() {
                             until you choose to apply it.
                         </div>
                     </div>
-                    <div style="display:flex;gap:8px;">
+                    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
                         <button class="btn btn-sm" onclick="predictiveRunNow()" id="predictive-run-now">Run analyzer now</button>
+                        <span id="threat-intel-toggle-wrap" style="display:none;align-items:center;gap:8px;padding:6px 10px;background:rgba(96,165,250,0.08);border:1px solid rgba(96,165,250,0.25);border-radius:6px;font-size:12px;color:var(--text-secondary);">
+                            <span id="threat-intel-status-label" style="font-weight:600;">Threat-intel blocklist</span>
+                            <span id="threat-intel-status-detail" style="color:var(--text-muted);"></span>
+                            <button class="btn btn-sm" id="threat-intel-toggle-btn" onclick="threatIntelToggle()" style="margin-left:4px;">Loading…</button>
+                        </span>
                     </div>
                 </div>
                 <div class="predictive-split" style="display:flex;align-items:stretch;flex:1;min-height:0;gap:0;">
@@ -50501,6 +50506,12 @@ function renderPredictiveInbox() {
     }
     predictiveSetupSplitter();
     predictiveLoad();
+    // Surface the threat-intel safety switch in the header so the
+    // operator can disable the blocklist immediately if it breaks
+    // anything. Hides itself if the API isn't reachable.
+    if (typeof threatIntelRefreshStatus === 'function') {
+        try { threatIntelRefreshStatus(); } catch (_) {}
+    }
 }
 
 /// Drag-to-resize between the proposals list and the embedded
@@ -52645,6 +52656,85 @@ function predictiveStartBadgePoll() {
     tick();
     predictiveBadgeTimer = setInterval(tick, 60000);
 }
+
+/// Threat-intel blocklist UI toggle. Lives on the Predictive Inbox
+/// header. CRITICAL: this is the safety switch — if the blocklist
+/// ever wrongly blocks legitimate traffic (a Hetzner-recycled IP, an
+/// upstream feed false-positive), the operator clicks Disable and
+/// the iptables rules + ipset are torn down immediately, not at the
+/// next 5-minute tick.
+async function threatIntelRefreshStatus() {
+    const wrap = document.getElementById('threat-intel-toggle-wrap');
+    const detail = document.getElementById('threat-intel-status-detail');
+    const btn = document.getElementById('threat-intel-toggle-btn');
+    if (!wrap || !btn) return;
+    try {
+        const resp = await fetch('/api/predictive/threat-intel/status');
+        if (!resp.ok) {
+            wrap.style.display = 'none';
+            return;
+        }
+        const s = await resp.json();
+        wrap.style.display = 'inline-flex';
+        // Build a concise status string for the chip.
+        if (!s.ipset_available) {
+            detail.textContent = 'ipset not installed';
+            btn.textContent = 'How to install';
+            btn.onclick = () => alert('Run on the affected host:\n\n  apt-get install -y ipset\n\n(or `dnf install -y ipset` on Rocky/RHEL). The next predictive tick (≤5min) will pull the feed and install the iptables rules.');
+            return;
+        }
+        if (s.enabled && s.iptables_rules_present) {
+            detail.textContent = `enforcing · ${s.ipset_entry_count.toLocaleString()} IPs`;
+            btn.textContent = 'Disable';
+            btn.style.background = 'rgba(239,68,68,0.15)';
+            btn.style.color = '#fca5a5';
+            btn.onclick = threatIntelToggle;
+        } else if (s.enabled) {
+            detail.textContent = `enabled but rules missing · ${s.ipset_entry_count.toLocaleString()} IPs ready`;
+            btn.textContent = 'Disable';
+            btn.style.background = '';
+            btn.style.color = '';
+            btn.onclick = threatIntelToggle;
+        } else {
+            detail.textContent = 'disabled';
+            btn.textContent = 'Enable';
+            btn.style.background = 'rgba(34,197,94,0.15)';
+            btn.style.color = '#86efac';
+            btn.onclick = threatIntelToggle;
+        }
+    } catch (e) {
+        wrap.style.display = 'none';
+    }
+}
+
+async function threatIntelToggle() {
+    const btn = document.getElementById('threat-intel-toggle-btn');
+    if (!btn) return;
+    const wasEnabled = btn.textContent === 'Disable';
+    const verb = wasEnabled ? 'disable' : 'enable';
+    if (!confirm(
+        wasEnabled
+            ? 'Disable threat-intel blocklist enforcement on THIS node?\n\nThe iptables DROP rules and the wolfstack_blocklist ipset will be removed immediately. Use this if the blocklist is wrongly blocking legitimate traffic.'
+            : 'Enable threat-intel blocklist enforcement on this node?\n\nThe next predictive tick (≤5 minutes) will pull the FireHOL Level 1 feed and install iptables DROP rules. Local interface IPs, cluster peer IPs, RFC1918 ranges, and Tailscale 100.64.0.0/10 are all auto-allowlisted.'
+    )) return;
+    btn.disabled = true;
+    btn.textContent = wasEnabled ? 'Disabling…' : 'Enabling…';
+    try {
+        const resp = await fetch(`/api/predictive/threat-intel/${verb}`, { method: 'POST' });
+        const j = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+            alert((j.error || `HTTP ${resp.status}`));
+        }
+    } catch (e) {
+        alert('Request failed: ' + ((e && e.message) || String(e)));
+    } finally {
+        btn.disabled = false;
+        threatIntelRefreshStatus();
+    }
+}
+
+window.threatIntelRefreshStatus = threatIntelRefreshStatus;
+window.threatIntelToggle = threatIntelToggle;
 
 window.renderPredictiveInbox = renderPredictiveInbox;
 window.predictiveRunNow = predictiveRunNow;

@@ -19495,6 +19495,51 @@ pub async fn predictive_baselines_reseed(
     }
 }
 
+// ─── Threat-intel safety switch ───────────────────────────────────
+//
+// The threat-intel blocklist installs iptables DROP rules. If
+// something breaks (we got the bogon filter wrong, an upstream feed
+// false-positive, a Hetzner-recycled IP that's also our cluster's
+// IP), the operator needs a one-click way to turn the blocklist
+// off WITHOUT waiting for the next 5-minute predictive tick. These
+// three endpoints are the safety switch the UI button calls.
+
+pub async fn predictive_threat_intel_status(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    HttpResponse::Ok().json(crate::predictive::threat_intel::status_snapshot())
+}
+
+pub async fn predictive_threat_intel_enable(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    match crate::predictive::threat_intel::enable_for_operator() {
+        Ok(()) => HttpResponse::Ok().json(serde_json::json!({
+            "success": true,
+            "note": "threat-intel enabled — the next predictive tick (≤5min) will pull the feed and install iptables rules",
+        })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+    }
+}
+
+pub async fn predictive_threat_intel_disable(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    match crate::predictive::threat_intel::disable_for_operator() {
+        Ok(()) => HttpResponse::Ok().json(serde_json::json!({
+            "success": true,
+            "note": "threat-intel disabled — iptables DROP rules removed and ipset destroyed; cluster traffic should flow normally",
+        })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+    }
+}
+
 // ─── OSV scanner config ───────────────────────────────────────────
 
 /// GET /api/predictive/osv-config — return the current OSV scanner
@@ -26897,6 +26942,9 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/predictive/osv-config", web::get().to(predictive_osv_config_get))
         .route("/api/predictive/osv-config", web::put().to(predictive_osv_config_put))
         .route("/api/predictive/baselines/reseed/{slug}", web::post().to(predictive_baselines_reseed))
+        .route("/api/predictive/threat-intel/status", web::get().to(predictive_threat_intel_status))
+        .route("/api/predictive/threat-intel/enable", web::post().to(predictive_threat_intel_enable))
+        .route("/api/predictive/threat-intel/disable", web::post().to(predictive_threat_intel_disable))
         // WolfAgents — named AI agents with persistent memory.
         .route("/api/agents", web::get().to(agents_list))
         .route("/api/agents", web::post().to(agents_create))

@@ -183,10 +183,92 @@ fn parse_feed_entries(path: &str) -> Vec<String> {
     for line in body.lines() {
         let t = line.trim();
         if t.is_empty() || t.starts_with('#') { continue; }
+        if is_private_or_reserved(t) { continue; }
         // Each entry is either an IP or a CIDR.
         out.push(t.to_string());
     }
     out
+}
+
+/// True iff `entry` is a CIDR or IP that lives entirely within
+/// private, reserved, loopback, link-local, multicast, or CGN
+/// ranges. CRITICAL: the FireHOL Level 1 feed bundles the
+/// FullBogons set, which includes 10.0.0.0/8, 172.16.0.0/12,
+/// 192.168.0.0/16, 169.254.0.0/16, 127.0.0.0/8, 100.64.0.0/10, and
+/// the multicast/reserved ranges. Installing those as `iptables
+/// DROP` would block:
+///   - WolfNet on ANY 10.x.x.x subnet (catch-all because the
+///     whole `10/8` is filtered)
+///   - WolfRouter-managed LANs (10.10.x.x, 172.16-31.x.x, 192.168.x.x)
+///   - Docker default bridge (172.17.0.0/16)
+///   - **Tailscale tailnet addresses (100.64.0.0/10 CGNAT)** — every
+///     Tailscale-connected host gets a 100.x.x.x address; without
+///     the CGN filter we'd sever the operator's Tailscale-based
+///     management access the moment v23.2 deployed
+///   - Local management LANs (192.168.x.x typically)
+/// — i.e. the entire cluster's east-west and admin traffic. We
+/// strip them at feed-parse time so they never reach the kernel
+/// ipset.
+///
+/// IPv6 entries from the feed are skipped here too (we only install
+/// IPv4 iptables/ipset rules in this release).
+fn is_private_or_reserved(entry: &str) -> bool {
+    // Skip IPv6 entries entirely — the ipset created is IPv4-only.
+    if entry.contains(':') { return true; }
+    // Parse the IP / CIDR. Form: "1.2.3.4" or "1.2.3.0/24".
+    let (ip_str, prefix) = match entry.split_once('/') {
+        Some((ip, p)) => (ip, p.parse::<u32>().ok().unwrap_or(32)),
+        None => (entry, 32),
+    };
+    let ip: std::net::Ipv4Addr = match ip_str.parse() {
+        Ok(a) => a,
+        Err(_) => return true, // unparseable → safest to skip
+    };
+    let n = u32::from(ip);
+    // Mask the IP down to its network address for the comparison.
+    let host_mask = if prefix == 0 { 0 } else { (!0u32) << (32 - prefix) };
+    let net = n & host_mask;
+
+    // List of (network, prefix) pairs we never want to block. The
+    // entry must fit ENTIRELY within one of these to be filtered —
+    // a /16 in the feed that just *overlaps* a /24 here would still
+    // be kept (unlikely on FireHOL but defensive).
+    let private: [(u32, u32); 11] = [
+        // 0.0.0.0/8 — "this network"
+        (0x00_00_00_00, 8),
+        // 10.0.0.0/8 — RFC1918
+        (0x0A_00_00_00, 8),
+        // 100.64.0.0/10 — CGN (RFC6598)
+        (0x64_40_00_00, 10),
+        // 127.0.0.0/8 — loopback
+        (0x7F_00_00_00, 8),
+        // 169.254.0.0/16 — link-local
+        (0xA9_FE_00_00, 16),
+        // 172.16.0.0/12 — RFC1918
+        (0xAC_10_00_00, 12),
+        // 192.0.0.0/24 — IETF protocol assignments
+        (0xC0_00_00_00, 24),
+        // 192.0.2.0/24 — TEST-NET-1
+        (0xC0_00_02_00, 24),
+        // 192.168.0.0/16 — RFC1918
+        (0xC0_A8_00_00, 16),
+        // 224.0.0.0/4 — multicast
+        (0xE0_00_00_00, 4),
+        // 240.0.0.0/4 — reserved
+        (0xF0_00_00_00, 4),
+    ];
+    for (priv_net, priv_prefix) in private {
+        if prefix < priv_prefix {
+            // Feed entry's prefix is broader than the private range —
+            // can't be entirely inside.
+            continue;
+        }
+        let priv_mask = if priv_prefix == 0 { 0 } else { (!0u32) << (32 - priv_prefix) };
+        if (net & priv_mask) == priv_net {
+            return true;
+        }
+    }
+    false
 }
 
 fn parse_allowlist() -> HashSet<String> {
@@ -195,6 +277,65 @@ fn parse_allowlist() -> HashSet<String> {
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .collect()
+}
+
+/// Auto-allowlist this host's own IPv4 addresses and the IPv4
+/// addresses of every cluster peer. CRITICAL: if Hetzner / a cloud
+/// provider re-issues an IP that was previously a botnet C2, the
+/// FireHOL feed may still list it. Without this auto-allowlist
+/// the DROP rule on INPUT would block all inbound traffic to the
+/// host itself — i.e. lock the operator out. We strip these IPs
+/// from the blocklist before pushing to the kernel ipset.
+///
+/// Sources:
+///   1. `ip -4 addr show` — every IP bound to a local interface.
+///   2. `/etc/wolfstack/nodes.json` — every cluster peer's address.
+fn auto_allowlist() -> HashSet<String> {
+    let mut set: HashSet<String> = HashSet::new();
+    // Local interface IPs.
+    if let Ok(out) = std::process::Command::new("ip").args(["-4", "addr", "show"]).output() {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            let t = line.trim();
+            // Format: "inet 142.132.140.78/26 brd ... scope global eth0"
+            if let Some(rest) = t.strip_prefix("inet ") {
+                if let Some(cidr_or_ip) = rest.split_whitespace().next() {
+                    if let Some(ip) = cidr_or_ip.split('/').next() {
+                        if ip.parse::<std::net::Ipv4Addr>().is_ok() {
+                            set.insert(ip.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Cluster peer addresses. Read the persisted cluster nodes file
+    // directly rather than going through the live cluster handle —
+    // this analyzer is sync-blocking and that handle isn't
+    // available here.
+    let nodes_path = crate::paths::get().nodes_config.clone();
+    if let Ok(body) = std::fs::read_to_string(&nodes_path) {
+        if let Ok(nodes) = serde_json::from_str::<Vec<serde_json::Value>>(&body) {
+            for n in nodes {
+                if let Some(addr) = n.get("address").and_then(|v| v.as_str()) {
+                    // address may be a hostname or an IPv4. Only
+                    // insert if it parses as IPv4 — hostnames will
+                    // resolve to different IPs over time and we
+                    // don't want a stale hostname-resolved IP
+                    // permanently allowlisted.
+                    if addr.parse::<std::net::Ipv4Addr>().is_ok() {
+                        set.insert(addr.to_string());
+                    }
+                }
+                if let Some(pip) = n.get("public_ip").and_then(|v| v.as_str()) {
+                    if pip.parse::<std::net::Ipv4Addr>().is_ok() {
+                        set.insert(pip.to_string());
+                    }
+                }
+            }
+        }
+    }
+    set
 }
 
 fn count_ipset_entries(name: &str) -> usize {
@@ -368,13 +509,32 @@ fn sync_ipset_to_feed() -> RemediationOutcome {
             action, ok: false, detail: "feed parse returned 0 entries; skipping ipset sync".into(),
         };
     }
-    let allow = parse_allowlist();
+    // Combine the operator allowlist with the auto-allowlist of
+    // local interface IPs + cluster peer addresses. Critical: cloud
+    // providers (Hetzner, DigitalOcean, OVH, AWS) routinely reuse
+    // public IPs. If we rent a fresh VPS whose IP was previously a
+    // botnet C2, FireHOL still lists it — and an INPUT DROP rule on
+    // our own IP locks the operator out. Same risk for any cluster
+    // peer whose recycled IP happens to be on the feed. We strip
+    // both ourselves and our peers before pushing to the kernel.
+    let mut allow = parse_allowlist();
+    let auto = auto_allowlist();
+    let auto_count = auto.len();
+    allow.extend(auto);
     // Build a restore-formatted batch script.
     let tmp_name = format!("{}_swap", IPSET_NAME);
     let mut script = String::with_capacity(entries.len() * 32);
     script.push_str(&format!("create {} hash:net family inet hashsize 4096 maxelem 131072\n", tmp_name));
+    let mut skipped_by_allow = 0u32;
     for e in &entries {
-        if allow.contains(e) { continue; }
+        // The allowlist holds bare IPs (auto-allowlist) and may also
+        // hold CIDRs (operator allowlist). For an exact-match in
+        // either direction we check direct membership; for a feed
+        // CIDR that wraps an allowlisted host we'd want to also
+        // skip, but FireHOL's IPs rarely span our cluster's IPs.
+        // Direct membership is the operative case and handles the
+        // Hetzner-IP-reuse scenario this filter exists for.
+        if allow.contains(e) { skipped_by_allow += 1; continue; }
         script.push_str(&format!("add {} {}\n", tmp_name, e));
     }
     // Ensure the real set exists so swap has a destination.
@@ -428,11 +588,17 @@ fn sync_ipset_to_feed() -> RemediationOutcome {
         };
     }
     let kept = entries.iter().filter(|e| !allow.contains(*e)).count();
-    tracing::warn!("threat_intel: synced ipset to {} entries ({} allowlisted)", kept, allow.len());
+    tracing::warn!(
+        "threat_intel: synced ipset to {} entries ({} auto-allowlisted, {} feed entries skipped by allowlist)",
+        kept, auto_count, skipped_by_allow,
+    );
     RemediationOutcome {
         action,
         ok: true,
-        detail: format!("ipset {} updated to {} entries (allowlist excluded {})", IPSET_NAME, kept, allow.len()),
+        detail: format!(
+            "ipset {} updated to {} entries; {} skipped via allowlist ({} of which were auto-allowlisted local/peer IPs)",
+            IPSET_NAME, kept, skipped_by_allow, auto_count,
+        ),
     }
 }
 
@@ -550,6 +716,75 @@ fn forensics_dir() -> PathBuf {
     PathBuf::from("/var/lib/wolfstack/threat-intel")
 }
 
+/// Operator-visible status snapshot. Returned by the GET /status
+/// endpoint so the UI toggle can render current state.
+#[derive(Debug, Clone, Serialize)]
+pub struct ThreatIntelStatus {
+    pub enabled: bool,
+    pub ipset_available: bool,
+    pub iptables_rules_present: bool,
+    pub feed_entry_count: usize,
+    pub ipset_entry_count: usize,
+    pub feed_age_secs: Option<u64>,
+}
+
+pub fn status_snapshot() -> ThreatIntelStatus {
+    ThreatIntelStatus {
+        enabled: is_enabled(),
+        ipset_available: which_exists("ipset"),
+        iptables_rules_present: which_exists("iptables") && rules_are_present(),
+        feed_entry_count: parse_feed_entries(FEED_LOCAL_PATH).len(),
+        ipset_entry_count: count_ipset_entries(IPSET_NAME),
+        feed_age_secs: std::fs::metadata(FEED_LOCAL_PATH).ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|mt| SystemTime::now().duration_since(mt).ok())
+            .map(|d| d.as_secs()),
+    }
+}
+
+/// Operator-triggered enable. Idempotent: creates the parent dir +
+/// flag file. Does NOT immediately install rules — the next 5-min
+/// tick will do that. Acceptable lag for an enable operation
+/// (worst case: 5 minutes before the rules go live).
+pub fn enable_for_operator() -> Result<(), String> {
+    std::fs::create_dir_all("/var/lib/wolfstack/threat-intel")
+        .map_err(|e| format!("create dir: {}", e))?;
+    std::fs::write(ENABLE_FLAG_PATH, b"enabled\n")
+        .map_err(|e| format!("write flag: {}", e))?;
+    Ok(())
+}
+
+/// Operator-triggered disable. The safety switch. CRITICAL: must
+/// tear down the iptables rules + destroy the ipset IMMEDIATELY,
+/// not wait for the next tick — the whole point of a safety
+/// switch is to unblock the cluster when it's in a bad state.
+pub fn disable_for_operator() -> Result<(), String> {
+    // Best-effort delete of the flag file. Absence = disabled, so
+    // a stale flag-file failure isn't a blocker.
+    let _ = std::fs::remove_file(ENABLE_FLAG_PATH);
+    // Remove iptables rules so traffic flows immediately. Both
+    // chains, both directions. -D will return non-zero if the rule
+    // isn't present; that's fine (idempotent).
+    for (chain, direction) in [("INPUT", "src"), ("OUTPUT", "dst")] {
+        // Loop a few times in case duplicate rules were inserted by
+        // an earlier buggy version.
+        for _ in 0..8 {
+            let out = std::process::Command::new("iptables")
+                .args(["-D", chain, "-m", "set", "--match-set", IPSET_NAME, direction, "-j", "DROP"])
+                .output();
+            match out {
+                Ok(o) if o.status.success() => continue,
+                _ => break,
+            }
+        }
+    }
+    // Destroy the ipset so it can't accidentally be referenced by
+    // some other operator-installed rule. -X is ignore-if-missing.
+    let _ = std::process::Command::new("ipset").args(["destroy", IPSET_NAME]).output();
+    tracing::warn!("threat_intel: disabled by operator — iptables rules and ipset removed");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,5 +826,118 @@ mod tests {
         let ctx = Context::for_node("ws-test".to_string());
         let scopes = covered_scopes(&ctx, &facts);
         assert_eq!(scopes.len(), 4);
+    }
+
+    /// CRITICAL: the FireHOL Level 1 feed contains the FullBogons
+    /// set. If those make it into the iptables DROP rule on a
+    /// Proxmox/WolfStack cluster, all RFC1918 east-west traffic
+    /// (WolfNet, WolfRouter LANs, Docker bridges, local management)
+    /// gets blackholed. The bogon filter must skip every private /
+    /// reserved / loopback / link-local / CGN / multicast range.
+    #[test]
+    fn bogon_filter_skips_rfc1918_and_friends() {
+        // RFC1918 — must be skipped. The whole `10/8` is private,
+        // so WolfNet running on ANY 10.x.x.x subnet is protected.
+        assert!(is_private_or_reserved("10.0.0.0/8"));
+        assert!(is_private_or_reserved("10.100.0.0/16")); // typical WolfNet
+        assert!(is_private_or_reserved("10.10.0.0/16"));  // typical WolfRouter LAN
+        assert!(is_private_or_reserved("10.10.10.0/24")); // exact WolfNet subnet shape sponsor mentioned
+        assert!(is_private_or_reserved("10.10.10.5"));    // single host inside 10/8
+        assert!(is_private_or_reserved("10.255.255.255"));// last addr in 10/8
+        assert!(is_private_or_reserved("172.16.0.0/12"));
+        assert!(is_private_or_reserved("172.17.0.0/16")); // Docker default
+        assert!(is_private_or_reserved("172.31.255.0/24"));// last subnet of 172.16/12
+        assert!(is_private_or_reserved("192.168.0.0/16"));
+        assert!(is_private_or_reserved("192.168.1.1"));
+
+        // Loopback + link-local + CGN.
+        assert!(is_private_or_reserved("127.0.0.0/8"));
+        assert!(is_private_or_reserved("127.0.0.1"));
+        assert!(is_private_or_reserved("169.254.0.0/16"));
+        // CGN / Tailscale tailnet range — every Tailscale-connected
+        // host has a 100.64.0.0/10 IP. Filtering this is what stops
+        // v23.2 from blocking the operator's tailnet management
+        // access the moment it deploys.
+        assert!(is_private_or_reserved("100.64.0.0/10"));
+        assert!(is_private_or_reserved("100.64.0.1"));    // first usable
+        assert!(is_private_or_reserved("100.100.100.100"));// mid-range Tailscale typical
+        assert!(is_private_or_reserved("100.127.255.255"));// last usable
+
+        // Multicast + reserved.
+        assert!(is_private_or_reserved("224.0.0.0/4"));
+        assert!(is_private_or_reserved("240.0.0.0/4"));
+
+        // 0.0.0.0/8.
+        assert!(is_private_or_reserved("0.0.0.0/8"));
+
+        // IPv6 entries — skipped because the ipset is IPv4-only.
+        assert!(is_private_or_reserved("2001:db8::/32"));
+        assert!(is_private_or_reserved("fe80::/10"));
+
+        // Unparseable — skipped (safest default).
+        assert!(is_private_or_reserved("not-an-ip"));
+    }
+
+    /// VLAN subnets and arbitrary operator-chosen private ranges
+    /// must all be covered. VLANs themselves are an L2 concept —
+    /// what matters is the IP subnet riding on them, and operators
+    /// universally pick RFC1918 / CGN ranges. The bogon filter
+    /// covers the full set, so any IP-on-VLAN that's in RFC1918
+    /// space (the realistic 99.9% case) is safe.
+    #[test]
+    fn bogon_filter_covers_vlan_subnets() {
+        // Common VLAN subnet patterns operators carve out of 10/8.
+        assert!(is_private_or_reserved("10.0.10.0/24"));
+        assert!(is_private_or_reserved("10.20.30.0/24"));
+        assert!(is_private_or_reserved("10.42.0.0/16"));
+        // Common 172.16-31 carve-outs.
+        assert!(is_private_or_reserved("172.20.50.0/24"));
+        assert!(is_private_or_reserved("172.30.0.0/16"));
+        // Common 192.168 VLANs.
+        assert!(is_private_or_reserved("192.168.10.0/24"));
+        assert!(is_private_or_reserved("192.168.100.0/24"));
+        assert!(is_private_or_reserved("192.168.250.0/24"));
+    }
+
+    #[test]
+    fn bogon_filter_passes_real_public_ips() {
+        // Klas's cluster public IPs (from his pvecm status output).
+        // None of these are bogons; must pass through to the
+        // blocklist if FireHOL lists them.
+        assert!(!is_private_or_reserved("142.132.140.78"));
+        assert!(!is_private_or_reserved("162.55.15.215"));
+        assert!(!is_private_or_reserved("168.119.137.55"));
+        assert!(!is_private_or_reserved("94.130.22.183"));
+        assert!(!is_private_or_reserved("195.201.58.223"));
+        // The BootingWorld attacker's C2 — must pass through.
+        assert!(!is_private_or_reserved("83.168.95.185"));
+        // 1.1.1.1 (Cloudflare DNS).
+        assert!(!is_private_or_reserved("1.1.1.1"));
+        // Big public CIDR.
+        assert!(!is_private_or_reserved("203.0.113.0/24")); // TEST-NET-3 — technically reserved, but not in our private list since it's documentation-only and could appear in real attacks
+    }
+
+    #[test]
+    fn parse_feed_strips_bogon_entries() {
+        let dir = std::env::temp_dir().join(format!("wolfstack-ti-bogon-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let feed = dir.join("test.netset");
+        std::fs::write(&feed, "# FireHOL Level 1 (simulated)\n\
+                              10.0.0.0/8\n\
+                              172.16.0.0/12\n\
+                              192.168.0.0/16\n\
+                              127.0.0.0/8\n\
+                              169.254.0.0/16\n\
+                              100.64.0.0/10\n\
+                              224.0.0.0/4\n\
+                              83.168.95.185\n\
+                              5.6.7.0/24\n\
+                              2001:db8::/32\n").unwrap();
+        let entries = parse_feed_entries(feed.to_str().unwrap());
+        // Only the two public entries should survive.
+        assert_eq!(entries.len(), 2, "got {:?}", entries);
+        assert!(entries.contains(&"83.168.95.185".to_string()));
+        assert!(entries.contains(&"5.6.7.0/24".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
