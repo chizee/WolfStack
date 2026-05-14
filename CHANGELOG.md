@@ -8,6 +8,8 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v23.5.1: per-CVE upgrade commands + no more wrong-PM menus** _(2026-05-14 — [`3cfc4af`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/3cfc4af7134592dca74c6d1e539fd4e16e18fa97))_
+- **v23.5.0: CVE inbox grouped by exploit category (klasSponsor)** _(2026-05-14 — [`af68f5f`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/af68f5f0d65bb38ed6f8ee13ce6e8c53de68fb33))_
 - **v23.4.1: certbot detection — verbose error trace + whereis probe** _(2026-05-14 — [`ef0863f`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/ef0863f1d0668e7f0dc9a2654bad97d275006c7a))_
 - **v23.4.0: per-cluster threat-intel + robust certbot detection** _(2026-05-14 — [`c176e00`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/c176e004bdf682cafb55c4525644f1b19b0d849b))_
 - **v23.3.2: hotfix — threat-intel UI back to working state** _(2026-05-14 — [`4f776a7`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/4f776a77e5d31dd87aeb4a2ddaa0003da42431b2))_
