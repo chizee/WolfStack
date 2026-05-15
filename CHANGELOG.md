@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v23.6.0: provider-agnostic vSwitch (VLAN + routed public IPs) with multi-distro persistence and pre-flight safety** _(2026-05-15 — [`b0e417c`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/b0e417cdd0dfc974f4029024b44d5f92889ba239))_
 - **v23.5.3: setup.sh installs apparmor explicitly on Debian/SUSE** _(2026-05-15 — [`f143902`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/f143902e1fc165f5517ba47478cba8ae31dedc32))_
 - **v23.5.2: fix invisible settings/delete icons in sidebar node tree** _(2026-05-14 — [`0945083`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/09450833e46ee709ad03f7b416bde90f9e0c0817))_
 - **v23.5.1: per-CVE upgrade commands + no more wrong-PM menus** _(2026-05-14 — [`3cfc4af`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/3cfc4af7134592dca74c6d1e539fd4e16e18fa97))_
