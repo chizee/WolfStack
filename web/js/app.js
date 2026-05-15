@@ -14229,7 +14229,7 @@ async function vlanSave(existingId) {
     const parent = document.getElementById('vlan-parent').value;
     const vlanId = parseInt(document.getElementById('vlan-id').value, 10);
     const mtu = parseInt(document.getElementById('vlan-mtu').value, 10);
-    const bridge = document.getElementById('vlan-bridge').value.trim();
+    let bridge = document.getElementById('vlan-bridge').value.trim();
     const subnet = document.getElementById('vlan-subnet').value.trim();
     const selfIp = document.getElementById('vlan-self-ip').value.trim();
     const notes = document.getElementById('vlan-notes').value.trim();
@@ -14241,8 +14241,27 @@ async function vlanSave(existingId) {
             return m ? { destination: m[1], via: m[2] } : null;
         })
         .filter(r => r);
-    if (!name || !parent || !subnet || !selfIp || !bridge) {
-        showToast('All fields except notes and routes are required', 'error');
+    // Auto-fill bridge name to vmbr<vlan_id> if the operator left it
+    // empty (matches the placeholder convention). Cheap correctness fix
+    // — better than failing validation for a field we can derive.
+    if (!bridge && vlanId > 0) {
+        bridge = `vmbr${vlanId}`;
+        const bridgeEl = document.getElementById('vlan-bridge');
+        if (bridgeEl) bridgeEl.value = bridge;
+    }
+    // Validate every required field individually so the operator knows
+    // exactly which one is empty. The previous "all fields are required"
+    // toast left them hunting through the dialog.
+    const missing = [];
+    if (!name) missing.push('Name');
+    if (!parent) missing.push('Parent NIC (no physical NIC was selected — open the Networking page first so WolfStack can detect interfaces)');
+    if (!Number.isInteger(vlanId) || vlanId < 1 || vlanId > 4094) missing.push('VLAN ID (must be 1-4094)');
+    if (!Number.isInteger(mtu) || mtu < 576 || mtu > 9216) missing.push('MTU (must be 576-9216)');
+    if (!bridge) missing.push('Bridge name');
+    if (!subnet) missing.push('Subnet (CIDR)');
+    if (!selfIp) missing.push('This server\'s IP on the subnet');
+    if (missing.length > 0) {
+        showToast(`Missing or invalid: ${missing.join(', ')}`, 'error', 8000);
         return;
     }
     const body = {
@@ -14543,6 +14562,273 @@ async function publicIpDelete(id, name) {
     } catch (e) {
         showToast(`Delete failed: ${e.message || e}`, 'error');
     }
+}
+
+// ─── Discover & import existing VLAN config ────────────────────────
+//
+// Scans the kernel for VLAN topologies already configured on this host
+// and lets the operator import the WolfStack-shaped ones directly.
+// Topologies WolfStack can't reproduce (vlan-aware bridges, Proxmox-
+// style) get a clear "don't add this through WolfStack — you'd
+// conflict" warning so the operator stops and reads.
+
+async function vlanShowDiscover() {
+    let data;
+    try {
+        const resp = await fetch(apiUrl('/api/networking/vlan/discover'));
+        if (!resp.ok) {
+            showToast('Discovery failed', 'error');
+            return;
+        }
+        data = await resp.json();
+    } catch (e) {
+        showToast(`Discovery failed: ${e.message || e}`, 'error');
+        return;
+    }
+    const found = data.discovered || [];
+    if (found.length === 0) {
+        showModal(`<div style="color:var(--text-secondary); font-size:13px;">
+            No existing VLAN configuration was detected on this host. WolfStack scanned the running kernel for VLAN sub-interfaces and vlan-aware bridges and found nothing. Use <strong>Add VLAN</strong> to configure one from scratch.
+        </div>`, 'Import existing');
+        return;
+    }
+
+    const renderItem = (d, idx) => {
+        const colour = d.kind === 'importable' ? '#22c55e'
+            : d.kind === 'sub_interface_only' ? '#fbbf24'
+            : '#ef4444';
+        const heading = d.kind === 'importable' ? 'Importable'
+            : d.kind === 'sub_interface_only' ? 'VLAN sub-interface (no bridge)'
+            : 'VLAN-aware bridge — incompatible with WolfStack';
+        const canImport = d.kind === 'importable' && !d.already_managed;
+        const importBtn = canImport
+            ? `<button class="btn btn-sm btn-primary" id="import-btn-${idx}" data-idx="${idx}">Import</button>`
+            : (d.already_managed
+                ? `<span style="color:var(--text-muted); font-size:11px;">already managed</span>`
+                : '');
+        return `
+            <div style="padding:10px 12px; background:${colour}10; border:1px solid ${colour}40; border-radius:6px; margin-bottom:8px;">
+                <div style="display:flex; align-items:center; gap:8px; margin-bottom:6px;">
+                    <span style="font-weight:600; color:${colour}; font-size:13px;">${vlanEsc(heading)}</span>
+                    <span style="margin-left:auto;">${importBtn}</span>
+                </div>
+                <div style="font-size:12px; color:var(--text-secondary); font-family:var(--font-mono); margin-bottom:6px;">
+                    parent <strong>${vlanEsc(d.parent_iface)}</strong> · VID <strong>${d.vlan_id}</strong>${d.bridge_name ? ` · bridge <strong>${vlanEsc(d.bridge_name)}</strong>` : ''}${d.self_ip ? ` · ${vlanEsc(d.self_ip)}` : ''}${d.subnet ? ` (${vlanEsc(d.subnet)})` : ''}${d.mtu ? ` · MTU ${d.mtu}` : ''}
+                </div>
+                <div style="font-size:11px; color:var(--text-muted); line-height:1.5;">${vlanEsc(d.note)}</div>
+            </div>`;
+    };
+
+    showModal(`
+        <div style="font-size:13px; color:var(--text-secondary); margin-bottom:12px;">
+            Found ${found.length} VLAN configuration${found.length === 1 ? '' : 's'} on this host.
+            <strong>Importable</strong> ones can be taken over by WolfStack with one click;
+            <strong>incompatible topologies</strong> (Proxmox vlan-aware bridges, etc.) need to be migrated manually before WolfStack can manage them — read each note carefully.
+        </div>
+        ${found.map(renderItem).join('')}
+    `, 'Import existing VLAN config');
+
+    // Wire up the per-item Import buttons. The modal is built via
+    // showModal which appends to body; we find the buttons by id and
+    // attach handlers that POST to vlan_upsert with a synthesised
+    // VlanAttachment built from the discovered values.
+    found.forEach((d, idx) => {
+        const btn = document.getElementById(`import-btn-${idx}`);
+        if (!btn) return;
+        btn.addEventListener('click', async () => {
+            await vlanImportDiscovered(d, btn);
+        });
+    });
+}
+
+async function vlanImportDiscovered(d, btn) {
+    const subnet = d.subnet || '';
+    const selfIp = d.self_ip || '';
+    if (!subnet || !selfIp) {
+        showToast('Cannot import: no IP/subnet detected on the bridge. Configure an address first or add the VLAN manually.', 'error', 8000);
+        return;
+    }
+    // Build a VlanAttachment from the discovered values. Provider is
+    // best-guess Custom unless the VID falls in Hetzner's range —
+    // operator can edit afterward.
+    const provider = (d.vlan_id >= 4000 && d.vlan_id <= 4091) ? 'hetzner' : 'custom';
+    const body = {
+        id: '',
+        name: `imported-vlan-${d.vlan_id}`,
+        provider,
+        parent_iface: d.parent_iface,
+        vlan_id: d.vlan_id,
+        mtu: d.mtu || (provider === 'hetzner' ? 1400 : 1500),
+        bridge_name: d.bridge_name || `vmbr${d.vlan_id}`,
+        subnet,
+        self_ip: selfIp,
+        routes: [],
+        notes: 'Imported from existing host configuration. Edit to refine.',
+    };
+    btn.disabled = true;
+    btn.textContent = 'Importing...';
+    try {
+        // Use ack_critical=true on import — the kernel state already
+        // matches what we'd be applying (we just discovered it from
+        // there), so any preflight finding about existing devices is
+        // expected and benign.
+        const resp = await fetch(apiUrl('/api/networking/vlan/attachments?ack_critical=true'), {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify(body),
+        });
+        const result = await resp.json();
+        if (!resp.ok) {
+            showToast(result.error || 'Import failed', 'error');
+            btn.disabled = false;
+            btn.textContent = 'Import';
+            return;
+        }
+        showToast(`Imported VLAN ${d.vlan_id}`, 'success');
+        btn.textContent = 'Imported';
+        loadNetworking();
+    } catch (e) {
+        showToast(`Import failed: ${e.message || e}`, 'error');
+        btn.disabled = false;
+        btn.textContent = 'Import';
+    }
+}
+
+// ─── Import VLAN config from another server (paste) ────────────────
+//
+// The operator copies their working `/etc/network/interfaces` from
+// another machine, pastes it into a textarea, and we extract every
+// VLAN block. Each becomes a "Use as template" candidate that opens
+// the Add VLAN dialog pre-filled. The operator still needs to pick a
+// different self IP (we make that obvious in the recommendation text).
+
+function vlanShowImportFromServer() {
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);z-index:100001;display:flex;align-items:center;justify-content:center';
+    const modal = document.createElement('div');
+    modal.style.cssText = 'background:var(--bg-card,#1e2028);border:1px solid var(--border-color,#2d2f3a);border-radius:12px;padding:22px 26px;max-width:680px;width:94%;max-height:88vh;overflow-y:auto;box-shadow:0 20px 60px rgba(0,0,0,0.5);color:var(--text-primary,#e4e4e7);font-family:inherit';
+    modal.innerHTML = `
+        <div style="font-size:16px; font-weight:600; color:var(--accent-light,#60a5fa); margin-bottom:6px;">Import VLAN config from another server</div>
+        <div style="font-size:12px; color:var(--text-secondary); margin-bottom:14px; line-height:1.55;">
+            Paste the full <code>/etc/network/interfaces</code> file from a working server here. WolfStack will extract every VLAN definition it finds and offer them as templates for setting up this server.
+            <br><br>
+            We support both common topologies:
+            <strong>WolfStack-shape</strong> (separate VLAN sub-interface on a physical NIC + plain bridge) and
+            <strong>Proxmox vlan-aware bridge</strong> (single bridge with <code>bridge-vlan-aware yes</code>).
+            Either way you'll get usable values; for the Proxmox case we also flag what to change so the new server doesn't conflict.
+        </div>
+        <textarea id="vlan-import-text" rows="12" style="width:100%; box-sizing:border-box; font-family:var(--font-mono); font-size:12px; background:var(--bg-input); border:1px solid var(--border); border-radius:6px; padding:10px; color:var(--text-primary); resize:vertical;"
+            placeholder="auto vlan4000&#10;iface vlan4000 inet static&#10;        address 10.0.1.5/24&#10;        mtu 1400&#10;        vlan-raw-device vmbr0&#10;        up ip route add 10.0.0.0/16 via 10.0.1.1 dev vlan4000"></textarea>
+        <div id="vlan-import-results" style="margin-top:12px;"></div>
+        <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:14px;">
+            <button id="vli-cancel" style="background:var(--bg-secondary,#2d2f3a);color:var(--text-primary,#e4e4e7);border:1px solid var(--border-color,#3d3f4a);border-radius:6px;padding:8px 18px;cursor:pointer;font-size:13px;">Close</button>
+            <button id="vli-parse" style="background:var(--accent,#3b82f6);color:#fff;border:none;border-radius:6px;padding:8px 18px;cursor:pointer;font-size:13px;">Parse</button>
+        </div>`;
+    overlay.appendChild(modal);
+    (document.fullscreenElement || document.body).appendChild(overlay);
+
+    modal.querySelector('#vli-cancel').addEventListener('click', () => overlay.remove());
+    modal.querySelector('#vli-parse').addEventListener('click', async () => {
+        const text = modal.querySelector('#vlan-import-text').value;
+        if (!text.trim()) {
+            showToast('Paste a config first', 'warning');
+            return;
+        }
+        const resultsEl = modal.querySelector('#vlan-import-results');
+        resultsEl.innerHTML = '<div style="color:var(--text-muted); font-size:12px;">Parsing...</div>';
+        try {
+            const resp = await fetch(apiUrl('/api/networking/vlan/parse-config'), {
+                method: 'POST',
+                headers: {'Content-Type':'application/json'},
+                body: JSON.stringify({ format: 'ifupdown', content: text }),
+            });
+            const data = await resp.json();
+            if (!resp.ok) {
+                resultsEl.innerHTML = `<div style="color:#ef4444; font-size:12px;">${vlanEsc(data.error || 'Parse failed')}</div>`;
+                return;
+            }
+            const parsed = data.parsed || [];
+            if (parsed.length === 0) {
+                resultsEl.innerHTML = `<div style="padding:10px 12px; background:rgba(234,179,8,0.10); border:1px solid rgba(234,179,8,0.30); border-radius:6px; font-size:12px; color:var(--text-secondary);">
+                    No VLAN definitions found in the pasted config. WolfStack looks for <code>iface vlanNNN</code> blocks or <code>iface DEV.NNN</code> blocks with a <code>vlan-raw-device</code> line. Make sure you pasted the <em>full</em> file.
+                </div>`;
+                return;
+            }
+            resultsEl.innerHTML = `
+                <div style="font-size:12px; color:var(--text-secondary); margin-bottom:8px;">Found ${parsed.length} VLAN${parsed.length === 1 ? '' : 's'}:</div>
+                ${parsed.map((p, idx) => {
+                    const colour = p.source_topology === 'physical_parent' ? '#22c55e' : '#fbbf24';
+                    const topology = p.source_topology === 'physical_parent'
+                        ? 'WolfStack-shape (separate VLAN sub-interface)'
+                        : 'Vlan-aware bridge (Proxmox-style)';
+                    return `
+                    <div style="padding:10px 12px; background:${colour}10; border:1px solid ${colour}40; border-radius:6px; margin-bottom:8px;">
+                        <div style="display:flex; align-items:center; gap:8px; margin-bottom:6px;">
+                            <span style="font-weight:600; color:${colour}; font-size:13px;">VLAN ${p.vlan_id}</span>
+                            <span style="font-size:11px; color:var(--text-muted);">${vlanEsc(topology)}</span>
+                            <span style="margin-left:auto;">
+                                <button class="btn btn-sm btn-primary" id="vli-use-${idx}" data-idx="${idx}">Use as template</button>
+                            </span>
+                        </div>
+                        <div style="font-size:12px; color:var(--text-secondary); font-family:var(--font-mono); margin-bottom:6px;">
+                            raw-device <strong>${vlanEsc(p.raw_device)}</strong>${p.self_ip ? ` · self-IP <strong>${vlanEsc(p.self_ip)}</strong>` : ''}${p.subnet ? ` · subnet <strong>${vlanEsc(p.subnet)}</strong>` : ''}${p.mtu ? ` · MTU <strong>${p.mtu}</strong>` : ''}
+                        </div>
+                        ${p.routes && p.routes.length > 0 ? `<div style="font-size:11px; color:var(--text-muted); font-family:var(--font-mono); margin-bottom:6px;">routes: ${p.routes.map(r => `${vlanEsc(r.destination)} via ${vlanEsc(r.via)}`).join('; ')}</div>` : ''}
+                        <div style="font-size:11px; color:var(--text-muted); line-height:1.5;">${vlanEsc(p.recommendation)}</div>
+                    </div>`;
+                }).join('')}`;
+            // Wire up per-candidate "Use as template" buttons.
+            parsed.forEach((p, idx) => {
+                const btn = modal.querySelector(`#vli-use-${idx}`);
+                if (!btn) return;
+                btn.addEventListener('click', () => {
+                    overlay.remove();
+                    vlanUseAsTemplate(p);
+                });
+            });
+        } catch (e) {
+            resultsEl.innerHTML = `<div style="color:#ef4444; font-size:12px;">Parse failed: ${vlanEsc(e.message || String(e))}</div>`;
+        }
+    });
+}
+
+// Open the Add VLAN dialog pre-filled with values from a parsed
+// candidate. For the WolfStack-shape topology we copy parent_iface
+// straight across; for vlan-aware-bridge we leave parent_iface BLANK
+// so the operator must pick the underlying physical NIC explicitly
+// (the source's vlan-raw-device was a bridge, not a physical NIC).
+// We always blank out self_ip — it WILL conflict with the source.
+function vlanUseAsTemplate(parsed) {
+    const isWolfStackShape = parsed.source_topology === 'physical_parent';
+    const provider = (parsed.vlan_id >= 4000 && parsed.vlan_id <= 4091) ? 'hetzner' : 'custom';
+    const ex = {
+        id: '',
+        name: `imported-vlan-${parsed.vlan_id}`,
+        provider,
+        // Only copy raw_device as parent if it was a physical NIC.
+        // Leaving blank for vlan-aware-bridge case forces the operator
+        // to pick correctly (the source bridge isn't valid here).
+        parent_iface: isWolfStackShape ? parsed.raw_device : '',
+        vlan_id: parsed.vlan_id,
+        mtu: parsed.mtu || (provider === 'hetzner' ? 1400 : 1500),
+        bridge_name: `vmbr${parsed.vlan_id}`,
+        subnet: parsed.subnet || '',
+        // Blank self_ip — operator MUST pick a different one.
+        self_ip: '',
+        routes: parsed.routes || [],
+        notes: `Imported as template from another server. Source IP was ${parsed.self_ip || '(none)'} — pick a different one for this server.`,
+    };
+    vlanShowAddDialog(ex);
+    // Briefly highlight the self-IP field so the operator notices it.
+    setTimeout(() => {
+        const ipEl = document.getElementById('vlan-self-ip');
+        if (ipEl) {
+            ipEl.style.borderColor = '#fbbf24';
+            ipEl.style.boxShadow = '0 0 0 3px rgba(234,179,8,0.20)';
+            ipEl.placeholder = 'PICK A DIFFERENT IP than the source';
+            ipEl.focus();
+        }
+    }, 100);
 }
 
 async function vlanShowPreview() {
@@ -14916,6 +15202,8 @@ async function vlanSaveReservations(vlan) {
 // Expose to window so onclick handlers can find them.
 window.vlanShowAddDialog = vlanShowAddDialog;
 window.vlanShowPreview = vlanShowPreview;
+window.vlanShowDiscover = vlanShowDiscover;
+window.vlanShowImportFromServer = vlanShowImportFromServer;
 window.vlanProviderChanged = vlanProviderChanged;
 window.vlanSyncBridgeName = vlanSyncBridgeName;
 window.vlanSave = vlanSave;

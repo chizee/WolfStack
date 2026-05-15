@@ -7416,6 +7416,8 @@ dns_cloudflare_api_token = your_token_here"
                         </div>
                     </div>
                     <div style="display:flex; gap:6px;">
+                        <button class="btn btn-sm" onclick="vlanShowDiscover()" title="Detect VLANs already configured on THIS host and import them into WolfStack management"><span class="ws-icon-clean-wrap" data-icon="settings"></span> Import existing</button>
+                        <button class="btn btn-sm" onclick="vlanShowImportFromServer()" title="Paste a working /etc/network/interfaces from ANOTHER server and use it as a template"><span class="ws-icon-clean-wrap" data-icon="settings"></span> Import from another server</button>
                         <button class="btn btn-sm" onclick="vlanShowPreview()" title="Show the config snippet that would be written"><span class="ws-icon-clean-wrap" data-icon="settings"></span> Preview config</button>
                         <button class="btn btn-sm btn-primary" onclick="vlanShowAddDialog()"><span class="ws-icon-clean-wrap" data-icon="add"></span> Add VLAN</button>
                         <button class="btn btn-sm btn-primary" onclick="publicIpShowAddDialog()"><span class="ws-icon-clean-wrap" data-icon="add"></span> Add Public IP</button>

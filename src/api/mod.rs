@@ -10412,6 +10412,51 @@ pub async fn vlan_preview(req: HttpRequest, state: web::Data<AppState>) -> HttpR
     }))
 }
 
+/// POST /api/networking/vlan/parse-config — parse a pasted
+/// `/etc/network/interfaces` from another server and return any VLAN
+/// definitions found. Used by the "import from another server" flow:
+/// operator copies a working config from machine A and uses the parsed
+/// values as a template for machine B.
+#[derive(Deserialize)]
+pub struct ParseConfigRequest {
+    /// For now, only "ifupdown" is supported. Future: netplan, networkd.
+    #[serde(default)]
+    pub format: String,
+    pub content: String,
+}
+
+pub async fn vlan_parse_config(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<ParseConfigRequest>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let body = body.into_inner();
+    // Default to ifupdown if format is empty/unknown — that's the only
+    // parser we have today and the user's pasting Debian-style config.
+    let parsed = if body.format.is_empty() || body.format == "ifupdown" {
+        crate::networking::vlan::parse_ifupdown_text(&body.content)
+    } else {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": format!("unsupported config format '{}'; only 'ifupdown' is supported in this version", body.format),
+        }));
+    };
+    HttpResponse::Ok().json(serde_json::json!({ "parsed": parsed }))
+}
+
+/// GET /api/networking/vlan/discover — read kernel state and report
+/// any VLAN topologies already configured on this host. Lets the
+/// operator import existing config rather than re-creating it (or, in
+/// the case of incompatible topologies like vlan-aware bridges, gives
+/// them a clear "don't add this through WolfStack, you'd conflict"
+/// warning).
+pub async fn vlan_discover(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let store = crate::networking::vlan::VlanStore::load();
+    let found = crate::networking::vlan::discover(&store);
+    HttpResponse::Ok().json(serde_json::json!({ "discovered": found }))
+}
+
 /// POST /api/networking/vlan/preflight — run safety checks against the
 /// current store + an optional proposed VlanAttachment. Returns the
 /// findings so the UI can render disruption warnings before commit.
@@ -27690,6 +27735,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/networking/vlan", web::get().to(vlan_list))
         .route("/api/networking/vlan/preview", web::get().to(vlan_preview))
         .route("/api/networking/vlan/preflight", web::post().to(vlan_preflight))
+        .route("/api/networking/vlan/discover", web::get().to(vlan_discover))
+        .route("/api/networking/vlan/parse-config", web::post().to(vlan_parse_config))
         .route("/api/networking/vlan/apply", web::post().to(vlan_apply))
         .route("/api/networking/vlan/attachments", web::post().to(vlan_upsert))
         .route("/api/networking/vlan/attachments/{id}", web::delete().to(vlan_remove))

@@ -278,6 +278,608 @@ pub struct PublicIpAttachment {
 // Persistence
 // ────────────────────────────────────────────────────────────────────
 
+// ────────────────────────────────────────────────────────────────────
+// Discovery — detect VLAN topologies that already exist on the host
+// ────────────────────────────────────────────────────────────────────
+//
+// Operators with existing servers (especially Proxmox boxes already
+// configured for a vSwitch) typically already have VLANs in place.
+// Re-creating them through WolfStack's UI would either duplicate
+// (kernel allows two interfaces with the same VID on the same parent
+// — confusing) or fail outright. This discovery pass reads the kernel
+// state and surfaces what's there so the operator can either import,
+// skip, or migrate.
+//
+// Two main topologies in the wild:
+//
+// 1. **WolfStack-shaped**: separate VLAN sub-interface (e.g.
+//    `eno1.4000`) on the parent NIC, plain bridge on top
+//    (e.g. `vmbr4000`) with the sub-iface as a member. This is what
+//    the WolfStack apply path generates — directly importable.
+//
+// 2. **VLAN-aware bridge** (Proxmox default for vSwitch setups):
+//    a single bridge with `vlan_filtering=1` and the parent NIC as a
+//    port, plus a `vlanN` interface using the bridge as raw device
+//    for IP termination on a specific VID. This is a different
+//    topology — WolfStack can't reproduce it without a different
+//    apply path, so we surface it as "not importable" with a clear
+//    explanation.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveredVlan {
+    /// What kind of topology we detected.
+    pub kind: DiscoveredKind,
+    /// Parent interface (eno1, vmbr0, etc.).
+    pub parent_iface: String,
+    /// VLAN ID on the wire.
+    pub vlan_id: u32,
+    /// Bridge name if we found one for this VID, otherwise None.
+    pub bridge_name: Option<String>,
+    /// Self IP on the bridge or VLAN interface, if any.
+    pub self_ip: Option<String>,
+    /// Subnet derived from the address prefix, if any.
+    pub subnet: Option<String>,
+    /// MTU we observed on the VLAN sub-interface or vlan-aware bridge port.
+    pub mtu: Option<u32>,
+    /// True if this VLAN is already in WolfStack's store.
+    pub already_managed: bool,
+    /// Human-readable explanation of what we found and what to do.
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoveredKind {
+    /// Separate VLAN sub-interface + plain bridge — directly importable.
+    Importable,
+    /// VLAN-aware bridge pattern (Proxmox-style) — can't import, would
+    /// conflict if the operator added a WolfStack-shaped VLAN for the
+    /// same VID on the same physical NIC.
+    VlanAwareBridge,
+    /// VLAN sub-interface with no bridge — operator's using it directly.
+    /// Importable as a manual reservation but no bridge to attach guests.
+    SubInterfaceOnly,
+}
+
+/// Walk the kernel state and report VLAN topologies. Read-only — no
+/// modifications to the host.
+pub fn discover(store: &VlanStore) -> Vec<DiscoveredVlan> {
+    let mut out = Vec::new();
+    let already: std::collections::HashSet<(String, u32)> = store.vlans.iter()
+        .map(|v| (v.parent_iface.clone(), v.vlan_id))
+        .collect();
+
+    let links = list_link_details();
+
+    // 1. Find every VLAN sub-interface (kind=vlan).
+    for l in &links {
+        if !l.is_vlan { continue; }
+        let parent = l.vlan_parent.clone().unwrap_or_default();
+        let vid = l.vlan_id.unwrap_or(0);
+        if vid == 0 { continue; }
+
+        // Is this sub-interface a member of some bridge?
+        let bridge_member = l.master.clone();
+
+        let (self_ip, subnet) = primary_ipv4(&l.name)
+            .or_else(|| bridge_member.as_ref().and_then(|b| primary_ipv4(b)))
+            .map(|(ip, prefix)| (Some(ip.clone()), Some(format!("{}/{}", network_addr(&ip, prefix), prefix))))
+            .unwrap_or((None, None));
+
+        let kind = if bridge_member.is_some() {
+            DiscoveredKind::Importable
+        } else {
+            DiscoveredKind::SubInterfaceOnly
+        };
+        let already_managed = already.contains(&(parent.clone(), vid));
+        let note = match (kind, already_managed) {
+            (_, true) => "Already managed by WolfStack — skip.".to_string(),
+            (DiscoveredKind::Importable, false) => format!(
+                "Sub-interface {} attached to bridge {}. Click Import to take over management.",
+                l.name, bridge_member.as_deref().unwrap_or("?"),
+            ),
+            (DiscoveredKind::SubInterfaceOnly, false) => format!(
+                "Sub-interface {} has no bridge — guests can't attach to a bridge that isn't there. \
+                 Importing would create the bridge from this point forward.",
+                l.name,
+            ),
+            (DiscoveredKind::VlanAwareBridge, false) => unreachable!(),
+        };
+
+        out.push(DiscoveredVlan {
+            kind,
+            parent_iface: parent,
+            vlan_id: vid,
+            bridge_name: bridge_member,
+            self_ip,
+            subnet,
+            mtu: Some(l.mtu),
+            already_managed,
+            note,
+        });
+    }
+
+    // 2. Find vlan-aware bridges and the VIDs they handle. These are
+    //    bridges with kind=bridge AND vlan_filtering=1. The actual
+    //    IP-bearing interfaces are typically `vlanN` ifupdown stanzas
+    //    that use the bridge as their raw device — those don't show
+    //    up as kind=vlan in `ip link` (they're managed by ifupdown's
+    //    vconfig wrapper). Read /etc/network/interfaces for the VID
+    //    list as a best-effort detection.
+    for l in &links {
+        if !l.is_vlan_aware_bridge { continue; }
+        // Read /etc/network/interfaces for `bridge-vids` and `vlan-raw-device <this bridge>`.
+        let interfaces_path = "/etc/network/interfaces";
+        let interfaces_content = std::fs::read_to_string(interfaces_path).unwrap_or_default();
+        let mut found_vids: Vec<u32> = Vec::new();
+        // Look for `iface vlanNNN inet ...` blocks that have
+        // `vlan-raw-device <l.name>` somewhere inside.
+        let mut current_iface: Option<String> = None;
+        let mut current_uses_this_bridge = false;
+        for line in interfaces_content.lines() {
+            let t = line.trim();
+            if let Some(rest) = t.strip_prefix("iface ") {
+                // Flush previous block.
+                if let Some(name) = current_iface.take() {
+                    if current_uses_this_bridge {
+                        if let Some(vid) = name.strip_prefix("vlan").and_then(|s| s.parse::<u32>().ok()) {
+                            found_vids.push(vid);
+                        }
+                    }
+                }
+                current_iface = rest.split_whitespace().next().map(|s| s.to_string());
+                current_uses_this_bridge = false;
+            } else if t.starts_with("vlan-raw-device") || t.starts_with("vlan_raw_device") {
+                if let Some(dev) = t.split_whitespace().nth(1) {
+                    if dev == l.name { current_uses_this_bridge = true; }
+                }
+            }
+        }
+        // Flush trailing block.
+        if let Some(name) = current_iface.take() {
+            if current_uses_this_bridge {
+                if let Some(vid) = name.strip_prefix("vlan").and_then(|s| s.parse::<u32>().ok()) {
+                    found_vids.push(vid);
+                }
+            }
+        }
+
+        // Find what physical NIC is bridged through here (the parent
+        // for VID purposes — the underlying L2 carrier).
+        let bridge_ports: Vec<String> = links.iter()
+            .filter(|p| p.master.as_deref() == Some(&l.name))
+            .filter(|p| !p.is_vlan)  // skip VLAN sub-interfaces in case any
+            .map(|p| p.name.clone())
+            .collect();
+        let phys_parent = bridge_ports.first().cloned().unwrap_or_else(|| "?".to_string());
+
+        for vid in found_vids {
+            let already_managed = already.contains(&(phys_parent.clone(), vid));
+            // For a vlan-aware bridge with `vlanNNN inet static address ...`,
+            // the IP lives on the vlanNNN interface. Look it up.
+            let vlan_iface_name = format!("vlan{}", vid);
+            let (self_ip, subnet) = primary_ipv4(&vlan_iface_name)
+                .map(|(ip, prefix)| (Some(ip.clone()), Some(format!("{}/{}", network_addr(&ip, prefix), prefix))))
+                .unwrap_or((None, None));
+
+            out.push(DiscoveredVlan {
+                kind: DiscoveredKind::VlanAwareBridge,
+                parent_iface: phys_parent.clone(),
+                vlan_id: vid,
+                bridge_name: Some(l.name.clone()),
+                self_ip,
+                subnet,
+                mtu: Some(l.mtu),
+                already_managed,
+                note: format!(
+                    "Detected on VLAN-aware bridge '{}' (Proxmox-style topology). \
+                     WolfStack manages plain bridges with a separate VLAN sub-interface — a different \
+                     topology. DO NOT add a WolfStack VLAN for ID {} on this NIC: you'd end up with two \
+                     interfaces both carrying VID {} traffic on the same physical port. Either keep your \
+                     existing config (no WolfStack action needed) or migrate manually: remove the \
+                     `vlan{}` stanza and the `bridge-vlan-aware`/`bridge-vids` lines from `{}`, then add \
+                     the VLAN through WolfStack.",
+                    l.name, vid, vid, vid, l.name,
+                ),
+            });
+        }
+    }
+
+    out
+}
+
+/// Minimal info we need per-link from `ip -d -j link show`. We parse
+/// the JSON manually so we don't pull in serde_json codegen for every
+/// link's full schema (it's verbose and we only need a few fields).
+#[derive(Debug, Clone, Default)]
+struct LinkInfo {
+    name: String,
+    mtu: u32,
+    is_vlan: bool,
+    /// Set when the link is a kind=vlan device.
+    vlan_id: Option<u32>,
+    vlan_parent: Option<String>,
+    /// Set when the link is a bridge with vlan_filtering=1.
+    is_vlan_aware_bridge: bool,
+    /// Master link name when this link is a slave (bridge port).
+    master: Option<String>,
+}
+
+fn list_link_details() -> Vec<LinkInfo> {
+    let out = Command::new("ip").args(["-d", "-j", "link", "show"]).output();
+    let stdout = match out {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return Vec::new(),
+    };
+    let json: serde_json::Value = match serde_json::from_slice(&stdout) {
+        Ok(j) => j,
+        Err(_) => return Vec::new(),
+    };
+    let arr = match json.as_array() {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for item in arr {
+        let name = item.get("ifname").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if name.is_empty() { continue; }
+        let mtu = item.get("mtu").and_then(|v| v.as_u64()).unwrap_or(1500) as u32;
+        let master = item.get("master").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+        let mut info = LinkInfo { name: name.clone(), mtu, master, ..Default::default() };
+
+        // linkinfo.info_kind tells us "vlan" or "bridge"; linkinfo.info_data
+        // has the kind-specific details (vlan_id, parent, vlan_filtering).
+        if let Some(linkinfo) = item.get("linkinfo") {
+            let kind = linkinfo.get("info_kind").and_then(|v| v.as_str()).unwrap_or("");
+            if kind == "vlan" {
+                info.is_vlan = true;
+                info.vlan_id = linkinfo.get("info_data")
+                    .and_then(|d| d.get("id"))
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as u32);
+                info.vlan_parent = item.get("link").and_then(|v| v.as_str()).map(|s| s.to_string());
+            } else if kind == "bridge" {
+                let vf = linkinfo.get("info_data")
+                    .and_then(|d| d.get("vlan_filtering"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                info.is_vlan_aware_bridge = vf == 1;
+            }
+        }
+        out.push(info);
+    }
+    out
+}
+
+/// Read the primary global IPv4 address on an interface (address +
+/// prefix), or None. Skips secondary/scope-link addresses.
+fn primary_ipv4(iface: &str) -> Option<(String, u8)> {
+    let out = Command::new("ip").args(["-o", "-4", "addr", "show", "dev", iface]).output().ok()?;
+    if !out.status.success() { return None; }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        // Format: "N: iface inet 1.2.3.4/24 scope global ..."
+        if let Some(addr) = parts.get(3) {
+            if let Some((ip, prefix)) = addr.split_once('/') {
+                if let Ok(p) = prefix.parse::<u8>() {
+                    return Some((ip.to_string(), p));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Compute the network address of `ip/prefix`. Best-effort IPv4 only;
+/// returns the input unchanged on parse failure.
+fn network_addr(ip: &str, prefix: u8) -> String {
+    let parsed: Result<std::net::Ipv4Addr, _> = ip.parse();
+    match parsed {
+        Ok(addr) => {
+            let n = u32::from(addr);
+            let mask = if prefix == 0 { 0 } else { !0u32 << (32 - prefix) };
+            std::net::Ipv4Addr::from(n & mask).to_string()
+        }
+        Err(_) => ip.to_string(),
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Parse ifupdown config from elsewhere (another server) — used to
+// import a working VLAN definition as a template for THIS server.
+// ────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParsedVlan {
+    /// Source topology — affects what we recommend the operator do.
+    pub source_topology: SourceTopology,
+    pub vlan_id: u32,
+    /// Whatever was on the right-hand side of `vlan-raw-device` in the
+    /// pasted config — could be a physical NIC (eno1) for the
+    /// WolfStack-shaped topology, or a bridge name (vmbr0) for the
+    /// vlan-aware-bridge topology. The recommendation explains.
+    pub raw_device: String,
+    pub mtu: Option<u32>,
+    pub self_ip: Option<String>,
+    pub subnet: Option<String>,
+    pub routes: Vec<RouteEntry>,
+    /// Plain-English summary of what we found and how the operator
+    /// should use it on this server.
+    pub recommendation: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceTopology {
+    /// `vlan-raw-device` pointed at a physical NIC — same shape WolfStack
+    /// generates. Direct template.
+    PhysicalParent,
+    /// `vlan-raw-device` pointed at a bridge (Proxmox-style vlan-aware
+    /// bridge). Different topology — operator needs to swap to physical
+    /// NIC for the WolfStack version.
+    VlanAwareBridge,
+}
+
+/// Parse Debian/Ubuntu `/etc/network/interfaces` text and pull out
+/// every `iface ... inet static/manual` block that's a VLAN. Tolerant
+/// of indentation, blank lines, comments, out-of-order directives,
+/// CRLF line endings, IPv6 blocks (skipped), and arbitrary unrelated
+/// stanzas (lo, eno1, vmbr0, bonds, ovs bridges, wireguard configs,
+/// etc.) — anything that doesn't look like a VLAN is dropped silently.
+///
+/// Designed for "operator pasted their entire /etc/network/interfaces
+/// from another server" — we extract just the VLAN bits and ignore
+/// the rest. Duplicate (raw_device, vlan_id) pairs (e.g. when two
+/// `iface X` blocks exist for the same interface) collapse to one.
+pub fn parse_ifupdown_text(text: &str) -> Vec<ParsedVlan> {
+    let mut blocks: Vec<IfaceBlock> = Vec::new();
+    let mut current: Option<IfaceBlock> = None;
+    let mut continuation: Option<String> = None;
+    for raw_line in text.lines() {
+        // Handle line-continuation backslashes — `up something \` followed
+        // by an indented next line means treat both as one logical line.
+        // Rare in real configs but legal per ifupdown grammar.
+        let raw_owned;
+        let raw = if let Some(prev) = continuation.take() {
+            raw_owned = format!("{} {}", prev, raw_line);
+            raw_owned.as_str()
+        } else {
+            raw_line
+        };
+        // Trim trailing CR (CRLF line endings from a Windows paste).
+        let trimmed_eol = raw.trim_end_matches(['\r', '\n']);
+        // If this line ends with `\`, it continues on the next line.
+        if let Some(rest) = trimmed_eol.strip_suffix('\\') {
+            continuation = Some(rest.trim_end().to_string());
+            continue;
+        }
+        // Strip inline comments. We split on `#` regardless of position;
+        // ifupdown values don't contain literal `#` characters in
+        // practice (operators put `#` only in comments).
+        let no_comment = trimmed_eol.split('#').next().unwrap_or(trimmed_eol);
+        let t = no_comment.trim();
+        if t.is_empty() { continue; }
+
+        if let Some(rest) = t.strip_prefix("iface ") {
+            // New iface block — flush the previous one.
+            if let Some(b) = current.take() { blocks.push(b); }
+            let mut parts = rest.split_whitespace();
+            let name = parts.next().unwrap_or("").to_string();
+            // Detect address family. `iface X inet ...` is v4;
+            // `iface X inet6 ...` is v6. WolfStack is v4-only today —
+            // skip v6 blocks rather than emit invalid candidates.
+            let family = parts.next().unwrap_or("");
+            let is_inet6 = family == "inet6";
+            current = Some(IfaceBlock { name, is_inet6, ..Default::default() });
+        } else if t.starts_with("auto ") || t.starts_with("allow-")
+            || t.starts_with("source ") || t.starts_with("source-directory ")
+            || t.starts_with("mapping ")
+        {
+            // Top-level directives that aren't iface blocks. Skip
+            // explicitly so we don't accidentally classify them as
+            // a directive in the previous block.
+            // Also: an `auto`/`allow-`/etc terminates the previous
+            // block's "current" status — but only conceptually. Real
+            // ifupdown uses a blank line or another `iface` to end a
+            // block; we already handle both. Just skip.
+        } else if let Some(b) = current.as_mut() {
+            // Directive inside the current block.
+            let mut parts = t.split_whitespace();
+            let key = parts.next().unwrap_or("");
+            let value = parts.collect::<Vec<_>>().join(" ");
+            match key {
+                "address" => b.address = Some(value),
+                "netmask" => b.netmask = Some(value),
+                "gateway" => b.gateway = Some(value),
+                "mtu" => b.mtu = value.parse().ok(),
+                "vlan-raw-device" | "vlan_raw_device" => b.vlan_raw_device = Some(value),
+                "vlan-id" => b.vlan_id_directive = value.parse().ok(),
+                // Accept all the common "run a command on bring-up"
+                // hooks since operators put route adds in any of them.
+                // We deliberately do NOT collect `down`/`pre-down`/
+                // `post-down` — those are teardown actions, not state.
+                "up" | "pre-up" | "post-up" => b.up_lines.push(value),
+                _ => {}
+            }
+        }
+    }
+    if let Some(b) = current.take() { blocks.push(b); }
+
+    // Filter for VLAN blocks. A block is a VLAN if any of:
+    // - it has `vlan-raw-device`
+    // - its name matches `vlanNNN` or `DEV.NNN`
+    // IPv6 blocks are skipped — WolfStack is v4-only.
+    let mut out: Vec<ParsedVlan> = Vec::new();
+    let mut seen: std::collections::HashSet<(String, u32)> = Default::default();
+    for b in blocks {
+        if b.is_inet6 { continue; }
+        let (vid, raw_device) = match (vlan_id_from_block(&b), b.vlan_raw_device.clone()) {
+            (Some(vid), Some(dev)) => (vid, dev),
+            (Some(vid), None) => {
+                // Name-derived: DEV.NNN — split.
+                if let Some((dev, _)) = b.name.rsplit_once('.') {
+                    (vid, dev.to_string())
+                } else {
+                    continue;
+                }
+            }
+            _ => continue,
+        };
+        // Bounds-check the VID against 802.1Q. Garbage names like
+        // `iface vlan99999` or `iface eth0.0` would otherwise produce
+        // nonsense candidates.
+        if !(1..=4094).contains(&vid) { continue; }
+        // Dedupe: a single (parent, VID) pair should appear once even
+        // if the operator pasted multiple iface blocks for it.
+        if !seen.insert((raw_device.clone(), vid)) { continue; }
+        // Determine source topology heuristically: if the raw_device
+        // name starts with `vmbr`/`br`, it's almost certainly a bridge
+        // (vlan-aware topology). Anything else is treated as physical.
+        let source_topology = if raw_device.starts_with("vmbr")
+            || raw_device.starts_with("br-")
+            || raw_device.starts_with("br0")
+            || raw_device == "br0"
+        {
+            SourceTopology::VlanAwareBridge
+        } else {
+            SourceTopology::PhysicalParent
+        };
+        let (self_ip, subnet) = parse_address_subnet(&b);
+        let routes = parse_routes_from_up(&b.up_lines);
+        let recommendation = match source_topology {
+            SourceTopology::PhysicalParent => format!(
+                "Source uses the WolfStack-shape topology (separate VLAN sub-interface on a physical NIC). \
+                 Pre-fill values: VID {}, MTU {}, subnet {}. \
+                 Pick a DIFFERENT self IP on this server — the source's IP {} is in use on the other machine.",
+                vid,
+                b.mtu.map(|m| m.to_string()).unwrap_or_else(|| "(default)".into()),
+                subnet.clone().unwrap_or_else(|| "(unknown)".into()),
+                self_ip.clone().unwrap_or_else(|| "(unknown)".into()),
+            ),
+            SourceTopology::VlanAwareBridge => format!(
+                "Source uses a vlan-aware bridge (Proxmox-style — `{}` is a bridge with `bridge-vlan-aware yes`). \
+                 WolfStack manages a different topology (separate VLAN sub-interface + plain bridge), but the \
+                 over-the-wire VLAN traffic is identical, so a WolfStack-managed server can co-exist on the same \
+                 vSwitch as the source. \
+                 Pre-fill values: VID {}, MTU {}, subnet {}. \
+                 PARENT NIC: pick the underlying physical NIC of the source's `{}` (e.g. eno1 — what the source has as `bridge-ports`). \
+                 Pick a DIFFERENT self IP — the source's IP {} is taken.",
+                raw_device,
+                vid,
+                b.mtu.map(|m| m.to_string()).unwrap_or_else(|| "(default)".into()),
+                subnet.clone().unwrap_or_else(|| "(unknown)".into()),
+                raw_device,
+                self_ip.clone().unwrap_or_else(|| "(unknown)".into()),
+            ),
+        };
+        out.push(ParsedVlan {
+            source_topology,
+            vlan_id: vid,
+            raw_device,
+            mtu: b.mtu,
+            self_ip,
+            subnet,
+            routes,
+            recommendation,
+        });
+    }
+    out
+}
+
+#[derive(Debug, Default, Clone)]
+struct IfaceBlock {
+    name: String,
+    /// True if the iface line was `iface X inet6 ...` rather than
+    /// `iface X inet ...`. We skip v6 blocks at output time —
+    /// WolfStack itself is v4-only and a v6 candidate would just
+    /// confuse the operator.
+    is_inet6: bool,
+    address: Option<String>,
+    netmask: Option<String>,
+    #[allow(dead_code)]
+    gateway: Option<String>,
+    mtu: Option<u32>,
+    vlan_raw_device: Option<String>,
+    vlan_id_directive: Option<u32>,
+    up_lines: Vec<String>,
+}
+
+fn vlan_id_from_block(b: &IfaceBlock) -> Option<u32> {
+    // Explicit `vlan-id` wins.
+    if let Some(v) = b.vlan_id_directive { return Some(v); }
+    // DEV.NNN pattern.
+    if let Some((_, vid)) = b.name.rsplit_once('.') {
+        if let Ok(n) = vid.parse::<u32>() { return Some(n); }
+    }
+    // vlanNNN pattern.
+    if let Some(rest) = b.name.strip_prefix("vlan") {
+        if let Ok(n) = rest.parse::<u32>() { return Some(n); }
+    }
+    None
+}
+
+fn parse_address_subnet(b: &IfaceBlock) -> (Option<String>, Option<String>) {
+    let addr = match b.address.clone() {
+        Some(a) => a,
+        None => return (None, None),
+    };
+    // Two forms in the wild:
+    //   address 10.0.1.5/24    (CIDR — modern)
+    //   address 10.0.1.5
+    //   netmask 255.255.255.0  (split — old-style)
+    if let Some((ip, prefix_str)) = addr.split_once('/') {
+        if let Ok(prefix) = prefix_str.parse::<u8>() {
+            let net = network_addr(ip, prefix);
+            return (Some(ip.to_string()), Some(format!("{}/{}", net, prefix)));
+        }
+    }
+    // Old-style with netmask.
+    if let Some(mask) = b.netmask.as_ref() {
+        if let Some(prefix) = netmask_to_prefix(mask) {
+            let net = network_addr(&addr, prefix);
+            return (Some(addr), Some(format!("{}/{}", net, prefix)));
+        }
+    }
+    (Some(addr), None)
+}
+
+fn netmask_to_prefix(mask: &str) -> Option<u8> {
+    let parsed: Result<std::net::Ipv4Addr, _> = mask.parse();
+    let bits = u32::from(parsed.ok()?);
+    Some(bits.count_ones() as u8)
+}
+
+/// Parse routes from `up ip route add X via Y dev Z` style up-hooks.
+/// Tolerates `ip route add` and `ip -4 route add` variants. dev clause
+/// is optional and ignored (we re-derive on apply).
+fn parse_routes_from_up(lines: &[String]) -> Vec<RouteEntry> {
+    let mut routes = Vec::new();
+    for line in lines {
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        // Look for "ip ... route add DEST via VIA"
+        if !toks.iter().any(|t| *t == "route") { continue; }
+        if !toks.iter().any(|t| *t == "add") { continue; }
+        let mut dest: Option<&str> = None;
+        let mut via: Option<&str> = None;
+        let mut i = 0;
+        while i < toks.len() {
+            if toks[i] == "add" && i + 1 < toks.len() {
+                dest = Some(toks[i + 1]);
+            }
+            if toks[i] == "via" && i + 1 < toks.len() {
+                via = Some(toks[i + 1]);
+            }
+            i += 1;
+        }
+        if let (Some(d), Some(v)) = (dest, via) {
+            routes.push(RouteEntry { destination: d.to_string(), via: v.to_string() });
+        }
+    }
+    routes
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VlanStore {
     #[serde(default)]
@@ -2646,6 +3248,274 @@ mod tests {
                 "expected at least one Warn finding for {:?}", mgr,
             );
         }
+    }
+
+    #[test]
+    fn parse_ifupdown_handles_real_proxmox_vlan_aware_bridge_config() {
+        // Real config from a user's working Proxmox-on-Hetzner box.
+        // Topology: vlan-aware bridge vmbr0 with eno1 as port, vlan4000
+        // sub-interface using vmbr0 as raw device for IP termination.
+        let cfg = r#"
+auto lo
+iface lo inet loopback
+
+iface lo inet6 loopback
+
+iface eno1 inet manual
+
+auto vmbr0
+iface vmbr0 inet static
+        address 162.55.15.215/28
+        gateway 162.55.15.209
+        bridge-ports eno1
+        bridge-stp off
+        bridge-fd 1
+        bridge-vlan-aware yes
+        bridge-vids 2-4094
+
+auto vlan4000
+iface vlan4000 inet static
+        address 10.0.1.5/24
+        mtu 1400
+        vlan-raw-device vmbr0
+        up ip route add 10.0.0.0/16 via 10.0.1.1 dev vlan4000
+        down ip route del 10.0.0.0/16 via 10.0.1.1 dev vlan4000
+"#;
+        let parsed = parse_ifupdown_text(cfg);
+        assert_eq!(parsed.len(), 1, "expected exactly one VLAN block, got {:?}", parsed);
+        let v = &parsed[0];
+        assert_eq!(v.vlan_id, 4000);
+        assert_eq!(v.raw_device, "vmbr0");
+        assert_eq!(v.mtu, Some(1400));
+        assert_eq!(v.self_ip.as_deref(), Some("10.0.1.5"));
+        assert_eq!(v.subnet.as_deref(), Some("10.0.1.0/24"));
+        assert_eq!(v.routes.len(), 1);
+        assert_eq!(v.routes[0].destination, "10.0.0.0/16");
+        assert_eq!(v.routes[0].via, "10.0.1.1");
+        // Topology detected as vlan-aware-bridge because raw_device starts with vmbr.
+        assert_eq!(v.source_topology, SourceTopology::VlanAwareBridge);
+        assert!(v.recommendation.contains("vlan-aware bridge"));
+        assert!(v.recommendation.contains("DIFFERENT self IP"));
+    }
+
+    #[test]
+    fn parse_ifupdown_handles_wolfstack_shape() {
+        // The other valid topology — vlan-raw-device pointed at a
+        // physical NIC (what WolfStack itself generates).
+        let cfg = r#"
+auto eno1.4000
+iface eno1.4000 inet manual
+        vlan-raw-device eno1
+        mtu 1400
+
+auto vmbr4000
+iface vmbr4000 inet static
+        address 10.0.1.5
+        netmask 255.255.255.0
+        bridge-ports eno1.4000
+        bridge-stp off
+        bridge-fd 0
+        mtu 1400
+"#;
+        let parsed = parse_ifupdown_text(cfg);
+        // The eno1.4000 block has vlan-raw-device → it's a VLAN.
+        let v = parsed.iter().find(|p| p.vlan_id == 4000).expect("must find VID 4000");
+        assert_eq!(v.raw_device, "eno1");
+        assert_eq!(v.source_topology, SourceTopology::PhysicalParent);
+        assert_eq!(v.mtu, Some(1400));
+    }
+
+    #[test]
+    fn parse_ifupdown_ignores_non_vlan_blocks() {
+        // The user's actual full /etc/network/interfaces — lo, eno1,
+        // vmbr0 (the management bridge), then vlan4000. We must extract
+        // ONLY vlan4000 and silently drop everything else.
+        let cfg = r#"
+auto lo
+iface lo inet loopback
+
+iface lo inet6 loopback
+
+iface eno1 inet manual
+
+auto vmbr0
+iface vmbr0 inet static
+        address 162.55.15.215/28
+        gateway 162.55.15.209
+        bridge-ports eno1
+        bridge-stp off
+        bridge-fd 1
+        bridge-vlan-aware yes
+        bridge-vids 2-4094
+        hwaddress 08:bf:b8:a6:98:8a
+        pointopoint 162.55.15.209
+        up sysctl -p
+        up route add -net 162.55.15.20 netmask 255.255.255.240 gw 162.55.15.209 dev eno1
+#For VLAN
+
+auto vlan4000
+iface vlan4000 inet static
+        address 10.0.1.5/24
+        mtu 1400
+        vlan-raw-device vmbr0
+        up ip route add 10.0.0.0/16 via 10.0.1.1 dev vlan4000
+        down ip route del 10.0.0.0/16 via 10.0.1.1 dev vlan4000
+#USE ONLY THIS FOR VM
+source /etc/network/interfaces.d/*
+"#;
+        let parsed = parse_ifupdown_text(cfg);
+        // Exactly ONE candidate — vlan4000. lo, eno1, vmbr0 must be skipped.
+        assert_eq!(parsed.len(), 1, "expected 1 VLAN, got {}: {:?}",
+            parsed.len(),
+            parsed.iter().map(|p| (p.vlan_id, p.raw_device.clone())).collect::<Vec<_>>(),
+        );
+        assert_eq!(parsed[0].vlan_id, 4000);
+        assert_eq!(parsed[0].raw_device, "vmbr0");
+    }
+
+    #[test]
+    fn parse_ifupdown_skips_ipv6_blocks() {
+        // An inet6 VLAN block would otherwise produce a v6 address that
+        // can't be represented in WolfStack's v4-only store.
+        let cfg = r#"
+iface vlan100 inet6 static
+        address fe80::5/64
+        vlan-raw-device eno1
+
+iface vlan200 inet static
+        address 10.0.2.5/24
+        vlan-raw-device eno1
+"#;
+        let parsed = parse_ifupdown_text(cfg);
+        // Only the v4 vlan200 should appear.
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].vlan_id, 200);
+    }
+
+    #[test]
+    fn parse_ifupdown_dedupes_repeated_blocks() {
+        // Two `iface vlan100` blocks (operator pasted half a config
+        // twice, or two near-identical defs). Output should collapse.
+        let cfg = r#"
+iface vlan100 inet static
+        address 10.0.1.5/24
+        vlan-raw-device eno1
+
+iface vlan100 inet static
+        address 10.0.1.5/24
+        vlan-raw-device eno1
+"#;
+        let parsed = parse_ifupdown_text(cfg);
+        assert_eq!(parsed.len(), 1);
+    }
+
+    #[test]
+    fn parse_ifupdown_handles_crlf_and_extra_whitespace() {
+        // Windows clipboard / SSH-paste through PuTTY can introduce CRLF.
+        // Extra trailing whitespace and tabs vs spaces shouldn't matter.
+        let cfg = "iface vlan300 inet static\r\n\taddress 10.0.3.5/24\r\n   \tvlan-raw-device eno1\t\r\n\tmtu 1500\r\n";
+        let parsed = parse_ifupdown_text(cfg);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].vlan_id, 300);
+        assert_eq!(parsed[0].raw_device, "eno1");
+        assert_eq!(parsed[0].mtu, Some(1500));
+    }
+
+    #[test]
+    fn parse_ifupdown_accepts_post_up_routes() {
+        // Routes are sometimes in `post-up` instead of `up`. Both must work.
+        let cfg = r#"
+iface vlan400 inet static
+        address 10.0.4.5/24
+        vlan-raw-device eno1
+        post-up ip route add 10.0.0.0/16 via 10.0.4.1 dev vlan400
+        pre-up ip route add 192.168.0.0/16 via 10.0.4.2
+"#;
+        let parsed = parse_ifupdown_text(cfg);
+        assert_eq!(parsed.len(), 1);
+        let routes = &parsed[0].routes;
+        assert_eq!(routes.len(), 2, "expected 2 routes, got {:?}", routes);
+        assert!(routes.iter().any(|r| r.destination == "10.0.0.0/16" && r.via == "10.0.4.1"));
+        assert!(routes.iter().any(|r| r.destination == "192.168.0.0/16" && r.via == "10.0.4.2"));
+    }
+
+    #[test]
+    fn parse_ifupdown_rejects_out_of_range_vids() {
+        // `eth0.0` and `vlan99999` are syntactically valid iface names
+        // but invalid as 802.1Q VIDs. Reject silently.
+        let cfg = r#"
+iface eth0.0 inet static
+        address 10.0.0.1/24
+        vlan-raw-device eth0
+
+iface vlan9999 inet static
+        address 10.0.1.1/24
+        vlan-raw-device eth0
+"#;
+        let parsed = parse_ifupdown_text(cfg);
+        assert!(parsed.is_empty(), "expected no candidates, got {:?}", parsed);
+    }
+
+    #[test]
+    fn parse_ifupdown_ignores_garbage_around_vlan_block() {
+        // Operator pasted a VLAN block with random unrelated text
+        // before and after. Parser must find the VLAN regardless.
+        let cfg = r#"
+# random notes from my email
+HOST: giant.example.com
+LAST_BACKUP: 2026-05-14
+IPV4: 162.55.15.215
+
+# the actual config bit:
+iface vlan500 inet static
+        address 10.0.5.5/24
+        vlan-raw-device eno1
+        mtu 1400
+
+# a snippet from /etc/wireguard/wg0.conf:
+[Interface]
+Address = 10.7.0.1/24
+PrivateKey = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=
+
+[Peer]
+PublicKey = bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb=
+AllowedIPs = 10.7.0.2/32
+"#;
+        let parsed = parse_ifupdown_text(cfg);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].vlan_id, 500);
+        assert_eq!(parsed[0].raw_device, "eno1");
+        assert_eq!(parsed[0].mtu, Some(1400));
+    }
+
+    #[test]
+    fn parse_ifupdown_strips_comments_and_handles_old_netmask() {
+        // Old-style with netmask + comments.
+        let cfg = r#"
+# operator notes here
+iface vlan100 inet static  # production VLAN
+        address 192.168.50.10
+        netmask 255.255.255.0
+        vlan-raw-device eth0
+        mtu 1500
+"#;
+        let parsed = parse_ifupdown_text(cfg);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].vlan_id, 100);
+        assert_eq!(parsed[0].self_ip.as_deref(), Some("192.168.50.10"));
+        assert_eq!(parsed[0].subnet.as_deref(), Some("192.168.50.0/24"));
+    }
+
+    #[test]
+    fn discovered_kind_serializes_as_snake_case() {
+        // The frontend keys off the JSON value strings, so a rename
+        // here would silently break the UI matching. Pin the format.
+        let imp = serde_json::to_string(&DiscoveredKind::Importable).unwrap();
+        let vab = serde_json::to_string(&DiscoveredKind::VlanAwareBridge).unwrap();
+        let sub = serde_json::to_string(&DiscoveredKind::SubInterfaceOnly).unwrap();
+        assert_eq!(imp, "\"importable\"");
+        assert_eq!(vab, "\"vlan_aware_bridge\"");
+        assert_eq!(sub, "\"sub_interface_only\"");
     }
 
     #[test]
