@@ -7406,6 +7406,34 @@ dns_cloudflare_api_token = your_token_here"
                 </div>
             </div>
 
+            <!-- VLAN attachments + routed public IPs -->
+            <div class="card">
+                <div class="card-header" style="display:flex; align-items:center; justify-content:space-between;">
+                    <div>
+                        <h3 style="margin:0;">VLAN attachments &amp; routed public IPs</h3>
+                        <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">
+                            Hetzner vSwitch / OVH vRack / Equinix Metal / generic 802.1Q VLAN, plus extra public IPs delivered to specific containers.
+                        </div>
+                    </div>
+                    <div style="display:flex; gap:6px;">
+                        <button class="btn btn-sm" onclick="vlanShowPreview()" title="Show the config snippet that would be written"><span class="ws-icon-clean-wrap" data-icon="settings"></span> Preview config</button>
+                        <button class="btn btn-sm btn-primary" onclick="vlanShowAddDialog()"><span class="ws-icon-clean-wrap" data-icon="add"></span> Add VLAN</button>
+                        <button class="btn btn-sm btn-primary" onclick="publicIpShowAddDialog()"><span class="ws-icon-clean-wrap" data-icon="add"></span> Add Public IP</button>
+                    </div>
+                </div>
+                <div class="card-body">
+                    <div id="vlan-status-banner" style="margin-bottom:12px;"></div>
+                    <h4 style="margin:8px 0 6px; font-size:13px; color:var(--text-secondary);">VLAN attachments</h4>
+                    <div id="vlan-attachments-list">
+                        <p style="color:var(--text-muted); font-size:12px;">No VLAN attachments configured.</p>
+                    </div>
+                    <h4 style="margin:18px 0 6px; font-size:13px; color:var(--text-secondary);">Routed public IPs</h4>
+                    <div id="public-ips-list">
+                        <p style="color:var(--text-muted); font-size:12px;">No routed public IPs configured.</p>
+                    </div>
+                </div>
+            </div>
+
             <!-- DNS Card -->
             <div class="card">
                 <div class="card-header">

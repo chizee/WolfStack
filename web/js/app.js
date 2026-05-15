@@ -13248,18 +13248,20 @@ async function loadWolfNetRoutesTable() {
 
 async function loadNetworking() {
     try {
-        const [ifResp, dnsResp, wnResp, mappingsResp, wgResp] = await Promise.all([
+        const [ifResp, dnsResp, wnResp, mappingsResp, wgResp, vlanResp] = await Promise.all([
             fetch(apiUrl('/api/networking/interfaces')),
             fetch(apiUrl('/api/networking/dns')),
             fetch(apiUrl('/api/networking/wolfnet')),
             fetch(apiUrl('/api/networking/ip-mappings')),
             fetch(apiUrl('/api/networking/wireguard')),
+            fetch(apiUrl('/api/networking/vlan')),
         ]);
         const interfaces = await ifResp.json();
         const dns = await dnsResp.json();
         const wolfnet = await wnResp.json();
         const mappings = mappingsResp.ok ? await mappingsResp.json() : [];
         const wgData = wgResp.ok ? await wgResp.json() : { installed: false, bridges: [] };
+        const vlanData = vlanResp.ok ? await vlanResp.json() : { vlans: [], public_ips: [], net_manager_label: 'unknown', auto_persist_supported: false };
 
         cachedInterfaces = interfaces;
         renderNetInterfaces(interfaces);
@@ -13267,6 +13269,7 @@ async function loadNetworking() {
         renderWolfNetStatus(wolfnet);
         renderIpMappings(mappings);
         renderWireGuardBridge(wgData);
+        renderVlanAttachments(vlanData);
     } catch (e) {
         console.error('Failed to load networking:', e);
     }
@@ -13955,6 +13958,921 @@ function renderWireGuardBridge(data) {
             <button class="btn btn-sm btn-danger" onclick="wgDeleteBridge('${cluster}')" style="font-size:12px;">Delete</button>
         </div>`;
 }
+
+// ─── VLAN attachments + routed public IPs ──────────────────────────
+//
+// Backed by /api/networking/vlan*. The backend persists a single JSON
+// store and regenerates /etc/network/interfaces.d/wolfstack-vlan.conf
+// on save. The kernel state is also nudged immediately so the VLAN /
+// bridge is usable without a reload.
+
+var _vlanCache = { vlans: [], public_ips: [], net_manager_label: '', auto_persist_supported: false };
+
+function vlanEsc(s) {
+    return String(s == null ? '' : s).replace(/[<>&"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
+}
+
+function renderVlanAttachments(data) {
+    _vlanCache = data || _vlanCache;
+    // Status banner — tells the operator whether their distro is fully
+    // auto-managed or whether they need to apply a snippet manually.
+    const banner = document.getElementById('vlan-status-banner');
+    if (banner) {
+        if (_vlanCache.auto_persist_supported) {
+            banner.innerHTML = `<div style="padding:6px 10px; background:rgba(34,197,94,0.10); border:1px solid rgba(34,197,94,0.25); border-radius:6px; font-size:12px; color:var(--text-secondary);">
+                Network manager detected: <strong>${vlanEsc(_vlanCache.net_manager_label)}</strong> — WolfStack writes the persistent config automatically.
+            </div>`;
+        } else {
+            banner.innerHTML = `<div style="padding:6px 10px; background:rgba(234,179,8,0.10); border:1px solid rgba(234,179,8,0.25); border-radius:6px; font-size:12px; color:var(--text-secondary);">
+                Network manager: <strong>${vlanEsc(_vlanCache.net_manager_label)}</strong> — WolfStack applies kernel state live but doesn't yet auto-write persistent config for this manager.
+                Click <em>Preview config</em> to see the equivalent ifupdown-style snippet to translate to your distro's format,
+                or check <code>/var/lib/wolfstack/suggested-vlan-config.txt</code> after saving.
+            </div>`;
+        }
+    }
+    // VLAN list.
+    const vEl = document.getElementById('vlan-attachments-list');
+    if (vEl) {
+        const vlans = _vlanCache.vlans || [];
+        if (vlans.length === 0) {
+            vEl.innerHTML = '<p style="color:var(--text-muted); font-size:12px;">No VLAN attachments configured.</p>';
+        } else {
+            vEl.innerHTML = vlans.map(v => {
+                const allocs = (v.allocations || []);
+                const members = allocs.length === 0
+                    ? '<div style="font-size:11px; color:var(--text-muted); margin-top:6px;">No containers/VMs attached yet.</div>'
+                    : `<div style="margin-top:8px;"><div style="font-size:11px; color:var(--text-muted); margin-bottom:4px;">Attached members (${allocs.length})</div>
+                        ${allocs.map(a => `<div style="display:flex; align-items:center; gap:6px; padding:3px 6px; background:var(--bg-tertiary); border-radius:4px; margin-bottom:3px; font-size:11px;">
+                            <span style="font-family:var(--font-mono); color:var(--accent-light);">${vlanEsc(a.ip)}</span>
+                            <span style="color:var(--text-muted);">on</span>
+                            <span>${vlanEsc(a.label || a.target_id)}</span>
+                            <span style="color:var(--text-muted); font-size:10px;">${vlanEsc(a.target_kind)}</span>
+                            <button class="btn btn-sm btn-danger" style="margin-left:auto; font-size:10px; padding:1px 6px;" onclick="vlanDetach('${vlanEsc(v.id)}', '${vlanEsc(a.target_kind)}', '${vlanEsc(a.target_id)}', '${vlanEsc(a.ip)}', '${vlanEsc(a.label || a.target_id)}')"><span class="ws-icon-clean-wrap" data-icon="close"></span></button>
+                        </div>`).join('')}
+                       </div>`;
+                const reservations = (v.external_reservations || []);
+                const resHtml = reservations.length === 0 ? '' :
+                    `<div style="margin-top:6px; font-size:10px; color:var(--text-muted);">External reservations: ${reservations.map(r => vlanEsc(r.spec)).join(', ')}</div>`;
+                return `
+                <div style="border:1px solid var(--border); border-radius:6px; padding:10px 12px; margin-bottom:6px; background:var(--bg-secondary);">
+                    <div style="display:flex; align-items:center; gap:8px;">
+                        <span style="font-weight:600;">${vlanEsc(v.name)}</span>
+                        <span class="badge" style="background:rgba(168,85,247,0.15); color:#a855f7; font-size:10px;">VLAN ${v.vlan_id}</span>
+                        <span class="badge" style="background:rgba(99,102,241,0.15); color:#a5b4fc; font-size:10px;">${vlanEsc(v.provider)}</span>
+                        <span style="margin-left:auto; display:flex; gap:6px;">
+                            <button class="btn btn-sm btn-primary" style="font-size:11px; padding:2px 8px;" onclick='vlanShowAttachDialog(${JSON.stringify(v).replace(/'/g, "&#39;")})'>+ Attach</button>
+                            <button class="btn btn-sm" style="font-size:11px; padding:2px 8px;" onclick="vlanTestConnectivity('${vlanEsc(v.id)}', '${vlanEsc(v.name)}')" title="Ping every known member of this VLAN to verify connectivity">Test</button>
+                            <button class="btn btn-sm" style="font-size:11px; padding:2px 8px;" onclick='vlanShowReservationsDialog(${JSON.stringify(v).replace(/'/g, "&#39;")})' title="Manage external reservations"><span class="ws-icon-clean-wrap" data-icon="settings"></span> Reservations</button>
+                            <button class="btn btn-sm" style="font-size:11px; padding:2px 8px;" onclick='vlanShowAddDialog(${JSON.stringify(v).replace(/'/g, "&#39;")})' title="Edit VLAN"><span class="ws-icon-clean-wrap" data-icon="settings"></span></button>
+                            <button class="btn btn-sm btn-danger" style="font-size:11px; padding:2px 8px;" onclick="vlanDelete('${vlanEsc(v.id)}', '${vlanEsc(v.name)}')"><span class="ws-icon-clean-wrap" data-icon="trash"></span></button>
+                        </span>
+                    </div>
+                    <div style="margin-top:6px; font-size:12px; color:var(--text-secondary); font-family:var(--font-mono);">
+                        ${vlanEsc(v.parent_iface)}.${v.vlan_id} on bridge <strong>${vlanEsc(v.bridge_name)}</strong> · ${vlanEsc(v.self_ip)} (${vlanEsc(v.subnet)}) · MTU ${v.mtu}
+                    </div>
+                    ${(v.routes||[]).length > 0 ? `<div style="margin-top:4px; font-size:11px; color:var(--text-muted); font-family:var(--font-mono);">routes: ${v.routes.map(r => `${vlanEsc(r.destination)} via ${vlanEsc(r.via)}`).join('; ')}</div>` : ''}
+                    ${v.notes ? `<div style="margin-top:4px; font-size:11px; color:var(--text-muted);">${vlanEsc(v.notes)}</div>` : ''}
+                    ${members}
+                    ${resHtml}
+                </div>
+            `;}).join('');
+        }
+    }
+    // Public IP list.
+    const pEl = document.getElementById('public-ips-list');
+    if (pEl) {
+        const pips = _vlanCache.public_ips || [];
+        if (pips.length === 0) {
+            pEl.innerHTML = '<p style="color:var(--text-muted); font-size:12px;">No routed public IPs configured.</p>';
+        } else {
+            pEl.innerHTML = pips.map(p => `
+                <div style="border:1px solid var(--border); border-radius:6px; padding:10px 12px; margin-bottom:6px; background:var(--bg-secondary);">
+                    <div style="display:flex; align-items:center; gap:8px;">
+                        <span style="font-weight:600;">${vlanEsc(p.name)}</span>
+                        <span class="badge" style="background:rgba(34,197,94,0.15); color:#22c55e; font-size:10px;">${vlanEsc(p.ip)}</span>
+                        <span class="badge" style="background:rgba(99,102,241,0.15); color:#a5b4fc; font-size:10px;">${vlanEsc(p.provider)}</span>
+                        <span style="margin-left:auto; display:flex; gap:6px;">
+                            <button class="btn btn-sm" style="font-size:11px; padding:2px 8px;" onclick='publicIpShowAddDialog(${JSON.stringify(p).replace(/'/g, "&#39;")})'><span class="ws-icon-clean-wrap" data-icon="settings"></span></button>
+                            <button class="btn btn-sm btn-danger" style="font-size:11px; padding:2px 8px;" onclick="publicIpDelete('${vlanEsc(p.id)}', '${vlanEsc(p.name)}')"><span class="ws-icon-clean-wrap" data-icon="trash"></span></button>
+                        </span>
+                    </div>
+                    <div style="margin-top:6px; font-size:12px; color:var(--text-secondary); font-family:var(--font-mono);">
+                        DNAT ${vlanEsc(p.ip)} to ${vlanEsc(p.container_internal_ip)} via ${vlanEsc(p.egress_iface)}
+                    </div>
+                </div>
+            `).join('');
+        }
+    }
+}
+
+function vlanProviderDefaults(provider) {
+    // Mirrors VlanProvider::default_mtu in src/networking/vlan.rs.
+    return { hetzner: 1400, ovh: 1500, equinix: 1500, custom: 1500 }[provider] || 1500;
+}
+
+function vlanShowAddDialog(existing) {
+    const ex = existing || {
+        id: '', name: '', provider: 'hetzner',
+        parent_iface: '', vlan_id: 4000, mtu: 1400,
+        bridge_name: '', subnet: '', self_ip: '',
+        routes: [], notes: ''
+    };
+    // Build a NIC dropdown from the cached interfaces (physical only —
+    // skip docker / wolfnet / loopback / virtual things).
+    const nicOptions = (cachedInterfaces || [])
+        .filter(i => !i.is_vlan
+            && !i.name.startsWith('docker') && !i.name.startsWith('br-')
+            && !i.name.startsWith('veth') && !i.name.startsWith('wn')
+            && !i.name.startsWith('wolfnet') && !i.name.startsWith('lo')
+            && !i.name.startsWith('vmbr'))
+        .map(i => `<option value="${vlanEsc(i.name)}" ${i.name === ex.parent_iface ? 'selected' : ''}>${vlanEsc(i.name)}${i.mac ? ` (${vlanEsc(i.mac)})` : ''}</option>`)
+        .join('');
+    const html = `
+        <div class="modal-overlay active" id="vlan-add-modal">
+            <div class="modal" style="max-width:640px;">
+                <div class="modal-header">
+                    <h3>Add VLAN attachment</h3>
+                    <button class="modal-close" onclick="document.getElementById('vlan-add-modal').remove()">&times;</button>
+                </div>
+                <div class="modal-body" style="display:flex; flex-direction:column; gap:10px;">
+                    <div style="padding:10px 12px; background:rgba(99,102,241,0.08); border:1px solid rgba(99,102,241,0.25); border-radius:6px; font-size:12px; color:var(--text-secondary); line-height:1.55;">
+                        <strong style="color:var(--text-primary);">Before you start — what your provider needs to be set up</strong>
+                        <p style="margin:6px 0;">A VLAN attachment requires that the upstream switch port for this server is configured as a trunk and is already passing traffic for this VLAN ID. WolfStack only configures the host side — the provider/upstream side has to be in place first.</p>
+                        <p style="margin:6px 0;">For each provider that's the same idea, just dressed up differently:</p>
+                        <ul style="margin:6px 0 6px 18px; padding:0;">
+                            <li>Cloud providers (Hetzner vSwitch, OVH vRack, Equinix Metal Layer-2, Vultr VPC, Linode VLAN, etc.): create the private network in the provider's panel, attach this server to it, note the VLAN ID. Allow ~60 seconds after attaching before saving here so the provider's switch finishes propagating.</li>
+                            <li>Self-managed switches: configure the upstream port as 802.1Q trunk allowing this VLAN ID. Frames arrive tagged.</li>
+                        </ul>
+                    </div>
+                    <div style="padding:10px 12px; background:rgba(234,179,8,0.10); border:1px solid rgba(234,179,8,0.30); border-radius:6px; font-size:12px; color:var(--text-secondary); line-height:1.55;">
+                        <strong style="color:#fbbf24;">MTU on a VLAN — what to set and why</strong>
+                        <p style="margin:6px 0;">A 802.1Q tag adds 4 bytes to each Ethernet frame. Modern switches handle the slightly larger 1522-byte frame transparently, so the IP MTU on a VLAN sub-interface is normally still <strong>1500</strong>. Some providers cap it lower because their internal backbone uses additional encapsulation (VXLAN, MPLS, etc.) that eats more bytes.</p>
+                        <p style="margin:6px 0;">Use the provider preset's MTU unless you have a documented reason to change it:</p>
+                        <ul style="margin:6px 0 6px 18px; padding:0;">
+                            <li><strong>Hetzner vSwitch:</strong> 1400 (mandatory — their switches silently drop tagged frames larger than this).</li>
+                            <li><strong>OVH vRack, Equinix Metal, most cloud private networks:</strong> 1500 (no penalty for the tag).</li>
+                            <li><strong>Old/strict 802.1Q switches that don't accept 1522-byte frames:</strong> 1496 (1500 - 4 for the tag).</li>
+                            <li><strong>Tunnelled overlays (WireGuard, IPSec, GRE):</strong> usually 1420 or lower depending on the encapsulation.</li>
+                        </ul>
+                        <p style="margin:6px 0;">If you see "small pings work but big transfers stall" after saving, drop the MTU by 8 bytes and re-test — that's the universal symptom of MTU set too high somewhere along the path.</p>
+                        <p style="margin:6px 0;"><strong>Whatever MTU you set, every guest attached to this bridge must use the same value.</strong> A container at 1500 talking to a bridge at 1400 will drop replies larger than 1400 silently. Match the values:</p>
+                        <ul style="margin:6px 0 6px 18px; padding:0;">
+                            <li>LXC: <code>lxc.net.0.mtu = ${ex.mtu}</code> in the container config.</li>
+                            <li>Docker custom network: <code>--opt com.docker.network.driver.mtu=${ex.mtu}</code>.</li>
+                            <li>VMs: set the guest's NIC MTU inside the guest OS.</li>
+                        </ul>
+                    </div>
+                    <label>Provider preset
+                        <select id="vlan-provider" onchange="vlanProviderChanged()">
+                            <option value="hetzner" ${ex.provider==='hetzner'?'selected':''}>Hetzner vSwitch (VLAN 4000-4091, MTU 1400)</option>
+                            <option value="ovh" ${ex.provider==='ovh'?'selected':''}>OVH vRack (any VLAN, MTU 1500)</option>
+                            <option value="equinix" ${ex.provider==='equinix'?'selected':''}>Equinix Metal (any VLAN, MTU 1500)</option>
+                            <option value="custom" ${ex.provider==='custom'?'selected':''}>Custom 802.1Q (any VLAN, any MTU)</option>
+                        </select>
+                    </label>
+                    <label>Name <input id="vlan-name" value="${vlanEsc(ex.name)}" placeholder="production-vswitch"></label>
+                    <label>Parent NIC
+                        <select id="vlan-parent">${nicOptions || '<option value="">— no physical NICs detected —</option>'}</select>
+                        <small style="color:var(--text-muted); font-size:11px;">The physical NIC connected to your provider's switch. Don't pick a virtual interface (docker, wolfnet, etc.).</small>
+                    </label>
+                    <div style="display:flex; gap:10px;">
+                        <label style="flex:1;">VLAN ID <input id="vlan-id" type="number" min="1" max="4094" value="${ex.vlan_id}" oninput="vlanSyncBridgeName()">
+                            <small style="color:var(--text-muted); font-size:11px;">The number your provider gave you. Hetzner: Robot &gt; vSwitches &gt; <em>your vSwitch</em> &gt; "VLAN ID" field. OVH: Manager &gt; Bare Metal Cloud &gt; vRack &gt; the VLAN you created.</small>
+                        </label>
+                        <label style="flex:1;">MTU <input id="vlan-mtu" type="number" min="576" max="9216" value="${ex.mtu}"></label>
+                    </div>
+                    <label>Bridge name <input id="vlan-bridge" value="${vlanEsc(ex.bridge_name)}" placeholder="vmbr4000">
+                        <small style="color:var(--text-muted); font-size:11px;">This is what containers/VMs attach to. Default <code>vmbr&lt;VLAN&gt;</code> matches Proxmox naming.</small>
+                    </label>
+                    <label>Subnet (CIDR) <input id="vlan-subnet" value="${vlanEsc(ex.subnet)}" placeholder="10.0.1.0/24">
+                        <small style="color:var(--text-muted); font-size:11px;">RFC1918 range you've chosen for the VLAN. All servers on the same VLAN should agree.</small>
+                    </label>
+                    <label>This server's IP on the subnet <input id="vlan-self-ip" value="${vlanEsc(ex.self_ip)}" placeholder="10.0.1.5">
+                        <small style="color:var(--text-muted); font-size:11px;">Pick a unique IP within the subnet, not the network/broadcast addresses. Convention: <code>.1</code> = the cloud-network gateway (if any), <code>.2-.254</code> for your servers. Each WolfStack server on this same VLAN needs a different self IP — coordinate by hand for now (the auto-picker on attach respects allocations across the WolfStack admin cluster, but a separate WolfStack install on another machine sharing the vSwitch is invisible until you add it as an external reservation).</small>
+                    </label>
+                    <label>Optional gateway routes (one per line, format: <code>DEST_CIDR via VIA_IP</code>)
+                        <textarea id="vlan-routes" rows="2" placeholder="10.0.0.0/16 via 10.0.1.1">${(ex.routes||[]).map(r => `${vlanEsc(r.destination)} via ${vlanEsc(r.via)}`).join('\n')}</textarea>
+                        <small style="color:var(--text-muted); font-size:11px;">For Hetzner Cloud-Network bridging: <code>10.0.0.0/16 via 10.0.1.1</code> where .1 is the cloud network gateway.</small>
+                    </label>
+                    <label>Notes <input id="vlan-notes" value="${vlanEsc(ex.notes)}" placeholder="Used by region servers"></label>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn" onclick="document.getElementById('vlan-add-modal').remove()">Cancel</button>
+                    <button class="btn btn-primary" onclick="vlanSave('${vlanEsc(ex.id)}')">Save &amp; apply</button>
+                </div>
+            </div>
+        </div>`;
+    const wrap = document.createElement('div');
+    wrap.innerHTML = html;
+    document.body.appendChild(wrap.firstElementChild);
+    vlanProviderChanged();
+}
+
+function vlanProviderChanged() {
+    const prov = (document.getElementById('vlan-provider') || {}).value || 'custom';
+    const mtuEl = document.getElementById('vlan-mtu');
+    // Only update MTU if it still matches a known default — preserves
+    // operator-customised MTUs across provider changes.
+    if (mtuEl) {
+        const cur = parseInt(mtuEl.value, 10);
+        if ([1400, 1500].includes(cur)) {
+            mtuEl.value = vlanProviderDefaults(prov);
+        }
+    }
+    vlanSyncBridgeName();
+}
+
+function vlanSyncBridgeName() {
+    const id = parseInt((document.getElementById('vlan-id') || {}).value, 10) || 0;
+    const bridgeEl = document.getElementById('vlan-bridge');
+    if (bridgeEl && (!bridgeEl.value || /^vmbr\d+$/.test(bridgeEl.value))) {
+        bridgeEl.value = id > 0 ? `vmbr${id}` : '';
+    }
+}
+
+async function vlanSave(existingId) {
+    const provider = document.getElementById('vlan-provider').value;
+    const name = document.getElementById('vlan-name').value.trim();
+    const parent = document.getElementById('vlan-parent').value;
+    const vlanId = parseInt(document.getElementById('vlan-id').value, 10);
+    const mtu = parseInt(document.getElementById('vlan-mtu').value, 10);
+    const bridge = document.getElementById('vlan-bridge').value.trim();
+    const subnet = document.getElementById('vlan-subnet').value.trim();
+    const selfIp = document.getElementById('vlan-self-ip').value.trim();
+    const notes = document.getElementById('vlan-notes').value.trim();
+    const routes = document.getElementById('vlan-routes').value.trim().split('\n')
+        .map(l => l.trim()).filter(Boolean)
+        .map(line => {
+            // Format: "DEST via VIA"
+            const m = line.match(/^(\S+)\s+via\s+(\S+)$/i);
+            return m ? { destination: m[1], via: m[2] } : null;
+        })
+        .filter(r => r);
+    if (!name || !parent || !subnet || !selfIp || !bridge) {
+        showToast('All fields except notes and routes are required', 'error');
+        return;
+    }
+    const body = {
+        id: existingId || '',
+        name, provider, parent_iface: parent,
+        vlan_id: vlanId, mtu, bridge_name: bridge,
+        subnet, self_ip: selfIp, routes, notes
+    };
+    // 1) Preflight — surface any "this is going to break X" findings
+    //    before we commit. The backend re-runs the same check and
+    //    blocks the save unless we pass ack_critical=true.
+    let findings = [];
+    try {
+        const pf = await fetch(apiUrl('/api/networking/vlan/preflight'), {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify(body),
+        });
+        if (pf.ok) {
+            const pfData = await pf.json();
+            findings = pfData.preflight || [];
+        }
+    } catch (_) { /* preflight is advisory — continue if it fails */ }
+
+    const critical = findings.filter(f => f.severity === 'critical');
+    const warnings = findings.filter(f => f.severity === 'warn');
+    let ackCritical = false;
+    if (critical.length > 0 || warnings.length > 0) {
+        ackCritical = await vlanShowPreflightConfirm(findings);
+        if (ackCritical === false && critical.length > 0) {
+            // Operator declined — abandon the save.
+            return;
+        }
+        // For warnings-only, the operator confirmed. ackCritical is
+        // irrelevant when there are no critical findings.
+    }
+
+    try {
+        const url = `/api/networking/vlan/attachments${ackCritical ? '?ack_critical=true' : ''}`;
+        const resp = await fetch(apiUrl(url), {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify(body),
+        });
+        const data = await resp.json();
+        if (resp.status === 409 && data.preflight) {
+            // Race: host state changed between our preflight and the submit.
+            // Re-prompt with the fresh findings.
+            const fresh = await vlanShowPreflightConfirm(data.preflight);
+            if (!fresh) return;
+            const retry = await fetch(apiUrl('/api/networking/vlan/attachments?ack_critical=true'), {
+                method: 'POST',
+                headers: {'Content-Type':'application/json'},
+                body: JSON.stringify(body),
+            });
+            const retryData = await retry.json();
+            if (!retry.ok) {
+                showToast(retryData.error || 'Save failed', 'error');
+                return;
+            }
+            document.getElementById('vlan-add-modal')?.remove();
+            showToast('VLAN saved and applied (after acknowledging warnings)', 'warning');
+            loadNetworking();
+            return;
+        }
+        if (!resp.ok) {
+            showToast(data.error || 'Save failed', 'error');
+            return;
+        }
+        document.getElementById('vlan-add-modal')?.remove();
+        const warns = (data.apply && data.apply.warnings) || [];
+        if (warns.length > 0) {
+            showToast(`VLAN saved with ${warns.length} runtime warning(s)`, 'warning');
+            showModal(`<pre style="white-space:pre-wrap;font-family:var(--font-mono);font-size:12px;">${vlanEsc(warns.join('\n'))}</pre>`, 'Apply warnings');
+        } else {
+            showToast('VLAN saved and applied', 'success');
+        }
+        loadNetworking();
+    } catch (e) {
+        showToast(`Save failed: ${e.message || e}`, 'error');
+    }
+}
+
+// Render a preflight findings dialog. Returns a promise that resolves
+// to true if the operator clicks "Apply anyway" (only path that lets
+// the save proceed when there are critical findings) or false if they
+// cancel. For warn-only findings the operator can click "Apply" and
+// the promise resolves to false (no ack_critical needed) — the backend
+// doesn't gate on warnings, just on critical findings.
+function vlanShowPreflightConfirm(findings) {
+    return new Promise((resolve) => {
+        const critical = findings.filter(f => f.severity === 'critical');
+        const warnings = findings.filter(f => f.severity === 'warn');
+        const info = findings.filter(f => f.severity === 'info');
+        const hasCrit = critical.length > 0;
+
+        const renderFinding = (f, colour) => `
+            <div style="padding:10px 12px; background:${colour}10; border:1px solid ${colour}40; border-radius:6px; margin-bottom:8px;">
+                <div style="font-weight:600; color:${colour}; font-size:13px; margin-bottom:4px;">${vlanEsc(f.title)}</div>
+                <div style="font-size:12px; color:var(--text-secondary); margin-bottom:6px;">${vlanEsc(f.why)}</div>
+                ${f.fix ? `<div style="font-size:11px; color:var(--text-muted);"><strong>Suggested fix:</strong> ${vlanEsc(f.fix)}</div>` : ''}
+            </div>`;
+
+        const headerColour = hasCrit ? '#ef4444' : (warnings.length ? '#fbbf24' : '#6366f1');
+        const headerText = hasCrit
+            ? `Your setup is currently probably not right — ${critical.length} critical issue${critical.length === 1 ? '' : 's'} found`
+            : (warnings.length
+                ? `Heads up: applying may briefly disrupt the network`
+                : 'Pre-flight info');
+
+        const overlay = document.createElement('div');
+        overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);z-index:100001;display:flex;align-items:center;justify-content:center';
+        const modal = document.createElement('div');
+        modal.style.cssText = 'background:var(--bg-card,#1e2028);border:1px solid var(--border-color,#2d2f3a);border-radius:12px;padding:22px 26px;max-width:640px;width:92%;max-height:88vh;overflow-y:auto;box-shadow:0 20px 60px rgba(0,0,0,0.5);color:var(--text-primary,#e4e4e7);font-family:inherit';
+        modal.innerHTML = `
+            <div style="font-size:16px; font-weight:600; color:var(--accent-light,#60a5fa); margin-bottom:14px;">Pre-flight check</div>
+            <div style="font-size:14px; font-weight:600; color:${headerColour}; margin-bottom:12px;">${headerText}</div>
+            ${critical.map(f => renderFinding(f, '#ef4444')).join('')}
+            ${warnings.map(f => renderFinding(f, '#fbbf24')).join('')}
+            ${info.map(f => renderFinding(f, '#6366f1')).join('')}
+            ${hasCrit ? `
+                <label style="display:flex; align-items:center; gap:8px; padding:10px 12px; background:rgba(239,68,68,0.05); border:1px solid rgba(239,68,68,0.30); border-radius:6px; margin-top:8px; cursor:pointer;">
+                    <input type="checkbox" id="pf-ack" style="margin:0;">
+                    <span style="font-size:12px;">I understand the critical issues above and want to apply anyway. I have console access in case I lose connection.</span>
+                </label>
+            ` : ''}
+            <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:14px;">
+                <button id="pf-cancel" style="background:var(--bg-secondary,#2d2f3a);color:var(--text-primary,#e4e4e7);border:1px solid var(--border-color,#3d3f4a);border-radius:6px;padding:8px 18px;cursor:pointer;font-size:13px;">Cancel</button>
+                <button id="pf-go" ${hasCrit ? 'disabled' : ''} style="background:${hasCrit ? '#ef4444' : 'var(--accent,#3b82f6)'};color:#fff;border:none;border-radius:6px;padding:8px 18px;cursor:pointer;font-size:13px;${hasCrit ? 'opacity:0.5;' : ''}">${hasCrit ? 'Apply anyway' : 'Apply'}</button>
+            </div>`;
+        overlay.appendChild(modal);
+        (document.fullscreenElement || document.body).appendChild(overlay);
+
+        const cleanup = (val) => { overlay.remove(); resolve(val); };
+        const ackBox = modal.querySelector('#pf-ack');
+        const goBtn = modal.querySelector('#pf-go');
+        if (ackBox && goBtn) {
+            ackBox.addEventListener('change', () => {
+                goBtn.disabled = !ackBox.checked;
+                goBtn.style.opacity = ackBox.checked ? '1' : '0.5';
+            });
+        }
+        modal.querySelector('#pf-cancel').addEventListener('click', () => cleanup(false));
+        goBtn.addEventListener('click', () => {
+            if (goBtn.disabled) return;
+            cleanup(hasCrit ? true : false);
+        });
+    });
+}
+
+async function vlanDelete(id, name) {
+    if (!await wolfConfirm(`Delete VLAN attachment "${name}"? This removes the bridge, the VLAN sub-interface, and the persistent config. Containers attached to the bridge will lose connectivity until reattached.`, 'Delete VLAN')) return;
+    try {
+        const resp = await fetch(apiUrl(`/api/networking/vlan/attachments/${encodeURIComponent(id)}`), { method: 'DELETE' });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+            showToast(data.error || 'Delete failed', 'error');
+            return;
+        }
+        showToast('VLAN removed', 'success');
+        loadNetworking();
+    } catch (e) {
+        showToast(`Delete failed: ${e.message || e}`, 'error');
+    }
+}
+
+function publicIpShowAddDialog(existing) {
+    const ex = existing || {
+        id: '', name: '', provider: 'hetzner',
+        ip: '', container_internal_ip: '', egress_iface: ''
+    };
+    // Egress NIC defaults to the primary interface — usually the right
+    // pick for routed-IP setups since it's the one with public reach.
+    const nicOptions = (cachedInterfaces || [])
+        .filter(i => !i.is_vlan
+            && !i.name.startsWith('docker') && !i.name.startsWith('br-')
+            && !i.name.startsWith('veth') && !i.name.startsWith('wn')
+            && !i.name.startsWith('lo'))
+        .map(i => `<option value="${vlanEsc(i.name)}" ${i.name === ex.egress_iface ? 'selected' : ''}>${vlanEsc(i.name)}</option>`)
+        .join('');
+    const html = `
+        <div class="modal-overlay active" id="pip-add-modal">
+            <div class="modal" style="max-width:520px;">
+                <div class="modal-header">
+                    <h3>Add routed public IP</h3>
+                    <button class="modal-close" onclick="document.getElementById('pip-add-modal').remove()">&times;</button>
+                </div>
+                <div class="modal-body" style="display:flex; flex-direction:column; gap:10px;">
+                    <div style="padding:10px 12px; background:rgba(99,102,241,0.08); border:1px solid rgba(99,102,241,0.25); border-radius:6px; font-size:12px; color:var(--text-secondary); line-height:1.55;">
+                        <strong style="color:var(--text-primary);">How this works (routed mode)</strong>
+                        <ul style="margin:6px 0 6px 18px; padding:0;">
+                            <li>The IP must already be <strong>assigned to this server in your provider's panel</strong> (Hetzner Robot &gt; IPs, OVH manager, etc.). WolfStack can't reassign IPs at the provider level.</li>
+                            <li>The host claims the IP on <code>lo</code>, enables proxy-ARP on the egress NIC so it answers ARP for the IP.</li>
+                            <li>iptables DNAT redirects inbound traffic to the container's internal IP; SNAT rewrites the container's outbound traffic to use the public IP as source.</li>
+                            <li>The container itself doesn't need any public-IP config — it sees only its internal IP. The host handles the translation.</li>
+                        </ul>
+                    </div>
+                    <div style="padding:10px 12px; background:rgba(234,179,8,0.10); border:1px solid rgba(234,179,8,0.30); border-radius:6px; font-size:12px; color:var(--text-secondary); line-height:1.55;">
+                        <strong style="color:#fbbf24;">Provider-side gotchas</strong>
+                        <ul style="margin:6px 0 6px 18px; padding:0;">
+                            <li><strong>Hetzner virtual MAC:</strong> If the IP has a virtual MAC bound in Robot, outbound packets get dropped at Hetzner's switch unless they leave with that exact MAC. Ask the IP owner to remove the virtual MAC binding (most common fix) OR generate one and tell us — bridged-mode support coming later.</li>
+                            <li><strong>Hetzner stale routing:</strong> If the IP previously belonged to a destroyed/reimaged server, Hetzner's core may take 5-30 min to refresh routing. Symptoms: <code>Destination Net Unreachable</code> from a Hetzner core IP.</li>
+                            <li><strong>OVH IP block routing:</strong> Make sure the IP is in your "additional IPs" not "block routed to vRack" — those need different config.</li>
+                        </ul>
+                    </div>
+                    <label>Provider
+                        <select id="pip-provider">
+                            <option value="hetzner" ${ex.provider==='hetzner'?'selected':''}>Hetzner additional IP</option>
+                            <option value="ovh" ${ex.provider==='ovh'?'selected':''}>OVH additional IP</option>
+                            <option value="equinix" ${ex.provider==='equinix'?'selected':''}>Equinix Metal</option>
+                            <option value="custom" ${ex.provider==='custom'?'selected':''}>Custom / other</option>
+                        </select>
+                    </label>
+                    <label>Name <input id="pip-name" value="${vlanEsc(ex.name)}" placeholder="regions80-public"></label>
+                    <label>Public IP <input id="pip-ip" value="${vlanEsc(ex.ip)}" placeholder="159.69.169.116"></label>
+                    <label>Container's internal IP (the one DNAT delivers to)
+                        <input id="pip-internal" value="${vlanEsc(ex.container_internal_ip)}" placeholder="10.0.3.100">
+                    </label>
+                    <label>Egress NIC (the public-reachable interface)
+                        <select id="pip-egress">${nicOptions || '<option value="">— no NICs detected —</option>'}</select>
+                    </label>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn" onclick="document.getElementById('pip-add-modal').remove()">Cancel</button>
+                    <button class="btn btn-primary" onclick="publicIpSave('${vlanEsc(ex.id)}')">Save &amp; apply</button>
+                </div>
+            </div>
+        </div>`;
+    const wrap = document.createElement('div');
+    wrap.innerHTML = html;
+    document.body.appendChild(wrap.firstElementChild);
+}
+
+async function publicIpSave(existingId) {
+    const body = {
+        id: existingId || '',
+        name: document.getElementById('pip-name').value.trim(),
+        provider: document.getElementById('pip-provider').value,
+        ip: document.getElementById('pip-ip').value.trim(),
+        container_internal_ip: document.getElementById('pip-internal').value.trim(),
+        egress_iface: document.getElementById('pip-egress').value,
+    };
+    if (!body.name || !body.ip || !body.container_internal_ip || !body.egress_iface) {
+        showToast('All fields are required', 'error');
+        return;
+    }
+    try {
+        const resp = await fetch(apiUrl('/api/networking/vlan/public-ips'), {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify(body),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+            showToast(data.error || 'Save failed', 'error');
+            return;
+        }
+        document.getElementById('pip-add-modal')?.remove();
+        const warns = (data.apply && data.apply.warnings) || [];
+        if (warns.length > 0) {
+            showToast(`Public IP saved with ${warns.length} warning(s)`, 'warning');
+            showModal(`<pre style="white-space:pre-wrap;font-family:var(--font-mono);font-size:12px;">${vlanEsc(warns.join('\n'))}</pre>`, 'Apply warnings');
+        } else {
+            showToast('Public IP saved and applied', 'success');
+        }
+        loadNetworking();
+    } catch (e) {
+        showToast(`Save failed: ${e.message || e}`, 'error');
+    }
+}
+
+async function publicIpDelete(id, name) {
+    if (!await wolfConfirm(`Remove routed public IP "${name}"? The IP will no longer be accessible until you re-add it.`, 'Remove public IP')) return;
+    try {
+        const resp = await fetch(apiUrl(`/api/networking/vlan/public-ips/${encodeURIComponent(id)}`), { method: 'DELETE' });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+            showToast(data.error || 'Delete failed', 'error');
+            return;
+        }
+        showToast('Public IP removed', 'success');
+        loadNetworking();
+    } catch (e) {
+        showToast(`Delete failed: ${e.message || e}`, 'error');
+    }
+}
+
+async function vlanShowPreview() {
+    try {
+        const resp = await fetch(apiUrl('/api/networking/vlan/preview'));
+        const data = await resp.json();
+        const snippet = data.snippet || '(empty — no VLANs or public IPs configured)';
+        const findings = data.preflight || [];
+        const critical = findings.filter(f => f.severity === 'critical');
+        const warnings = findings.filter(f => f.severity === 'warn');
+        const renderFinding = (f, colour) => `
+            <div style="padding:8px 10px; background:${colour}10; border:1px solid ${colour}40; border-radius:6px; margin-bottom:6px;">
+                <div style="font-weight:600; color:${colour}; font-size:12px;">${vlanEsc(f.title)}</div>
+                <div style="font-size:11px; color:var(--text-secondary); margin-top:3px;">${vlanEsc(f.why)}</div>
+                ${f.fix ? `<div style="font-size:11px; color:var(--text-muted); margin-top:3px;"><strong>Fix:</strong> ${vlanEsc(f.fix)}</div>` : ''}
+            </div>`;
+        const findingsHtml = (critical.length || warnings.length) ? `
+            <div style="margin-bottom:12px;">
+                <div style="font-size:13px; font-weight:600; color:${critical.length ? '#ef4444' : '#fbbf24'}; margin-bottom:6px;">
+                    ${critical.length ? `Your setup is currently probably not right — ${critical.length} critical issue${critical.length === 1 ? '' : 's'}` : `${warnings.length} warning${warnings.length === 1 ? '' : 's'}`}
+                </div>
+                ${critical.map(f => renderFinding(f, '#ef4444')).join('')}
+                ${warnings.map(f => renderFinding(f, '#fbbf24')).join('')}
+            </div>
+        ` : '';
+        showModal(`${findingsHtml}
+        <div style="font-size:12px; color:var(--text-secondary); margin-bottom:8px;">
+            This is the ifupdown-style snippet WolfStack would write. On netplan / NetworkManager / systemd-networkd hosts the equivalent native config is generated and applied instead. On other distros it lands at <code>/var/lib/wolfstack/suggested-vlan-config.txt</code> for manual translation.
+        </div>
+        <pre style="white-space:pre; overflow:auto; max-height:380px; font-family:var(--font-mono); font-size:11px; background:var(--bg-secondary); padding:10px; border-radius:6px;">${vlanEsc(snippet)}</pre>`,
+        'Generated config');
+    } catch (e) {
+        showToast(`Preview failed: ${e.message || e}`, 'error');
+    }
+}
+
+// ─── Attach a guest (LXC / Proxmox / Docker / VM) to a VLAN ────────
+
+async function vlanShowAttachDialog(vlan) {
+    // Fetch cluster-wide used IPs first so the auto-pick can avoid them.
+    let clusterUsed = { local_ips: [], peer_ips: {} };
+    try {
+        const r = await fetch(apiUrl(`/api/networking/vlan/cluster-used?subnet=${encodeURIComponent(vlan.subnet)}`));
+        if (r.ok) clusterUsed = await r.json();
+    } catch (_) { /* offline cluster — proceed with local-only view */ }
+    const allUsed = new Set([...(clusterUsed.local_ips || []),
+        ...Object.values(clusterUsed.peer_ips || {}).flat()]);
+    // Render compact "in use" hint.
+    const usedSummary = allUsed.size === 0
+        ? '<span style="color:var(--text-muted);">No IPs allocated yet on this subnet.</span>'
+        : `${allUsed.size} IP${allUsed.size === 1 ? '' : 's'} already in use across this WolfStack admin cluster (auto-pick avoids these).`;
+    // Cross-cluster awareness: if there are no external reservations
+    // AND no peer_ips, that's potentially the standalone-on-shared-vSwitch
+    // case the operator should know about. Show a one-time hint.
+    const peerCount = Object.keys(clusterUsed.peer_ips || {}).length;
+    const reservationCount = (vlan.external_reservations || []).length;
+    const crossClusterHint = (peerCount === 0 && reservationCount === 0)
+        ? `<div style="padding:8px 10px; background:rgba(234,179,8,0.10); border:1px solid rgba(234,179,8,0.30); border-radius:6px; font-size:11px; color:var(--text-secondary); margin-top:6px;">
+            <strong style="color:#fbbf24;">Heads up:</strong> the auto-picker can only see WolfStack peers in your own admin cluster. If you have other servers on this same vSwitch that aren't part of this WolfStack install (a colleague's box, a standalone server, the cloud-network gateway), close this dialog and click <strong>Reservations</strong> on the VLAN row to declare those IPs. Otherwise the auto-picker might double-allocate.
+           </div>`
+        : '';
+    const html = `
+        <div class="modal-overlay active" id="vlan-attach-modal">
+            <div class="modal" style="max-width:560px;">
+                <div class="modal-header">
+                    <h3>Attach to VLAN ${vlanEsc(vlan.name)}</h3>
+                    <button class="modal-close" onclick="document.getElementById('vlan-attach-modal').remove()">&times;</button>
+                </div>
+                <div class="modal-body" style="display:flex; flex-direction:column; gap:10px;">
+                    <div style="padding:8px 10px; background:rgba(99,102,241,0.08); border:1px solid rgba(99,102,241,0.25); border-radius:6px; font-size:12px;">
+                        <div>Bridge: <code>${vlanEsc(vlan.bridge_name)}</code> · Subnet: <code>${vlanEsc(vlan.subnet)}</code> · MTU: <code>${vlan.mtu}</code></div>
+                        <div style="margin-top:4px; color:var(--text-muted);">${usedSummary}</div>
+                    </div>
+                    <label>What are you attaching?
+                        <select id="va-kind" onchange="vlanAttachBackendChanged()">
+                            <option value="lxc_native">LXC container on this server</option>
+                            <option value="lxc_proxmox">Proxmox LXC container</option>
+                            <option value="docker">Docker container</option>
+                            <option value="vm_proxmox">Proxmox virtual machine</option>
+                            <option value="vm_native">Virtual machine (libvirt / native)</option>
+                            <option value="manual">Just reserve the IP (no backend changes)</option>
+                        </select>
+                    </label>
+                    <label>Target name <input id="va-target" placeholder="">
+                        <small id="va-target-hint" style="color:var(--text-muted); font-size:11px;"></small>
+                    </label>
+                    <label>Label (optional) <input id="va-label" placeholder="regions80-vswitch"></label>
+                    <label>IP address
+                        <div style="display:flex; gap:6px;">
+                            <input id="va-ip" placeholder="leave blank for auto-pick" style="flex:1;">
+                            <button class="btn btn-sm" type="button" onclick='vlanAutoPickIp(${JSON.stringify(vlan).replace(/'/g, "&#39;")})'>Pick next free</button>
+                        </div>
+                        <small style="color:var(--text-muted); font-size:11px;">Must be inside <code>${vlanEsc(vlan.subnet)}</code>. Leave blank to let WolfStack pick the next free IP on save.</small>
+                    </label>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn" onclick="document.getElementById('vlan-attach-modal').remove()">Cancel</button>
+                    <button class="btn btn-primary" onclick='vlanDoAttach("${vlanEsc(vlan.id)}")'>Attach</button>
+                </div>
+            </div>
+        </div>`;
+    const wrap = document.createElement('div');
+    wrap.innerHTML = html;
+    document.body.appendChild(wrap.firstElementChild);
+    vlanAttachBackendChanged();
+}
+
+// Backend-specific hint for the Target Name field. Updates live as
+// the operator switches the dropdown so they don't have to remember
+// "is this a name or a VMID?".
+function vlanAttachBackendChanged() {
+    const kind = (document.getElementById('va-kind') || {}).value || 'lxc_native';
+    const targetEl = document.getElementById('va-target');
+    const hintEl = document.getElementById('va-target-hint');
+    if (!targetEl || !hintEl) return;
+    const hints = {
+        lxc_native:  { ph: 'regions80',  hint: 'The LXC container name (whatever you ran `lxc-create -n NAME`).' },
+        lxc_proxmox: { ph: '101',        hint: 'The Proxmox VMID (numeric, e.g. 101). Find it in the Proxmox UI or `pct list`.' },
+        docker:      { ph: 'my-app',     hint: 'The Docker container name (`docker ps` shows them in the rightmost column).' },
+        vm_proxmox:  { ph: '200',        hint: 'The Proxmox VMID (numeric). Find it in the Proxmox UI or `qm list`.' },
+        vm_native:   { ph: 'web01',      hint: 'The libvirt domain name (`virsh list --all` shows them).' },
+        manual:      { ph: 'note',       hint: 'A label so you remember why this IP is reserved. No container/VM is touched.' },
+    };
+    const h = hints[kind] || hints.lxc_native;
+    targetEl.placeholder = h.ph;
+    hintEl.textContent = h.hint;
+}
+
+async function vlanAutoPickIp(vlan) {
+    // Fetch fresh used-IPs and put the next-available into the field.
+    try {
+        const r = await fetch(apiUrl(`/api/networking/vlan/cluster-used?subnet=${encodeURIComponent(vlan.subnet)}`));
+        const data = r.ok ? await r.json() : { local_ips: [], peer_ips: {} };
+        const used = new Set([...(data.local_ips || []),
+            ...Object.values(data.peer_ips || {}).flat()]);
+        // Compute next-available client-side too (matches the server's rules).
+        const next = computeNextAvailableIp(vlan, [...used]);
+        if (next) {
+            document.getElementById('va-ip').value = next;
+        } else {
+            showToast('No free IPs left on this subnet', 'warning');
+        }
+    } catch (e) {
+        showToast(`Couldn't fetch used IPs: ${e.message || e}`, 'error');
+    }
+}
+
+// Mirror of next_available_ip in src/networking/vlan.rs — kept in sync so
+// the UI can preview the auto-pick without a roundtrip on every keystroke.
+function computeNextAvailableIp(vlan, clusterUsed) {
+    const subnet = vlan.subnet;
+    const m = /^(\d+\.\d+\.\d+\.\d+)\/(\d+)$/.exec(subnet);
+    if (!m) return null;
+    const [, netStr, prefixStr] = m;
+    const prefix = parseInt(prefixStr, 10);
+    const hostBits = 32 - prefix;
+    if (hostBits < 2) return null;
+    const ipToInt = ip => ip.split('.').reduce((acc, o) => (acc << 8 | parseInt(o, 10)) >>> 0, 0) >>> 0;
+    const intToIp = n => [(n >>> 24) & 0xff, (n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff].join('.');
+    const netN = ipToInt(netStr);
+    const mask = prefix === 0 ? 0 : ((0xffffffff << hostBits) >>> 0);
+    const netAddr = (netN & mask) >>> 0;
+    const bcastAddr = (netAddr | (~mask >>> 0)) >>> 0;
+    const selfN = ipToInt(vlan.self_ip);
+    const used = new Set();
+    used.add(netAddr); used.add(bcastAddr); used.add(selfN);
+    const conventionalGw = (netAddr + 1) >>> 0;
+    if (selfN !== conventionalGw) used.add(conventionalGw);
+    (vlan.allocations || []).forEach(a => { try { used.add(ipToInt(a.ip)); } catch (_) {} });
+    (vlan.external_reservations || []).forEach(r => {
+        const range = /^(\d+\.\d+\.\d+\.\d+)\s*-\s*(\d+\.\d+\.\d+\.\d+)$/.exec(r.spec.trim());
+        if (range) {
+            const lo = ipToInt(range[1]); const hi = ipToInt(range[2]);
+            for (let n = lo; n <= hi; n++) used.add(n);
+        } else if (/^\d+\.\d+\.\d+\.\d+$/.test(r.spec.trim())) {
+            used.add(ipToInt(r.spec.trim()));
+        }
+    });
+    (clusterUsed || []).forEach(s => { try { used.add(ipToInt(s)); } catch (_) {} });
+    for (let n = (netAddr + 1) >>> 0; n <= ((bcastAddr - 1) >>> 0); n++) {
+        if (!used.has(n)) return intToIp(n);
+    }
+    return null;
+}
+
+async function vlanDoAttach(vlanId) {
+    const body = {
+        vlan_id: vlanId,
+        target_kind: document.getElementById('va-kind').value,
+        target_id: document.getElementById('va-target').value.trim(),
+        ip: document.getElementById('va-ip').value.trim(),
+        label: document.getElementById('va-label').value.trim(),
+    };
+    if (!body.target_id) {
+        showToast('Target ID is required', 'error');
+        return;
+    }
+    try {
+        const resp = await fetch(apiUrl('/api/networking/vlan/attach'), {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify(body),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+            showToast(data.error || 'Attach failed', 'error');
+            return;
+        }
+        document.getElementById('vlan-attach-modal')?.remove();
+        showToast(`Attached: ${data.message}`, 'success');
+        loadNetworking();
+    } catch (e) {
+        showToast(`Attach failed: ${e.message || e}`, 'error');
+    }
+}
+
+async function vlanDetach(vlanId, targetKind, targetId, ip, label) {
+    if (!await wolfConfirm(`Detach ${label} (${ip}) from this VLAN? This will remove the network interface from the container/VM and release the IP.`, 'Detach from VLAN')) return;
+    try {
+        const resp = await fetch(apiUrl('/api/networking/vlan/detach'), {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({ vlan_id: vlanId, target_kind: targetKind, target_id: targetId, ip }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+            showToast(data.error || 'Detach failed', 'error');
+            return;
+        }
+        if (data.warning) {
+            showToast(data.warning, 'warning');
+        } else {
+            showToast(data.message || 'Detached', 'success');
+        }
+        loadNetworking();
+    } catch (e) {
+        showToast(`Detach failed: ${e.message || e}`, 'error');
+    }
+}
+
+// ─── Connectivity test ─────────────────────────────────────────────
+//
+// Pings every known member of a VLAN (local allocations + cluster
+// peers + configured gateways) and renders a per-IP reachable list.
+// First-line diagnostic for "is this vSwitch even working".
+
+async function vlanTestConnectivity(vlanId, vlanName) {
+    showToast(`Testing ${vlanName}...`, 'info', 1500);
+    let data;
+    try {
+        const resp = await fetch(apiUrl(`/api/networking/vlan/test/${encodeURIComponent(vlanId)}`), {
+            method: 'POST',
+        });
+        data = await resp.json();
+        if (!resp.ok) {
+            showToast(data.error || 'Test failed', 'error');
+            return;
+        }
+    } catch (e) {
+        showToast(`Test failed: ${e.message || e}`, 'error');
+        return;
+    }
+    const results = data.results || [];
+    if (results.length === 0) {
+        showModal(`<div style="color:var(--text-secondary); font-size:13px;">${vlanEsc(data.summary || 'Nothing to test.')}</div>`,
+            `Connectivity test: ${vlanName}`);
+        return;
+    }
+    const okCount = results.filter(r => r.reachable).length;
+    const totalCount = results.length;
+    const headerColor = okCount === totalCount ? '#22c55e' : okCount === 0 ? '#ef4444' : '#fbbf24';
+    const rows = results.map(r => {
+        const colour = r.reachable ? '#22c55e' : '#ef4444';
+        const status = r.reachable ? 'reachable' : 'no reply';
+        return `<tr>
+            <td style="padding:5px 10px; font-family:var(--font-mono); font-size:12px;">${vlanEsc(r.ip)}</td>
+            <td style="padding:5px 10px; color:${colour}; font-size:12px;">${status}</td>
+            <td style="padding:5px 10px; color:var(--text-muted); font-size:12px;">${vlanEsc(r.label)}</td>
+        </tr>`;
+    }).join('');
+    showModal(`
+        <div style="font-size:14px; font-weight:600; color:${headerColor}; margin-bottom:10px;">${vlanEsc(data.summary || `${okCount}/${totalCount} reachable`)}</div>
+        <table style="width:100%; border-collapse:collapse; font-size:13px;">
+            <thead>
+                <tr style="text-align:left; border-bottom:1px solid var(--border);">
+                    <th style="padding:5px 10px;">IP</th>
+                    <th style="padding:5px 10px;">Status</th>
+                    <th style="padding:5px 10px;">Member</th>
+                </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+        </table>
+        <div style="margin-top:10px; font-size:11px; color:var(--text-muted);">
+            "no reply" can mean: the target is offline, ICMP is firewalled, or the VLAN isn't passing traffic between this server and the target. Start by checking firewall rules on the target, then verify the MTU matches across all members.
+        </div>
+    `, `Connectivity test: ${vlanName}`);
+}
+
+// ─── External reservations (held by non-WolfStack machines) ────────
+
+function vlanShowReservationsDialog(vlan) {
+    const initial = (vlan.external_reservations || []).map(r =>
+        `${r.spec}${r.note ? '   # ' + r.note : ''}`
+    ).join('\n');
+    const html = `
+        <div class="modal-overlay active" id="vlan-res-modal">
+            <div class="modal" style="max-width:560px;">
+                <div class="modal-header">
+                    <h3>External reservations for ${vlanEsc(vlan.name)}</h3>
+                    <button class="modal-close" onclick="document.getElementById('vlan-res-modal').remove()">&times;</button>
+                </div>
+                <div class="modal-body" style="display:flex; flex-direction:column; gap:10px;">
+                    <div style="padding:8px 10px; background:rgba(99,102,241,0.08); border:1px solid rgba(99,102,241,0.25); border-radius:6px; font-size:12px; line-height:1.55;">
+                        Use this to declare IPs on <code>${vlanEsc(vlan.subnet)}</code> that are held by machines NOT managed by this WolfStack install — standalone servers on the same vSwitch, the cloud-network gateway, manually-configured boxes, etc. The auto-picker treats these as taken so it doesn't double-allocate.
+                        <div style="margin-top:6px; color:var(--text-muted);">Format: one entry per line. Either a single IP (<code>10.0.1.5</code>) or an inclusive range (<code>10.0.1.20-10.0.1.30</code>). Optional <code># comment</code> after the entry.</div>
+                    </div>
+                    <textarea id="vlan-res-text" rows="8" style="font-family:var(--font-mono); font-size:12px;" placeholder="10.0.1.1   # cloud-network gateway&#10;10.0.1.20-10.0.1.30   # external cluster">${vlanEsc(initial)}</textarea>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn" onclick="document.getElementById('vlan-res-modal').remove()">Cancel</button>
+                    <button class="btn btn-primary" onclick='vlanSaveReservations(${JSON.stringify(vlan).replace(/'/g, "&#39;")})'>Save</button>
+                </div>
+            </div>
+        </div>`;
+    const wrap = document.createElement('div');
+    wrap.innerHTML = html;
+    document.body.appendChild(wrap.firstElementChild);
+}
+
+async function vlanSaveReservations(vlan) {
+    const lines = document.getElementById('vlan-res-text').value.split('\n')
+        .map(l => l.trim()).filter(Boolean);
+    const reservations = lines.map(line => {
+        const hashIdx = line.indexOf('#');
+        const spec = (hashIdx >= 0 ? line.substring(0, hashIdx) : line).trim();
+        const note = hashIdx >= 0 ? line.substring(hashIdx + 1).trim() : '';
+        return { spec, note };
+    }).filter(r => r.spec);
+    // Re-upsert the VLAN with the new reservations list. The backend
+    // preserves all other fields.
+    const updated = { ...vlan, external_reservations: reservations };
+    try {
+        const resp = await fetch(apiUrl('/api/networking/vlan/attachments'), {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify(updated),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+            showToast(data.error || 'Save failed', 'error');
+            return;
+        }
+        document.getElementById('vlan-res-modal')?.remove();
+        showToast(`Saved ${reservations.length} external reservation(s)`, 'success');
+        loadNetworking();
+    } catch (e) {
+        showToast(`Save failed: ${e.message || e}`, 'error');
+    }
+}
+
+// Expose to window so onclick handlers can find them.
+window.vlanShowAddDialog = vlanShowAddDialog;
+window.vlanShowPreview = vlanShowPreview;
+window.vlanProviderChanged = vlanProviderChanged;
+window.vlanSyncBridgeName = vlanSyncBridgeName;
+window.vlanSave = vlanSave;
+window.vlanDelete = vlanDelete;
+window.vlanShowAttachDialog = vlanShowAttachDialog;
+window.vlanAttachBackendChanged = vlanAttachBackendChanged;
+window.vlanAutoPickIp = vlanAutoPickIp;
+window.vlanDoAttach = vlanDoAttach;
+window.vlanDetach = vlanDetach;
+window.vlanShowReservationsDialog = vlanShowReservationsDialog;
+window.vlanSaveReservations = vlanSaveReservations;
+window.vlanTestConnectivity = vlanTestConnectivity;
+window.publicIpShowAddDialog = publicIpShowAddDialog;
+window.publicIpSave = publicIpSave;
+window.publicIpDelete = publicIpDelete;
 
 async function wgLoadBridgeDetails(cluster) {
     try {

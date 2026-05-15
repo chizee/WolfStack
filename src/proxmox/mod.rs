@@ -230,7 +230,7 @@ impl PveClient {
         let data = self.get(&format!("/nodes/{}/qemu", self.node_name)).await?;
         let arr = data.as_array().ok_or("Expected array from /qemu")?;
 
-        Ok(arr.iter().map(|v| {
+        let mut guests: Vec<PveGuest> = arr.iter().map(|v| {
             let vmid = v.get("vmid").and_then(|v| v.as_u64()).unwrap_or(0);
             // Name fallback: name -> hostname -> "VM {vmid}"
             let name = v.get("name").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
@@ -255,7 +255,35 @@ impl PveClient {
                 uptime: v.get("uptime").and_then(|v| v.as_u64()).unwrap_or(0),
                 node: self.node_name.clone(),
             }
-        }).collect())
+        }).collect();
+
+        // /qemu list returns `disk: 0` for almost every VM because the
+        // host can't see inside the guest's filesystem unless the QEMU
+        // guest agent reports it. /status/current pulls the agent-
+        // reported value when the agent is running. For VMs without
+        // the agent we leave the value at 0 — better honest "unknown"
+        // than the misleading near-zero we used to show for full disks.
+        let running_indexes: Vec<usize> = guests.iter().enumerate()
+            .filter(|(_, g)| g.status == "running")
+            .map(|(i, _)| i)
+            .collect();
+        let status_paths: Vec<String> = running_indexes.iter().map(|idx| {
+            format!("/nodes/{}/qemu/{}/status/current", self.node_name, guests[*idx].vmid)
+        }).collect();
+        let status_futures: Vec<_> = status_paths.iter().map(|p| self.get(p)).collect();
+        let status_results = futures::future::join_all(status_futures).await;
+        for (i, result) in running_indexes.iter().zip(status_results.into_iter()) {
+            if let Ok(s) = result {
+                if let Some(d) = s.get("disk").and_then(|v| v.as_u64()) {
+                    if d > 0 { guests[*i].disk = d; }
+                }
+                if let Some(md) = s.get("maxdisk").and_then(|v| v.as_u64()) {
+                    if md > 0 { guests[*i].maxdisk = md; }
+                }
+            }
+        }
+
+        Ok(guests)
     }
 
     /// List all LXC containers on this node
@@ -285,6 +313,37 @@ impl PveClient {
                 node: self.node_name.clone(),
             }
         }).collect();
+
+        // The /lxc list endpoint's `disk` field is notoriously unreliable
+        // — it's frequently 0 or stale even for running containers, because
+        // Proxmox doesn't trigger a fresh stat for the list. The accurate
+        // live value comes from /lxc/{vmid}/status/current per container.
+        // Without this, the dashboard shows "9% used" on a container that's
+        // actually 95% full and no alert fires. We fan out the per-CT
+        // status fetches in parallel for running containers only — stopped
+        // ones legitimately report no usage.
+        let running_indexes: Vec<usize> = guests.iter().enumerate()
+            .filter(|(_, g)| g.status == "running")
+            .map(|(i, _)| i)
+            .collect();
+        let status_paths: Vec<String> = running_indexes.iter().map(|idx| {
+            format!("/nodes/{}/lxc/{}/status/current", self.node_name, guests[*idx].vmid)
+        }).collect();
+        let status_futures: Vec<_> = status_paths.iter().map(|p| self.get(p)).collect();
+        let status_results = futures::future::join_all(status_futures).await;
+        for (i, result) in running_indexes.iter().zip(status_results.into_iter()) {
+            if let Ok(s) = result {
+                // status/current returns a richer view: `disk` here IS
+                // the live rootfs usage. `maxdisk` matches the configured
+                // disk size. Prefer these over the list values.
+                if let Some(d) = s.get("disk").and_then(|v| v.as_u64()) {
+                    guests[*i].disk = d;
+                }
+                if let Some(md) = s.get("maxdisk").and_then(|v| v.as_u64()) {
+                    if md > 0 { guests[*i].maxdisk = md; }
+                }
+            }
+        }
 
         // For containers with no name, fetch hostname from their individual config
         // Fetch all unnamed configs concurrently for speed on remote servers

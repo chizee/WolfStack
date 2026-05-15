@@ -279,6 +279,7 @@ pub async fn list_databases(params: &ConnParams) -> Result<Vec<String>, String> 
 
 /// List tables in a specific database
 pub async fn list_tables(params: &ConnParams, database: &str) -> Result<Vec<serde_json::Value>, String> {
+    reject_unsafe_identifier(database, "database")?;
     let mut p = params.clone();
     p.database = Some(database.to_string());
 
@@ -319,6 +320,8 @@ pub async fn table_structure(
     database: &str,
     table: &str,
 ) -> Result<Vec<serde_json::Value>, String> {
+    reject_unsafe_identifier(database, "database")?;
+    reject_unsafe_identifier(table, "table")?;
     let mut p = params.clone();
     p.database = Some(database.to_string());
 
@@ -358,6 +361,47 @@ pub async fn table_structure(
     Ok(columns)
 }
 
+/// Full MySQL string-literal escape — handles every byte sequence
+/// that can break out of a single-quoted string. The previous version
+/// only handled `\` and `'`, missing null bytes, control characters,
+/// and Ctrl-Z (which Windows mysql clients treat as EOF). Per
+/// mysql_real_escape_string semantics.
+fn mysql_escape_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    for ch in s.chars() {
+        match ch {
+            '\0' => out.push_str("\\0"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '"' => out.push_str("\\\""),
+            '\x1a' => out.push_str("\\Z"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Reject identifiers that don't look like real MySQL identifiers.
+/// Backtick-quoting in the queries below handles SQL semantics, but a
+/// crafted identifier with a null byte or control character can still
+/// confuse the C-mysql client at the transport layer (truncation, log
+/// injection). MySQL's own limit is 64 chars; we cap at 128 to allow
+/// some quoted-edge-case headroom while still bounding the input.
+fn reject_unsafe_identifier(name: &str, kind: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err(format!("{} name is empty", kind));
+    }
+    if name.len() > 128 {
+        return Err(format!("{} name too long ({} chars, max 128)", kind, name.len()));
+    }
+    if name.chars().any(|c| c == '\0' || c.is_control()) {
+        return Err(format!("{} name contains control characters", kind));
+    }
+    Ok(())
+}
+
 /// Get paginated table data
 pub async fn table_data(
     params: &ConnParams,
@@ -368,12 +412,27 @@ pub async fn table_data(
     order_by: Option<&str>,
     order_dir: Option<&str>,
 ) -> Result<serde_json::Value, String> {
+    // Validate identifiers BEFORE opening a connection — cheaper to
+    // fail fast and avoids partial state.
+    reject_unsafe_identifier(database, "database")?;
+    reject_unsafe_identifier(table, "table")?;
+    if let Some(col) = order_by {
+        reject_unsafe_identifier(col, "order_by column")?;
+    }
+    // Cap pagination so a crafted request can't cause a multi-GB
+    // result set to be built in memory.
+    if page_size == 0 || page_size > 10_000 {
+        return Err(format!("page_size {} out of range (1..10000)", page_size));
+    }
+
     let mut p = params.clone();
     p.database = Some(database.to_string());
 
     let (pool, mut conn) = get_conn_with_timeout(&p).await?;
 
-    // Sanitize table name (backtick-quote it)
+    // Sanitize table name (backtick-quote it). Combined with the
+    // identifier validation above, this is the textbook MySQL pattern
+    // for safe identifier interpolation.
     let safe_table = format!("`{}`.`{}`",
         database.replace('`', "``"),
         table.replace('`', "``")
@@ -497,6 +556,7 @@ pub async fn execute_query(
 /// Dump a database to SQL text.
 /// If `include_data` is true, includes INSERT statements with row data.
 pub async fn dump_database(params: &ConnParams, database: &str, include_data: bool) -> Result<String, String> {
+    reject_unsafe_identifier(database, "database")?;
     let mut p = params.clone();
     p.database = Some(database.to_string());
     let (pool, mut conn) = get_conn_with_timeout(&p).await?;
@@ -555,7 +615,7 @@ pub async fn dump_database(params: &ConnParams, database: &str, include_data: bo
                     for i in 0..row.len() {
                         let val: Option<String> = row.get(i);
                         match val {
-                            Some(v) => values.push(format!("'{}'", v.replace('\\', "\\\\").replace('\'', "\\'"))),
+                            Some(v) => values.push(format!("'{}'", mysql_escape_string(&v))),
                             None => values.push("NULL".to_string()),
                         }
                     }
@@ -988,17 +1048,29 @@ pub async fn pg_table_structure(params: &ConnParams, database: &str, table: &str
 
 /// Get PostgreSQL table data (paginated)
 pub async fn pg_table_data(params: &ConnParams, database: &str, table: &str, page: u32, page_size: u32, order_by: Option<&str>, order_dir: Option<&str>) -> Result<serde_json::Value, String> {
+    // Validate identifiers via the shared allowlist before connecting.
+    // Previous version used a brittle denylist that rejected legitimate
+    // table names with hyphens AND missed null-byte / control-char
+    // attacks. Allowlisting via reject_unsafe_identifier is safer.
+    reject_unsafe_identifier(database, "database")?;
+    reject_unsafe_identifier(table, "table")?;
+    if let Some(col) = order_by {
+        reject_unsafe_identifier(col, "order_by column")?;
+    }
+    if page_size == 0 || page_size > 10_000 {
+        return Err(format!("page_size {} out of range (1..10000)", page_size));
+    }
+
     let mut p = params.clone();
     p.database = Some(database.to_string());
     let client = pg_connect(&p).await?;
 
-    // Validate table name to prevent injection
-    if table.contains(';') || table.contains('\'') || table.contains('"') || table.contains('-') {
-        return Err("Invalid table name".to_string());
-    }
-
     let offset = page * page_size;
-    let count_query = format!("SELECT COUNT(*) FROM \"{}\"", table);
+    // Quote the identifier with double-quote-doubling — Postgres parses
+    // "" inside quoted identifiers as a literal ". Same trick as MySQL
+    // backticks, just different quote char.
+    let safe_table = format!("\"{}\"", table.replace('"', "\"\""));
+    let count_query = format!("SELECT COUNT(*) FROM {}", safe_table);
     let total: i64 = client.query_one(&count_query, &[]).await
         .map_err(|e| format!("Count failed: {}", e))?
         .get(0);
@@ -1008,7 +1080,7 @@ pub async fn pg_table_data(params: &ConnParams, database: &str, table: &str, pag
         let dir = match order_dir { Some("desc") | Some("DESC") => "DESC", _ => "ASC" };
         format!(" ORDER BY {} {}", safe_col, dir)
     } else { String::new() };
-    let data_query = format!("SELECT * FROM \"{}\"{} LIMIT {} OFFSET {}", table, order_clause, page_size, offset);
+    let data_query = format!("SELECT * FROM {}{} LIMIT {} OFFSET {}", safe_table, order_clause, page_size, offset);
     let rows = client.query(&data_query, &[]).await
         .map_err(|e| format!("Data query failed: {}", e))?;
 

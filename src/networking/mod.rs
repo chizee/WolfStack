@@ -16,6 +16,8 @@ use std::process::Command;
 use tracing::{info, warn};
 
 pub mod router;
+pub mod vlan;
+pub mod vlan_attach;
 
 /// Network interface info
 #[derive(Debug, Clone, Serialize, Deserialize)]

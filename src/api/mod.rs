@@ -10215,6 +10215,639 @@ pub async fn net_wireguard_client_config(req: HttpRequest, state: web::Data<AppS
     }
 }
 
+// ─── VLAN / vSwitch / Public-IP attachment API ─────────────────────
+//
+// Backed by `crate::networking::vlan`. Lets the operator add/remove
+// 802.1Q VLAN attachments (Hetzner vSwitch, OVH vRack, Equinix Metal,
+// generic 802.1Q) and routed extra public IPs without hand-editing
+// /etc/network/interfaces.
+
+/// GET /api/networking/vlan — current store + detected network manager.
+pub async fn vlan_list(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let store = crate::networking::vlan::VlanStore::load();
+    let manager = crate::networking::vlan::detect_net_manager();
+    HttpResponse::Ok().json(serde_json::json!({
+        "vlans": store.vlans,
+        "public_ips": store.public_ips,
+        "net_manager": manager,
+        "net_manager_label": manager.label(),
+        "auto_persist_supported": manager.auto_persist_supported(),
+    }))
+}
+
+/// POST /api/networking/vlan/attachments — create or update a VLAN
+/// attachment. Body is the full `VlanAttachment` (id may be empty for
+/// create — server generates one).
+///
+/// Preflight gate: by default, refuses to save when `preflight` reports
+/// any `critical` findings. The frontend calls `/api/networking/vlan/preflight`
+/// first, shows the operator the findings, and re-submits with
+/// `?ack_critical=true` after they confirm. This is the safety net that
+/// stops a typo'd parent NIC or duplicate bridge from silently breaking
+/// the operator's network.
+#[derive(Deserialize, Default)]
+pub struct VlanUpsertQuery {
+    #[serde(default)]
+    pub ack_critical: bool,
+}
+
+pub async fn vlan_upsert(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<crate::networking::vlan::VlanAttachment>,
+    query: web::Query<VlanUpsertQuery>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let proposed = body.into_inner();
+
+    // Preflight before we mutate state. Re-run server-side even though
+    // the frontend likely already showed the operator the same findings —
+    // the host could have changed between preflight and submit.
+    let store_for_check = crate::networking::vlan::VlanStore::load();
+    let manager = crate::networking::vlan::detect_net_manager();
+    let findings = crate::networking::vlan::preflight(&store_for_check, manager, Some(&proposed));
+    let critical: Vec<_> = findings.iter()
+        .filter(|f| matches!(f.severity, crate::networking::vlan::PreflightSeverity::Critical))
+        .cloned()
+        .collect();
+    if !critical.is_empty() && !query.ack_critical {
+        return HttpResponse::Conflict().json(serde_json::json!({
+            "error": "preflight reported critical findings; pass ?ack_critical=true to apply anyway",
+            "preflight": findings,
+        }));
+    }
+
+    let mut store = store_for_check;
+    let id = match store.upsert_vlan(proposed) {
+        Ok(id) => id,
+        Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    };
+    if let Err(e) = store.save() {
+        return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }));
+    }
+    // Apply immediately so the operator sees the live result. Failures
+    // here are surfaced but don't fail the save — the persisted state
+    // is still valid and the UI can show what went wrong.
+    let report = match crate::networking::vlan::apply(&store) {
+        Ok(r) => r,
+        Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("saved but apply failed: {}", e),
+            "id": id,
+            "preflight": findings,
+        })),
+    };
+    HttpResponse::Ok().json(serde_json::json!({
+        "id": id,
+        "apply": report,
+        "preflight": findings,
+    }))
+}
+
+/// DELETE /api/networking/vlan/attachments/{id} — remove and tear down.
+pub async fn vlan_remove(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let id = path.into_inner();
+    let mut store = crate::networking::vlan::VlanStore::load();
+    let target = store.get_vlan(&id).cloned();
+    if !store.remove_vlan(&id) {
+        return HttpResponse::NotFound().json(serde_json::json!({
+            "error": format!("vlan attachment '{}' not found", id),
+        }));
+    }
+    if let Err(e) = store.save() {
+        return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }));
+    }
+    // Tear down the kernel state for the removed VLAN before
+    // re-applying the rest, so we don't leave orphan devices.
+    if let Some(t) = target {
+        crate::networking::vlan::teardown_vlan_kernel_state(&t.parent_iface, t.vlan_id, &t.bridge_name);
+    }
+    let _ = crate::networking::vlan::apply(&store);
+    HttpResponse::Ok().json(serde_json::json!({ "removed": true }))
+}
+
+/// POST /api/networking/vlan/public-ips — create or update a routed
+/// public IP attachment.
+pub async fn public_ip_upsert(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<crate::networking::vlan::PublicIpAttachment>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let mut store = crate::networking::vlan::VlanStore::load();
+    let id = match store.upsert_public_ip(body.into_inner()) {
+        Ok(id) => id,
+        Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    };
+    if let Err(e) = store.save() {
+        return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }));
+    }
+    let report = match crate::networking::vlan::apply(&store) {
+        Ok(r) => r,
+        Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("saved but apply failed: {}", e),
+            "id": id,
+        })),
+    };
+    HttpResponse::Ok().json(serde_json::json!({ "id": id, "apply": report }))
+}
+
+/// DELETE /api/networking/vlan/public-ips/{id} — remove and tear down
+/// iptables/lo state for a routed public IP.
+pub async fn public_ip_remove(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let id = path.into_inner();
+    let mut store = crate::networking::vlan::VlanStore::load();
+    let target = store.get_public_ip(&id).cloned();
+    if !store.remove_public_ip(&id) {
+        return HttpResponse::NotFound().json(serde_json::json!({
+            "error": format!("public ip attachment '{}' not found", id),
+        }));
+    }
+    if let Err(e) = store.save() {
+        return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }));
+    }
+    if let Some(t) = target {
+        crate::networking::vlan::teardown_public_ip_kernel_state(&t.ip, &t.container_internal_ip, &t.egress_iface);
+    }
+    let _ = crate::networking::vlan::apply(&store);
+    HttpResponse::Ok().json(serde_json::json!({ "removed": true }))
+}
+
+/// POST /api/networking/vlan/apply — re-apply the entire store.
+/// Useful as an "I edited the JSON by hand, please reconcile" button
+/// or after a fresh boot if persistence wasn't perfect.
+pub async fn vlan_apply(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let store = crate::networking::vlan::VlanStore::load();
+    match crate::networking::vlan::apply(&store) {
+        Ok(report) => HttpResponse::Ok().json(report),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// GET /api/networking/vlan/preview — dry-run rendering of the current
+/// store. Lets the UI show the operator the config snippet that would
+/// be written before they hit save. Now also runs preflight against
+/// the live host so the operator sees disruption warnings up-front.
+pub async fn vlan_preview(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let store = crate::networking::vlan::VlanStore::load();
+    let snippet = crate::networking::vlan::render_ifupdown(&store);
+    let manager = crate::networking::vlan::detect_net_manager();
+    let preflight = crate::networking::vlan::preflight(&store, manager, None);
+    HttpResponse::Ok().json(serde_json::json!({
+        "snippet": snippet,
+        "manager": manager,
+        "preflight": preflight,
+    }))
+}
+
+/// POST /api/networking/vlan/preflight — run safety checks against the
+/// current store + an optional proposed VlanAttachment. Returns the
+/// findings so the UI can render disruption warnings before commit.
+/// Body is the proposed VlanAttachment (or empty `{}` for a global
+/// re-check of the saved store).
+pub async fn vlan_preflight(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<serde_json::Value>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let store = crate::networking::vlan::VlanStore::load();
+    let manager = crate::networking::vlan::detect_net_manager();
+    // Try to deserialize the body as a VlanAttachment. An empty body /
+    // missing required fields just means "no proposal — check current state".
+    let proposed: Option<crate::networking::vlan::VlanAttachment> =
+        serde_json::from_value(body.into_inner()).ok();
+    let findings = crate::networking::vlan::preflight(&store, manager, proposed.as_ref());
+    HttpResponse::Ok().json(serde_json::json!({
+        "manager": manager,
+        "preflight": findings,
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct VlanAttachRequest {
+    /// VLAN attachment id (vlan-XXXXX) on this node.
+    pub vlan_id: String,
+    pub target_kind: crate::networking::vlan::TargetKind,
+    pub target_id: String,
+    /// IP to allocate. Empty/missing = ask backend to pick next-available.
+    #[serde(default)]
+    pub ip: String,
+    /// Operator-facing label. Optional.
+    #[serde(default)]
+    pub label: String,
+}
+
+/// POST /api/networking/vlan/attach — allocate an IP on a VLAN and
+/// run the backend-specific attach (write container config, restart,
+/// etc.). On failure, the IP is NOT recorded so a retry doesn't see
+/// a phantom allocation.
+pub async fn vlan_attach(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<VlanAttachRequest>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let body = body.into_inner();
+    let mut store = crate::networking::vlan::VlanStore::load();
+
+    // Look up the VLAN.
+    let vlan = match store.vlans.iter().find(|v| v.id == body.vlan_id) {
+        Some(v) => v.clone(),
+        None => return HttpResponse::NotFound().json(serde_json::json!({
+            "error": format!("vlan attachment '{}' not found", body.vlan_id),
+        })),
+    };
+
+    // Pick the IP — operator-supplied or next-available.
+    let ip = if body.ip.is_empty() {
+        // Aggregate cluster-wide used IPs for this subnet first so we
+        // don't conflict with allocations on other nodes.
+        let cluster_used = aggregate_cluster_used_ips(&state, &vlan.subnet).await;
+        match crate::networking::vlan::next_available_ip(&vlan, &cluster_used) {
+            Some(ip) => ip,
+            None => return HttpResponse::Conflict().json(serde_json::json!({
+                "error": "subnet has no free IPs left (after subtracting local + external + cluster allocations)",
+            })),
+        }
+    } else {
+        body.ip.clone()
+    };
+
+    let cidr_prefix = vlan.subnet.split('/').nth(1).and_then(|s| s.parse::<u8>().ok()).unwrap_or(24);
+    let ip_cidr = format!("{}/{}", ip, cidr_prefix);
+    let gateway = vlan.routes.first().map(|r| r.via.as_str())
+        .or(if vlan.self_ip != ip { Some(vlan.self_ip.as_str()) } else { None });
+    let params = crate::networking::vlan_attach::AttachParams {
+        bridge: &vlan.bridge_name,
+        ip_cidr: &ip_cidr,
+        mtu: vlan.mtu,
+        gateway,
+        target_id: &body.target_id,
+    };
+
+    // Run the backend-specific attach.
+    let outcome_result = match body.target_kind {
+        crate::networking::vlan::TargetKind::LxcNative =>
+            crate::networking::vlan_attach::attach_lxc_native(&params),
+        crate::networking::vlan::TargetKind::LxcProxmox =>
+            crate::networking::vlan_attach::attach_lxc_proxmox(&params),
+        crate::networking::vlan::TargetKind::VmProxmox =>
+            crate::networking::vlan_attach::attach_vm_proxmox(&params),
+        crate::networking::vlan::TargetKind::VmNative =>
+            crate::networking::vlan_attach::attach_vm_libvirt(&params),
+        crate::networking::vlan::TargetKind::Docker => {
+            // Hetzner vSwitch enforces 1 MAC per port — macvlan would
+            // create a unique MAC per container and the vSwitch would
+            // silently drop those packets. ipvlan L2 shares the parent's
+            // MAC and works on Hetzner. For OVH/Equinix/Custom we use
+            // macvlan (true L2 isolation between containers).
+            let driver = match vlan.provider {
+                crate::networking::vlan::VlanProvider::Hetzner =>
+                    crate::networking::vlan_attach::DockerVlanDriver::IpvlanL2,
+                _ => crate::networking::vlan_attach::DockerVlanDriver::Macvlan,
+            };
+            // Docker macvlan/ipvlan attaches to the underlying L2
+            // device, NOT the bridge — pass the tagged sub-interface
+            // (e.g. eno1.4000), which is how the kernel actually sees
+            // the VLAN traffic.
+            let parent = format!("{}.{}", vlan.parent_iface, vlan.vlan_id);
+            crate::networking::vlan_attach::attach_docker(
+                &params, &parent, &vlan.subnet, &vlan.self_ip, driver,
+            )
+        }
+        crate::networking::vlan::TargetKind::Manual => {
+            // Manual reservation — no backend to call.
+            Ok(crate::networking::vlan_attach::AttachOutcome {
+                message: format!("Reserved {} on {} (no backend attach — manual)", ip, vlan.bridge_name),
+                restarted: false,
+            })
+        }
+    };
+
+    let outcome = match outcome_result {
+        Ok(o) => o,
+        Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("backend attach failed: {}", e),
+        })),
+    };
+
+    // Backend succeeded — record the allocation.
+    if let Err(e) = store.allocate_ip(&body.vlan_id, &ip, body.target_kind, &body.target_id, &body.label) {
+        return HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("backend attached but failed to record allocation: {}. Manual cleanup may be needed.", e),
+        }));
+    }
+    if let Err(e) = store.save() {
+        return HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("backend attached but allocation save failed: {}", e),
+        }));
+    }
+    HttpResponse::Ok().json(serde_json::json!({
+        "ip": ip,
+        "ip_cidr": ip_cidr,
+        "message": outcome.message,
+        "restarted": outcome.restarted,
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct VlanDetachRequest {
+    pub vlan_id: String,
+    pub target_kind: crate::networking::vlan::TargetKind,
+    pub target_id: String,
+    /// IP being released. Required so we can deallocate the right slot
+    /// when a target has multiple interfaces on the same VLAN.
+    pub ip: String,
+}
+
+/// POST /api/networking/vlan/detach — reverse of attach. Always tries
+/// to release the IP from the local store even if the backend detach
+/// fails (so a half-cleaned-up state doesn't permanently leak the IP).
+pub async fn vlan_detach(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<VlanDetachRequest>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let body = body.into_inner();
+    let mut store = crate::networking::vlan::VlanStore::load();
+    let vlan = match store.vlans.iter().find(|v| v.id == body.vlan_id) {
+        Some(v) => v.clone(),
+        None => return HttpResponse::NotFound().json(serde_json::json!({
+            "error": format!("vlan attachment '{}' not found", body.vlan_id),
+        })),
+    };
+    let backend_result = match body.target_kind {
+        crate::networking::vlan::TargetKind::LxcNative =>
+            crate::networking::vlan_attach::detach_lxc_native(&body.target_id, &vlan.bridge_name),
+        crate::networking::vlan::TargetKind::LxcProxmox =>
+            crate::networking::vlan_attach::detach_lxc_proxmox(&body.target_id, &vlan.bridge_name),
+        crate::networking::vlan::TargetKind::VmProxmox =>
+            crate::networking::vlan_attach::detach_vm_proxmox(&body.target_id, &vlan.bridge_name),
+        crate::networking::vlan::TargetKind::VmNative =>
+            crate::networking::vlan_attach::detach_vm_libvirt(&body.target_id, &vlan.bridge_name),
+        crate::networking::vlan::TargetKind::Docker =>
+            crate::networking::vlan_attach::detach_docker(&body.target_id, &vlan.bridge_name),
+        crate::networking::vlan::TargetKind::Manual =>
+            Ok(crate::networking::vlan_attach::AttachOutcome {
+                message: format!("Released manual reservation {} on {}", body.ip, vlan.bridge_name),
+                restarted: false,
+            }),
+    };
+    // Always release the local allocation even on backend failure.
+    let removed = store.deallocate_ip(&body.vlan_id, &body.ip);
+    let _ = store.save();
+    match backend_result {
+        Ok(o) => HttpResponse::Ok().json(serde_json::json!({
+            "released": removed,
+            "message": o.message,
+        })),
+        Err(e) => HttpResponse::Ok().json(serde_json::json!({
+            "released": removed,
+            "warning": format!("local allocation released, but backend detach reported: {}", e),
+        })),
+    }
+}
+
+/// POST /api/networking/vlan/test/{vlan_id} — ping every IP that this
+/// server thinks is on the named VLAN's subnet (local allocations,
+/// peer allocations, external reservations, and the configured
+/// gateway). Returns reachable/unreachable per IP. Lets the operator
+/// verify a freshly-created vSwitch is actually working without
+/// dropping to a shell.
+pub async fn vlan_test(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let vlan_id = path.into_inner();
+    let store = crate::networking::vlan::VlanStore::load();
+    let vlan = match store.vlans.iter().find(|v| v.id == vlan_id) {
+        Some(v) => v.clone(),
+        None => return HttpResponse::NotFound().json(serde_json::json!({
+            "error": format!("vlan attachment '{}' not found", vlan_id),
+        })),
+    };
+
+    // Build the candidate list: local allocations, gateway IPs from
+    // routes, and aggregated peer/external IPs from cluster-used.
+    let mut candidates: Vec<(String, String)> = Vec::new();  // (ip, label)
+    for a in &vlan.allocations {
+        let label = if a.label.is_empty() { a.target_id.clone() } else { a.label.clone() };
+        candidates.push((a.ip.clone(), format!("local: {}", label)));
+    }
+    for r in &vlan.routes {
+        candidates.push((r.via.clone(), format!("gateway for {}", r.destination)));
+    }
+    let peer_map = fetch_peer_ips_in_subnet(&state, &vlan.subnet).await;
+    for (peer_id, ips) in peer_map {
+        for ip in ips {
+            // Skip our own self_ip - we don't ping ourselves.
+            if ip == vlan.self_ip { continue; }
+            candidates.push((ip, format!("peer {}", peer_id)));
+        }
+    }
+    // Dedupe by IP, keep the first label seen.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    candidates.retain(|(ip, _)| seen.insert(ip.clone()));
+
+    if candidates.is_empty() {
+        return HttpResponse::Ok().json(serde_json::json!({
+            "vlan_id": vlan_id,
+            "results": [],
+            "summary": "Nothing to test — no allocations, peers, or gateways known on this VLAN yet.",
+        }));
+    }
+
+    // Run the pings in parallel via tokio::task::spawn_blocking so the
+    // sequential 1-second timeouts don't add up.
+    let mut futures = Vec::with_capacity(candidates.len());
+    for (ip, label) in candidates {
+        futures.push(tokio::task::spawn_blocking(move || {
+            let out = std::process::Command::new("ping")
+                .args(["-c", "1", "-W", "1", "-n", &ip])
+                .output();
+            let reachable = matches!(out, Ok(o) if o.status.success());
+            serde_json::json!({
+                "ip": ip,
+                "label": label,
+                "reachable": reachable,
+            })
+        }));
+    }
+    let mut results = Vec::with_capacity(futures.len());
+    for f in futures {
+        match f.await {
+            Ok(v) => results.push(v),
+            Err(e) => results.push(serde_json::json!({
+                "ip": "?", "label": "ping task panicked",
+                "reachable": false, "error": e.to_string(),
+            })),
+        }
+    }
+    let total = results.len();
+    let ok = results.iter().filter(|r| r.get("reachable").and_then(|v| v.as_bool()).unwrap_or(false)).count();
+    HttpResponse::Ok().json(serde_json::json!({
+        "vlan_id": vlan_id,
+        "results": results,
+        "summary": format!("{} of {} reachable", ok, total),
+    }))
+}
+
+/// GET /api/networking/vlan/cluster-used?subnet=10.0.1.0/24 — return
+/// every IP currently in use on the named subnet across every node in
+/// THIS WolfStack admin cluster. The frontend uses this to render
+/// "X.Y.Z.W is taken (by NodeFoo)" hints when picking an IP manually.
+///
+/// Cycle-breaker: when called via X-WolfStack-Secret (peer auth), we
+/// return ONLY the local node's allocations — no further fan-out.
+pub async fn vlan_cluster_used(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    let caller = match require_auth(&req, &state) { Ok(u) => u, Err(resp) => return resp };
+    let from_peer = caller == "cluster-node";
+    let subnet = req.uri().query()
+        .and_then(|q| {
+            for pair in q.split('&') {
+                if let Some(rest) = pair.strip_prefix("subnet=") {
+                    return urlencoding::decode(rest).ok().map(|s| s.into_owned());
+                }
+            }
+            None
+        })
+        .unwrap_or_default();
+    if subnet.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "subnet query parameter is required",
+        }));
+    }
+
+    let local_ips = local_ips_in_subnet(&subnet);
+    if from_peer {
+        // Peer call — return only local, don't re-aggregate.
+        return HttpResponse::Ok().json(serde_json::json!({
+            "node_id": state.node_id.clone(),
+            "ips": local_ips,
+        }));
+    }
+    // Operator call — fan out to peers in parallel.
+    let peer_ips = fetch_peer_ips_in_subnet(&state, &subnet).await;
+    HttpResponse::Ok().json(serde_json::json!({
+        "subnet": subnet,
+        "local_ips": local_ips,
+        "peer_ips": peer_ips,
+    }))
+}
+
+/// Helper: list the IPs allocated locally on the named subnet.
+fn local_ips_in_subnet(subnet: &str) -> Vec<String> {
+    let store = crate::networking::vlan::VlanStore::load();
+    let mut out: Vec<String> = Vec::new();
+    for v in &store.vlans {
+        if v.subnet != subnet { continue; }
+        // Self IP counts.
+        out.push(v.self_ip.clone());
+        // Allocations.
+        for a in &v.allocations { out.push(a.ip.clone()); }
+        // External reservations expanded.
+        for r in &v.external_reservations {
+            if let Some((lo, hi)) = r.spec.split_once('-') {
+                if let (Ok(lo_ip), Ok(hi_ip)) =
+                    (lo.trim().parse::<std::net::Ipv4Addr>(), hi.trim().parse::<std::net::Ipv4Addr>())
+                {
+                    let l = u32::from(lo_ip);
+                    let h = u32::from(hi_ip);
+                    for n in l..=h {
+                        out.push(std::net::Ipv4Addr::from(n).to_string());
+                    }
+                }
+            } else if r.spec.parse::<std::net::Ipv4Addr>().is_ok() {
+                out.push(r.spec.trim().to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Fan out to every online wolfstack peer asking for its
+/// vlan/cluster-used local view, returning a map of peer-id to IP list.
+async fn fetch_peer_ips_in_subnet(
+    state: &web::Data<AppState>,
+    subnet: &str,
+) -> std::collections::HashMap<String, Vec<String>> {
+    let nodes = state.cluster.get_all_nodes();
+    let secret = state.cluster_secret.clone();
+    let self_id = state.cluster.self_id.clone();
+    let peers: Vec<(String, String, u16)> = nodes.iter()
+        .filter(|n| !n.is_self && n.id != self_id && n.online && n.node_type == "wolfstack")
+        .map(|n| (n.id.clone(), n.address.clone(), n.port))
+        .collect();
+    if peers.is_empty() { return std::collections::HashMap::new(); }
+    let client = &*API_HTTP_CLIENT;
+    let path = format!("/api/networking/vlan/cluster-used?subnet={}", urlencoding::encode(subnet));
+    let mut futures = Vec::with_capacity(peers.len());
+    for (id, address, port) in peers {
+        let secret = secret.clone();
+        let client = client.clone();
+        let path = path.clone();
+        futures.push(async move {
+            let urls = build_node_urls(&address, port, &path);
+            for url in &urls {
+                if let Ok(resp) = client.get(url)
+                    .timeout(std::time::Duration::from_secs(4))
+                    .header("X-WolfStack-Secret", &secret)
+                    .send()
+                    .await
+                {
+                    if resp.status().is_success() {
+                        if let Ok(body) = resp.json::<serde_json::Value>().await {
+                            if let Some(arr) = body.get("ips").and_then(|v| v.as_array()) {
+                                let ips: Vec<String> = arr.iter()
+                                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                    .collect();
+                                return Some((id, ips));
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        });
+    }
+    let results = futures::future::join_all(futures).await;
+    let mut out: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    for r in results.into_iter().flatten() {
+        out.insert(r.0, r.1);
+    }
+    out
+}
+
+/// Aggregate every used IP on the named subnet from local + peers.
+/// Used by the attach endpoint when picking next-available IP.
+async fn aggregate_cluster_used_ips(
+    state: &web::Data<AppState>,
+    subnet: &str,
+) -> Vec<String> {
+    let mut all = local_ips_in_subnet(subnet);
+    let peer_map = fetch_peer_ips_in_subnet(state, subnet).await;
+    for (_, ips) in peer_map {
+        all.extend(ips);
+    }
+    all
+}
+
 // ─── Backup API ───
 
 #[derive(Deserialize)]
@@ -27053,6 +27686,19 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/networking/wireguard/{cluster}/clients", web::post().to(net_wireguard_add_client))
         .route("/api/networking/wireguard/{cluster}/clients/{id}", web::delete().to(net_wireguard_remove_client))
         .route("/api/networking/wireguard/{cluster}/clients/{id}/config", web::get().to(net_wireguard_client_config))
+        // VLAN attachments + routed public IPs
+        .route("/api/networking/vlan", web::get().to(vlan_list))
+        .route("/api/networking/vlan/preview", web::get().to(vlan_preview))
+        .route("/api/networking/vlan/preflight", web::post().to(vlan_preflight))
+        .route("/api/networking/vlan/apply", web::post().to(vlan_apply))
+        .route("/api/networking/vlan/attachments", web::post().to(vlan_upsert))
+        .route("/api/networking/vlan/attachments/{id}", web::delete().to(vlan_remove))
+        .route("/api/networking/vlan/public-ips", web::post().to(public_ip_upsert))
+        .route("/api/networking/vlan/public-ips/{id}", web::delete().to(public_ip_remove))
+        .route("/api/networking/vlan/attach", web::post().to(vlan_attach))
+        .route("/api/networking/vlan/detach", web::post().to(vlan_detach))
+        .route("/api/networking/vlan/cluster-used", web::get().to(vlan_cluster_used))
+        .route("/api/networking/vlan/test/{vlan_id}", web::post().to(vlan_test))
         // Backups
         .route("/api/backups", web::get().to(backup_list))
         .route("/api/backups", web::post().to(backup_create))
