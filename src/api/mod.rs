@@ -10921,6 +10921,341 @@ pub async fn security_rotate_fleet(
     }))
 }
 
+// ════════════════════════════════════════════════════════════════════
+// Fleet-wide aggregation endpoints — power the Fleet Security page.
+// Each endpoint fans out to every WolfStack peer in the cluster,
+// collects responses in parallel, and returns a structured per-node
+// view that the UI can render as a unified table.
+// ════════════════════════════════════════════════════════════════════
+
+#[derive(Serialize)]
+pub struct FleetNodeResult<T: Serialize> {
+    pub node_id: String,
+    pub hostname: String,
+    pub address: String,
+    pub status: String,        // "ok" | "failed" | "skipped"
+    pub data: Option<T>,
+    pub error: Option<String>,
+}
+
+/// Fan out an authenticated GET to every WolfStack peer (including
+/// self) and collect each one's JSON response. Self is handled
+/// in-process via the supplied `local` closure to avoid the loopback
+/// round-trip.
+async fn fleet_fanout_get<T, Local>(
+    state: &web::Data<AppState>,
+    path: &str,
+    local: Local,
+) -> Vec<FleetNodeResult<T>>
+where
+    T: serde::de::DeserializeOwned + Serialize + Send + 'static,
+    Local: FnOnce() -> T,
+{
+    let (self_id, peers) = {
+        let n = state.cluster.nodes.read().unwrap();
+        let self_id = state.cluster.self_id.clone();
+        let peers: Vec<crate::agent::Node> = n.values().cloned().collect();
+        (self_id, peers)
+    };
+    let secret = crate::auth::default_cluster_secret().to_string();
+    let local_result = std::sync::Mutex::new(Some(local()));
+    let mut tasks = Vec::new();
+    for node in peers {
+        let is_self = node.id == self_id;
+        let secret_c = secret.clone();
+        let path = path.to_string();
+        let local_ref = if is_self {
+            let mut g = local_result.lock().unwrap();
+            g.take()
+        } else { None };
+        tasks.push(async move {
+            if let Some(data) = local_ref {
+                return FleetNodeResult {
+                    node_id: node.id, hostname: node.hostname, address: node.address,
+                    status: "ok".into(), data: Some(data), error: None,
+                };
+            }
+            if node.node_type != "wolfstack" {
+                return FleetNodeResult {
+                    node_id: node.id, hostname: node.hostname, address: node.address,
+                    status: "skipped".into(), data: None,
+                    error: Some("non-WolfStack node".into()),
+                };
+            }
+            let urls = [
+                format!("https://{}:{}{}", node.address, node.port, path),
+                format!("http://{}:{}{}", node.address, node.port + 1, path),
+            ];
+            let client = match reqwest::Client::builder()
+                .danger_accept_invalid_certs(true)
+                .timeout(std::time::Duration::from_secs(8))
+                .build() {
+                Ok(c) => c,
+                Err(e) => return FleetNodeResult {
+                    node_id: node.id, hostname: node.hostname, address: node.address,
+                    status: "failed".into(), data: None,
+                    error: Some(format!("client build: {}", e)),
+                },
+            };
+            for url in &urls {
+                let resp = client.get(url).header("X-WolfStack-Secret", &secret_c).send().await;
+                if let Ok(r) = resp {
+                    if r.status().is_success() {
+                        if let Ok(v) = r.json::<T>().await {
+                            return FleetNodeResult {
+                                node_id: node.id, hostname: node.hostname, address: node.address,
+                                status: "ok".into(), data: Some(v), error: None,
+                            };
+                        }
+                    }
+                }
+            }
+            FleetNodeResult {
+                node_id: node.id, hostname: node.hostname, address: node.address,
+                status: "failed".into(), data: None,
+                error: Some("all transports failed".into()),
+            }
+        });
+    }
+    futures::future::join_all(tasks).await
+}
+
+/// GET /api/fleet/security/lockouts — aggregated blocked-IP view
+/// across every WolfStack node. UI uses this to power the "Fleet
+/// blocked IPs" table on the Fleet Security page.
+pub async fn fleet_security_lockouts(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let limiter = state.login_limiter.clone();
+    let local = move || {
+        serde_json::json!({
+            "lockouts": limiter.current_lockouts().into_iter().map(|(ip, secs, user)| {
+                serde_json::json!({ "ip": ip, "remaining_seconds": secs, "last_username": user })
+            }).collect::<Vec<_>>(),
+            "audit": limiter.audit_log(),
+            "config": limiter.config(),
+        })
+    };
+    let results = fleet_fanout_get::<serde_json::Value, _>(
+        &state, "/api/security/auth-lockouts", local,
+    ).await;
+    HttpResponse::Ok().json(serde_json::json!({ "nodes": results }))
+}
+
+/// GET /api/fleet/security/listening-ports — what's listening on
+/// 0.0.0.0 across every node. Surfaces internet-exposed services so
+/// the operator can see the attack surface at a glance.
+pub async fn fleet_security_listening_ports(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let local = move || collect_listening_ports();
+    let results = fleet_fanout_get::<serde_json::Value, _>(
+        &state, "/api/security/listening-ports-local", local,
+    ).await;
+    HttpResponse::Ok().json(serde_json::json!({ "nodes": results }))
+}
+
+/// GET /api/security/listening-ports-local — node-local listener
+/// snapshot. Called by the coordinator via fleet-fanout. Auth: either
+/// session or cluster secret.
+pub async fn security_listening_ports_local(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    let has_secret = req.headers().get("X-WolfStack-Secret")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v == crate::auth::default_cluster_secret())
+        .unwrap_or(false);
+    if !has_secret {
+        if let Err(e) = require_auth(&req, &state) { return e; }
+    }
+    HttpResponse::Ok().json(collect_listening_ports())
+}
+
+/// Parse `ss -tlnp` output into a structured per-port view. Filters to
+/// listeners on `0.0.0.0` and `::` (publicly-exposed), groups by port,
+/// and notes the owning process. Returns an empty list if `ss` isn't
+/// available.
+fn collect_listening_ports() -> serde_json::Value {
+    let out = std::process::Command::new("ss")
+        .args(["-tlnp4", "-tlnp6"])
+        .output();
+    let stdout = match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => return serde_json::json!({ "ports": [], "error": "ss unavailable" }),
+    };
+    let mut ports: Vec<serde_json::Value> = Vec::new();
+    for line in stdout.lines() {
+        if !line.starts_with("LISTEN") { continue; }
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 5 { continue; }
+        let local_addr = cols[3];
+        // Only public listeners — 0.0.0.0:* or [::]:*
+        let public = local_addr.starts_with("0.0.0.0:")
+            || local_addr.starts_with("*:")
+            || local_addr.starts_with("[::]:");
+        if !public { continue; }
+        let port = local_addr.rsplit(':').next().unwrap_or("?");
+        // The process column wraps; collect everything after column 4
+        // and parse the "users:((..." segment.
+        let proc_col = cols[5..].join(" ");
+        let process = proc_col
+            .find("\"")
+            .and_then(|s| proc_col[s + 1..].find("\"").map(|e| &proc_col[s + 1..s + 1 + e]))
+            .unwrap_or("?")
+            .to_string();
+        ports.push(serde_json::json!({
+            "port": port,
+            "local_addr": local_addr,
+            "process": process,
+        }));
+    }
+    serde_json::json!({ "ports": ports })
+}
+
+/// POST /api/fleet/security/push-lockout-policy — write the same
+/// lockout config to every WolfStack node. Operator sets the policy
+/// once in the UI, we propagate it to all 14.
+pub async fn fleet_security_push_lockout_policy(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<crate::auth::LoginLockoutConfig>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let cfg = body.into_inner();
+
+    // Apply locally first.
+    if let Err(e) = state.login_limiter.set_config(cfg.clone()) {
+        return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }));
+    }
+
+    // Fan out to peers.
+    let (self_id, peers) = {
+        let n = state.cluster.nodes.read().unwrap();
+        let self_id = state.cluster.self_id.clone();
+        let peers: Vec<crate::agent::Node> = n.values()
+            .filter(|p| p.id != self_id && p.node_type == "wolfstack")
+            .cloned()
+            .collect();
+        (self_id, peers)
+    };
+    let _ = self_id;
+    let secret = crate::auth::default_cluster_secret().to_string();
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .ok();
+    let mut node_results: Vec<serde_json::Value> = Vec::new();
+    if let Some(client) = client {
+        for node in peers {
+            let urls = [
+                format!("https://{}:{}/api/security/auth-config", node.address, node.port),
+                format!("http://{}:{}/api/security/auth-config", node.address, node.port + 1),
+            ];
+            let mut ok = false;
+            let mut err = String::new();
+            for url in &urls {
+                let r = client.post(url)
+                    .header("X-WolfStack-Secret", &secret)
+                    .json(&cfg)
+                    .send().await;
+                match r {
+                    Ok(resp) if resp.status().is_success() => { ok = true; break; }
+                    Ok(resp) => { err = format!("HTTP {}", resp.status()); }
+                    Err(e) => { err = format!("transport: {}", e); }
+                }
+            }
+            node_results.push(serde_json::json!({
+                "node_id": node.id,
+                "hostname": node.hostname,
+                "address": node.address,
+                "ok": ok,
+                "error": if ok { String::new() } else { err },
+            }));
+        }
+    }
+    HttpResponse::Ok().json(serde_json::json!({
+        "ok": true,
+        "self_applied": true,
+        "peers": node_results,
+    }))
+}
+
+/// POST /api/fleet/security/force-logout-all — invalidate every active
+/// session on every WolfStack node. Use this when you suspect session
+/// cookie theft. Operator must re-login everywhere after.
+pub async fn fleet_security_force_logout_all(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    // Local destroy: blow away every session in the SessionManager.
+    state.sessions.destroy_all();
+    // Fan out.
+    let (self_id, peers) = {
+        let n = state.cluster.nodes.read().unwrap();
+        let self_id = state.cluster.self_id.clone();
+        let peers: Vec<crate::agent::Node> = n.values()
+            .filter(|p| p.id != self_id && p.node_type == "wolfstack")
+            .cloned()
+            .collect();
+        (self_id, peers)
+    };
+    let _ = self_id;
+    let secret = crate::auth::default_cluster_secret().to_string();
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .ok();
+    let mut succeeded = 1usize; // self
+    let mut failed = 0usize;
+    if let Some(client) = client {
+        for node in peers {
+            let urls = [
+                format!("https://{}:{}/api/security/sessions-destroy-all", node.address, node.port),
+                format!("http://{}:{}/api/security/sessions-destroy-all", node.address, node.port + 1),
+            ];
+            let mut ok = false;
+            for url in &urls {
+                let r = client.post(url)
+                    .header("X-WolfStack-Secret", &secret)
+                    .send().await;
+                if matches!(r, Ok(ref resp) if resp.status().is_success()) {
+                    ok = true; break;
+                }
+            }
+            if ok { succeeded += 1; } else { failed += 1; }
+        }
+    }
+    HttpResponse::Ok().json(serde_json::json!({
+        "ok": true,
+        "summary": format!("Destroyed all sessions on {} node(s); {} failed", succeeded, failed),
+    }))
+}
+
+/// POST /api/security/sessions-destroy-all — node-local session wipe.
+/// Cluster-secret only (called by the coordinator's force-logout).
+pub async fn security_sessions_destroy_all(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    let has_secret = req.headers().get("X-WolfStack-Secret")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v == crate::auth::default_cluster_secret())
+        .unwrap_or(false);
+    if !has_secret {
+        return HttpResponse::Unauthorized().json(serde_json::json!({ "error": "cluster secret required" }));
+    }
+    state.sessions.destroy_all();
+    HttpResponse::Ok().json(serde_json::json!({ "ok": true }))
+}
+
 pub async fn vlan_discover(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(e) = require_auth(&req, &state) { return e; }
     let store = crate::networking::vlan::VlanStore::load();
@@ -28217,6 +28552,13 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/security/auth-unblock", web::post().to(security_auth_unblock))
         .route("/api/security/auth-unblock-peer", web::post().to(security_auth_unblock_peer))
         .route("/api/security/kernel-block-ip", web::post().to(security_kernel_block_ip))
+        .route("/api/security/listening-ports-local", web::get().to(security_listening_ports_local))
+        .route("/api/security/sessions-destroy-all", web::post().to(security_sessions_destroy_all))
+        // Fleet-wide aggregation and operations
+        .route("/api/fleet/security/lockouts", web::get().to(fleet_security_lockouts))
+        .route("/api/fleet/security/listening-ports", web::get().to(fleet_security_listening_ports))
+        .route("/api/fleet/security/push-lockout-policy", web::post().to(fleet_security_push_lockout_policy))
+        .route("/api/fleet/security/force-logout-all", web::post().to(fleet_security_force_logout_all))
         .route("/api/networking/vlan/parse-config", web::post().to(vlan_parse_config))
         .route("/api/networking/vlan/apply", web::post().to(vlan_apply))
         .route("/api/networking/vlan/attachments", web::post().to(vlan_upsert))

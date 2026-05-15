@@ -844,6 +844,134 @@
         </div>
 
         <!-- ═══ Security Page (per-node) ═══ -->
+        <!-- ═══ Fleet Security page — cross-cluster ops ═══ -->
+        <div id="page-fleet-security" class="page-view" style="display:none;">
+            <div class="card" style="margin-bottom:24px; background:linear-gradient(135deg, rgba(220,38,38,0.10), rgba(99,102,241,0.06)); border-color:rgba(220,38,38,0.30);">
+                <div class="card-body" style="display:flex; align-items:center; justify-content:space-between; padding:24px 28px; flex-wrap:wrap; gap:20px;">
+                    <div style="display:flex; align-items:center; gap:18px; flex:1; min-width:300px;">
+                        <div style="width:56px; height:56px; background:linear-gradient(135deg,#dc2626,#7c3aed); border-radius:14px; display:flex; align-items:center; justify-content:center; font-size:26px;"><span class="ws-icon-clean-wrap" data-icon="lock"></span></div>
+                        <div>
+                            <h2 style="font-size:22px; margin-bottom:2px; color:var(--text-primary); font-weight:700;">Fleet Security</h2>
+                            <p style="color:var(--text-secondary); font-size:13px; margin:0;">Cross-cluster operations — every node, every cluster, one screen.</p>
+                        </div>
+                    </div>
+                    <button class="btn btn-sm" onclick="renderFleetSecurity()" title="Refresh all panels">↻ Refresh</button>
+                </div>
+            </div>
+
+            <!-- ── Emergency: rotate root passwords ── -->
+            <div class="card" style="margin-bottom:20px; border:1px solid rgba(220,38,38,0.35); background:linear-gradient(135deg, rgba(220,38,38,0.06), rgba(220,38,38,0.01));">
+                <div class="card-header">
+                    <h3 style="margin:0; color:#fca5a5;">Emergency: rotate root passwords</h3>
+                    <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">Generates a fresh 32-char random password on every WolfStack-managed node in this cluster, applies it via chpasswd, kills all active root SSH sessions, returns the per-node passwords once.</div>
+                </div>
+                <div class="card-body">
+                    <button class="btn" onclick="emergencyRotateRootPasswords()" style="background:rgba(220,38,38,0.18); border:1px solid rgba(220,38,38,0.5); color:#fca5a5; font-weight:600;">Rotate root passwords fleet-wide</button>
+                    <div style="font-size:11px; color:var(--text-muted); margin-top:8px;">Proxmox-only nodes will be listed as "skipped" with manual instructions. Your own SSH session WILL be terminated. Save the returned passwords IMMEDIATELY.</div>
+                </div>
+            </div>
+
+            <!-- ── Force logout all sessions ── -->
+            <div class="card" style="margin-bottom:20px;">
+                <div class="card-header">
+                    <h3 style="margin:0;">Force-logout every WolfStack session, fleet-wide</h3>
+                    <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">Invalidates every active WolfStack web-UI session on every node in the cluster. Use when you suspect a session cookie has been stolen. Everyone (including you) has to re-login.</div>
+                </div>
+                <div class="card-body">
+                    <button class="btn" onclick="fleetForceLogoutAll()" style="background:rgba(234,179,8,0.15); border:1px solid rgba(234,179,8,0.45); color:#fbbf24; font-weight:600;">Logout everyone, everywhere</button>
+                </div>
+            </div>
+
+            <!-- ── Lockout policy (push to all) ── -->
+            <div class="card" style="margin-bottom:20px;">
+                <div class="card-header" style="display:flex; align-items:center; justify-content:space-between;">
+                    <div>
+                        <h3 style="margin:0;">Brute-force lockout policy</h3>
+                        <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">Set ONE policy and push it to every WolfStack-managed node. Covers WolfStack web UI, SSH, and Proxmox web UI on each node.</div>
+                    </div>
+                </div>
+                <div class="card-body">
+                    <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(160px, 1fr)); gap:12px;">
+                        <div class="form-group">
+                            <label for="fleet-sec-max-failures">Failures before block</label>
+                            <input class="form-control" id="fleet-sec-max-failures" type="number" min="1" max="1000" value="10">
+                        </div>
+                        <div class="form-group">
+                            <label for="fleet-sec-window">Detection window (sec)</label>
+                            <input class="form-control" id="fleet-sec-window" type="number" min="10" max="86400" value="300">
+                        </div>
+                        <div class="form-group">
+                            <label for="fleet-sec-lockout">Lockout (sec)</label>
+                            <input class="form-control" id="fleet-sec-lockout" type="number" min="60" max="2592000" value="172800">
+                            <small style="color:var(--text-muted); font-size:11px;">Default 172800 = 48h</small>
+                        </div>
+                        <div class="form-group">
+                            <label style="display:flex; align-items:center; gap:8px; cursor:pointer; padding-top:24px;">
+                                <input type="checkbox" id="fleet-sec-enabled" checked>
+                                <span>Enabled</span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label for="fleet-sec-trusted">Trusted IPs / CIDRs (one per line)</label>
+                        <textarea class="form-control" id="fleet-sec-trusted" rows="3" style="font-family:var(--font-mono); font-size:12px;" placeholder="192.168.1.5&#10;2a01:4f8:151:7225::/64"></textarea>
+                        <small style="color:var(--text-muted); font-size:11px;"><strong>Add your admin IPs here BEFORE saving</strong> — these IPs never get locked out, on any node. IPv4 + IPv6, single or CIDR.</small>
+                    </div>
+                    <button class="btn btn-primary" onclick="fleetPushLockoutPolicy()">Push policy to every node</button>
+                    <div id="fleet-sec-policy-status" style="margin-top:10px; font-size:12px; color:var(--text-secondary);"></div>
+                </div>
+            </div>
+
+            <!-- ── Fleet blocked IPs aggregated ── -->
+            <div class="card" style="margin-bottom:20px;">
+                <div class="card-header">
+                    <h3 style="margin:0;">Blocked IPs across the fleet</h3>
+                    <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">Every IP currently kernel-blocked on any WolfStack node. Click "Unblock everywhere" to clear from all nodes at once.</div>
+                </div>
+                <div class="card-body">
+                    <div id="fleet-blocked-ips">
+                        <div style="color:var(--text-muted); font-size:13px;">Loading…</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ── Public listening ports per node ── -->
+            <div class="card" style="margin-bottom:20px;">
+                <div class="card-header">
+                    <h3 style="margin:0;">Internet-exposed services</h3>
+                    <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">Every TCP listener bound to <code>0.0.0.0</code> or <code>::</code> across the fleet. Anything in this list is reachable from the internet (unless firewalled at the network edge). Red = high-risk (database, admin UI, file-share); yellow = exposes credentials; green = expected public services.</div>
+                </div>
+                <div class="card-body">
+                    <div id="fleet-listening-ports">
+                        <div style="color:var(--text-muted); font-size:13px;">Loading…</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ── Roadmap: future fleet ops ── -->
+            <div class="card" style="margin-bottom:20px; border:1px dashed var(--border);">
+                <div class="card-header">
+                    <h3 style="margin:0; color:var(--text-muted);">Coming next</h3>
+                    <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">Fleet operations on the roadmap. Tell us which to prioritise.</div>
+                </div>
+                <div class="card-body">
+                    <ul style="margin:0; padding-left:20px; font-size:13px; color:var(--text-secondary); line-height:1.7;">
+                        <li><strong>Rotate cluster secret</strong> — generate new inter-node auth token + distribute, killing any leaked-secret access.</li>
+                        <li><strong>Push SSH hardening</strong> — set <code>PermitRootLogin=prohibit-password</code> + <code>PasswordAuthentication=no</code> on every node at once.</li>
+                        <li><strong>Push authorized_keys</strong> — manage the set of SSH keys allowed across the fleet from one screen.</li>
+                        <li><strong>Fleet apt update + upgrade</strong> — rolling, with a confirm gate and dry-run report.</li>
+                        <li><strong>Rolling reboot</strong> — reboot every node in sequence with health-check holds between each.</li>
+                        <li><strong>WolfStack admin user/2FA fleet management</strong> — add/remove WolfStack accounts, enforce TOTP fleet-wide.</li>
+                        <li><strong>Open-port audit + alert</strong> — alert when a new public listener appears on any node.</li>
+                        <li><strong>Failed-service watch</strong> — surface failed systemd units across every node.</li>
+                        <li><strong>Backup verification</strong> — confirm last successful backup on every node and trigger a fleet backup.</li>
+                        <li><strong>SSL cert expiry</strong> — surface every cert across every node, with auto-renewal status.</li>
+                        <li><strong>Operator audit log</strong> — fleet-wide log of who-did-what-where, exportable.</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+
         <div id="page-security" class="page-view" style="display:none;">
             <!-- Security Header -->
             <div class="card" style="margin-bottom:24px; background:linear-gradient(135deg, rgba(34,197,94,0.12), rgba(59,130,246,0.08)); border-color:rgba(34,197,94,0.25);">
@@ -915,26 +1043,10 @@
                 </div>
             </div>
 
-            <!-- ═══ Emergency Actions ═══ -->
-            <div class="card" style="margin-bottom:24px; border:1px solid rgba(220,38,38,0.35); background:linear-gradient(135deg, rgba(220,38,38,0.08), rgba(220,38,38,0.02));">
-                <div class="card-header" style="display:flex; align-items:center; justify-content:space-between;">
-                    <div>
-                        <h3 style="margin:0; color:#fca5a5;">Emergency response</h3>
-                        <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">Fast actions to use when you suspect or confirm a fleet compromise.</div>
-                    </div>
-                </div>
-                <div class="card-body">
-                    <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); gap:16px;">
-                        <div style="padding:14px 16px; background:var(--bg-secondary); border:1px solid var(--border); border-radius:8px;">
-                            <div style="font-weight:600; font-size:14px; margin-bottom:4px;">Rotate root password on every node</div>
-                            <div style="font-size:12px; color:var(--text-secondary); line-height:1.5; margin-bottom:10px;">
-                                Generates a fresh 32-char random password on EVERY WolfStack-managed node in this cluster, applies it via <code>chpasswd</code>, kills any active root SSH sessions, and returns the per-node passwords to you here ONCE. Each node also writes a local backup to <code>/root/.wolfstack-emergency-passwords.txt</code> (mode 0600).
-                            </div>
-                            <button class="btn" onclick="emergencyRotateRootPasswords()" style="background:rgba(220,38,38,0.18); border:1px solid rgba(220,38,38,0.5); color:#fca5a5; font-weight:600; width:100%;">Rotate root passwords fleet-wide</button>
-                            <div style="font-size:11px; color:var(--text-muted); margin-top:8px;">Proxmox-only nodes are listed as "skipped" with instructions. Your own SSH session WILL be terminated.</div>
-                        </div>
-                    </div>
-                </div>
+            <!-- Emergency response moved to the Fleet Security page (sidebar → Apps & Tools → Fleet Security). Per-node Security page now focuses on per-node concerns only. -->
+            <div style="margin-bottom:20px; padding:10px 14px; background:rgba(99,102,241,0.08); border:1px solid rgba(99,102,241,0.25); border-radius:8px; font-size:13px; color:var(--text-secondary);">
+                Fleet-wide operations (rotate root passwords on every node, push lockout policy, view blocked IPs across the cluster, force-logout everyone) are now on the
+                <a href="#" onclick="selectView('fleet-security'); return false;" style="color:var(--accent-light); font-weight:600;">Fleet Security page</a>.
             </div>
 
             <!-- Security Components Grid -->

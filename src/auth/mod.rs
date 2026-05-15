@@ -159,6 +159,16 @@ impl SessionManager {
         }
     }
 
+    /// Destroy every active session. Used by the fleet-wide
+    /// force-logout — operator wants to invalidate suspected stolen
+    /// cookies. Every user has to re-authenticate after this.
+    pub fn destroy_all(&self) {
+        let mut sessions = self.sessions.write().unwrap();
+        let n = sessions.len();
+        sessions.clear();
+        tracing::warn!("auth: destroyed {} active session(s) (force-logout)", n);
+    }
+
     /// Clean up expired sessions
     pub fn cleanup(&self) {
         let mut sessions = self.sessions.write().unwrap();

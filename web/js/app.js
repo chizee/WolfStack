@@ -1868,7 +1868,7 @@ function selectView(page) {
     document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
     document.querySelector(`.nav-item[data-page="${page}"]`)?.classList.add('active');
 
-    const titles = { datacenter: 'Datacenter', settings: 'Settings', docs: 'Help & Documentation', appstore: 'App Store', issues: 'Issues', inbox: 'Predictive Inbox', 'global-wolfnet': 'Global View', kubernetes: 'WolfKube', topology: '3D Server Room', wolfflow: 'WolfFlow', wolfagents: 'WolfAgents', 'cluster-browser': 'Cluster Browser', databases: 'Databases', 'control-panel': 'Control Panel', array: 'Storage Array', xopools: 'XO Pools', tenants: 'Tenants' };
+    const titles = { datacenter: 'Datacenter', settings: 'Settings', docs: 'Help & Documentation', appstore: 'App Store', issues: 'Issues', inbox: 'Predictive Inbox', 'global-wolfnet': 'Global View', kubernetes: 'WolfKube', topology: '3D Server Room', wolfflow: 'WolfFlow', wolfagents: 'WolfAgents', 'cluster-browser': 'Cluster Browser', databases: 'Databases', 'control-panel': 'Control Panel', array: 'Storage Array', xopools: 'XO Pools', tenants: 'Tenants', 'fleet-security': 'Fleet Security' };
     document.getElementById('page-title').textContent = titles[page] || page;
 
     if (page === 'datacenter') {
@@ -1918,6 +1918,8 @@ function selectView(page) {
         renderXoPools();
     } else if (page === 'tenants') {
         renderTenants();
+    } else if (page === 'fleet-security') {
+        renderFleetSecurity();
     }
 
     // Restore task log toggle button when leaving topology
@@ -15519,6 +15521,231 @@ async function securityUnblockIp(ip) {
 window.securityRefreshLockouts = securityRefreshLockouts;
 window.securitySaveLockoutConfig = securitySaveLockoutConfig;
 window.securityUnblockIp = securityUnblockIp;
+
+// ─── Fleet Security page ───────────────────────────────────────────
+//
+// Renders the cross-cluster security dashboard:
+//   - Fleet-blocked IPs aggregated from every node
+//   - Public listening-port audit (what's exposed on 0.0.0.0)
+//   - Policy push (one form → every node)
+//   - Force-logout-all sessions
+//   - The existing fleet-rotate-root-passwords action (moved here from
+//     the per-node Security page)
+
+function renderFleetSecurity() {
+    fleetLoadBlockedIps();
+    fleetLoadListeningPorts();
+    fleetPrefillPolicy();
+}
+
+async function fleetPrefillPolicy() {
+    try {
+        const r = await fetch(apiUrl('/api/security/auth-config'));
+        if (!r.ok) return;
+        const c = await r.json();
+        document.getElementById('fleet-sec-max-failures').value = c.max_failures ?? 10;
+        document.getElementById('fleet-sec-window').value = c.window_seconds ?? 300;
+        document.getElementById('fleet-sec-lockout').value = c.lockout_seconds ?? 172800;
+        document.getElementById('fleet-sec-enabled').checked = c.enabled !== false;
+        document.getElementById('fleet-sec-trusted').value = (c.trusted_ips || []).join('\n');
+    } catch (_) { /* form keeps defaults */ }
+}
+
+async function fleetLoadBlockedIps() {
+    const el = document.getElementById('fleet-blocked-ips');
+    el.innerHTML = '<div style="color:var(--text-muted); font-size:13px;">Loading…</div>';
+    let data;
+    try {
+        const r = await fetch(apiUrl('/api/fleet/security/lockouts'));
+        if (!r.ok) {
+            el.innerHTML = '<div style="color:#ef4444; font-size:13px;">Failed to load fleet lockouts.</div>';
+            return;
+        }
+        data = await r.json();
+    } catch (e) {
+        el.innerHTML = `<div style="color:#ef4444; font-size:13px;">Error: ${vlanEsc(e.message || e)}</div>`;
+        return;
+    }
+    const nodes = data.nodes || [];
+    // Aggregate by IP across all nodes.
+    const byIp = {};
+    let totalAttempts = 0;
+    for (const n of nodes) {
+        if (n.status !== 'ok' || !n.data) continue;
+        for (const l of (n.data.lockouts || [])) {
+            if (!byIp[l.ip]) byIp[l.ip] = {
+                ip: l.ip,
+                nodes: [],
+                max_remaining: 0,
+                last_username: l.last_username,
+            };
+            byIp[l.ip].nodes.push({ hostname: n.hostname, remaining: l.remaining_seconds });
+            byIp[l.ip].max_remaining = Math.max(byIp[l.ip].max_remaining, l.remaining_seconds);
+            if (l.last_username) byIp[l.ip].last_username = l.last_username;
+        }
+        totalAttempts += (n.data.audit || []).length;
+    }
+    const ips = Object.values(byIp).sort((a, b) => b.max_remaining - a.max_remaining);
+    const failedNodes = nodes.filter(n => n.status === 'failed').length;
+    const summary = `${ips.length} unique IP${ips.length === 1 ? '' : 's'} blocked across ${nodes.filter(n => n.status === 'ok').length} node${nodes.length === 1 ? '' : 's'}` +
+                    (failedNodes > 0 ? ` (<span style="color:#fbbf24;">${failedNodes} node${failedNodes === 1 ? '' : 's'} unreachable</span>)` : '') +
+                    ` · ${totalAttempts} recent auth events`;
+
+    if (ips.length === 0) {
+        el.innerHTML = `<div style="font-size:13px; color:var(--text-secondary); margin-bottom:6px;">${summary}</div>
+                        <div style="color:var(--text-muted); font-size:12px;">No IPs are currently blocked on any node.</div>`;
+        return;
+    }
+    const fmtTime = s => {
+        const h = Math.floor(s / 3600); const m = Math.floor((s % 3600) / 60);
+        return h > 0 ? `${h}h ${m}m` : `${m}m`;
+    };
+    el.innerHTML = `
+        <div style="font-size:13px; color:var(--text-secondary); margin-bottom:10px;">${summary}</div>
+        <table style="width:100%; border-collapse:collapse; font-size:13px;">
+            <thead><tr style="text-align:left; border-bottom:2px solid var(--border);">
+                <th style="padding:6px 10px;">IP</th>
+                <th style="padding:6px 10px;">Blocked on</th>
+                <th style="padding:6px 10px;">Max remaining</th>
+                <th style="padding:6px 10px;">Last user attempted</th>
+                <th style="padding:6px 10px;"></th>
+            </tr></thead>
+            <tbody>${ips.map(x => `<tr>
+                <td style="padding:6px 10px; font-family:var(--font-mono); font-size:12px;">${vlanEsc(x.ip)}</td>
+                <td style="padding:6px 10px; font-size:11px;">${x.nodes.map(n => vlanEsc(n.hostname)).join(', ')} <span style="color:var(--text-muted);">(${x.nodes.length}/${nodes.length})</span></td>
+                <td style="padding:6px 10px; color:#fbbf24;">${fmtTime(x.max_remaining)}</td>
+                <td style="padding:6px 10px; color:var(--text-muted); font-size:11px;">${vlanEsc(x.last_username || '—')}</td>
+                <td style="padding:6px 10px;"><button class="btn btn-sm" onclick="fleetUnblockIp('${vlanEsc(x.ip)}')" style="font-size:11px;">Unblock everywhere</button></td>
+            </tr>`).join('')}</tbody>
+        </table>`;
+}
+
+async function fleetUnblockIp(ip) {
+    if (!await wolfConfirm(`Unblock ${ip} on EVERY node in the cluster?`, 'Fleet unblock')) return;
+    try {
+        const r = await fetch(apiUrl('/api/security/auth-unblock'), {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({ ip, propagate: true }),
+        });
+        const d = await r.json();
+        if (!r.ok) { showToast(d.error || 'Unblock failed', 'error'); return; }
+        showToast(`Unblocked ${ip} on all nodes`, 'success');
+        fleetLoadBlockedIps();
+    } catch (e) {
+        showToast(`Unblock failed: ${e.message || e}`, 'error');
+    }
+}
+
+async function fleetLoadListeningPorts() {
+    const el = document.getElementById('fleet-listening-ports');
+    el.innerHTML = '<div style="color:var(--text-muted); font-size:13px;">Loading…</div>';
+    let data;
+    try {
+        const r = await fetch(apiUrl('/api/fleet/security/listening-ports'));
+        if (!r.ok) {
+            el.innerHTML = '<div style="color:#ef4444; font-size:13px;">Failed to load listening ports.</div>';
+            return;
+        }
+        data = await r.json();
+    } catch (e) {
+        el.innerHTML = `<div style="color:#ef4444; font-size:13px;">Error: ${vlanEsc(e.message || e)}</div>`;
+        return;
+    }
+    const nodes = data.nodes || [];
+    // Classify each port by risk so the operator's eye lands on the
+    // genuinely concerning entries first. Categorisation is heuristic
+    // and operator-overrideable — these are sane defaults for a
+    // Proxmox-on-Hetzner topology.
+    const HIGH_RISK = ['8553', '8554', '8550', '8006', '8007', '3128', '2375', '2376', '3306', '5432', '5984', '6379', '11211', '27017', '9200', '5601', '3389', '5900', '5901', '139', '445', '111', '2049'];
+    const YELLOW_RISK = ['25', '21', '23', '22', '3240'];
+    const GREEN_RISK = ['80', '443'];
+    const classify = port => {
+        if (HIGH_RISK.includes(port)) return '#ef4444';
+        if (YELLOW_RISK.includes(port)) return '#fbbf24';
+        if (GREEN_RISK.includes(port)) return '#22c55e';
+        return 'var(--text-muted)';
+    };
+    const risk_label = port => {
+        if (HIGH_RISK.includes(port)) return 'high';
+        if (YELLOW_RISK.includes(port)) return 'medium';
+        if (GREEN_RISK.includes(port)) return 'low';
+        return 'unknown';
+    };
+    // Build per-node table.
+    const okNodes = nodes.filter(n => n.status === 'ok');
+    if (okNodes.length === 0) {
+        el.innerHTML = '<div style="color:var(--text-muted); font-size:13px;">No data returned from any node.</div>';
+        return;
+    }
+    el.innerHTML = okNodes.map(n => {
+        const ports = (n.data && n.data.ports) || [];
+        if (ports.length === 0) {
+            return `<div style="margin-bottom:10px; font-size:12px;"><strong>${vlanEsc(n.hostname)}</strong> <span style="color:var(--text-muted);">no public listeners</span></div>`;
+        }
+        return `<div style="margin-bottom:14px;">
+            <div style="font-weight:600; font-size:13px; margin-bottom:4px;">${vlanEsc(n.hostname)} <span style="font-family:var(--font-mono); color:var(--text-muted); font-size:11px;">${vlanEsc(n.address)}</span></div>
+            <div style="display:flex; flex-wrap:wrap; gap:6px;">
+                ${ports.map(p => `<span style="padding:3px 8px; background:${classify(p.port)}15; border:1px solid ${classify(p.port)}50; border-radius:4px; font-family:var(--font-mono); font-size:11px;" title="${vlanEsc(p.process)} · risk: ${risk_label(p.port)}">${vlanEsc(p.port)} <span style="color:var(--text-muted);">${vlanEsc(p.process)}</span></span>`).join('')}
+            </div>
+        </div>`;
+    }).join('');
+}
+
+async function fleetPushLockoutPolicy() {
+    const trustedRaw = document.getElementById('fleet-sec-trusted').value;
+    const trusted = trustedRaw.split('\n').map(l => l.trim()).filter(Boolean);
+    const body = {
+        max_failures: parseInt(document.getElementById('fleet-sec-max-failures').value, 10),
+        window_seconds: parseInt(document.getElementById('fleet-sec-window').value, 10),
+        lockout_seconds: parseInt(document.getElementById('fleet-sec-lockout').value, 10),
+        enabled: document.getElementById('fleet-sec-enabled').checked,
+        trusted_ips: trusted,
+    };
+    if (!await wolfConfirm(`Push this lockout policy to EVERY WolfStack node in the cluster?`, 'Push policy')) return;
+    const status = document.getElementById('fleet-sec-policy-status');
+    status.innerHTML = '<span style="color:#fbbf24;">Pushing to all nodes…</span>';
+    try {
+        const r = await fetch(apiUrl('/api/fleet/security/push-lockout-policy'), {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify(body),
+        });
+        const d = await r.json();
+        if (!r.ok) {
+            status.innerHTML = `<span style="color:#ef4444;">Failed: ${vlanEsc(d.error || 'unknown')}</span>`;
+            return;
+        }
+        const peers = d.peers || [];
+        const ok = peers.filter(p => p.ok).length;
+        const fail = peers.filter(p => !p.ok).length;
+        const failList = peers.filter(p => !p.ok).map(p => `${p.hostname}: ${p.error}`).join('; ');
+        status.innerHTML = `<span style="color:#22c55e;">Self applied.</span> ${ok} peer${ok === 1 ? '' : 's'} OK${fail > 0 ? `, <span style="color:#ef4444;">${fail} failed</span>${failList ? ` — ${vlanEsc(failList)}` : ''}` : ''}.`;
+    } catch (e) {
+        status.innerHTML = `<span style="color:#ef4444;">${vlanEsc(e.message || e)}</span>`;
+    }
+}
+
+async function fleetForceLogoutAll() {
+    if (!await wolfConfirm(`Destroy every active WolfStack session on every node in the cluster?\n\nEveryone (including you) will need to log in again. Use this when you suspect a session cookie has been stolen.`, 'Force logout all', { okText: 'Logout everyone', danger: true })) return;
+    try {
+        const r = await fetch(apiUrl('/api/fleet/security/force-logout-all'), { method: 'POST' });
+        const d = await r.json();
+        if (!r.ok) { showToast(d.error || 'Logout failed', 'error'); return; }
+        showToast(d.summary || 'Logged out fleet-wide', 'success');
+        // We've just destroyed our own session too. Redirect to login.
+        setTimeout(() => { window.location.href = '/login.html'; }, 1500);
+    } catch (e) {
+        showToast(`Force logout failed: ${e.message || e}`, 'error');
+    }
+}
+
+window.renderFleetSecurity = renderFleetSecurity;
+window.fleetLoadBlockedIps = fleetLoadBlockedIps;
+window.fleetUnblockIp = fleetUnblockIp;
+window.fleetLoadListeningPorts = fleetLoadListeningPorts;
+window.fleetPushLockoutPolicy = fleetPushLockoutPolicy;
+window.fleetForceLogoutAll = fleetForceLogoutAll;
 window.vlanProviderChanged = vlanProviderChanged;
 window.vlanSyncBridgeName = vlanSyncBridgeName;
 window.vlanSave = vlanSave;
@@ -55117,6 +55344,10 @@ window.predTermClose = predTermClose;
 // drawer.
 
 const APP_DRAWER_TILES = [
+    {
+        id: 'fleet-security', icon: '', name: 'Fleet Security',
+        desc: 'Fleet-wide root-password rotation, lockout policy, blocked IPs, exposed ports — every cluster you manage, one screen.',
+    },
     {
         id: 'control-panel', icon: '', name: 'Control Panel',
         desc: 'Every VM, LXC and Docker across the cluster, one view.',
