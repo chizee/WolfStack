@@ -224,6 +224,7 @@ pub struct AppState {
     pub tls_enabled: bool,
     /// Login rate limiter (brute-force protection)
     pub login_limiter: Arc<crate::auth::LoginRateLimiter>,
+    pub scan_detector: Arc<crate::scan_detector::ScanDetector>,
     /// WireGuard bridge configs (cluster → bridge)
     pub wireguard_bridges: Arc<std::sync::RwLock<std::collections::HashMap<String, crate::networking::WireGuardBridge>>>,
     /// Patreon integration state
@@ -11237,6 +11238,601 @@ pub async fn fleet_security_force_logout_all(
         "ok": true,
         "summary": format!("Destroyed all sessions on {} node(s); {} failed", succeeded, failed),
     }))
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Fleet-wide cluster-secret rotation
+// ════════════════════════════════════════════════════════════════════
+//
+// The cluster secret is the inter-node auth token. If it leaks (via
+// the same path that leaked the root password) every WolfStack-to-
+// WolfStack call from anywhere on the internet can impersonate a
+// peer. This endpoint generates a new secret, distributes it to every
+// peer using the OLD secret (last-time use), each peer writes the new
+// value to disk, and returns success. The new secret takes effect
+// after the next WolfStack restart on each node — until then the old
+// is still active.
+//
+// Operator must restart WolfStack on every node to fully cut over.
+// We surface that explicitly in the response so they don't think it's
+// already live.
+
+#[derive(Deserialize)]
+pub struct RotateClusterSecretReceiveRequest {
+    pub new_secret: String,
+}
+
+/// POST /api/security/cluster-secret/receive — peer-callable. Saves
+/// the new secret to /etc/wolfstack/cluster-secret. Authenticated via
+/// X-WolfStack-Secret using the CURRENT (old) secret — that's the
+/// last legitimate use of the old secret before it's superseded.
+pub async fn security_cluster_secret_receive(
+    req: HttpRequest,
+    _state: web::Data<AppState>,
+    body: web::Json<RotateClusterSecretReceiveRequest>,
+) -> HttpResponse {
+    let presented = req.headers().get("X-WolfStack-Secret")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !crate::auth::validate_cluster_secret(presented, crate::auth::default_cluster_secret()) {
+        return HttpResponse::Unauthorized().json(serde_json::json!({
+            "error": "invalid cluster secret",
+        }));
+    }
+    let new = body.into_inner().new_secret;
+    // Sanity-check format: must start with wsk_ and be reasonable length.
+    if !new.starts_with("wsk_") || new.len() < 16 || new.len() > 256 {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "new secret must start with 'wsk_' and be 16-256 chars",
+        }));
+    }
+    if let Err(e) = crate::auth::save_cluster_secret(&new) {
+        return HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": e,
+        }));
+    }
+    HttpResponse::Ok().json(serde_json::json!({
+        "ok": true,
+        "applied_at_restart": true,
+        "note": "Secret written to /etc/wolfstack/cluster-secret. Restart WolfStack to activate.",
+    }))
+}
+
+/// POST /api/fleet/security/rotate-cluster-secret — coordinator
+/// endpoint. Generates a new secret, fans out to every peer, returns
+/// per-peer status + the new secret value (so the operator can save
+/// it — though it's also persisted on every node).
+pub async fn fleet_security_rotate_cluster_secret(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let new_secret = crate::auth::generate_cluster_secret();
+
+    // Apply locally first.
+    if let Err(e) = crate::auth::save_cluster_secret(&new_secret) {
+        return HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("local save failed: {}", e),
+        }));
+    }
+
+    // Fan out to every WolfStack peer using the CURRENT (old) secret.
+    // If the old secret has already been compromised AND used to
+    // change the secret elsewhere, this fanout would fail — operator
+    // would see partial success and need to rotate manually.
+    let (self_id, peers) = {
+        let n = state.cluster.nodes.read().unwrap();
+        let self_id = state.cluster.self_id.clone();
+        let peers: Vec<crate::agent::Node> = n.values()
+            .filter(|p| p.id != self_id && p.node_type == "wolfstack")
+            .cloned()
+            .collect();
+        (self_id, peers)
+    };
+    let _ = self_id;
+    let old_secret = crate::auth::default_cluster_secret().to_string();
+    let client = match reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("client build: {}", e),
+        })),
+    };
+    let mut peer_results: Vec<serde_json::Value> = Vec::new();
+    for node in peers {
+        let urls = [
+            format!("https://{}:{}/api/security/cluster-secret/receive", node.address, node.port),
+            format!("http://{}:{}/api/security/cluster-secret/receive", node.address, node.port + 1),
+        ];
+        let body = serde_json::json!({ "new_secret": new_secret });
+        let mut ok = false;
+        let mut err = String::new();
+        for url in &urls {
+            let r = client.post(url)
+                .header("X-WolfStack-Secret", &old_secret)
+                .json(&body)
+                .send().await;
+            match r {
+                Ok(resp) if resp.status().is_success() => { ok = true; break; }
+                Ok(resp) => { err = format!("HTTP {}", resp.status()); }
+                Err(e) => { err = format!("transport: {}", e); }
+            }
+        }
+        peer_results.push(serde_json::json!({
+            "node_id": node.id,
+            "hostname": node.hostname,
+            "address": node.address,
+            "ok": ok,
+            "error": if ok { String::new() } else { err },
+        }));
+    }
+    let success_count = peer_results.iter().filter(|r| r["ok"].as_bool() == Some(true)).count();
+    let fail_count = peer_results.len() - success_count;
+    HttpResponse::Ok().json(serde_json::json!({
+        "ok": fail_count == 0,
+        "new_secret": new_secret,
+        "self_applied": true,
+        "peers": peer_results,
+        "summary": format!(
+            "Local + {}/{} peer(s) saved the new secret. {} failed. \
+             RESTART WOLFSTACK ON EVERY NODE to activate the new secret. \
+             Until restart, the OLD secret is still in use.",
+            success_count, peer_results.len(), fail_count,
+        ),
+        "important": "Save the new secret value from this response if you want to keep a copy outside the fleet. WolfStack also persists it to /etc/wolfstack/cluster-secret on every node.",
+    }))
+}
+
+// ════════════════════════════════════════════════════════════════════
+// SSH hardening — fleet-wide push of safe sshd config
+// ════════════════════════════════════════════════════════════════════
+//
+// Writes /etc/ssh/sshd_config.d/00-wolfstack-hardening.conf with the
+// settings the operator chose (PasswordAuthentication, PermitRootLogin,
+// PubkeyAuthentication). Verifies via `sshd -t` BEFORE reloading; if
+// the config is invalid we restore the backup and refuse the change
+// rather than risk a broken sshd that locks the operator out.
+//
+// **CRITICAL SAFETY GUARD**: We refuse to push a config that would
+// make the operator unable to log back in. Specifically: if the host
+// has NO authorized_keys for any user with a usable shell, we refuse
+// to set PasswordAuthentication=no — that would lock everyone out
+// permanently. Operator must either add a key first or override the
+// safety with `force=true`.
+
+#[derive(Deserialize, Serialize, Clone)]
+pub struct SshHardeningConfig {
+    /// Set to "no", "yes", or "prohibit-password". Default: prohibit-password.
+    #[serde(default = "default_permit_root")]
+    pub permit_root_login: String,
+    /// "yes" or "no". Default: no.
+    #[serde(default = "default_password_auth")]
+    pub password_authentication: String,
+    /// "yes" or "no". Default: yes (force key-only).
+    #[serde(default = "default_pubkey_auth")]
+    pub pubkey_authentication: String,
+    /// Bypass the "would lock you out" safety check. Use ONLY when you
+    /// know what you're doing.
+    #[serde(default)]
+    pub force: bool,
+}
+
+fn default_permit_root() -> String { "prohibit-password".into() }
+fn default_password_auth() -> String { "no".into() }
+fn default_pubkey_auth() -> String { "yes".into() }
+
+const SSH_HARDENING_PATH: &str = "/etc/ssh/sshd_config.d/00-wolfstack-hardening.conf";
+
+/// POST /api/security/ssh-hardening-local — apply hardening to THIS
+/// node. Validates with `sshd -t`, refuses if the change would lock
+/// the operator out (no authorized_keys + disabling password auth).
+pub async fn security_ssh_hardening_local(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<SshHardeningConfig>,
+) -> HttpResponse {
+    let has_secret = req.headers().get("X-WolfStack-Secret")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| crate::auth::validate_cluster_secret(v, crate::auth::default_cluster_secret()))
+        .unwrap_or(false);
+    if !has_secret {
+        if let Err(e) = require_auth(&req, &state) { return e; }
+    }
+    let cfg = body.into_inner();
+
+    // Safety: refuse to disable password auth if there are no SSH keys
+    // for any user with a real shell. This is the lock-out guard.
+    if cfg.password_authentication == "no" && !cfg.force && !any_authorized_keys_present() {
+        return HttpResponse::Conflict().json(serde_json::json!({
+            "ok": false,
+            "error": "REFUSED: disabling password authentication when no authorized_keys files exist would permanently lock you out. Add an SSH key first OR pass force=true.",
+        }));
+    }
+
+    let snippet = format!(
+        "# Auto-generated by WolfStack — fleet SSH hardening.\n\
+         # Edit via Settings → Security → SSH hardening, NOT here.\n\
+         PermitRootLogin {}\n\
+         PasswordAuthentication {}\n\
+         PubkeyAuthentication {}\n\
+         ChallengeResponseAuthentication no\n\
+         KbdInteractiveAuthentication no\n\
+         UsePAM yes\n\
+         MaxAuthTries 3\n",
+        sanitize_yes_no_or_prohibit(&cfg.permit_root_login, "prohibit-password"),
+        sanitize_yes_no(&cfg.password_authentication, "no"),
+        sanitize_yes_no(&cfg.pubkey_authentication, "yes"),
+    );
+
+    // Backup any existing snippet for rollback.
+    let backup = std::fs::read_to_string(SSH_HARDENING_PATH).ok();
+
+    if let Err(e) = std::fs::write(SSH_HARDENING_PATH, &snippet) {
+        return HttpResponse::InternalServerError().json(serde_json::json!({
+            "ok": false,
+            "error": format!("write {}: {}", SSH_HARDENING_PATH, e),
+        }));
+    }
+
+    // Validate. If `sshd -t` rejects the merged config, restore the
+    // backup (or delete the file) and report the error.
+    let validate = std::process::Command::new("sshd").arg("-t").output();
+    let valid = matches!(validate.as_ref(), Ok(o) if o.status.success());
+    if !valid {
+        let stderr = validate
+            .map(|o| String::from_utf8_lossy(&o.stderr).trim().to_string())
+            .unwrap_or_else(|e| format!("sshd spawn: {}", e));
+        match backup {
+            Some(b) => { let _ = std::fs::write(SSH_HARDENING_PATH, b); }
+            None => { let _ = std::fs::remove_file(SSH_HARDENING_PATH); }
+        }
+        return HttpResponse::InternalServerError().json(serde_json::json!({
+            "ok": false,
+            "error": format!("sshd -t rejected the new config; rolled back. Error: {}", stderr),
+        }));
+    }
+
+    // Reload sshd. SIGHUP keeps existing sessions alive, picks up the
+    // new config for new connections.
+    let reload = std::process::Command::new("systemctl")
+        .args(["reload", "ssh"])
+        .output();
+    let reload_ok = matches!(reload.as_ref(), Ok(o) if o.status.success());
+    if !reload_ok {
+        // Try the other unit name (Debian uses `ssh`, RHEL uses `sshd`).
+        let _ = std::process::Command::new("systemctl")
+            .args(["reload", "sshd"])
+            .output();
+    }
+    HttpResponse::Ok().json(serde_json::json!({
+        "ok": true,
+        "applied": cfg,
+        "config_path": SSH_HARDENING_PATH,
+    }))
+}
+
+fn sanitize_yes_no(v: &str, fallback: &str) -> String {
+    match v.trim().to_lowercase().as_str() {
+        "yes" => "yes".into(),
+        "no" => "no".into(),
+        _ => fallback.into(),
+    }
+}
+
+fn sanitize_yes_no_or_prohibit(v: &str, fallback: &str) -> String {
+    match v.trim().to_lowercase().as_str() {
+        "yes" => "yes".into(),
+        "no" => "no".into(),
+        "prohibit-password" | "without-password" => "prohibit-password".into(),
+        _ => fallback.into(),
+    }
+}
+
+/// True iff at least one user with a real shell has a non-empty
+/// authorized_keys file. Used by the SSH-hardening lock-out guard.
+fn any_authorized_keys_present() -> bool {
+    use std::io::BufRead;
+    let passwd = match std::fs::File::open("/etc/passwd") {
+        Ok(f) => f,
+        Err(_) => return true, // can't tell — fail open (don't refuse)
+    };
+    for line in std::io::BufReader::new(passwd).lines().flatten() {
+        let parts: Vec<&str> = line.split(':').collect();
+        if parts.len() < 7 { continue; }
+        let user = parts[0];
+        let home = parts[5];
+        let shell = parts[6];
+        if !shell.ends_with("sh") { continue; } // skip nologin / false
+        let _ = user;
+        let path = format!("{}/.ssh/authorized_keys", home);
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if meta.len() > 0 { return true; }
+        }
+    }
+    // Check /root specifically (might not be in /etc/passwd loop above).
+    if let Ok(meta) = std::fs::metadata("/root/.ssh/authorized_keys") {
+        if meta.len() > 0 { return true; }
+    }
+    false
+}
+
+/// POST /api/fleet/security/ssh-hardening — push the same SSH
+/// hardening config to every WolfStack peer. Each peer applies +
+/// validates locally; the response is per-peer success/failure.
+pub async fn fleet_security_ssh_hardening(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<SshHardeningConfig>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let cfg = body.into_inner();
+
+    // Apply locally first — if our own config is rejected, abort
+    // before touching peers. We invoke security_ssh_hardening_local's
+    // logic directly via a synthesised request would be ugly; instead
+    // we duplicate the small core: write file + sshd -t.
+    // Simplest: serialise the config and POST to ourselves on loopback.
+    // Cleaner: extract a helper. Going with the helper.
+    if let Err(e) = apply_ssh_hardening_local_inline(&cfg) {
+        return HttpResponse::InternalServerError().json(serde_json::json!({
+            "ok": false,
+            "error": format!("local: {}", e),
+        }));
+    }
+
+    let (self_id, peers) = {
+        let n = state.cluster.nodes.read().unwrap();
+        let self_id = state.cluster.self_id.clone();
+        let peers: Vec<crate::agent::Node> = n.values()
+            .filter(|p| p.id != self_id && p.node_type == "wolfstack")
+            .cloned()
+            .collect();
+        (self_id, peers)
+    };
+    let _ = self_id;
+    let secret = crate::auth::default_cluster_secret().to_string();
+    let client = match reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("client build: {}", e),
+        })),
+    };
+
+    let mut peer_results: Vec<serde_json::Value> = Vec::new();
+    for node in peers {
+        let urls = [
+            format!("https://{}:{}/api/security/ssh-hardening-local", node.address, node.port),
+            format!("http://{}:{}/api/security/ssh-hardening-local", node.address, node.port + 1),
+        ];
+        let mut ok = false;
+        let mut err = String::new();
+        for url in &urls {
+            let r = client.post(url)
+                .header("X-WolfStack-Secret", &secret)
+                .json(&cfg)
+                .send().await;
+            match r {
+                Ok(resp) if resp.status().is_success() => { ok = true; break; }
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    err = format!("HTTP {}: {}", status, body);
+                }
+                Err(e) => { err = format!("transport: {}", e); }
+            }
+        }
+        peer_results.push(serde_json::json!({
+            "node_id": node.id,
+            "hostname": node.hostname,
+            "address": node.address,
+            "ok": ok,
+            "error": if ok { String::new() } else { err },
+        }));
+    }
+    HttpResponse::Ok().json(serde_json::json!({
+        "ok": true,
+        "self_applied": true,
+        "peers": peer_results,
+        "applied_config": cfg,
+    }))
+}
+
+/// Inline copy of the core SSH-hardening logic (write file + sshd -t
+/// + reload). Used by both the local endpoint and the fleet endpoint
+/// to apply locally without an HTTP round-trip to ourselves.
+fn apply_ssh_hardening_local_inline(cfg: &SshHardeningConfig) -> Result<(), String> {
+    if cfg.password_authentication == "no" && !cfg.force && !any_authorized_keys_present() {
+        return Err("REFUSED: disabling password auth with no SSH keys present would lock you out (pass force=true to override)".into());
+    }
+    let snippet = format!(
+        "# Auto-generated by WolfStack — fleet SSH hardening.\n\
+         # Edit via Settings → Security → SSH hardening, NOT here.\n\
+         PermitRootLogin {}\n\
+         PasswordAuthentication {}\n\
+         PubkeyAuthentication {}\n\
+         ChallengeResponseAuthentication no\n\
+         KbdInteractiveAuthentication no\n\
+         UsePAM yes\n\
+         MaxAuthTries 3\n",
+        sanitize_yes_no_or_prohibit(&cfg.permit_root_login, "prohibit-password"),
+        sanitize_yes_no(&cfg.password_authentication, "no"),
+        sanitize_yes_no(&cfg.pubkey_authentication, "yes"),
+    );
+    let backup = std::fs::read_to_string(SSH_HARDENING_PATH).ok();
+    std::fs::write(SSH_HARDENING_PATH, &snippet)
+        .map_err(|e| format!("write {}: {}", SSH_HARDENING_PATH, e))?;
+    let validate = std::process::Command::new("sshd").arg("-t").output();
+    if !matches!(validate.as_ref(), Ok(o) if o.status.success()) {
+        let stderr = validate
+            .map(|o| String::from_utf8_lossy(&o.stderr).trim().to_string())
+            .unwrap_or_else(|e| format!("sshd spawn: {}", e));
+        match backup {
+            Some(b) => { let _ = std::fs::write(SSH_HARDENING_PATH, b); }
+            None => { let _ = std::fs::remove_file(SSH_HARDENING_PATH); }
+        }
+        return Err(format!("sshd -t rejected config (rolled back): {}", stderr));
+    }
+    let _ = std::process::Command::new("systemctl").args(["reload", "ssh"]).output();
+    let _ = std::process::Command::new("systemctl").args(["reload", "sshd"]).output();
+    Ok(())
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Outbound-scan detector — config + events API
+// ════════════════════════════════════════════════════════════════════
+
+/// GET /api/security/scan-detector — current config + recent events.
+pub async fn security_scan_detector_get(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    let has_secret = req.headers().get("X-WolfStack-Secret")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| crate::auth::validate_cluster_secret(v, crate::auth::default_cluster_secret()))
+        .unwrap_or(false);
+    if !has_secret {
+        if let Err(e) = require_auth(&req, &state) { return e; }
+    }
+    HttpResponse::Ok().json(serde_json::json!({
+        "config": state.scan_detector.config(),
+        "events": state.scan_detector.events(),
+    }))
+}
+
+/// POST /api/security/scan-detector — update detector config.
+pub async fn security_scan_detector_set(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<crate::scan_detector::ScanDetectorConfig>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    match state.scan_detector.set_config(body.into_inner()) {
+        Ok(saved) => HttpResponse::Ok().json(saved),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// GET /api/fleet/security/scan-detector — fleet-wide aggregated view.
+pub async fn fleet_security_scan_detector(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let det = state.scan_detector.clone();
+    let local = move || serde_json::json!({
+        "config": det.config(),
+        "events": det.events(),
+    });
+    let results = fleet_fanout_get::<serde_json::Value, _>(
+        &state, "/api/security/scan-detector", local,
+    ).await;
+    HttpResponse::Ok().json(serde_json::json!({ "nodes": results }))
+}
+
+/// POST /api/fleet/security/push-scan-detector — push the same
+/// detector config to every WolfStack node.
+pub async fn fleet_security_push_scan_detector(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<crate::scan_detector::ScanDetectorConfig>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let cfg = body.into_inner();
+    if let Err(e) = state.scan_detector.set_config(cfg.clone()) {
+        return HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("local apply: {}", e),
+        }));
+    }
+    let (self_id, peers) = {
+        let n = state.cluster.nodes.read().unwrap();
+        let self_id = state.cluster.self_id.clone();
+        let peers: Vec<crate::agent::Node> = n.values()
+            .filter(|p| p.id != self_id && p.node_type == "wolfstack")
+            .cloned().collect();
+        (self_id, peers)
+    };
+    let _ = self_id;
+    let secret = crate::auth::default_cluster_secret().to_string();
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(std::time::Duration::from_secs(8))
+        .build().ok();
+    let mut peer_results = Vec::new();
+    if let Some(client) = client {
+        for node in peers {
+            let urls = [
+                format!("https://{}:{}/api/security/scan-detector", node.address, node.port),
+                format!("http://{}:{}/api/security/scan-detector", node.address, node.port + 1),
+            ];
+            let mut ok = false;
+            let mut err = String::new();
+            for url in &urls {
+                let r = client.post(url)
+                    .header("X-WolfStack-Secret", &secret)
+                    .json(&cfg)
+                    .send().await;
+                match r {
+                    Ok(resp) if resp.status().is_success() => { ok = true; break; }
+                    Ok(resp) => { err = format!("HTTP {}", resp.status()); }
+                    Err(e) => { err = format!("transport: {}", e); }
+                }
+            }
+            peer_results.push(serde_json::json!({
+                "hostname": node.hostname,
+                "address": node.address,
+                "ok": ok,
+                "error": if ok { String::new() } else { err },
+            }));
+        }
+    }
+    HttpResponse::Ok().json(serde_json::json!({
+        "ok": true, "self_applied": true, "peers": peer_results,
+    }))
+}
+
+/// GET /api/security/host-audit — node-local container/VM/host audit.
+/// Heavy: spawns lots of subprocesses (lxc-ls, pct, docker, qm, virsh,
+/// find, ps, sshd -T, crontab). Run on a blocking task to keep the
+/// async runtime responsive.
+pub async fn security_host_audit(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    let has_secret = req.headers().get("X-WolfStack-Secret")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| crate::auth::validate_cluster_secret(v, crate::auth::default_cluster_secret()))
+        .unwrap_or(false);
+    if !has_secret {
+        if let Err(e) = require_auth(&req, &state) { return e; }
+    }
+    let audit = tokio::task::spawn_blocking(crate::security_audit::collect_host_audit).await;
+    match audit {
+        Ok(a) => HttpResponse::Ok().json(a),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("audit task panicked: {}", e),
+        })),
+    }
+}
+
+/// GET /api/fleet/security/host-audit — fan out collect_host_audit()
+/// to every WolfStack-managed peer and aggregate.
+pub async fn fleet_security_host_audit(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let local = move || crate::security_audit::collect_host_audit();
+    let results = fleet_fanout_get::<crate::security_audit::HostAudit, _>(
+        &state, "/api/security/host-audit", local,
+    ).await;
+    HttpResponse::Ok().json(serde_json::json!({ "nodes": results }))
 }
 
 /// POST /api/security/sessions-destroy-all — node-local session wipe.
@@ -28559,6 +29155,16 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/fleet/security/listening-ports", web::get().to(fleet_security_listening_ports))
         .route("/api/fleet/security/push-lockout-policy", web::post().to(fleet_security_push_lockout_policy))
         .route("/api/fleet/security/force-logout-all", web::post().to(fleet_security_force_logout_all))
+        .route("/api/fleet/security/rotate-cluster-secret", web::post().to(fleet_security_rotate_cluster_secret))
+        .route("/api/security/cluster-secret/receive", web::post().to(security_cluster_secret_receive))
+        .route("/api/security/host-audit", web::get().to(security_host_audit))
+        .route("/api/fleet/security/host-audit", web::get().to(fleet_security_host_audit))
+        .route("/api/security/ssh-hardening-local", web::post().to(security_ssh_hardening_local))
+        .route("/api/fleet/security/ssh-hardening", web::post().to(fleet_security_ssh_hardening))
+        .route("/api/security/scan-detector", web::get().to(security_scan_detector_get))
+        .route("/api/security/scan-detector", web::post().to(security_scan_detector_set))
+        .route("/api/fleet/security/scan-detector", web::get().to(fleet_security_scan_detector))
+        .route("/api/fleet/security/push-scan-detector", web::post().to(fleet_security_push_scan_detector))
         .route("/api/networking/vlan/parse-config", web::post().to(vlan_parse_config))
         .route("/api/networking/vlan/apply", web::post().to(vlan_apply))
         .route("/api/networking/vlan/attachments", web::post().to(vlan_upsert))

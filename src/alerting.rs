@@ -279,6 +279,56 @@ fn mask_secret(s: &str) -> String {
 // ─── Send notifications to configured channels ───
 // ═══════════════════════════════════════════════
 
+/// Send a security alert that's stamped with the operator's cluster
+/// name and hostname, then dispatched through every configured
+/// channel — Discord, Slack, Telegram (via the standard webhook
+/// AlertConfig), AND email (via the AiConfig SMTP settings).
+///
+/// Operators with multiple clusters need to know WHICH node fired
+/// the alert at a glance. Title prefix is `[<cluster> / <host>]`;
+/// body has a stable header block so the operator can sort/filter
+/// across an inbox of alerts from a fleet of 14 nodes.
+///
+/// Best-effort — channels are tried independently; one failing
+/// doesn't block the others. Returns nothing because the operator
+/// would never act on a "channel X failed" notice — the warning
+/// goes to journald instead.
+pub async fn send_node_alert(
+    cluster_name: &str,
+    hostname: &str,
+    title: &str,
+    body: &str,
+) {
+    let when = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string();
+    let full_title = format!("[{} / {}] {}", cluster_name, hostname, title);
+    let full_body = format!(
+        "Cluster:  {}\n\
+         Host:     {}\n\
+         When:     {}\n\n\
+         {}",
+        cluster_name, hostname, when, body,
+    );
+
+    // Webhook channels (Discord / Slack / Telegram).
+    let alert_cfg = AlertConfig::load();
+    if alert_cfg.enabled && alert_cfg.has_channels() {
+        send_alert(&alert_cfg, &full_title, &full_body).await;
+    }
+
+    // Email — sync function, run on the blocking pool so we don't
+    // stall the async runtime over SMTP handshakes.
+    let email_cfg = crate::ai::AiConfig::load();
+    if email_cfg.email_enabled && !email_cfg.email_to.is_empty() {
+        let t = full_title.clone();
+        let b = full_body.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = crate::ai::send_alert_email(&email_cfg, &t, &b) {
+                warn!("alert email failed: {}", e);
+            }
+        }).await.ok();
+    }
+}
+
 /// Send alert to all configured channels (non-blocking, best-effort)
 pub async fn send_alert(config: &AlertConfig, title: &str, message: &str) {
     if !config.enabled || !config.has_channels() {

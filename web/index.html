@@ -846,10 +846,13 @@
         <!-- ═══ Security Page (per-node) ═══ -->
         <!-- ═══ Fleet Security page — cross-cluster ops ═══ -->
         <div id="page-fleet-security" class="page-view" style="display:none;">
-            <div class="card" style="margin-bottom:24px; background:linear-gradient(135deg, rgba(220,38,38,0.10), rgba(99,102,241,0.06)); border-color:rgba(220,38,38,0.30);">
+            <!-- Header uses theme variables (var(--bg-card) + var(--accent))
+                 so light/dark/custom themes all render correctly. No
+                 hardcoded brand colours — operators set their own. -->
+            <div class="card" style="margin-bottom:24px;">
                 <div class="card-body" style="display:flex; align-items:center; justify-content:space-between; padding:24px 28px; flex-wrap:wrap; gap:20px;">
                     <div style="display:flex; align-items:center; gap:18px; flex:1; min-width:300px;">
-                        <div style="width:56px; height:56px; background:linear-gradient(135deg,#dc2626,#7c3aed); border-radius:14px; display:flex; align-items:center; justify-content:center; font-size:26px;"><span class="ws-icon-clean-wrap" data-icon="lock"></span></div>
+                        <div style="width:56px; height:56px; background:var(--accent); border-radius:14px; display:flex; align-items:center; justify-content:center; font-size:26px; color:#fff;"><span class="ws-icon-clean-wrap" data-icon="lock"></span></div>
                         <div>
                             <h2 style="font-size:22px; margin-bottom:2px; color:var(--text-primary); font-weight:700;">Fleet Security</h2>
                             <p style="color:var(--text-secondary); font-size:13px; margin:0;">Cross-cluster operations — every node, every cluster, one screen.</p>
@@ -935,6 +938,124 @@
                 </div>
             </div>
 
+            <!-- ── Outbound scan detector ── -->
+            <div class="card" style="margin-bottom:20px;">
+                <div class="card-header">
+                    <h3 style="margin:0;">Outbound scan detector</h3>
+                    <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">Detects processes (host or container) making rapid outbound connections — the zmap fingerprint that triggered the recent Hetzner abuse mail. Alerts and (optionally) auto-kills + UID-blocks the offending process. Runs on every WolfStack-managed node.</div>
+                </div>
+                <div class="card-body">
+                    <div id="fleet-scan-detector-status" style="margin-bottom:14px; font-size:13px; color:var(--text-secondary);">Loading…</div>
+
+                    <h4 style="margin:14px 0 6px; font-size:13px; color:var(--text-secondary);">Policy (push to all nodes)</h4>
+                    <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(160px, 1fr)); gap:12px;">
+                        <div class="form-group">
+                            <label for="scan-threshold">Distinct destinations to trigger</label>
+                            <input class="form-control" id="scan-threshold" type="number" min="5" max="10000" value="50">
+                        </div>
+                        <div class="form-group">
+                            <label for="scan-window">Window (sec)</label>
+                            <input class="form-control" id="scan-window" type="number" min="5" max="3600" value="60">
+                        </div>
+                        <div class="form-group">
+                            <label for="scan-sample">Sample interval (sec)</label>
+                            <input class="form-control" id="scan-sample" type="number" min="5" max="600" value="15">
+                        </div>
+                        <div class="form-group">
+                            <label for="scan-action">On detection</label>
+                            <select class="form-control" id="scan-action">
+                                <option value="kill_and_block">Kill process + block UID outbound</option>
+                                <option value="alert_only">Alert only (no kill)</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label style="display:flex; align-items:center; gap:8px; cursor:pointer; padding-top:24px;">
+                                <input type="checkbox" id="scan-enabled" checked>
+                                <span>Detector enabled</span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label for="scan-allowlist">Allowlist comm names (one per line)</label>
+                        <textarea class="form-control" id="scan-allowlist" rows="4" style="font-family:var(--font-mono); font-size:12px;" placeholder="apt&#10;dockerd&#10;ceph-osd"></textarea>
+                        <small style="color:var(--text-muted); font-size:11px;">Process names that bypass detection (legitimate fan-out tools). Pre-filled with sane defaults for Proxmox/WolfStack/Ceph hosts.</small>
+                    </div>
+                    <button class="btn btn-primary" onclick="fleetPushScanDetector()">Push policy to every node</button>
+                    <div id="fleet-scan-policy-status" style="margin-top:10px; font-size:12px; color:var(--text-secondary);"></div>
+
+                    <h4 style="margin:18px 0 6px; font-size:13px; color:var(--text-secondary);">Recent detections (fleet-wide)</h4>
+                    <div id="fleet-scan-events" style="max-height:280px; overflow-y:auto; border:1px solid var(--border); border-radius:6px;">
+                        <div style="padding:12px; font-size:12px; color:var(--text-muted);">Loading…</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ── Container / VM / host audit ── -->
+            <div class="card" style="margin-bottom:20px;">
+                <div class="card-header">
+                    <h3 style="margin:0;">Workload + host audit</h3>
+                    <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">Every container, VM, and host security-relevant signal across the fleet. Surfaces compromised configurations (privileged containers, mounted docker.sock, host-network containers), known-bad processes, executables in temp dirs, sshd policy gaps, recent authorized_keys changes, suspicious cron entries.</div>
+                </div>
+                <div class="card-body">
+                    <div id="fleet-host-audit">
+                        <div style="color:var(--text-muted); font-size:13px;">Loading…</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ── SSH hardening push ── -->
+            <div class="card" style="margin-bottom:20px;">
+                <div class="card-header">
+                    <h3 style="margin:0;">Push SSH hardening</h3>
+                    <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">Apply <code>PasswordAuthentication</code> + <code>PermitRootLogin</code> + <code>PubkeyAuthentication</code> policy to every WolfStack node. Each node validates with <code>sshd -t</code> before reloading; if invalid, rolls back. <strong style="color:#fca5a5;">Will refuse to disable password auth if no SSH keys exist (lock-out guard).</strong></div>
+                </div>
+                <div class="card-body">
+                    <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:12px;">
+                        <div class="form-group">
+                            <label for="ssh-permit-root">PermitRootLogin</label>
+                            <select class="form-control" id="ssh-permit-root">
+                                <option value="prohibit-password" selected>prohibit-password (key-only)</option>
+                                <option value="no">no (no root via SSH at all)</option>
+                                <option value="yes">yes (NOT RECOMMENDED)</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="ssh-password-auth">PasswordAuthentication</label>
+                            <select class="form-control" id="ssh-password-auth">
+                                <option value="no" selected>no (key-only)</option>
+                                <option value="yes">yes (NOT RECOMMENDED)</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="ssh-pubkey">PubkeyAuthentication</label>
+                            <select class="form-control" id="ssh-pubkey">
+                                <option value="yes" selected>yes</option>
+                                <option value="no">no</option>
+                            </select>
+                        </div>
+                    </div>
+                    <label style="display:flex; align-items:center; gap:8px; font-size:12px; margin-top:6px; color:var(--text-muted);">
+                        <input type="checkbox" id="ssh-force"> Override the lock-out guard (force=true) — only check this if you're SURE you have a working SSH key on every node.
+                    </label>
+                    <div style="margin-top:14px;">
+                        <button class="btn btn-primary" onclick="fleetPushSshHardening()">Push to every node</button>
+                    </div>
+                    <div id="fleet-ssh-status" style="margin-top:10px; font-size:12px; color:var(--text-secondary);"></div>
+                </div>
+            </div>
+
+            <!-- ── Cluster secret rotation ── -->
+            <div class="card" style="margin-bottom:20px;">
+                <div class="card-header">
+                    <h3 style="margin:0;">Rotate cluster secret</h3>
+                    <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">Generate a fresh inter-node auth token and distribute to every WolfStack node. Use when you suspect the cluster secret has leaked alongside other credentials. Takes effect after WolfStack restarts on each node — old secret remains active until then.</div>
+                </div>
+                <div class="card-body">
+                    <button class="btn" onclick="fleetRotateClusterSecret()" style="background:rgba(220,38,38,0.15); border:1px solid rgba(220,38,38,0.45); color:#fca5a5; font-weight:600;">Rotate cluster secret fleet-wide</button>
+                    <div id="fleet-cluster-secret-status" style="margin-top:10px; font-size:12px; color:var(--text-secondary);"></div>
+                </div>
+            </div>
+
             <!-- ── Public listening ports per node ── -->
             <div class="card" style="margin-bottom:20px;">
                 <div class="card-header">
@@ -948,28 +1069,6 @@
                 </div>
             </div>
 
-            <!-- ── Roadmap: future fleet ops ── -->
-            <div class="card" style="margin-bottom:20px; border:1px dashed var(--border);">
-                <div class="card-header">
-                    <h3 style="margin:0; color:var(--text-muted);">Coming next</h3>
-                    <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">Fleet operations on the roadmap. Tell us which to prioritise.</div>
-                </div>
-                <div class="card-body">
-                    <ul style="margin:0; padding-left:20px; font-size:13px; color:var(--text-secondary); line-height:1.7;">
-                        <li><strong>Rotate cluster secret</strong> — generate new inter-node auth token + distribute, killing any leaked-secret access.</li>
-                        <li><strong>Push SSH hardening</strong> — set <code>PermitRootLogin=prohibit-password</code> + <code>PasswordAuthentication=no</code> on every node at once.</li>
-                        <li><strong>Push authorized_keys</strong> — manage the set of SSH keys allowed across the fleet from one screen.</li>
-                        <li><strong>Fleet apt update + upgrade</strong> — rolling, with a confirm gate and dry-run report.</li>
-                        <li><strong>Rolling reboot</strong> — reboot every node in sequence with health-check holds between each.</li>
-                        <li><strong>WolfStack admin user/2FA fleet management</strong> — add/remove WolfStack accounts, enforce TOTP fleet-wide.</li>
-                        <li><strong>Open-port audit + alert</strong> — alert when a new public listener appears on any node.</li>
-                        <li><strong>Failed-service watch</strong> — surface failed systemd units across every node.</li>
-                        <li><strong>Backup verification</strong> — confirm last successful backup on every node and trigger a fleet backup.</li>
-                        <li><strong>SSL cert expiry</strong> — surface every cert across every node, with auto-renewal status.</li>
-                        <li><strong>Operator audit log</strong> — fleet-wide log of who-did-what-where, exportable.</li>
-                    </ul>
-                </div>
-            </div>
         </div>
 
         <div id="page-security" class="page-view" style="display:none;">

@@ -15536,6 +15536,8 @@ function renderFleetSecurity() {
     fleetLoadBlockedIps();
     fleetLoadListeningPorts();
     fleetPrefillPolicy();
+    fleetLoadScanDetector();
+    fleetLoadHostAudit();
 }
 
 async function fleetPrefillPolicy() {
@@ -15746,6 +15748,274 @@ window.fleetUnblockIp = fleetUnblockIp;
 window.fleetLoadListeningPorts = fleetLoadListeningPorts;
 window.fleetPushLockoutPolicy = fleetPushLockoutPolicy;
 window.fleetForceLogoutAll = fleetForceLogoutAll;
+
+// ─── Cluster secret rotation ───────────────────────────────────────
+
+async function fleetRotateClusterSecret() {
+    if (!await wolfConfirm(
+        `Generate a NEW cluster secret and distribute it to every WolfStack node?\n\n` +
+        `The new secret takes effect after each node's next WolfStack restart. ` +
+        `Until restart, the OLD secret is still active. ` +
+        `If you've been compromised, restart all nodes ASAP after this rotation completes.`,
+        'Rotate cluster secret', { okText: 'Generate + distribute', danger: true }
+    )) return;
+    const status = document.getElementById('fleet-cluster-secret-status');
+    status.innerHTML = '<span style="color:#fbbf24;">Generating + distributing…</span>';
+    try {
+        const r = await fetch(apiUrl('/api/fleet/security/rotate-cluster-secret'), { method: 'POST' });
+        const d = await r.json();
+        if (!r.ok) {
+            status.innerHTML = `<span style="color:#ef4444;">${vlanEsc(d.error || 'failed')}</span>`;
+            return;
+        }
+        const peers = d.peers || [];
+        const ok = peers.filter(p => p.ok).length;
+        const fail = peers.filter(p => !p.ok).length;
+        const newSecret = d.new_secret || '';
+        status.innerHTML = `
+            <div style="padding:10px; background:var(--bg-input); border:1px solid var(--border); border-radius:6px; margin-bottom:6px;">
+                <div style="color:#22c55e; font-weight:600; margin-bottom:6px;">Self + ${ok} peer(s) OK · ${fail} failed</div>
+                <div style="font-size:11px; color:var(--text-muted); margin-bottom:6px;">New secret (also persisted to /etc/wolfstack/cluster-secret on every node):</div>
+                <code style="font-family:var(--font-mono); font-size:11px; word-break:break-all; user-select:all; background:var(--bg-secondary); padding:4px 6px; border-radius:3px; display:block;">${vlanEsc(newSecret)}</code>
+                <div style="font-size:11px; color:#fbbf24; margin-top:6px;">${vlanEsc(d.summary || '')}</div>
+            </div>`;
+    } catch (e) {
+        status.innerHTML = `<span style="color:#ef4444;">${vlanEsc(e.message || e)}</span>`;
+    }
+}
+
+// ─── SSH hardening push ────────────────────────────────────────────
+
+async function fleetPushSshHardening() {
+    const body = {
+        permit_root_login: document.getElementById('ssh-permit-root').value,
+        password_authentication: document.getElementById('ssh-password-auth').value,
+        pubkey_authentication: document.getElementById('ssh-pubkey').value,
+        force: document.getElementById('ssh-force').checked,
+    };
+    if (!await wolfConfirm(
+        `Push this SSH config to EVERY WolfStack node?\n\n` +
+        `PermitRootLogin: ${body.permit_root_login}\n` +
+        `PasswordAuthentication: ${body.password_authentication}\n` +
+        `PubkeyAuthentication: ${body.pubkey_authentication}` +
+        (body.force ? `\nForce: TRUE (lock-out guard bypassed)` : `\nLock-out guard: ACTIVE`),
+        'Push SSH hardening', { okText: 'Push', danger: true }
+    )) return;
+    const status = document.getElementById('fleet-ssh-status');
+    status.innerHTML = '<span style="color:#fbbf24;">Pushing + validating on every node…</span>';
+    try {
+        const r = await fetch(apiUrl('/api/fleet/security/ssh-hardening'), {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify(body),
+        });
+        const d = await r.json();
+        if (!r.ok) {
+            status.innerHTML = `<span style="color:#ef4444;">${vlanEsc(d.error || 'failed')}</span>`;
+            return;
+        }
+        const peers = d.peers || [];
+        const ok = peers.filter(p => p.ok).length;
+        const fail = peers.filter(p => !p.ok).length;
+        const failDetails = peers.filter(p => !p.ok).map(p => `<li><strong>${vlanEsc(p.hostname)}</strong>: ${vlanEsc(p.error)}</li>`).join('');
+        status.innerHTML = `
+            <div style="color:#22c55e; font-weight:600;">Self applied · ${ok} peer(s) OK${fail > 0 ? ` · <span style="color:#ef4444;">${fail} failed</span>` : ''}</div>
+            ${fail > 0 ? `<ul style="margin:6px 0 0 18px; font-size:11px; color:var(--text-muted);">${failDetails}</ul>` : ''}`;
+    } catch (e) {
+        status.innerHTML = `<span style="color:#ef4444;">${vlanEsc(e.message || e)}</span>`;
+    }
+}
+
+// ─── Outbound scan detector ────────────────────────────────────────
+
+async function fleetLoadScanDetector() {
+    const statusEl = document.getElementById('fleet-scan-detector-status');
+    const eventsEl = document.getElementById('fleet-scan-events');
+    statusEl.textContent = 'Loading…';
+    eventsEl.innerHTML = '<div style="padding:12px; font-size:12px; color:var(--text-muted);">Loading…</div>';
+    let data;
+    try {
+        const r = await fetch(apiUrl('/api/fleet/security/scan-detector'));
+        if (!r.ok) {
+            statusEl.innerHTML = '<span style="color:#ef4444;">Failed to load.</span>';
+            return;
+        }
+        data = await r.json();
+    } catch (e) {
+        statusEl.innerHTML = `<span style="color:#ef4444;">${vlanEsc(e.message || e)}</span>`;
+        return;
+    }
+    const nodes = data.nodes || [];
+    const okNodes = nodes.filter(n => n.status === 'ok');
+    if (okNodes.length > 0 && okNodes[0].data) {
+        const c = okNodes[0].data.config || {};
+        document.getElementById('scan-threshold').value = c.threshold_destinations ?? 50;
+        document.getElementById('scan-window').value = c.window_seconds ?? 60;
+        document.getElementById('scan-sample').value = c.sample_interval_seconds ?? 15;
+        document.getElementById('scan-action').value = c.action || 'kill_and_block';
+        document.getElementById('scan-enabled').checked = c.enabled !== false;
+        document.getElementById('scan-allowlist').value = (c.allowlist_comms || []).join('\n');
+    }
+    const totalEvents = nodes.reduce((s, n) => s + ((n.data && n.data.events) ? n.data.events.length : 0), 0);
+    const enabled = okNodes.filter(n => n.data && n.data.config && n.data.config.enabled !== false).length;
+    statusEl.innerHTML = `Detector active on <strong>${enabled}/${okNodes.length}</strong> node${okNodes.length === 1 ? '' : 's'}. <strong>${totalEvents}</strong> recent detection${totalEvents === 1 ? '' : 's'}.`;
+    const allEvents = [];
+    for (const n of okNodes) {
+        for (const e of (n.data && n.data.events || [])) {
+            allEvents.push({ ...e, hostname: n.hostname });
+        }
+    }
+    allEvents.sort((a, b) => b.timestamp - a.timestamp);
+    if (allEvents.length === 0) {
+        eventsEl.innerHTML = '<div style="padding:12px; font-size:12px; color:var(--text-muted);">No detection events yet — that\'s good.</div>';
+    } else {
+        eventsEl.innerHTML = `<table style="width:100%; border-collapse:collapse;">
+            <thead><tr style="text-align:left; border-bottom:1px solid var(--border); background:var(--bg-secondary); position:sticky; top:0;">
+                <th style="padding:6px 10px; font-size:11px;">When</th>
+                <th style="padding:6px 10px; font-size:11px;">Node</th>
+                <th style="padding:6px 10px; font-size:11px;">PID / comm</th>
+                <th style="padding:6px 10px; font-size:11px;">Distinct dests</th>
+                <th style="padding:6px 10px; font-size:11px;">Action taken</th>
+            </tr></thead>
+            <tbody>${allEvents.map(e => {
+                const ago = ((Date.now() / 1000) - e.timestamp) | 0;
+                const agoStr = ago < 60 ? `${ago}s ago` : ago < 3600 ? `${(ago / 60) | 0}m ago` : `${(ago / 3600) | 0}h ago`;
+                return `<tr>
+                    <td style="padding:4px 10px; font-size:11px; color:var(--text-muted);">${agoStr}</td>
+                    <td style="padding:4px 10px; font-size:11px; font-family:var(--font-mono);">${vlanEsc(e.hostname)}</td>
+                    <td style="padding:4px 10px; font-size:11px;"><strong>${e.pid}</strong> ${vlanEsc(e.comm)} <span style="color:var(--text-muted);">(uid ${e.uid})</span></td>
+                    <td style="padding:4px 10px; color:#ef4444; font-weight:600;">${e.distinct_destinations}</td>
+                    <td style="padding:4px 10px; font-size:11px;">${vlanEsc(e.action_taken)}</td>
+                </tr>`;
+            }).join('')}</tbody>
+        </table>`;
+    }
+}
+
+async function fleetPushScanDetector() {
+    const allowlistRaw = document.getElementById('scan-allowlist').value;
+    const allowlist = allowlistRaw.split('\n').map(l => l.trim()).filter(Boolean);
+    const body = {
+        threshold_destinations: parseInt(document.getElementById('scan-threshold').value, 10),
+        window_seconds: parseInt(document.getElementById('scan-window').value, 10),
+        sample_interval_seconds: parseInt(document.getElementById('scan-sample').value, 10),
+        action: document.getElementById('scan-action').value,
+        enabled: document.getElementById('scan-enabled').checked,
+        allowlist_comms: allowlist,
+    };
+    const status = document.getElementById('fleet-scan-policy-status');
+    status.innerHTML = '<span style="color:#fbbf24;">Pushing…</span>';
+    try {
+        const r = await fetch(apiUrl('/api/fleet/security/push-scan-detector'), {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify(body),
+        });
+        const d = await r.json();
+        if (!r.ok) {
+            status.innerHTML = `<span style="color:#ef4444;">${vlanEsc(d.error || 'failed')}</span>`;
+            return;
+        }
+        const peers = d.peers || [];
+        const ok = peers.filter(p => p.ok).length;
+        const fail = peers.filter(p => !p.ok).length;
+        status.innerHTML = `<span style="color:#22c55e;">Self applied · ${ok} peer(s) OK${fail > 0 ? ` · <span style="color:#ef4444;">${fail} failed</span>` : ''}.</span>`;
+    } catch (e) {
+        status.innerHTML = `<span style="color:#ef4444;">${vlanEsc(e.message || e)}</span>`;
+    }
+}
+
+// ─── Fleet host audit (containers + VMs + host findings) ───────────
+
+async function fleetLoadHostAudit() {
+    const el = document.getElementById('fleet-host-audit');
+    el.innerHTML = '<div style="color:var(--text-muted); font-size:13px;">Loading… (this can take 10-30s — each node enumerates LXC, Proxmox CT, Docker, Proxmox VM, libvirt VM, and runs host checks.)</div>';
+    let data;
+    try {
+        const r = await fetch(apiUrl('/api/fleet/security/host-audit'));
+        if (!r.ok) {
+            el.innerHTML = '<div style="color:#ef4444; font-size:13px;">Failed to load.</div>';
+            return;
+        }
+        data = await r.json();
+    } catch (e) {
+        el.innerHTML = `<div style="color:#ef4444; font-size:13px;">${vlanEsc(e.message || e)}</div>`;
+        return;
+    }
+    const nodes = data.nodes || [];
+    const okNodes = nodes.filter(n => n.status === 'ok');
+    if (okNodes.length === 0) {
+        el.innerHTML = '<div style="color:var(--text-muted); font-size:13px;">No data returned from any node.</div>';
+        return;
+    }
+    okNodes.sort((a, b) => {
+        const crit = n => (n.data?.host_findings || []).filter(f => f.severity === 'critical').length;
+        const warn = n => (n.data?.host_findings || []).filter(f => f.severity === 'warn').length;
+        const aCrit = crit(a), bCrit = crit(b);
+        if (aCrit !== bCrit) return bCrit - aCrit;
+        return warn(b) - warn(a);
+    });
+    el.innerHTML = okNodes.map(n => {
+        const audit = n.data;
+        const workloads = audit.workloads || [];
+        const findings = audit.host_findings || [];
+        const critCount = findings.filter(f => f.severity === 'critical').length;
+        const warnCount = findings.filter(f => f.severity === 'warn').length;
+        const headerColour = critCount > 0 ? '#ef4444' : warnCount > 0 ? '#fbbf24' : '#22c55e';
+        const headerStatus = critCount > 0 ? `${critCount} critical, ${warnCount} warn` : warnCount > 0 ? `${warnCount} warn` : 'clean';
+
+        const findingsHtml = findings.length === 0 ? '' : `
+            <div style="margin-top:10px;">
+                ${findings.map(f => {
+                    const c = f.severity === 'critical' ? '#ef4444' : f.severity === 'warn' ? '#fbbf24' : '#6366f1';
+                    return `<div style="padding:8px 10px; background:${c}10; border:1px solid ${c}40; border-radius:6px; margin-bottom:6px;">
+                        <div style="font-weight:600; color:${c}; font-size:12px;">${vlanEsc(f.title)}</div>
+                        <div style="font-size:11px; color:var(--text-secondary); margin-top:3px; white-space:pre-wrap;">${vlanEsc(f.detail)}</div>
+                    </div>`;
+                }).join('')}
+            </div>`;
+
+        const workloadsHtml = workloads.length === 0 ? '' : `
+            <div style="margin-top:10px;">
+                <div style="font-size:11px; color:var(--text-muted); margin-bottom:4px;">Workloads (${workloads.length})</div>
+                <table style="width:100%; border-collapse:collapse; font-size:12px;">
+                    <thead><tr style="text-align:left; border-bottom:1px solid var(--border);">
+                        <th style="padding:4px 8px;">Kind</th>
+                        <th style="padding:4px 8px;">Name</th>
+                        <th style="padding:4px 8px;">State</th>
+                        <th style="padding:4px 8px;">Risks</th>
+                    </tr></thead>
+                    <tbody>${workloads.map(w => `<tr>
+                        <td style="padding:3px 8px; font-size:11px; color:var(--text-muted);">${vlanEsc(w.kind)}</td>
+                        <td style="padding:3px 8px; font-family:var(--font-mono); font-size:11px;">${vlanEsc(w.name)}</td>
+                        <td style="padding:3px 8px;"><span style="display:inline-block; padding:1px 6px; background:${w.running ? '#22c55e20' : 'var(--bg-secondary)'}; color:${w.running ? '#22c55e' : 'var(--text-muted)'}; border-radius:3px; font-size:10px; font-weight:600;">${w.running ? 'running' : 'stopped'}</span></td>
+                        <td style="padding:3px 8px;">${
+                            w.risks.length === 0 ? '<span style="color:var(--text-muted); font-size:11px;">—</span>'
+                            : w.risks.map(r => `<div style="color:#ef4444; font-size:11px;">⚠ ${vlanEsc(r)}</div>`).join('')
+                        }</td>
+                    </tr>`).join('')}</tbody>
+                </table>
+            </div>`;
+
+        return `<div style="padding:14px 16px; background:var(--bg-secondary); border:1px solid ${headerColour}40; border-radius:8px; margin-bottom:14px;">
+            <div style="display:flex; align-items:center; justify-content:space-between;">
+                <div>
+                    <strong style="font-size:14px;">${vlanEsc(audit.hostname)}</strong>
+                    <span style="margin-left:8px; padding:2px 8px; background:${headerColour}20; color:${headerColour}; border-radius:3px; font-size:11px; font-weight:600;">${headerStatus}</span>
+                </div>
+                <span style="font-size:11px; color:var(--text-muted);">${workloads.length} workload${workloads.length === 1 ? '' : 's'}</span>
+            </div>
+            ${findingsHtml}
+            ${workloadsHtml}
+        </div>`;
+    }).join('');
+}
+
+window.fleetRotateClusterSecret = fleetRotateClusterSecret;
+window.fleetPushSshHardening = fleetPushSshHardening;
+window.fleetLoadScanDetector = fleetLoadScanDetector;
+window.fleetPushScanDetector = fleetPushScanDetector;
+window.fleetLoadHostAudit = fleetLoadHostAudit;
 window.vlanProviderChanged = vlanProviderChanged;
 window.vlanSyncBridgeName = vlanSyncBridgeName;
 window.vlanSave = vlanSave;

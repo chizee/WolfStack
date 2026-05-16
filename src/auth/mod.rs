@@ -444,6 +444,10 @@ const AUDIT_LOG_MAX: usize = 500;
 /// happens regardless of the source surface (WolfStack UI, sshd, PVE).
 pub type PropagateBlockHook = std::sync::Arc<dyn Fn(&str, u64) + Send + Sync>;
 pub type PropagateUnblockHook = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+/// (title, body) callback fired when a lockout newly triggers. main.rs
+/// wires this to alerting::send_node_alert so the operator gets a
+/// Discord / Slack / Telegram / email with the cluster + hostname.
+pub type SecurityAlertHook = std::sync::Arc<dyn Fn(String, String) + Send + Sync>;
 
 pub struct LoginRateLimiter {
     attempts: RwLock<HashMap<String, AttemptRecord>>,
@@ -451,6 +455,7 @@ pub struct LoginRateLimiter {
     config: RwLock<LoginLockoutConfig>,
     propagate_block: RwLock<Option<PropagateBlockHook>>,
     propagate_unblock: RwLock<Option<PropagateUnblockHook>>,
+    alert_hook: RwLock<Option<SecurityAlertHook>>,
 }
 
 impl LoginRateLimiter {
@@ -461,7 +466,12 @@ impl LoginRateLimiter {
             config: RwLock::new(LoginLockoutConfig::load()),
             propagate_block: RwLock::new(None),
             propagate_unblock: RwLock::new(None),
+            alert_hook: RwLock::new(None),
         }
+    }
+
+    pub fn install_alert_hook(&self, hook: SecurityAlertHook) {
+        *self.alert_hook.write().unwrap() = Some(hook);
     }
 
     /// Install hooks the limiter will call whenever a lock/unlock
@@ -655,6 +665,25 @@ impl LoginRateLimiter {
             kernel_block_ip(ip);
             self.persist_lockouts();
             self.fire_block_hook(ip, cfg.lockout_seconds);
+            // Alert operator out-of-band (Discord/Slack/Telegram/email).
+            // Title includes the source IP; body has the username
+            // attempted, threshold, and lockout duration. Cluster +
+            // hostname are stamped in by the alert hook itself.
+            let hook = self.alert_hook.read().unwrap().clone();
+            if let Some(h) = hook {
+                let title = format!("🚨 IP {} blocked after {} failed logins", ip, cfg.max_failures);
+                let body = format!(
+                    "Source IP {} crossed the brute-force threshold and is now kernel-blocked.\n\n\
+                     User attempted: {}\n\
+                     Threshold: {} failed logins within {} seconds\n\
+                     Lockout: {} seconds ({} hours)\n\n\
+                     The block is enforced via iptables DROP and is propagating to every other WolfStack-managed node in the cluster.",
+                    ip, if username.is_empty() { "(unknown)".to_string() } else { username.to_string() },
+                    cfg.max_failures, cfg.window_seconds,
+                    cfg.lockout_seconds, cfg.lockout_seconds / 3600,
+                );
+                h(title, body);
+            }
         }
         self.audit_push(AuthLogEntry {
             timestamp: now_secs(),

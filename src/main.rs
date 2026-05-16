@@ -69,6 +69,8 @@ mod certbot;
 mod dns_providers;
 mod edge;
 mod threat_intel;
+mod security_audit;
+mod scan_detector;
 #[allow(dead_code)]
 mod integrations;
 
@@ -605,6 +607,7 @@ async fn main() -> std::io::Result<()> {
             statuspage: statuspage_state.clone(),
             tls_enabled,
             login_limiter: Arc::new(auth::LoginRateLimiter::new()),
+            scan_detector: Arc::new(scan_detector::ScanDetector::new()),
             wireguard_bridges: Arc::new(std::sync::RwLock::new(networking::load_wireguard_bridges())),
             patreon: Arc::new(patreon::PatreonState::new()),
             migration_tasks: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
@@ -656,6 +659,34 @@ async fn main() -> std::io::Result<()> {
                 }),
             );
         }
+        // Install the alert hooks on the limiter + scan detector so
+        // every security event (lockout, scan detection) sends a
+        // Discord / Slack / Telegram / email alert stamped with the
+        // cluster name + hostname. Both modules call the same shape
+        // of hook (title, body) — the hook decorates with node context
+        // and dispatches via alerting::send_node_alert.
+        {
+            let cluster_for_alert_lim = app_state.cluster.clone();
+            app_state.login_limiter.install_alert_hook(std::sync::Arc::new(move |title, body| {
+                let cluster_name = cluster_for_alert_lim.get_self_cluster_name();
+                let hostname = hostname::get()
+                    .map(|h| h.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| "unknown".into());
+                tokio::spawn(async move {
+                    crate::alerting::send_node_alert(&cluster_name, &hostname, &title, &body).await;
+                });
+            }));
+            let cluster_for_alert_scan = app_state.cluster.clone();
+            app_state.scan_detector.install_alert_hook(std::sync::Arc::new(move |title, body| {
+                let cluster_name = cluster_for_alert_scan.get_self_cluster_name();
+                let hostname = hostname::get()
+                    .map(|h| h.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| "unknown".into());
+                tokio::spawn(async move {
+                    crate::alerting::send_node_alert(&cluster_name, &hostname, &title, &body).await;
+                });
+            }));
+        }
         // Restore kernel iptables rules for any non-expired lockouts
         // from the previous WolfStack process. Kernel rules survive a
         // service restart; this keeps our in-memory state aligned.
@@ -664,6 +695,12 @@ async fn main() -> std::io::Result<()> {
         // so SSH and Proxmox brute-force attacks trigger the same
         // kernel-block + fleet propagation as WolfStack-UI attacks.
         crate::auth::log_monitor::start_monitor(app_state.login_limiter.clone());
+        // Start the outbound-scan detector. Periodically samples
+        // /proc/net/tcp[6] for SYN_SENT-state sockets, counts distinct
+        // destinations per process across the rolling window, and
+        // kills + UID-blocks any process that crosses the threshold.
+        // This is what would have caught the zmap incident at minute 1.
+        app_state.scan_detector.clone().start();
 
         // Storage-array health watcher — every 60s, scan /proc/mdstat
         // and per-disk SMART. Fire an alert_log entry on first
