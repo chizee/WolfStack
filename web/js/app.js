@@ -15532,12 +15532,56 @@ window.securityUnblockIp = securityUnblockIp;
 //   - The existing fleet-rotate-root-passwords action (moved here from
 //     the per-node Security page)
 
-function renderFleetSecurity() {
-    fleetLoadBlockedIps();
-    fleetLoadListeningPorts();
-    fleetPrefillPolicy();
-    fleetLoadScanDetector();
-    fleetLoadHostAudit();
+// Tracks how many panel loads are still in flight so the Refresh
+// button can show a spinner that goes away ONLY when every panel is
+// done, not just the first one to return.
+let _fleetSecRefreshInFlight = 0;
+
+async function renderFleetSecurity() {
+    fleetSecMarkRefreshStart();
+    // Wrap each loader so we count completions even when one errors.
+    const wrap = (p) => {
+        _fleetSecRefreshInFlight++;
+        return Promise.resolve(p).catch(() => null).finally(fleetSecMarkRefreshTick);
+    };
+    await Promise.all([
+        wrap(fleetLoadBlockedIps()),
+        wrap(fleetLoadListeningPorts()),
+        wrap(fleetPrefillPolicy()),
+        wrap(fleetLoadScanDetector()),
+        wrap(fleetLoadHostAudit()),
+    ]);
+    fleetSecMarkRefreshDone();
+}
+
+function fleetSecMarkRefreshStart() {
+    const btn = document.querySelector('button[onclick="renderFleetSecurity()"]');
+    if (!btn) return;
+    if (!btn.dataset.origText) btn.dataset.origText = btn.textContent;
+    btn.disabled = true;
+    btn.style.opacity = '0.7';
+    btn.style.cursor = 'wait';
+    btn.textContent = '↻ Refreshing…';
+}
+
+function fleetSecMarkRefreshTick() {
+    if (_fleetSecRefreshInFlight > 0) _fleetSecRefreshInFlight--;
+}
+
+function fleetSecMarkRefreshDone() {
+    const btn = document.querySelector('button[onclick="renderFleetSecurity()"]');
+    if (!btn) return;
+    const stamp = new Date().toLocaleTimeString();
+    btn.disabled = false;
+    btn.style.opacity = '1';
+    btn.style.cursor = 'pointer';
+    btn.textContent = `✓ Refreshed ${stamp}`;
+    // After 4s, revert to plain ↻ Refresh so the button doesn't
+    // permanently show a stale timestamp.
+    setTimeout(() => {
+        if (!btn) return;
+        btn.textContent = btn.dataset.origText || '↻ Refresh';
+    }, 4000);
 }
 
 async function fleetPrefillPolicy() {
