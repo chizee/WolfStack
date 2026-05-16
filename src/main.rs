@@ -637,7 +637,13 @@ async fn main() -> std::io::Result<()> {
             let cluster_block = app_state.cluster.clone();
             let cluster_unblock = app_state.cluster.clone();
             let self_id_block = app_state.cluster.self_id.clone();
-            let secret_block = crate::auth::default_cluster_secret().to_string();
+            // Use the LOADED cluster secret (the operator's custom value
+            // if they have one set in /etc/wolfstack/cluster-secret),
+            // NOT the hardcoded builtin default. Existing federation
+            // calls all use this — and the receiving endpoints'
+            // require_auth() accepts loaded + builtin + on-disk so the
+            // sender always authenticates correctly.
+            let secret_block = app_state.cluster_secret.clone();
             let secret_unblock = secret_block.clone();
             app_state.login_limiter.install_propagation_hooks(
                 std::sync::Arc::new(move |ip, secs| {

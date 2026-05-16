@@ -656,14 +656,11 @@ pub async fn security_kernel_block_ip(
     state: web::Data<AppState>,
     body: web::Json<KernelBlockRequest>,
 ) -> HttpResponse {
-    // Either cluster-secret or operator session.
-    let has_secret = req.headers().get("X-WolfStack-Secret")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v == crate::auth::default_cluster_secret())
-        .unwrap_or(false);
-    if !has_secret {
-        if let Err(e) = require_auth(&req, &state) { return e; }
-    }
+    // require_auth accepts ANY of three valid cluster secrets
+    // (loaded / hardcoded / on-disk) OR an authenticated session.
+    // Rolling our own check here meant peers running with a custom
+    // cluster secret (the standard production setup) were rejected.
+    if let Err(e) = require_auth(&req, &state) { return e; }
     let body = body.into_inner();
     let source = if body.source_node.is_empty() {
         "operator".to_string()
@@ -743,7 +740,7 @@ pub async fn security_auth_unblock(
     state.login_limiter.unblock(&body.ip);
     if body.propagate {
         let cluster = state.cluster.clone();
-        let secret = crate::auth::default_cluster_secret().to_string();
+        let secret = state.cluster_secret.clone();
         let ip = body.ip.clone();
         tokio::spawn(async move {
             propagate_kernel_unblock_to_peers(cluster, secret, ip).await;
@@ -795,13 +792,7 @@ pub async fn security_auth_unblock_peer(
     state: web::Data<AppState>,
     body: web::Json<UnblockRequest>,
 ) -> HttpResponse {
-    let has_secret = req.headers().get("X-WolfStack-Secret")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v == crate::auth::default_cluster_secret())
-        .unwrap_or(false);
-    if !has_secret {
-        return HttpResponse::Unauthorized().json(serde_json::json!({ "error": "cluster secret required" }));
-    }
+    if let Err(e) = require_auth(&req, &state) { return e; }
     state.login_limiter.unblock(&body.ip);
     HttpResponse::Ok().json(serde_json::json!({ "ok": true }))
 }
@@ -10801,7 +10792,7 @@ pub async fn security_rotate_fleet(
         (state.cluster.self_id.clone(), n.values().cloned().collect::<Vec<_>>())
     };
 
-    let secret = crate::auth::default_cluster_secret().to_string();
+    let secret = state.cluster_secret.clone();
     let mut futures = Vec::new();
 
     for node in nodes {
@@ -10958,7 +10949,7 @@ where
         let peers: Vec<crate::agent::Node> = n.values().cloned().collect();
         (self_id, peers)
     };
-    let secret = crate::auth::default_cluster_secret().to_string();
+    let secret = state.cluster_secret.clone();
     let local_result = std::sync::Mutex::new(Some(local()));
     let mut tasks = Vec::new();
     for node in peers {
@@ -11067,13 +11058,7 @@ pub async fn security_listening_ports_local(
     req: HttpRequest,
     state: web::Data<AppState>,
 ) -> HttpResponse {
-    let has_secret = req.headers().get("X-WolfStack-Secret")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v == crate::auth::default_cluster_secret())
-        .unwrap_or(false);
-    if !has_secret {
-        if let Err(e) = require_auth(&req, &state) { return e; }
-    }
+    if let Err(e) = require_auth(&req, &state) { return e; }
     HttpResponse::Ok().json(collect_listening_ports())
 }
 
@@ -11145,7 +11130,7 @@ pub async fn fleet_security_push_lockout_policy(
         (self_id, peers)
     };
     let _ = self_id;
-    let secret = crate::auth::default_cluster_secret().to_string();
+    let secret = state.cluster_secret.clone();
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .timeout(std::time::Duration::from_secs(8))
@@ -11208,7 +11193,7 @@ pub async fn fleet_security_force_logout_all(
         (self_id, peers)
     };
     let _ = self_id;
-    let secret = crate::auth::default_cluster_secret().to_string();
+    let secret = state.cluster_secret.clone();
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .timeout(std::time::Duration::from_secs(5))
@@ -11434,13 +11419,7 @@ pub async fn security_ssh_hardening_local(
     state: web::Data<AppState>,
     body: web::Json<SshHardeningConfig>,
 ) -> HttpResponse {
-    let has_secret = req.headers().get("X-WolfStack-Secret")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| crate::auth::validate_cluster_secret(v, crate::auth::default_cluster_secret()))
-        .unwrap_or(false);
-    if !has_secret {
-        if let Err(e) = require_auth(&req, &state) { return e; }
-    }
+    if let Err(e) = require_auth(&req, &state) { return e; }
     let cfg = body.into_inner();
 
     // Safety: refuse to disable password auth if there are no SSH keys
@@ -11593,7 +11572,7 @@ pub async fn fleet_security_ssh_hardening(
         (self_id, peers)
     };
     let _ = self_id;
-    let secret = crate::auth::default_cluster_secret().to_string();
+    let secret = state.cluster_secret.clone();
     let client = match reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .timeout(std::time::Duration::from_secs(15))
@@ -11693,13 +11672,7 @@ pub async fn security_scan_detector_get(
     req: HttpRequest,
     state: web::Data<AppState>,
 ) -> HttpResponse {
-    let has_secret = req.headers().get("X-WolfStack-Secret")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| crate::auth::validate_cluster_secret(v, crate::auth::default_cluster_secret()))
-        .unwrap_or(false);
-    if !has_secret {
-        if let Err(e) = require_auth(&req, &state) { return e; }
-    }
+    if let Err(e) = require_auth(&req, &state) { return e; }
     HttpResponse::Ok().json(serde_json::json!({
         "config": state.scan_detector.config(),
         "events": state.scan_detector.events(),
@@ -11759,7 +11732,7 @@ pub async fn fleet_security_push_scan_detector(
         (self_id, peers)
     };
     let _ = self_id;
-    let secret = crate::auth::default_cluster_secret().to_string();
+    let secret = state.cluster_secret.clone();
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .timeout(std::time::Duration::from_secs(8))
@@ -11805,13 +11778,7 @@ pub async fn security_host_audit(
     req: HttpRequest,
     state: web::Data<AppState>,
 ) -> HttpResponse {
-    let has_secret = req.headers().get("X-WolfStack-Secret")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| crate::auth::validate_cluster_secret(v, crate::auth::default_cluster_secret()))
-        .unwrap_or(false);
-    if !has_secret {
-        if let Err(e) = require_auth(&req, &state) { return e; }
-    }
+    if let Err(e) = require_auth(&req, &state) { return e; }
     let audit = tokio::task::spawn_blocking(crate::security_audit::collect_host_audit).await;
     match audit {
         Ok(a) => HttpResponse::Ok().json(a),
@@ -11841,13 +11808,7 @@ pub async fn security_sessions_destroy_all(
     req: HttpRequest,
     state: web::Data<AppState>,
 ) -> HttpResponse {
-    let has_secret = req.headers().get("X-WolfStack-Secret")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v == crate::auth::default_cluster_secret())
-        .unwrap_or(false);
-    if !has_secret {
-        return HttpResponse::Unauthorized().json(serde_json::json!({ "error": "cluster secret required" }));
-    }
+    if let Err(e) = require_auth(&req, &state) { return e; }
     state.sessions.destroy_all();
     HttpResponse::Ok().json(serde_json::json!({ "ok": true }))
 }
