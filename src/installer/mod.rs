@@ -5,6 +5,7 @@
 //! Installer — manages installation and status of Wolf suite components
 
 pub mod packages;
+pub mod self_signed;
 
 use serde::{Deserialize, Serialize};
 use std::process::Command;

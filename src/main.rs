@@ -530,6 +530,38 @@ async fn main() -> std::io::Result<()> {
         plugins::start_all_backends();
     });
 
+    // HTTPS-by-default: if the operator has NOT opted out (--no-tls),
+    // has NOT supplied --tls-cert/--tls-key, and there's no existing
+    // cert anywhere `find_tls_certificate()` would discover (operator
+    // wolfstack/tls/, certbot CLI, /etc/letsencrypt/live, Proxmox VE),
+    // auto-generate a self-signed cert at the standard
+    // /etc/wolfstack/tls/{cert,key}.pem path. The existing TLS
+    // discovery below picks it up via wolfstack_local_cert_paths()
+    // with zero changes to the decision tree.
+    //
+    // Pre-v23.11 behaviour was to silently fall back to HTTP-only in
+    // this case — which broke inter-node federation HTTPS calls and
+    // surprised browsers expecting HTTPS on :8553. Self-signed is the
+    // right default for the thousands of installs without a public
+    // domain; operators who configure Let's Encrypt or supply their
+    // own cert are unaffected (early-returns above keep their path).
+    if !cli.no_tls && cli.tls_cert.is_none() && cli.tls_key.is_none() {
+        if installer::find_tls_certificate(cli.tls_domain.as_deref()).is_none() {
+            let detected_hostname = hostname::get()
+                .map(|h| h.to_string_lossy().to_string())
+                .unwrap_or_else(|_| "wolfstack".into());
+            let ips = installer::self_signed::detect_local_ips();
+            if let Err(e) = installer::self_signed::ensure_self_signed_cert(
+                &detected_hostname, &ips,
+            ) {
+                tracing::warn!(
+                    "TLS: could not auto-generate self-signed cert ({}) — will fall back to HTTP-only. Run wolfstack with --tls-cert/--tls-key to provide one manually.",
+                    e
+                );
+            }
+        }
+    }
+
     // Check if TLS will be available (so the frontend knows the correct protocol for URLs)
     let tls_enabled = if cli.no_tls {
         false
