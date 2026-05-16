@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v23.11.1: upgrade modals warn about HTTPS switchover + offer redirect** _(2026-05-16 — [`8c3996a`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/8c3996a0ac2821a1f2b2611fe787de054763973a))_
 - **v23.11.0: HTTPS by default — auto-generate self-signed cert on first start when no other cert is configured** _(2026-05-16 — [`d1f4ba3`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/d1f4ba388c073475174863c7d25e834bd191f80d))_
 - **v23.10.8: fleet aggregation collects ALL transport errors, not just the last** _(2026-05-16 — [`23bcc4e`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/23bcc4e9e8725e4bb91949aeae389fe4aa7c84f7))_
 - **v23.10.7: fleet aggregation now reports the real failure reason per node** _(2026-05-16 — [`7c54319`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/7c5431974bbf8e61f713e14348736e8c859aaa34))_
