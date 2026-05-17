@@ -34222,6 +34222,10 @@ async function loadDnsProviders() {
         dnsKnownPlugins = data.known_plugins || [];
         renderDnsProviders();
         renderDnsPluginsDropdown();
+        // Best-effort plugin status load — failure here mustn't block
+        // the rest of the page (the dedicated Refresh button gives
+        // operators a retry path).
+        try { loadCertbotPlugins(); } catch (_) { /* swallow */ }
         // Re-render the cert form's dropdown if it's currently open.
         if (typeof renderCertDnsProviderOptions === 'function') {
             renderCertDnsProviderOptions();
@@ -34239,6 +34243,157 @@ function renderDnsPluginsDropdown() {
         opts.push('<option value="' + escapeHtml(p) + '">' + escapeHtml(p) + '</option>');
     });
     sel.innerHTML = opts.join('');
+}
+
+// \u2500\u2500\u2500 Certbot DNS plugin status + install \u2500\u2500\u2500
+//
+// Fetches /api/dns-providers/plugins which reports \u2014 per plugin \u2014 whether
+// certbot has it loaded and, if not, the exact distro-aware install
+// command (apt / dnf / pacman / pipx). Renders a grid of badges with
+// "Install" buttons. Works identically across host, LXC, Proxmox CT, VM,
+// and Docker because the install commands themselves are environment-
+// agnostic (we deliberately avoid snap).
+
+async function loadCertbotPlugins() {
+    var box = document.getElementById('dns-plugins-status');
+    if (!box) return;
+    box.innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:14px;font-size:12px;">Checking certbot plugins\u2026</div>';
+    var data;
+    try {
+        var resp = await fetch('/api/dns-providers/plugins');
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        data = await resp.json();
+    } catch (e) {
+        box.innerHTML = '<div style="color:var(--danger);padding:12px;font-size:12px;">Failed to load plugin status: ' + escapeHtml(e.message || String(e)) + '</div>';
+        return;
+    }
+    if (data.error) {
+        box.innerHTML = '<div style="color:var(--danger);padding:12px;font-size:12px;">' + escapeHtml(data.error) + '</div>';
+        return;
+    }
+    if (!data.certbot_installed) {
+        box.innerHTML = '<div style="padding:12px;background:rgba(234,179,8,0.12);border:1px solid rgba(234,179,8,0.45);border-radius:6px;color:var(--text-primary);font-size:12px;">' +
+            '<strong style="color:#fbbf24;">Certbot itself is not installed on this node.</strong> ' +
+            'Install certbot first via the system package manager (apt install certbot / dnf install certbot / pacman -S certbot / apk add certbot / zypper install certbot), ' +
+            'then refresh this page to see plugin status.' +
+            '</div>';
+        return;
+    }
+    var html = '';
+    // Runtime badge \u2014 surfaces "host" / "LXC" / "Docker" so the
+    // operator knows what context they're in BEFORE clicking install.
+    // For LXC/Docker we also show a single advisory banner that
+    // applies to every plugin install on this node.
+    var containerLabel = data.container_kind || 'host';
+    var containerColor = containerLabel === 'host' ? 'var(--success)' : (containerLabel === 'LXC' ? '#f59e0b' : '#3b82f6');
+    html += '<div style="margin-bottom:8px;font-size:11px;color:var(--text-muted);">' +
+        'Runtime: <span style="color:' + containerColor + ';font-weight:600;">' + escapeHtml(containerLabel) + '</span>';
+    if (data.all_installed_plugins && data.all_installed_plugins.length) {
+        html += ' &middot; <span title="' + escapeAttr(data.all_installed_plugins.join(', ')) + '">' + data.all_installed_plugins.length + ' plugin(s) loaded</span>';
+    }
+    if (data.snap && data.snap.usable) {
+        html += ' &middot; <span style="color:#22c55e;">snap available</span>';
+    }
+    html += '</div>';
+    // Package-cache staleness warning. apt-cache / dnf info read the
+    // LOCAL index — if it's stale we may incorrectly mark a package as
+    // unavailable on this host and offer pipx fallback when the distro
+    // package would actually work. Surface this so the operator can
+    // refresh and re-check.
+    if (data.package_cache_status && data.package_cache_status.fresh === false) {
+        html += '<div style="margin-bottom:10px;padding:10px;background:rgba(245,158,11,0.12);border:1px solid rgba(245,158,11,0.4);border-radius:6px;font-size:11px;color:var(--text-primary);">' +
+            '<strong>⚠ Package cache is stale.</strong> ' + escapeHtml(data.package_cache_status.message) +
+            (data.package_cache_status.refresh_command
+                ? '<div style="margin-top:4px;"><code style="font-size:11px;">' + escapeHtml(data.package_cache_status.refresh_command) + '</code></div>'
+                : '') +
+            '</div>';
+    }
+    if (containerLabel === 'LXC') {
+        html += '<div style="margin-bottom:10px;padding:10px;background:rgba(245,158,11,0.12);border:1px solid rgba(245,158,11,0.4);border-radius:6px;font-size:11px;color:var(--text-primary);">' +
+            '<strong>LXC container:</strong> DNS-01 challenges (what these plugins do) work fine here. If you also use HTTP-01, the container needs <code>CAP_NET_BIND_SERVICE</code> \u2014 on Proxmox try <code>pct set &lt;CTID&gt; -features keyctl=1</code> and ensure cap_net_bind_service is not dropped. Snap-installed certbot does NOT work in unprivileged LXC; we use the distro package below.' +
+            '</div>';
+    } else if (containerLabel === 'Docker') {
+        html += '<div style="margin-bottom:10px;padding:10px;background:rgba(59,130,246,0.12);border:1px solid rgba(59,130,246,0.4);border-radius:6px;font-size:11px;color:var(--text-primary);">' +
+            '<strong>Docker container:</strong> Plugin installs persist only until the container is recreated. For permanence, bake the plugin package into your Dockerfile or persist <code>/etc/letsencrypt</code> via a volume.' +
+            '</div>';
+    }
+    html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px;">';
+    (data.plugins || []).forEach(function (p) {
+        var statusBadge = p.installed
+            ? '<span style="color:var(--success);font-weight:600;">\u2713 installed</span>'
+            : '<span style="color:var(--text-muted);">not installed</span>';
+        var installBtn = p.installed
+            ? ''
+            : '<button class="btn btn-sm" onclick="installCertbotPlugin(\'' + escapeAttr(p.plugin) + '\')" style="background:var(--accent,#3b82f6);color:#fff;border:none;border-radius:4px;padding:4px 10px;cursor:pointer;font-size:11px;font-weight:600;margin-top:6px;">Install</button>';
+        var methodLine = (!p.installed && p.install_method)
+            ? '<div style="font-size:10px;color:var(--text-muted);margin-top:3px;">' + escapeHtml(p.install_method) + '</div>'
+            : '';
+        var cmdLine = (!p.installed && p.install_command)
+            ? '<details style="margin-top:4px;"><summary style="font-size:10px;cursor:pointer;color:var(--text-muted);">show command</summary><pre style="font-size:10px;margin:4px 0 0;padding:6px;background:var(--bg-card);border-radius:4px;overflow:auto;white-space:pre-wrap;">' + escapeHtml(p.install_command) + '</pre></details>'
+            : '';
+        // EFF-official snap install path, only when snap is usable on
+        // this host (so not in LXC/Docker). Operators can pick this
+        // over the distro/pipx route if they prefer the snap-managed
+        // certbot — it covers all plugins from one source and gets
+        // auto-renewed by snapd.
+        var snapLine = (!p.installed && p.snap_install_command)
+            ? '<details style="margin-top:4px;"><summary style="font-size:10px;cursor:pointer;color:#22c55e;">snap alternative (EFF-recommended)</summary><pre style="font-size:10px;margin:4px 0 0;padding:6px;background:var(--bg-card);border-radius:4px;overflow:auto;white-space:pre-wrap;">' + escapeHtml(p.snap_install_command) + '</pre></details>'
+            : '';
+        var noteLine = (!p.installed && p.container_notes)
+            ? '<details style="margin-top:4px;"><summary style="font-size:10px;cursor:pointer;color:#fbbf24;">container notes</summary><div style="font-size:10px;margin:4px 0 0;padding:6px;background:var(--bg-card);border-radius:4px;line-height:1.4;">' + escapeHtml(p.container_notes) + '</div></details>'
+            : '';
+        html += '<div style="background:var(--bg-input);border:1px solid var(--border);border-radius:6px;padding:10px;">' +
+            '<div style="font-weight:600;font-size:12px;margin-bottom:2px;">dns-' + escapeHtml(p.plugin) + '</div>' +
+            '<div style="font-size:11px;">' + statusBadge + '</div>' +
+            methodLine +
+            installBtn +
+            cmdLine +
+            snapLine +
+            noteLine +
+            '</div>';
+    });
+    html += '</div>';
+    box.innerHTML = html;
+}
+
+async function installCertbotPlugin(plugin) {
+    var box = document.getElementById('dns-plugins-status');
+    if (!box) return;
+    if (!confirm('Install the certbot dns-' + plugin + ' plugin on THIS node?\n\nThis runs the distro package manager (or pipx). It may take 30\u201360s.')) {
+        return;
+    }
+    // Mark just this plugin as installing so the rest of the grid
+    // stays interactive.
+    var prev = box.innerHTML;
+    var marker = '<div style="margin:8px 0;padding:10px;background:rgba(59,130,246,0.12);border:1px solid rgba(59,130,246,0.45);border-radius:6px;font-size:12px;color:var(--text-primary);">' +
+        'Installing dns-' + escapeHtml(plugin) + '\u2026 this can take 30\u201360 seconds.' +
+        '</div>';
+    box.innerHTML = marker + prev;
+    try {
+        var resp = await fetch('/api/dns-providers/plugins/' + encodeURIComponent(plugin) + '/install', {
+            method: 'POST'
+        });
+        var data = await resp.json();
+        if (resp.ok && data.ok) {
+            toast('dns-' + plugin + ' installed', 'success');
+        } else {
+            var err = data.error || ('HTTP ' + resp.status);
+            // Show install log in a modal so the operator can debug.
+            var modal = document.createElement('div');
+            modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:10000;display:flex;align-items:center;justify-content:center;padding:20px;';
+            modal.innerHTML = '<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:10px;padding:18px;max-width:760px;max-height:80vh;overflow:auto;">' +
+                '<h4 style="margin:0 0 8px;color:var(--danger);">Plugin install failed</h4>' +
+                '<div style="font-size:12px;color:var(--text-muted);margin-bottom:8px;">dns-' + escapeHtml(plugin) + '</div>' +
+                '<pre style="background:var(--bg-input);padding:10px;border-radius:6px;font-size:11px;white-space:pre-wrap;max-height:50vh;overflow:auto;">' + escapeHtml(err) + '</pre>' +
+                '<div style="text-align:right;margin-top:10px;"><button class="btn" onclick="this.closest(\'div[style*=fixed]\').remove()">Close</button></div>' +
+                '</div>';
+            document.body.appendChild(modal);
+        }
+    } catch (e) {
+        toast('Install error: ' + (e.message || String(e)), 'error');
+    }
+    // Re-check status (succeeded or failed, get the fresh picture).
+    loadCertbotPlugins();
 }
 
 function renderDnsProviders() {
@@ -57003,6 +57158,77 @@ async function arrayLoad() {
     arrayRender();
 }
 
+async function arrayDiagnoseInline() {
+    const inline = document.getElementById('array-diagnose-inline');
+    if (!inline) return;
+    // If we already have output, hide it (toggle).
+    if (inline.innerHTML.trim()) { inline.innerHTML = ''; return; }
+    inline.innerHTML = '<div id="array-diagnose-out"></div>';
+    await arrayDiagnose();
+}
+
+async function arrayDiagnose() {
+    const out = document.getElementById('array-diagnose-out');
+    if (!out) return;
+    out.innerHTML = '<div style="color:var(--text-muted);font-size:12px;">Running detection report…</div>';
+    let report;
+    try {
+        const r = await fetch('/api/array/diagnose');
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        report = await r.json();
+    } catch (e) {
+        out.innerHTML = '<div style="color:var(--danger,#ef4444);font-size:13px;">Diagnose failed: ' + escapeHtml(e.message || String(e)) + '</div>';
+        return;
+    }
+    const row = (k, v) => '<tr><td style="padding:4px 10px 4px 0;color:var(--text-muted);white-space:nowrap;vertical-align:top;font-size:12px;">' + escapeHtml(k) + '</td><td style="padding:4px 0;font-size:12px;color:var(--text-primary);word-break:break-all;">' + v + '</td></tr>';
+    const yes = '<span style="color:#22c55e;font-weight:600;">yes</span>';
+    const no = '<span style="color:#ef4444;font-weight:600;">no</span>';
+    const envCell = (val, exists) => val
+        ? '<code>' + escapeHtml(val) + '</code> (' + (exists ? yes + ' exists' : no + ' missing') + ')'
+        : '<span style="color:var(--text-muted);">not set</span>';
+    let html = '<div class="card" style="margin-top:8px;"><div class="card-body">';
+    html += '<h4 style="margin:0 0 10px;font-size:14px;">Detection report</h4>';
+    html += '<table style="width:100%;border-collapse:collapse;">';
+    html += row('Detected backend', '<code>' + escapeHtml(report.detected_backend || '?') + '</code>');
+    html += row('Arrays parsed', String(report.parsed_array_count));
+    html += '<tr><td colspan="2" style="padding:10px 0 4px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-muted);">NoNRAID signals</td></tr>';
+    html += row('md_nonraid kernel module', report.nonraid_kernel_module_loaded ? yes : no);
+    html += row('/proc/nmdstat', report.procfs_nmdstat_present
+        ? yes + ' (' + report.procfs_nmdstat_bytes + ' bytes)'
+        : no + ' — md_nonraid module not loaded?');
+    html += row('nmdctl path', report.nmdctl_path
+        ? '<code>' + escapeHtml(report.nmdctl_path) + '</code>'
+        : no + ' — install nonraid-tools (Debian: apt install nonraid-tools)');
+    html += row('WOLFSTACK_NMDCTL env', envCell(report.nmdctl_env_override, report.nmdctl_env_override_exists));
+    html += '<tr><td colspan="2" style="padding:10px 0 4px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-muted);">mdadm / legacy Unraid signals</td></tr>';
+    html += row('mdadm path', report.mdadm_path ? '<code>' + escapeHtml(report.mdadm_path) + '</code>' : no);
+    html += row('/proc/mdstat', report.procfs_mdstat_present
+        ? yes + ' (' + report.procfs_mdstat_bytes + ' bytes)'
+        : no + ' — md kernel module not loaded');
+    html += row('mdcmd path (legacy)', report.mdcmd_path ? '<code>' + escapeHtml(report.mdcmd_path) + '</code>' : no + ' — only present on commercial Unraid');
+    html += row('WOLFSTACK_MDCMD env', envCell(report.mdcmd_env_override, report.mdcmd_env_override_exists));
+    html += '<tr><td colspan="2" style="padding:10px 0 4px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-muted);">Environment</td></tr>';
+    html += row('Searched dirs', '<code style="font-size:11px;">' + escapeHtml((report.which_searched_dirs || []).join(':')) + '</code>');
+    html += row('Process $PATH', '<code style="font-size:11px;">' + escapeHtml(report.process_path_env || '(empty)') + '</code>');
+    html += '</table>';
+    if (report.procfs_nmdstat_head) {
+        html += '<details style="margin-top:12px;" open><summary style="cursor:pointer;font-size:12px;font-weight:600;">Show /proc/nmdstat (head)</summary>';
+        html += '<pre style="background:var(--bg-card);border:1px solid var(--border);border-radius:6px;padding:10px;margin-top:8px;font-size:11px;overflow:auto;max-height:300px;white-space:pre-wrap;">' + escapeHtml(report.procfs_nmdstat_head) + '</pre></details>';
+    }
+    if (report.procfs_mdstat_head) {
+        html += '<details style="margin-top:12px;"><summary style="cursor:pointer;font-size:12px;font-weight:600;">Show /proc/mdstat (head)</summary>';
+        html += '<pre style="background:var(--bg-card);border:1px solid var(--border);border-radius:6px;padding:10px;margin-top:8px;font-size:11px;overflow:auto;max-height:300px;white-space:pre-wrap;">' + escapeHtml(report.procfs_mdstat_head) + '</pre></details>';
+    }
+    if (report.hints && report.hints.length) {
+        html += '<div style="margin-top:14px;padding:12px;background:rgba(234,179,8,0.12);border:1px solid rgba(234,179,8,0.45);border-radius:6px;font-size:12px;color:var(--text-primary);">';
+        html += '<strong style="color:#fbbf24;">Suggestions</strong><ul style="margin:6px 0 0 18px;padding:0;">';
+        for (const h of report.hints) html += '<li style="margin:4px 0;">' + escapeHtml(h) + '</li>';
+        html += '</ul></div>';
+    }
+    html += '</div></div>';
+    out.innerHTML = html;
+}
+
 function arrayRender() {
     const list = document.getElementById('array-list');
     const badge = document.getElementById('array-backend-badge');
@@ -57015,11 +57241,14 @@ function arrayRender() {
             <div class="card"><div class="card-body" style="text-align:center;padding:40px 20px;">
                 <div style="font-size:48px;line-height:1;margin-bottom:12px;"></div>
                 <h3 style="margin:0 0 8px;">No arrays detected</h3>
-                <p style="color:var(--text-muted);max-width:520px;margin:0 auto;">
+                <p style="color:var(--text-muted);max-width:520px;margin:0 auto 16px;">
                     No mdadm or NoNRAID arrays are present on any node in this cluster, and none of your federated clusters reported any.
                     To create one, use <code>mdadm --create</code> or NoNRAID's setup tooling at the CLI —
                     WolfStack will pick up the array as soon as it's assembled and visible in <code>/proc/mdstat</code> on any node.
                 </p>
+                <button onclick="arrayDiagnose()" style="background:var(--accent,#3b82f6);color:#fff;border:none;border-radius:6px;padding:10px 20px;cursor:pointer;font-size:13px;font-weight:600;">Diagnose detection</button>
+                <div style="color:var(--text-muted);font-size:12px;margin-top:6px;">Use this if you know NoNRAID / mdadm IS installed but it's not being picked up</div>
+                <div id="array-diagnose-out" style="margin-top:18px;text-align:left;"></div>
             </div></div>
         `;
         return;

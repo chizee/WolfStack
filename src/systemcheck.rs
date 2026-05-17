@@ -92,6 +92,12 @@ fn hint(name_deb: &str, name_rhel: &str, name_arch: &str, name_suse: &str) -> St
         DistroFamily::RedHat => format!("dnf install {}", name_rhel),
         DistroFamily::Arch   => format!("pacman -S {}", name_arch),
         DistroFamily::Suse   => format!("zypper install {}", name_suse),
+        // Alpine package names usually match Debian's for our basic
+        // toolchain (tcpdump, traceroute, conntrack-tools, etc.) —
+        // good-enough hint string. Real install goes through the
+        // package allowlist in installer::packages which has Alpine
+        // names per-entry.
+        DistroFamily::Alpine => format!("apk add {}", name_deb),
         DistroFamily::Unknown => format!("Install the '{}' package for your distro", name_deb),
     }
 }

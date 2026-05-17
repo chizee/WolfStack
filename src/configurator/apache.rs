@@ -22,7 +22,9 @@ struct ApachePaths {
 
 fn apache_paths(target: &ExecTarget) -> ApachePaths {
     match target.detect_distro() {
-        DistroFamily::Debian | DistroFamily::Arch | DistroFamily::Unknown => ApachePaths {
+        // Alpine's apache2 package follows the Debian-style layout
+        // (/etc/apache2/) per Alpine wiki — group it with Debian here.
+        DistroFamily::Debian | DistroFamily::Arch | DistroFamily::Alpine | DistroFamily::Unknown => ApachePaths {
             sites_available: "/etc/apache2/sites-available",
             sites_enabled: "/etc/apache2/sites-enabled",
             mods_available: Some("/etc/apache2/mods-available"),

@@ -177,13 +177,22 @@ pub struct ComponentStatus {
 pub enum DistroFamily {
     Debian,  // Debian, Ubuntu, etc.
     RedHat,  // RHEL, Fedora, CentOS, etc.
-    Suse,    // SLES, openSUSE (IBM Power SLES)
+    Suse,    // SLES, openSUSE Leap, openSUSE Tumbleweed
     Arch,    // Arch, Manjaro, EndeavourOS, CachyOS, etc.
+    Alpine,  // Alpine Linux (apk) — common Docker base + LXC image
     Unknown,
 }
 
 /// Detect the current distro family
 pub fn detect_distro() -> DistroFamily {
+    // Alpine check first — `/etc/alpine-release` is unambiguous and
+    // some Alpine images also ship `/etc/debian_version` for build-tool
+    // compatibility (would false-positive Debian).
+    if std::path::Path::new("/etc/alpine-release").exists()
+        || std::path::Path::new("/sbin/apk").exists()
+    {
+        return DistroFamily::Alpine;
+    }
     if std::path::Path::new("/etc/arch-release").exists()
         || std::path::Path::new("/usr/bin/pacman").exists()
     {
@@ -203,6 +212,9 @@ pub fn detect_distro() -> DistroFamily {
         // Try os-release as final fallback
         if let Ok(content) = std::fs::read_to_string("/etc/os-release") {
             let lower = content.to_lowercase();
+            if lower.contains("alpine") {
+                return DistroFamily::Alpine;
+            }
             if lower.contains("arch") || lower.contains("manjaro") || lower.contains("endeavour") || lower.contains("cachyos") {
                 return DistroFamily::Arch;
             }
@@ -224,6 +236,7 @@ pub fn pkg_install_cmd(distro: DistroFamily) -> (&'static str, &'static str) {
         DistroFamily::RedHat => ("dnf", "install -y"),
         DistroFamily::Suse => ("zypper", "install -y"),
         DistroFamily::Arch => ("pacman", "-S --noconfirm"),
+        DistroFamily::Alpine => ("apk", "add --no-cache"),
         DistroFamily::Unknown => ("apt-get", "install -y"),
     }
 }
@@ -352,6 +365,7 @@ fn install_mariadb(distro: DistroFamily) -> Result<String, String> {
         DistroFamily::RedHat => "mariadb-server",
         DistroFamily::Suse => "mariadb",
         DistroFamily::Arch => "mariadb",
+        DistroFamily::Alpine => "mariadb",
         DistroFamily::Unknown => "mariadb-server",
     };
 
@@ -378,6 +392,7 @@ fn install_postgresql(distro: DistroFamily) -> Result<String, String> {
         DistroFamily::RedHat => "postgresql-server",
         DistroFamily::Suse => "postgresql-server",
         DistroFamily::Arch => "postgresql",
+        DistroFamily::Alpine => "postgresql",
         DistroFamily::Unknown => "postgresql",
     };
 

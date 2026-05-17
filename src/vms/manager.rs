@@ -2185,12 +2185,14 @@ impl VmManager {
             crate::installer::DistroFamily::RedHat => ("dnf", "ethtool"),
             crate::installer::DistroFamily::Suse => ("zypper", "ethtool"),
             crate::installer::DistroFamily::Arch => ("pacman", "ethtool"),
+            crate::installer::DistroFamily::Alpine => ("apk", "ethtool"),
             crate::installer::DistroFamily::Unknown => ("apt-get", "ethtool"),
         };
         info!("ethtool not found — installing {} via {} so VLAN passthrough fix can apply", pkg_name, pkg_mgr);
         let args: Vec<&str> = match pkg_mgr {
             "pacman" => vec!["-Sy", "--noconfirm", pkg_name],
             "zypper" => vec!["--non-interactive", "install", pkg_name],
+            "apk"    => vec!["add", "--no-cache", pkg_name],
             _ => vec!["install", "-y", pkg_name],
         };
         let result = Command::new(pkg_mgr).args(&args).output();
@@ -2210,12 +2212,14 @@ impl VmManager {
             crate::installer::DistroFamily::RedHat => ("dnf", "dnsmasq"),
             crate::installer::DistroFamily::Suse => ("zypper", "dnsmasq"),
             crate::installer::DistroFamily::Arch => ("pacman", "dnsmasq"),
+            crate::installer::DistroFamily::Alpine => ("apk", "dnsmasq"),
             crate::installer::DistroFamily::Unknown => ("apt-get", "dnsmasq-base"),
         };
         info!("dnsmasq not found — installing {} via {} so VM DHCP will work", pkg_name, pkg_mgr);
         let args: Vec<&str> = match pkg_mgr {
             "pacman" => vec!["-Sy", "--noconfirm", pkg_name],
             "zypper" => vec!["--non-interactive", "install", pkg_name],
+            "apk"    => vec!["add", "--no-cache", pkg_name],
             _ => vec!["install", "-y", pkg_name],
         };
         let result = Command::new(pkg_mgr).args(&args).output();

@@ -810,6 +810,17 @@ pub fn install_ceph() -> Result<String, String> {
             }
             Ok("Ceph packages installed successfully via pacman".to_string())
         }
+        crate::installer::DistroFamily::Alpine => {
+            // Alpine ships ceph in the community repo, but the package
+            // set is narrower than Debian/RedHat and split (no
+            // ceph-volume helper, radosgw is `ceph-radosgw`). For now
+            // we refuse the auto-install rather than ship half a stack;
+            // operator can install manually with apk add ceph ceph-common
+            // ceph-mon ceph-osd ceph-mgr ceph-mds ceph-fuse ceph-radosgw.
+            Err("Alpine Ceph auto-install is not supported — install manually: \
+                 apk add ceph ceph-common ceph-mon ceph-osd ceph-mgr ceph-mds ceph-fuse ceph-radosgw. \
+                 (Some helper tools are missing on Alpine; full feature set is not guaranteed.)".to_string())
+        }
         crate::installer::DistroFamily::Unknown => {
             Err("Unsupported distro — cannot auto-install. Please install Ceph packages manually.".to_string())
         }

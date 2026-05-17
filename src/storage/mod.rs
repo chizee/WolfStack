@@ -924,6 +924,7 @@ fn install_sshfs() -> Result<(), String> {
         crate::installer::DistroFamily::RedHat => ("dnf", "fuse-sshfs"),
         crate::installer::DistroFamily::Suse => ("zypper", "sshfs"),
         crate::installer::DistroFamily::Arch => ("pacman", "sshfs"),
+        crate::installer::DistroFamily::Alpine => ("apk", "sshfs-fuse"),
         crate::installer::DistroFamily::Unknown => ("apt-get", "sshfs"),
     };
     let output = Command::new(pkg_mgr)
@@ -991,6 +992,7 @@ fn install_s3fs() -> Result<(), String> {
         crate::installer::DistroFamily::RedHat => ("dnf", "s3fs-fuse"),
         crate::installer::DistroFamily::Suse => ("zypper", "s3fs"),
         crate::installer::DistroFamily::Arch => ("pacman", "s3fs-fuse"),
+        crate::installer::DistroFamily::Alpine => ("apk", "s3fs-fuse"),
         crate::installer::DistroFamily::Unknown => ("apt-get", "s3fs"),
     };
     // RHEL/CentOS may need EPEL for s3fs-fuse
@@ -1376,6 +1378,7 @@ pub fn provider_action(name: &str, action: &str) -> Result<String, String> {
                 crate::installer::DistroFamily::RedHat => Command::new("dnf").args(["install", "-y", "fuse3"]).output(),
                 crate::installer::DistroFamily::Suse => Command::new("zypper").args(["install", "-y", "fuse3"]).output(),
                 crate::installer::DistroFamily::Arch => Command::new("pacman").args(["-S", "--noconfirm", "fuse3"]).output(),
+                crate::installer::DistroFamily::Alpine => Command::new("apk").args(["add", "--no-cache", "fuse3"]).output(),
                 crate::installer::DistroFamily::Unknown => Command::new("apt-get").args(["install", "-y", "fuse3"]).output(),
             };
             if let Ok(o) = &install_result {

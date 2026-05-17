@@ -6067,6 +6067,87 @@ pub async fn dns_providers_remove(
     HttpResponse::Ok().json(serde_json::json!({ "removed": true }))
 }
 
+/// GET /api/dns-providers/plugins — report which certbot DNS plugins
+/// are installed on THIS node, and for each missing one, the exact
+/// install command for this host's distro.
+///
+/// This is the answer to klasSponsor's "certbot DNS not working on
+/// Debian trixie/Ubuntu" — works on Proxmox because Proxmox typically
+/// has the plugin packages pre-installed; plain Debian/Ubuntu doesn't.
+/// The endpoint runs in the wolfstack service context, so it sees
+/// the same view of installed plugins that certbot will see when
+/// issuing a certificate (no PATH / venv mismatch).
+pub async fn dns_providers_plugins(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let report = tokio::task::spawn_blocking(|| {
+        let installed = crate::certbot::installed_plugins();
+        let container = crate::certbot::detect_container_kind();
+        // Compute the install command for every missing plugin in
+        // ONE pass that batches the apt-cache / dnf probes — old
+        // path did N×~50ms shellouts (one per plugin); new path is
+        // a single ~50ms probe regardless of plugin count.
+        let plugins = crate::certbot::preflight_all(&installed);
+        let cache_status = crate::certbot::package_cache_status();
+        let snap_info = crate::certbot::snap_status();
+        serde_json::json!({
+            "certbot_installed": crate::certbot::is_installed(),
+            "all_installed_plugins": installed,
+            "plugins": plugins,
+            "container_kind": container.label(),
+            "package_cache_status": cache_status,
+            "snap": snap_info,
+        })
+    })
+    .await
+    .unwrap_or_else(|e| serde_json::json!({ "error": format!("preflight failed: {}", e) }));
+    HttpResponse::Ok().json(report)
+}
+
+/// POST /api/dns-providers/plugins/{plugin}/install — install the
+/// distro package (or pipx-inject) for the named DNS plugin. Runs
+/// the install command in the wolfstack service context (root), so it
+/// works identically in host / LXC container / Proxmox CT / VM / Docker
+/// — the only contexts that differ are snap-based ones, which we
+/// explicitly avoid in the install plan.
+pub async fn dns_providers_plugin_install(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    let actor = match require_auth(&req, &state) { Ok(a) => a, Err(r) => return r };
+    let plugin = path.into_inner();
+    if !crate::dns_providers::is_known_plugin(&plugin) {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": format!("unknown plugin '{}'", plugin)
+        }));
+    }
+    let plugin_for_block = plugin.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        crate::certbot::install_plugin(&plugin_for_block)
+    }).await;
+    match result {
+        Ok(Ok(log)) => {
+            gateway_audit(&state, &actor, "info", "Installed certbot DNS plugin",
+                &format!("dns-{}", plugin));
+            HttpResponse::Ok().json(serde_json::json!({
+                "ok": true,
+                "plugin": plugin,
+                "log": log,
+            }))
+        }
+        Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "ok": false,
+            "plugin": plugin,
+            "error": e,
+        })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "ok": false,
+            "plugin": plugin,
+            "error": format!("install task failed: {}", e),
+        })),
+    }
+}
+
 /// POST /api/dns-providers/{id}/test — staging-CA dry-run to validate
 /// credentials. Stores the result on the provider entry so the UI can
 /// show "last tested OK 2 minutes ago" or surface the error.
@@ -27007,6 +27088,40 @@ pub async fn array_parity_cancel(req: HttpRequest, state: web::Data<AppState>, p
     HttpResponse::Ok().json(body)
 }
 
+/// GET /api/array/diagnose — every signal the array backend detector
+/// looks at, plus the raw /proc/mdstat head. Designed to be safe to
+/// run on any host; reveals nothing the operator can't already see by
+/// reading those files directly. Use this when the UI says "No
+/// arrays" but you know NoNRAID is installed.
+pub async fn array_diagnose(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let report = tokio::task::spawn_blocking(crate::array::diagnose)
+        .await
+        .unwrap_or_else(|e| crate::array::ArrayDiagnostics {
+            detected_backend: "unknown".into(),
+            nmdctl_path: None,
+            nmdctl_env_override: None,
+            nmdctl_env_override_exists: false,
+            nonraid_kernel_module_loaded: false,
+            procfs_nmdstat_present: false,
+            procfs_nmdstat_bytes: 0,
+            procfs_nmdstat_head: String::new(),
+            mdcmd_path: None,
+            mdcmd_env_override: None,
+            mdcmd_env_override_exists: false,
+            mdadm_path: None,
+            procfs_mdstat_present: false,
+            procfs_mdstat_bytes: 0,
+            procfs_mdstat_head: String::new(),
+            which_searched_dirs: Vec::new(),
+            process_path_env: String::new(),
+            parsed_array_count: 0,
+            nonraid_disabled_by_env: false,
+            hints: vec![format!("diagnose task failed: {}", e)],
+        });
+    HttpResponse::Ok().json(report)
+}
+
 /// GET /api/array/config — schedules + alert overrides.
 pub async fn array_config_get(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
@@ -28850,6 +28965,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/cluster/leave", web::post().to(cluster_leave))
         .route("/api/dns-providers", web::get().to(dns_providers_list))
         .route("/api/dns-providers", web::post().to(dns_providers_add))
+        .route("/api/dns-providers/plugins", web::get().to(dns_providers_plugins))
+        .route("/api/dns-providers/plugins/{plugin}/install", web::post().to(dns_providers_plugin_install))
         .route("/api/dns-providers/{id}", web::put().to(dns_providers_update))
         .route("/api/dns-providers/{id}", web::delete().to(dns_providers_remove))
         .route("/api/dns-providers/{id}/test", web::post().to(dns_providers_test))
@@ -29001,6 +29118,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         // Disk-array (mdadm / NoNRAID) — see src/array/.
         .route("/api/array",                                      web::get().to(array_list))
         .route("/api/array/cluster",                              web::get().to(array_cluster))
+        .route("/api/array/diagnose",                             web::get().to(array_diagnose))
         .route("/api/array/config",                               web::get().to(array_config_get))
         .route("/api/array/config",                               web::post().to(array_config_save))
         .route("/api/array/{name}",                               web::get().to(array_detail))

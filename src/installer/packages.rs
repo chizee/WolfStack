@@ -36,6 +36,11 @@ struct PackageMapping {
     rhel: Option<&'static str>,
     arch: Option<&'static str>,
     suse: Option<&'static str>,
+    /// Alpine Linux apk package name. None means we haven't verified
+    /// it's available — caller surfaces "not available on this distro"
+    /// rather than guessing wrong. Most apk packages share their name
+    /// with Debian or Arch, so we set the common cases here.
+    alpine: Option<&'static str>,
     /// systemd unit to enable+start once the install succeeds. `None`
     /// for tools that don't have a daemon (e.g. tcpdump). cronie's
     /// daemon won't actually start running cron jobs without this.
@@ -54,6 +59,10 @@ const PACKAGES: &[PackageMapping] = &[
         rhel: Some("cronie"),
         arch: Some("cronie"),
         suse: Some("cron"),
+        // Alpine: dcron is the default cron implementation; provides
+        // /usr/bin/crontab. busybox-suid also provides crontab but
+        // dcron is the standard package operators install.
+        alpine: Some("dcron"),
         service_unit: Some("cronie.service"),
     },
     PackageMapping {
@@ -63,6 +72,7 @@ const PACKAGES: &[PackageMapping] = &[
         rhel: Some("tcpdump"),
         arch: Some("tcpdump"),
         suse: Some("tcpdump"),
+        alpine: Some("tcpdump"),
         service_unit: None,
     },
     PackageMapping {
@@ -76,6 +86,7 @@ const PACKAGES: &[PackageMapping] = &[
         rhel: Some("traceroute"),
         arch: Some("traceroute"),
         suse: Some("traceroute"),
+        alpine: Some("traceroute"),
         service_unit: None,
     },
     PackageMapping {
@@ -85,6 +96,7 @@ const PACKAGES: &[PackageMapping] = &[
         rhel: Some("conntrack-tools"),
         arch: Some("conntrack-tools"),
         suse: Some("conntrack-tools"),
+        alpine: Some("conntrack-tools"),
         service_unit: None,
     },
     PackageMapping {
@@ -94,6 +106,7 @@ const PACKAGES: &[PackageMapping] = &[
         rhel: Some("iptables"),
         arch: Some("iptables"),
         suse: Some("iptables"),
+        alpine: Some("iptables"),
         service_unit: None,
     },
     PackageMapping {
@@ -103,6 +116,7 @@ const PACKAGES: &[PackageMapping] = &[
         rhel: Some("dnsmasq"),
         arch: Some("dnsmasq"),
         suse: Some("dnsmasq"),
+        alpine: Some("dnsmasq"),
         service_unit: None,
     },
     PackageMapping {
@@ -112,6 +126,9 @@ const PACKAGES: &[PackageMapping] = &[
         rhel: Some("qemu-kvm"),
         arch: Some("qemu-full"),
         suse: Some("qemu-x86"),
+        // Alpine ships qemu-system-x86_64 as its own package; the
+        // qemu meta-package doesn't exist.
+        alpine: Some("qemu-system-x86_64"),
         service_unit: None,
     },
     PackageMapping {
@@ -121,6 +138,7 @@ const PACKAGES: &[PackageMapping] = &[
         rhel: Some("libvirt-client"),
         arch: Some("libvirt"),
         suse: Some("libvirt-client"),
+        alpine: Some("libvirt-client"),
         service_unit: Some("libvirtd.service"),
     },
     PackageMapping {
@@ -130,6 +148,7 @@ const PACKAGES: &[PackageMapping] = &[
         rhel: Some("openssh-server"),
         arch: Some("openssh"),
         suse: Some("openssh"),
+        alpine: Some("openssh-server"),
         service_unit: Some("sshd.service"),
     },
     PackageMapping {
@@ -139,6 +158,7 @@ const PACKAGES: &[PackageMapping] = &[
         rhel: Some("wireguard-tools"),
         arch: Some("wireguard-tools"),
         suse: Some("wireguard-tools"),
+        alpine: Some("wireguard-tools"),
         service_unit: None,
     },
     PackageMapping {
@@ -148,6 +168,7 @@ const PACKAGES: &[PackageMapping] = &[
         rhel: Some("nftables"),
         arch: Some("nftables"),
         suse: Some("nftables"),
+        alpine: Some("nftables"),
         service_unit: None,
     },
     PackageMapping {
@@ -157,6 +178,8 @@ const PACKAGES: &[PackageMapping] = &[
         rhel: Some("bind-utils"),
         arch: Some("bind"),
         suse: Some("bind-utils"),
+        // Alpine names it bind-tools (NOT bind-utils).
+        alpine: Some("bind-tools"),
         service_unit: None,
     },
     PackageMapping {
@@ -169,6 +192,7 @@ const PACKAGES: &[PackageMapping] = &[
         rhel: Some("ipset"),
         arch: Some("ipset"),
         suse: Some("ipset"),
+        alpine: Some("ipset"),
         service_unit: None,
     },
 ];
@@ -209,6 +233,7 @@ fn resolve(pkg: &PackageMapping, distro: DistroFamily) -> Option<&'static str> {
         DistroFamily::RedHat => pkg.rhel,
         DistroFamily::Arch => pkg.arch,
         DistroFamily::Suse => pkg.suse,
+        DistroFamily::Alpine => pkg.alpine,
         DistroFamily::Unknown => pkg.debian, // best effort fall-through
     }
 }
@@ -263,6 +288,7 @@ pub fn install(logical: &str) -> Result<InstallReport, String> {
         DistroFamily::RedHat => ("dnf", vec!["install", "-y", resolved]),
         DistroFamily::Arch => ("pacman", vec!["-Sy", "--noconfirm", resolved]),
         DistroFamily::Suse => ("zypper", vec!["install", "-y", resolved]),
+        DistroFamily::Alpine => ("apk", vec!["add", "--no-cache", resolved]),
         DistroFamily::Unknown => ("apt-get", vec!["install", "-y", resolved]),
     };
 
