@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v23.12.1: DNS Provider Test uses saved Certbot email — no more "no place to put" dead-end** _(2026-05-17 — [`92f6c7e`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/92f6c7e43eff409a8b894f9fba2a6736b7649a04))_
 - **v23.12.0: HTTPS-everywhere inter-node — drop 8554 listener for CA-cert installs, fixes Frigate/RTSP clash** _(2026-05-17 — [`000c5d5`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/000c5d503c0131d287fba254a57e023e7c3d9fd5))_
 - **v23.11.2: NoNRAID rewrite + certbot DNS plugin install across all distros** _(2026-05-17 — [`7da2256`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/7da2256cf06876849b2b0f92ac03dec7b3576392))_
 - **v23.11.1: upgrade modals warn about HTTPS switchover + offer redirect** _(2026-05-16 — [`8c3996a`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/8c3996a0ac2821a1f2b2611fe787de054763973a))_
