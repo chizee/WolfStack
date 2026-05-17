@@ -1645,7 +1645,7 @@ function mountClusterPill() {
     pill.id = 'ws-cluster-pill';
     pill.style.cssText = 'display:none;align-items:center;gap:6px;margin-left:14px;padding:4px 12px;border-radius:999px;'
         + 'font-size:11px;font-weight:600;letter-spacing:0.2px;'
-        + 'background:rgba(99,102,241,0.12);border:1px solid rgba(99,102,241,0.35);color:#a5b4fc;cursor:default;';
+        + 'background:rgba(59, 130, 246,0.12);border:1px solid rgba(59, 130, 246,0.35);color:#93c5fd;cursor:default;';
     pill.title = 'Current scope — actions on this page apply here';
     title.parentElement.appendChild(pill);
     updateClusterPill();
@@ -3306,7 +3306,7 @@ function buildServerTree(nodes) {
 
         html += `
         <div class="server-tree-node">
-            <div class="server-node-header" data-cluster-id="${clusterId}" onclick="toggleServerNode('${clusterId}')" style="background: linear-gradient(90deg, rgba(99,102,241,0.05), transparent);">
+            <div class="server-node-header" data-cluster-id="${clusterId}" onclick="toggleServerNode('${clusterId}')" style="background: linear-gradient(90deg, rgba(59, 130, 246,0.05), transparent);">
                 <span class="tree-toggle ${shouldExpandCluster ? 'expanded' : ''}" id="toggle-${clusterId}">▶</span>
                 <span class="server-dot ${anyOnline ? 'online' : 'offline'}"></span>
                 <span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"><span style="position:relative;display:inline-block;margin-right:6px;"><span style="position:absolute;bottom:-4px;right:-6px;min-width:15px;height:15px;line-height:15px;text-align:center;font-size:9px;font-weight:700;color:#fff;background:#16a34a;border-radius:50%;z-index:2;">${clusterNodes.length}</span></span>${clusterName}</span>
@@ -3318,7 +3318,7 @@ function buildServerTree(nodes) {
                 </a>
                 <a class="nav-item server-child-item wolfrun-cluster-item" data-cluster="${escapedName}" data-view="wolfrun" onclick="showWolfRunPage('${escapedName}')" style="margin-left: 8px; padding: 0 10px; line-height:1.4; display:flex; align-items:center; gap:5px;">
                     <span class="icon ws-icon-clean-wrap" data-icon="rocket" style="font-size:15px;"></span> <span style="font-weight:600;">WolfRun</span>
-                    <span class="wolfrun-svc-count" id="wolfrun-count-${clusterId}" style="margin-left:auto; font-size:10px; padding:1px 6px; background:var(--primary-color,#6366f1); color:#fff; border-radius:10px; display:none;"></span>
+                    <span class="wolfrun-svc-count" id="wolfrun-count-${clusterId}" style="margin-left:auto; font-size:10px; padding:1px 6px; background:var(--primary-color,#3b82f6); color:#fff; border-radius:10px; display:none;"></span>
                 </a>
                 <a class="nav-item server-child-item cluster-backups-item" data-cluster="${escapedName}" data-view="cluster-backups" onclick="showClusterBackupsPage('${escapedName}')" style="margin-left: 8px; padding: 0 10px; line-height:1.4; display:flex; align-items:center; gap:5px;">
                     <span class="icon ws-icon-clean-wrap" data-icon="save" style="font-size:15px;"></span> <span style="font-weight:600;">Backups</span>
@@ -3547,7 +3547,7 @@ function renderDatacenterOverview() {
     const renderCard = (node) => {
         const m = node.metrics;
         const isPve = node.node_type === 'proxmox';
-        const pveBadge = isPve ? '<span style="font-size:9px;padding:1px 5px;border-radius:3px;background:rgba(99,102,241,0.15);color:var(--accent-light);margin-left:4px;">PVE</span>' : '';
+        const pveBadge = isPve ? '<span style="font-size:9px;padding:1px 5px;border-radius:3px;background:rgba(59, 130, 246,0.15);color:var(--accent-light);margin-left:4px;">PVE</span>' : '';
 
         // If offline or no metrics — always critical (red glow)
         if (!m || !node.online) {
@@ -3601,7 +3601,7 @@ function renderDatacenterOverview() {
         };
 
         const components = isPve
-            ? `<span style="font-size:10px;padding:1px 5px;border-radius:3px;background:rgba(99,102,241,0.1);color:var(--accent-light);">${node.vm_count || 0} VMs</span><span style="font-size:10px;padding:1px 5px;border-radius:3px;background:rgba(99,102,241,0.1);color:var(--accent-light);">${node.lxc_count || 0} CTs</span>`
+            ? `<span style="font-size:10px;padding:1px 5px;border-radius:3px;background:rgba(59, 130, 246,0.1);color:var(--accent-light);">${node.vm_count || 0} VMs</span><span style="font-size:10px;padding:1px 5px;border-radius:3px;background:rgba(59, 130, 246,0.1);color:var(--accent-light);">${node.lxc_count || 0} CTs</span>`
             : (node.components || []).filter(c => c.installed).map(c =>
                 `<span style="font-size:10px;padding:1px 5px;border-radius:3px;background:${c.running ? 'var(--success-bg)' : 'var(--danger-bg)'};color:${c.running ? 'var(--success)' : 'var(--danger)'};" ${hasConfigurator(c.component) ? 'title="Configurator available — click Components to configure"' : ''}>${c.component}${hasConfigurator(c.component) ? ' ' : ''}</span>`
             ).join('');
@@ -3751,7 +3751,7 @@ function drawServerSparklines(nodes) {
         if (sparkHistory[id].cpu.length > 30) sparkHistory[id].cpu.shift();
         if (sparkHistory[id].mem.length > 30) sparkHistory[id].mem.shift();
 
-        drawSparkline(`spark-cpu-${id}`, sparkHistory[id].cpu, 'rgba(99,102,241,0.8)', 'rgba(99,102,241,0.15)');
+        drawSparkline(`spark-cpu-${id}`, sparkHistory[id].cpu, 'rgba(59, 130, 246,0.8)', 'rgba(59, 130, 246,0.15)');
         drawSparkline(`spark-mem-${id}`, sparkHistory[id].mem, 'rgba(16,185,129,0.8)', 'rgba(16,185,129,0.15)');
     });
 }
@@ -3805,7 +3805,7 @@ const CLUSTER_COLORS = [
     { marker: '#3b82f6', label: '#60a5fa', border: 'rgba(96,165,250,0.3)' },   // blue
     { marker: '#f59e0b', label: '#fbbf24', border: 'rgba(251,191,36,0.3)' },   // amber
     { marker: '#ef4444', label: '#f87171', border: 'rgba(248,113,113,0.3)' },  // red
-    { marker: '#a855f7', label: '#c084fc', border: 'rgba(192,132,252,0.3)' },  // purple
+    { marker: '#06b6d4', label: '#c084fc', border: 'rgba(192,132,252,0.3)' },  // purple
     { marker: '#ec4899', label: '#f472b6', border: 'rgba(244,114,182,0.3)' },  // pink
     { marker: '#14b8a6', label: '#2dd4bf', border: 'rgba(45,212,191,0.3)' },   // teal
     { marker: '#f97316', label: '#fb923c', border: 'rgba(251,146,60,0.3)' },   // orange
@@ -4617,7 +4617,7 @@ function setTimeRange(samples) {
 
 function redrawAllCharts() {
     if (!document.getElementById('cpu-chart-canvas')) return;
-    drawChart('cpu-chart-canvas', cpuHistory, 'rgba(99, 102, 241, 1)', 'rgba(99, 102, 241, 0.2)');
+    drawChart('cpu-chart-canvas', cpuHistory, 'rgba(59, 130, 246, 1)', 'rgba(59, 130, 246, 0.2)');
     drawChart('mem-chart-canvas', memHistory, 'rgba(16, 185, 129, 1)', 'rgba(16, 185, 129, 0.2)');
     drawNetChart('net-chart-canvas', netHistory);
     drawMultiLineChart('disk-chart-canvas', 'disk-chart-legend', diskHistory);
@@ -4838,7 +4838,7 @@ function drawNetChart(canvasId, fullData) {
         const prevY = padding.top + h - (rates[i - 1].tx / maxRate) * h;
         ctx.bezierCurveTo((prevX + x) / 2, prevY, (prevX + x) / 2, y, x, y);
     }
-    ctx.strokeStyle = '#e879f9';
+    ctx.strokeStyle = '#f87171';
     ctx.lineWidth = 2;
     ctx.stroke();
 
@@ -4862,7 +4862,7 @@ function drawNetChart(canvasId, fullData) {
     ctx.fillRect(lx, ly - 4, 12, 3);
     ctx.fillStyle = 'rgba(255,255,255,0.5)';
     ctx.fillText('↓ Download', lx + 16, ly);
-    ctx.fillStyle = '#e879f9';
+    ctx.fillStyle = '#f87171';
     ctx.fillRect(lx, ly + 12, 12, 3);
     ctx.fillStyle = 'rgba(255,255,255,0.5)';
     ctx.fillText('↑ Upload', lx + 16, ly + 16);
@@ -4983,7 +4983,7 @@ function drawMultiLineChart(canvasId, legendId, historyMap) {
             const r = data[idx];
             const secsAgo = Math.round((data.length - 1 - idx) * 2);
             const timeLabel = secsAgo >= 60 ? `${Math.round(secsAgo / 60)}m ago` : `${secsAgo}s ago`;
-            tooltip.innerHTML = `<span style="color:#06b6d4;">↓ ${formatRate(r.rx)}</span><br><span style="color:#e879f9;">↑ ${formatRate(r.tx)}</span><br><span style="color:var(--text-muted);">${timeLabel}</span>`;
+            tooltip.innerHTML = `<span style="color:#06b6d4;">↓ ${formatRate(r.rx)}</span><br><span style="color:#f87171;">↑ ${formatRate(r.tx)}</span><br><span style="color:var(--text-muted);">${timeLabel}</span>`;
         } else if (meta.type === 'multi') {
             let html = '';
             for (const [mount, rawData] of Object.entries(meta.historyMap)) {
@@ -5444,7 +5444,7 @@ function renderVms(vms) {
                          <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#b91c1c;" onclick="vmForceStopConfirm('${vm.name}', this)" title="Force Stop (power off immediately)"><span class="ws-icon-clean-wrap" data-icon="stop"></span></button>` :
                 `<button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="showVmSettings('${vm.name}')" title="Settings"><span class="ws-icon-clean-wrap" data-icon="settings"></span></button>
                          <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#3b82f6;" onclick="migrateVm('${vm.name}')" title="Migrate to another node"><span class="ws-icon-clean-wrap" data-icon="migrate"></span></button>
-                         <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#8b5cf6;" onclick="migrateVmDiskStorage('${vm.name}')" title="Move disk to different storage (same node)"><span class="ws-icon-clean-wrap" data-icon="migrate"></span></button>
+                         <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#06b6d4;" onclick="migrateVmDiskStorage('${vm.name}')" title="Move disk to different storage (same node)"><span class="ws-icon-clean-wrap" data-icon="migrate"></span></button>
                          <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#22c55e;" onclick="vmAction('${vm.name}', 'start', this)" title="Start">▶️</button>
                          <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#ef4444;" onclick="deleteVm('${vm.name}')" title="Delete"><span class="ws-icon-clean-wrap" data-icon="trash"></span></button>`
             }
@@ -7686,7 +7686,7 @@ async function loadDiskInfo() {
 
 const _PART_COLORS = [
     '#3b82f6','#10b981','#f59e0b','#8b5cf6','#ec4899','#06b6d4','#84cc16','#f97316',
-    '#6366f1','#14b8a6','#eab308','#d946ef','#0ea5e9','#22c55e','#e11d48','#a855f7',
+    '#3b82f6','#14b8a6','#eab308','#d946ef','#0ea5e9','#22c55e','#e11d48','#06b6d4',
 ];
 
 function renderDiskInfo(devices) {
@@ -10050,9 +10050,9 @@ function openNodeSettings(nodeId) {
                             <span style="font-weight:600;font-size:13px;color:var(--text,#fff);">Disable Direct Login</span>
                             <div style="font-size:11px;color:var(--text-muted);margin-top:2px;">Prevent users from logging in directly. The server will still be accessible via the primary dashboard.</div>
                         </div>
-                        <div onclick="(function(el){var cb=el.querySelector('input');cb.checked=!cb.checked;var t=el.querySelector('.toggle-track'),k=el.querySelector('.toggle-knob');t.style.background=cb.checked?'var(--accent,#6366f1)':'var(--bg-input,#1e1e2e)';k.style.left=cb.checked?'22px':'3px';})(this)" style="position:relative;display:inline-block;width:44px;height:24px;flex-shrink:0;margin-left:16px;cursor:pointer;">
+                        <div onclick="(function(el){var cb=el.querySelector('input');cb.checked=!cb.checked;var t=el.querySelector('.toggle-track'),k=el.querySelector('.toggle-knob');t.style.background=cb.checked?'var(--accent,#3b82f6)':'var(--bg-input,#1e1e2e)';k.style.left=cb.checked?'22px':'3px';})(this)" style="position:relative;display:inline-block;width:44px;height:24px;flex-shrink:0;margin-left:16px;cursor:pointer;">
                             <input type="checkbox" id="node-settings-login-disabled" ${node.login_disabled ? 'checked' : ''} style="opacity:0;width:0;height:0;position:absolute;">
-                            <span class="toggle-track" style="position:absolute;top:0;left:0;right:0;bottom:0;background:${node.login_disabled ? 'var(--accent,#6366f1)' : 'var(--bg-input,#1e1e2e)'};transition:.3s;border-radius:24px;border:1px solid var(--border,#333);"></span>
+                            <span class="toggle-track" style="position:absolute;top:0;left:0;right:0;bottom:0;background:${node.login_disabled ? 'var(--accent,#3b82f6)' : 'var(--bg-input,#1e1e2e)'};transition:.3s;border-radius:24px;border:1px solid var(--border,#333);"></span>
                             <span class="toggle-knob" style="position:absolute;height:18px;width:18px;left:${node.login_disabled ? '22px' : '3px'};bottom:3px;background:white;transition:.3s;border-radius:50%;pointer-events:none;"></span>
                         </div>
                     </div>
@@ -12120,6 +12120,17 @@ function setCertScope(scope) {
     loadCertManager();
 }
 
+// Top-level entry point from the Certificates page CTA — opens the
+// component-detail view for WolfProxy (which sets up the configurator-*
+// DOM elements loadCertManager depends on) then swaps the body for the
+// cluster cert manager. Single function so the CTA's onclick stays a
+// one-liner and the navigation order is auditable.
+async function openClusterCertManager() {
+    await openComponentDetail('wolfproxy');
+    await loadCertManager();
+}
+window.openClusterCertManager = openClusterCertManager;
+
 async function loadCertManager() {
     document.getElementById('configurator-title').textContent = 'SSL Certificates';
     const scopeChip = _certScope === 'cluster'
@@ -13375,7 +13386,7 @@ async function loadWolfNetRoutesTable() {
         entries.forEach(e => {
             const typeIcon = e.type === 'host' ? '' : e.type === 'local' ? '' : '';
             const typeLabel = e.type === 'host' ? 'Host' : e.type === 'local' ? 'Local' : 'Remote';
-            const bg = e.type === 'host' ? 'rgba(59,130,246,0.1)' : e.type === 'local' ? 'rgba(34,197,94,0.08)' : 'rgba(168,85,247,0.08)';
+            const bg = e.type === 'host' ? 'rgba(59,130,246,0.1)' : e.type === 'local' ? 'rgba(34,197,94,0.08)' : 'rgba(6, 182, 212,0.08)';
             html += `<tr style="background:${bg};">
                 <td style="font-family:var(--font-mono); font-size:12px; font-weight:600;">${escapeHtml(e.ip || '—')}</td>
                 <td>${typeIcon} ${typeLabel}</td>
@@ -13449,7 +13460,7 @@ function renderNetInterfaces(interfaces) {
         // Name styling
         let nameLabel = `<strong>${iface.name}</strong>`;
         if (iface.is_vlan) {
-            nameLabel += ` <span class="badge" style="background:rgba(168,85,247,0.15); color:#a855f7; font-size:9px; margin-left:4px;">VLAN ${iface.vlan_id || ''}</span>`;
+            nameLabel += ` <span class="badge" style="background:rgba(6, 182, 212,0.15); color:#06b6d4; font-size:9px; margin-left:4px;">VLAN ${iface.vlan_id || ''}</span>`;
         }
         if (iface.name.startsWith('docker') || iface.name.startsWith('br-') || iface.name.startsWith('veth')) {
             nameLabel += ` <span class="badge" style="background:rgba(59,130,246,0.15); color:#60a5fa; font-size:9px; margin-left:4px;">Docker</span>`;
@@ -14162,8 +14173,8 @@ function renderVlanAttachments(data) {
                 <div style="border:1px solid var(--border); border-radius:6px; padding:10px 12px; margin-bottom:6px; background:var(--bg-secondary);">
                     <div style="display:flex; align-items:center; gap:8px;">
                         <span style="font-weight:600;">${vlanEsc(v.name)}</span>
-                        <span class="badge" style="background:rgba(168,85,247,0.15); color:#a855f7; font-size:10px;">VLAN ${v.vlan_id}</span>
-                        <span class="badge" style="background:rgba(99,102,241,0.15); color:#a5b4fc; font-size:10px;">${vlanEsc(v.provider)}</span>
+                        <span class="badge" style="background:rgba(6, 182, 212,0.15); color:#06b6d4; font-size:10px;">VLAN ${v.vlan_id}</span>
+                        <span class="badge" style="background:rgba(59, 130, 246,0.15); color:#93c5fd; font-size:10px;">${vlanEsc(v.provider)}</span>
                         <span style="margin-left:auto; display:flex; gap:6px;">
                             <button class="btn btn-sm btn-primary" style="font-size:11px; padding:2px 8px;" onclick='vlanShowAttachDialog(${JSON.stringify(v).replace(/'/g, "&#39;")})'>+ Attach</button>
                             <button class="btn btn-sm" style="font-size:11px; padding:2px 8px;" onclick="vlanTestConnectivity('${vlanEsc(v.id)}', '${vlanEsc(v.name)}')" title="Ping every known member of this VLAN to verify connectivity">Test</button>
@@ -14195,7 +14206,7 @@ function renderVlanAttachments(data) {
                     <div style="display:flex; align-items:center; gap:8px;">
                         <span style="font-weight:600;">${vlanEsc(p.name)}</span>
                         <span class="badge" style="background:rgba(34,197,94,0.15); color:#22c55e; font-size:10px;">${vlanEsc(p.ip)}</span>
-                        <span class="badge" style="background:rgba(99,102,241,0.15); color:#a5b4fc; font-size:10px;">${vlanEsc(p.provider)}</span>
+                        <span class="badge" style="background:rgba(59, 130, 246,0.15); color:#93c5fd; font-size:10px;">${vlanEsc(p.provider)}</span>
                         <span style="margin-left:auto; display:flex; gap:6px;">
                             <button class="btn btn-sm" style="font-size:11px; padding:2px 8px;" onclick='publicIpShowAddDialog(${JSON.stringify(p).replace(/'/g, "&#39;")})'><span class="ws-icon-clean-wrap" data-icon="settings"></span></button>
                             <button class="btn btn-sm btn-danger" style="font-size:11px; padding:2px 8px;" onclick="publicIpDelete('${vlanEsc(p.id)}', '${vlanEsc(p.name)}')"><span class="ws-icon-clean-wrap" data-icon="trash"></span></button>
@@ -14510,7 +14521,7 @@ function vlanShowPreflightConfirm(findings) {
                 ${f.fix ? `<div style="font-size:11px; color:var(--text-muted);"><strong>Suggested fix:</strong> ${vlanEsc(f.fix)}</div>` : ''}
             </div>`;
 
-        const headerColour = hasCrit ? '#ef4444' : (warnings.length ? '#fbbf24' : '#6366f1');
+        const headerColour = hasCrit ? '#ef4444' : (warnings.length ? '#fbbf24' : '#3b82f6');
         const headerText = hasCrit
             ? `Your setup is currently probably not right — ${critical.length} critical issue${critical.length === 1 ? '' : 's'} found`
             : (warnings.length
@@ -14526,7 +14537,7 @@ function vlanShowPreflightConfirm(findings) {
             <div style="font-size:14px; font-weight:600; color:${headerColour}; margin-bottom:12px;">${headerText}</div>
             ${critical.map(f => renderFinding(f, '#ef4444')).join('')}
             ${warnings.map(f => renderFinding(f, '#fbbf24')).join('')}
-            ${info.map(f => renderFinding(f, '#6366f1')).join('')}
+            ${info.map(f => renderFinding(f, '#3b82f6')).join('')}
             ${hasCrit ? `
                 <label style="display:flex; align-items:center; gap:8px; padding:10px 12px; background:rgba(239,68,68,0.05); border:1px solid rgba(239,68,68,0.30); border-radius:6px; margin-top:8px; cursor:pointer;">
                     <input type="checkbox" id="pf-ack" style="margin:0;">
@@ -15044,7 +15055,7 @@ async function vlanShowAttachDialog(vlan) {
                     <button class="modal-close" onclick="document.getElementById('vlan-attach-modal').remove()">&times;</button>
                 </div>
                 <div class="modal-body">
-                    <div style="padding:10px 12px; background:rgba(99,102,241,0.08); border:1px solid rgba(99,102,241,0.25); border-radius:6px; font-size:12px; margin-bottom:14px;">
+                    <div style="padding:10px 12px; background:rgba(59, 130, 246,0.08); border:1px solid rgba(59, 130, 246,0.25); border-radius:6px; font-size:12px; margin-bottom:14px;">
                         <div>Bridge: <code>${vlanEsc(vlan.bridge_name)}</code> · Subnet: <code>${vlanEsc(vlan.subnet)}</code> · MTU: <code>${vlan.mtu}</code></div>
                         <div style="margin-top:4px; color:var(--text-muted);">${usedSummary}</div>
                     </div>
@@ -15296,7 +15307,7 @@ function vlanShowReservationsDialog(vlan) {
                     <button class="modal-close" onclick="document.getElementById('vlan-res-modal').remove()">&times;</button>
                 </div>
                 <div class="modal-body" style="display:flex; flex-direction:column; gap:10px;">
-                    <div style="padding:8px 10px; background:rgba(99,102,241,0.08); border:1px solid rgba(99,102,241,0.25); border-radius:6px; font-size:12px; line-height:1.55;">
+                    <div style="padding:8px 10px; background:rgba(59, 130, 246,0.08); border:1px solid rgba(59, 130, 246,0.25); border-radius:6px; font-size:12px; line-height:1.55;">
                         Use this to declare IPs on <code>${vlanEsc(vlan.subnet)}</code> that are held by machines NOT managed by this WolfStack install — standalone servers on the same vSwitch, the cloud-network gateway, manually-configured boxes, etc. The auto-picker treats these as taken so it doesn't double-allocate.
                         <div style="margin-top:6px; color:var(--text-muted);">Format: one entry per line. Either a single IP (<code>10.0.1.5</code>) or an inclusive range (<code>10.0.1.20-10.0.1.30</code>). Optional <code># comment</code> after the entry.</div>
                     </div>
@@ -15588,7 +15599,7 @@ async function securityRefreshLockouts() {
         auditEl.innerHTML = '<div style="padding:12px; font-size:12px; color:var(--text-muted);">No attempts logged yet.</div>';
     } else {
         const rows = audit.slice(0, 100).map(e => {
-            const colour = e.success ? '#22c55e' : (e.was_locked ? '#a855f7' : '#ef4444');
+            const colour = e.success ? '#22c55e' : (e.was_locked ? '#06b6d4' : '#ef4444');
             const status = e.success ? 'OK' : (e.was_locked ? 'BLOCKED' : 'FAIL');
             const ago = ((Date.now() / 1000) - e.timestamp) | 0;
             const agoStr = ago < 60 ? `${ago}s ago` : ago < 3600 ? `${(ago / 60) | 0}m ago` : `${(ago / 3600) | 0}h ago`;
@@ -16245,7 +16256,7 @@ async function fleetLoadHostAudit() {
         const findingsHtml = findings.length === 0 ? '' : `
             <div style="margin-top:10px;">
                 ${findings.map(f => {
-                    const c = f.severity === 'critical' ? '#ef4444' : f.severity === 'warn' ? '#fbbf24' : '#6366f1';
+                    const c = f.severity === 'critical' ? '#ef4444' : f.severity === 'warn' ? '#fbbf24' : '#3b82f6';
                     return `<div style="padding:8px 10px; background:${c}10; border:1px solid ${c}40; border-radius:6px; margin-bottom:6px;">
                         <div style="font-weight:600; color:${c}; font-size:12px;">${vlanEsc(f.title)}</div>
                         <div style="font-size:11px; color:var(--text-secondary); margin-top:3px; white-space:pre-wrap;">${vlanEsc(f.detail)}</div>
@@ -16641,7 +16652,7 @@ function renderWolfNetPage(wn, config, localInfo, fullStatus) {
                 const statusBadge = p.connected
                     ? '<span class="badge" style="background:rgba(34,197,94,0.15); color:#22c55e;">● Connected</span>'
                     : p.relay_via
-                        ? `<span class="badge" style="background:rgba(168,85,247,0.15); color:#a855f7;">◉ Relay via ${escapeHtml(p.relay_via)}</span>`
+                        ? `<span class="badge" style="background:rgba(6, 182, 212,0.15); color:#06b6d4;">◉ Relay via ${escapeHtml(p.relay_via)}</span>`
                         : '<span class="badge" style="background:rgba(239,68,68,0.15); color:#ef4444;">○ Offline</span>';
 
                 const lastSeen = p.last_seen_secs !== null && p.last_seen_secs !== undefined
@@ -19625,7 +19636,7 @@ async function cloneLxcContainer(name) {
                     </select></div>
                 <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px;">
                     <button class="btn" onclick="document.getElementById('lxc-clone-modal')?.remove()">Cancel</button>
-                    <button class="btn" style="background:var(--primary,#7c3aed);color:#fff;" onclick="doCloneLxc('${name}')">Clone</button>
+                    <button class="btn" style="background:var(--primary,#3b82f6);color:#fff;" onclick="doCloneLxc('${name}')">Clone</button>
                 </div>
             </div>
         </div>
@@ -19669,7 +19680,7 @@ async function doCloneLxc(name) {
     modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:10000;backdrop-filter:blur(4px);';
     modal.innerHTML = `
         <div style="background:var(--card-bg,#1e1e2e);border:1px solid var(--border,#333);border-radius:12px;padding:28px 36px;min-width:400px;max-width:500px;box-shadow:0 20px 60px rgba(0,0,0,0.5);text-align:center;">
-            <div style="width:48px;height:48px;border:4px solid var(--border,#555);border-top:4px solid var(--primary,#7c3aed);border-radius:50%;animation:spin 1s linear infinite;margin:0 auto 16px;"></div>
+            <div style="width:48px;height:48px;border:4px solid var(--border,#555);border-top:4px solid var(--primary,#3b82f6);border-radius:50%;animation:spin 1s linear infinite;margin:0 auto 16px;"></div>
             <h3 style="margin:0 0 8px;color:var(--text,#fff);">Cloning Container</h3>
             <p id="lxc-op-status" style="margin:0;color:var(--text-muted,#aaa);font-size:0.9em;">Cloning <strong>${name}</strong> → <strong>${newName}</strong>${targetNode ? ' (remote)' : ''}...</p>
             <div id="lxc-op-result" style="display:none;margin-top:16px;padding:12px;border-radius:8px;text-align:left;font-size:0.9em;"></div>
@@ -20600,7 +20611,7 @@ async function openLxcStorage(name) {
             </div>
             <div class="modal-body" style="font-size:13px;">
                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:14px; padding:10px; background:var(--bg-card); border-radius:6px;">
-                    <div><div style="color:var(--text-muted); font-size:11px;">Backend</div><strong>${escapeHtml(info.backend || '?')}</strong>${info.proxmox ? ' <span class="badge" style="background:rgba(168,85,247,0.15); color:#a855f7; font-size:10px; padding:1px 6px;">PVE</span>' : ''}</div>
+                    <div><div style="color:var(--text-muted); font-size:11px;">Backend</div><strong>${escapeHtml(info.backend || '?')}</strong>${info.proxmox ? ' <span class="badge" style="background:rgba(6, 182, 212,0.15); color:#06b6d4; font-size:10px; padding:1px 6px;">PVE</span>' : ''}</div>
                     <div><div style="color:var(--text-muted); font-size:11px;">Filesystem</div><strong>${escapeHtml(info.fs_type || '?')}</strong></div>
                     <div><div style="color:var(--text-muted); font-size:11px;">Storage</div><code style="font-size:11px;">${escapeHtml(info.storage || '—')}</code></div>
                     <div><div style="color:var(--text-muted); font-size:11px;">Rootfs</div><code style="font-size:11px;">${escapeHtml(info.rootfs || '—')}</code></div>
@@ -21395,7 +21406,7 @@ function selectLxcTemplate(distro, release, arch, variant) {
                     <span id="lxc-wolfnet-status" style="font-size:12px; color:var(--text-muted);">Checking...</span>
                 </div>
                 <div style="display:flex; gap:8px; margin-bottom:10px; flex-wrap:wrap;">
-                    <button type="button" class="btn btn-sm lxc-net-preset" data-net="wolfnet" onclick="lxcSelectNetPreset('wolfnet')" style="flex:1; min-width:140px; padding:10px 12px; text-align:left; border:2px solid var(--primary,#a855f7); background:rgba(168,85,247,0.1);">
+                    <button type="button" class="btn btn-sm lxc-net-preset" data-net="wolfnet" onclick="lxcSelectNetPreset('wolfnet')" style="flex:1; min-width:140px; padding:10px 12px; text-align:left; border:2px solid var(--primary,#06b6d4); background:rgba(6, 182, 212,0.1);">
                         <strong style="display:block; font-size:12px;">WolfNet</strong>
                         <span style="font-size:10px; color:var(--text-muted);">Recommended — reachable from every cluster node, auto-assigned IP, zero config.</span>
                     </button>
@@ -21635,8 +21646,8 @@ function lxcSelectNetPreset(mode) {
     // Highlight the selected card, dim others.
     document.querySelectorAll('.lxc-net-preset').forEach(btn => {
         const sel = btn.dataset.net === mode;
-        btn.style.borderColor = sel ? 'var(--primary,#a855f7)' : 'transparent';
-        btn.style.background = sel ? 'rgba(168,85,247,0.1)' : 'transparent';
+        btn.style.borderColor = sel ? 'var(--primary,#06b6d4)' : 'transparent';
+        btn.style.background = sel ? 'rgba(6, 182, 212,0.1)' : 'transparent';
     });
     // Show/hide per-mode detail panels.
     document.getElementById('lxc-net-wolfnet').style.display = mode === 'wolfnet' ? '' : 'none';
@@ -21719,7 +21730,7 @@ async function createLxcContainer() {
     modal.innerHTML = `
         <div style="background:var(--card-bg,#1e1e2e);border:1px solid var(--border,#333);border-radius:12px;padding:32px 40px;min-width:420px;max-width:520px;box-shadow:0 20px 60px rgba(0,0,0,0.5);text-align:center;">
             <div id="lxc-create-spinner" style="margin-bottom:16px;">
-                <div style="width:48px;height:48px;border:4px solid var(--border,#555);border-top:4px solid var(--primary,#7c3aed);border-radius:50%;animation:spin 1s linear infinite;margin:0 auto;"></div>
+                <div style="width:48px;height:48px;border:4px solid var(--border,#555);border-top:4px solid var(--primary,#3b82f6);border-radius:50%;animation:spin 1s linear infinite;margin:0 auto;"></div>
             </div>
             <h3 id="lxc-create-title" style="margin:0 0 8px 0;color:var(--text,#fff);font-size:1.2em;">Creating Container</h3>
             <p id="lxc-create-status" style="margin:0 0 16px 0;color:var(--text-muted,#aaa);font-size:0.95em;">
@@ -24737,12 +24748,12 @@ function toggleClusterScheduleScope(scope) {
     const selLabel = document.getElementById('cb-scope-select-label');
     if (scope === 'all') {
         if (targetsSection) targetsSection.style.display = 'none';
-        if (allLabel) allLabel.style.borderColor = 'var(--primary-color, #6366f1)';
+        if (allLabel) allLabel.style.borderColor = 'var(--primary-color, #3b82f6)';
         if (selLabel) selLabel.style.borderColor = 'var(--border)';
     } else {
         if (targetsSection) targetsSection.style.display = '';
         if (allLabel) allLabel.style.borderColor = 'var(--border)';
-        if (selLabel) selLabel.style.borderColor = 'var(--primary-color, #6366f1)';
+        if (selLabel) selLabel.style.borderColor = 'var(--primary-color, #3b82f6)';
         // Auto-fetch targets if we haven't yet
         if (Object.keys(_clusterScheduleTargets).length === 0) fetchClusterScheduleTargets();
     }
@@ -25242,7 +25253,7 @@ function _aiRenderAgentProposal(p) {
         '<div>' +
             '<div style="font-size:11px; color:var(--text-muted); margin-bottom:2px;">Allowed tools</div>' +
             '<div style="display:flex; flex-wrap:wrap; gap:4px;">' +
-                tools.map(function(t) { return '<span style="background:rgba(168,85,247,0.12); color:#c4b5fd; padding:2px 8px; border-radius:4px; font-size:11px; font-family:var(--font-mono,monospace);">' + escapeHtml(t) + '</span>'; }).join('') +
+                tools.map(function(t) { return '<span style="background:rgba(6, 182, 212,0.12); color:#93c5fd; padding:2px 8px; border-radius:4px; font-size:11px; font-family:var(--font-mono,monospace);">' + escapeHtml(t) + '</span>'; }).join('') +
             '</div>' +
         '</div>' +
         (scopeLines.length ? '<div style="margin-top:4px; display:flex; flex-direction:column; gap:2px;">' + scopeLines.join('') + '</div>' : '') +
@@ -27792,7 +27803,7 @@ async function scanForIssues() {
             var clusterId = 'issues-cluster-' + clusterName.replace(/[^a-z0-9]/gi, '-');
             scaffoldHtml += '<div class="card" style="margin-bottom:16px;">';
             // Cluster header
-            scaffoldHtml += '<div style="padding:12px 16px; background:linear-gradient(90deg, rgba(99,102,241,0.06), transparent); border-bottom:1px solid var(--border); display:flex; align-items:center; gap:10px;">';
+            scaffoldHtml += '<div style="padding:12px 16px; background:linear-gradient(90deg, rgba(59, 130, 246,0.06), transparent); border-bottom:1px solid var(--border); display:flex; align-items:center; gap:10px;">';
             scaffoldHtml += '<span style="font-size:18px;"></span>';
             scaffoldHtml += '<span style="font-weight:600; font-size:14px; color:var(--text-primary);">' + escapeHtml(clusterName) + '</span>';
             scaffoldHtml += '<span style="font-size:12px; color:var(--text-muted);">' + clusterNodes.length + ' node' + (clusterNodes.length !== 1 ? 's' : '') + '</span>';
@@ -27819,7 +27830,7 @@ async function scanForIssues() {
                 scaffoldHtml += '</div></div></td>';
                 scaffoldHtml += '<td style="padding:12px 16px;" colspan="3">';
                 scaffoldHtml += '<div style="display:flex; align-items:center; gap:8px; color:var(--text-muted); font-size:13px;">';
-                scaffoldHtml += '<span style="display:inline-block;width:14px;height:14px;border:2px solid rgba(99,102,241,0.2);border-top-color:rgba(99,102,241,0.8);border-radius:50%;animation:spin 0.7s linear infinite;"></span>';
+                scaffoldHtml += '<span style="display:inline-block;width:14px;height:14px;border:2px solid rgba(59, 130, 246,0.2);border-top-color:rgba(59, 130, 246,0.8);border-radius:50%;animation:spin 0.7s linear infinite;"></span>';
                 scaffoldHtml += 'Scanning ' + escapeHtml(node.hostname || node.id || 'local') + '...</div>';
                 scaffoldHtml += '</td></tr>';
             });
@@ -28019,7 +28030,7 @@ function renderIssueResults(results, latestVersion, clusters, clusterKeys) {
 
         html += '<div class="card" style="margin-bottom:16px;">';
         // Cluster header
-        html += '<div style="padding:12px 16px; background:linear-gradient(90deg, rgba(99,102,241,0.06), transparent); border-bottom:1px solid var(--border); display:flex; align-items:center; gap:10px;">';
+        html += '<div style="padding:12px 16px; background:linear-gradient(90deg, rgba(59, 130, 246,0.06), transparent); border-bottom:1px solid var(--border); display:flex; align-items:center; gap:10px;">';
         html += '<span style="font-size:18px;"></span>';
         html += '<span style="font-weight:600; font-size:14px; color:var(--text-primary);">' + escapeHtml(clusterName) + '</span>';
         html += '<span style="font-size:12px; color:var(--text-muted);">' + clusterNodes.length + ' node' + (clusterNodes.length !== 1 ? 's' : '') + '</span>';
@@ -28154,7 +28165,7 @@ function showProgressModal(icon, title) {
             var row = document.createElement('div');
             row.id = 'pm-row-' + id;
             row.style.cssText = 'display:flex; align-items:center; gap:10px; padding:10px 0; border-bottom:1px solid var(--border);';
-            row.innerHTML = '<span class="pm-icon" style="display:inline-block;width:18px;height:18px;border:2px solid rgba(99,102,241,0.2);border-top-color:rgba(99,102,241,0.8);border-radius:50%;animation:spin 0.7s linear infinite;flex-shrink:0;"></span>'
+            row.innerHTML = '<span class="pm-icon" style="display:inline-block;width:18px;height:18px;border:2px solid rgba(59, 130, 246,0.2);border-top-color:rgba(59, 130, 246,0.8);border-radius:50%;animation:spin 0.7s linear infinite;flex-shrink:0;"></span>'
                 + '<span style="font-weight:600; color:var(--text-primary); font-size:14px;">\uD83D\uDDA5\uFE0F ' + escapeHtml(hostname) + '</span>'
                 + '<span class="pm-status" style="margin-left:auto; font-size:12px; color:var(--text-muted);">Sending command...</span>';
             overlay.querySelector('.pm-list').appendChild(row);
@@ -28583,7 +28594,7 @@ function renderGwnTable() {
     } else {
         sorted.forEach(function (r) {
             var typeIcon = r.type === 'WolfNet' ? '\uD83C\uDF10' : r.type === 'Peer' ? '\uD83D\uDD17' : r.type === 'LXC' ? '\uD83D\uDCE6' : r.type === 'Docker' ? '\uD83D\uDC33' : r.type === 'VM' ? '\uD83D\uDDA5\uFE0F' : '\u2796';
-            var bg = r.type === 'WolfNet' ? 'rgba(59,130,246,0.08)' : r.type === 'LXC' ? 'rgba(234,179,8,0.08)' : r.type === 'Docker' ? 'rgba(99,102,241,0.08)' : r.type === 'VM' ? 'rgba(16,185,129,0.08)' : r.type === 'Peer' ? 'rgba(59,130,246,0.04)' : 'transparent';
+            var bg = r.type === 'WolfNet' ? 'rgba(59,130,246,0.08)' : r.type === 'LXC' ? 'rgba(234,179,8,0.08)' : r.type === 'Docker' ? 'rgba(59, 130, 246,0.08)' : r.type === 'VM' ? 'rgba(16,185,129,0.08)' : r.type === 'Peer' ? 'rgba(59,130,246,0.04)' : 'transparent';
             html += '<tr style="background:' + bg + ';"><td>' + escapeHtml(r.cluster || '') + '</td><td>' + escapeHtml(r.server) + '</td><td>' + typeIcon + ' ' + escapeHtml(r.type) + '</td><td>' + escapeHtml(r.name) + '</td><td><code>' + escapeHtml(r.ip || '—') + '</code></td><td style="font-size:11px;">' + escapeHtml(r.peers || '') + '</td><td>' + escapeHtml(r.state) + '</td></tr>';
         });
     }
@@ -28631,7 +28642,7 @@ async function scanGlobalWolfNet() {
         rows.forEach(function (r) {
             gwnScanData.push(r);
             var typeIcon = r.type === 'WolfNet' ? '\uD83C\uDF10' : r.type === 'Peer' ? '\uD83D\uDD17' : r.type === 'LXC' ? '\uD83D\uDCE6' : r.type === 'Docker' ? '\uD83D\uDC33' : r.type === 'VM' ? '\uD83D\uDDA5\uFE0F' : '\u2796';
-            var bg = r.type === 'WolfNet' ? 'rgba(59,130,246,0.08)' : r.type === 'LXC' ? 'rgba(234,179,8,0.08)' : r.type === 'Docker' ? 'rgba(99,102,241,0.08)' : r.type === 'VM' ? 'rgba(16,185,129,0.08)' : r.type === 'Peer' ? 'rgba(59,130,246,0.04)' : 'transparent';
+            var bg = r.type === 'WolfNet' ? 'rgba(59,130,246,0.08)' : r.type === 'LXC' ? 'rgba(234,179,8,0.08)' : r.type === 'Docker' ? 'rgba(59, 130, 246,0.08)' : r.type === 'VM' ? 'rgba(16,185,129,0.08)' : r.type === 'Peer' ? 'rgba(59,130,246,0.04)' : 'transparent';
             var tr = document.createElement('tr');
             tr.style.background = bg;
             tr.innerHTML = '<td>' + escapeHtml(r.cluster || '') + '</td><td>' + escapeHtml(r.server) + '</td><td>' + typeIcon + ' ' + escapeHtml(r.type) + '</td><td>' + escapeHtml(r.name) + '</td><td><code>' + escapeHtml(r.ip || '\u2014') + '</code></td><td style="font-size:11px;">' + escapeHtml(r.peers || '') + '</td><td>' + escapeHtml(r.state) + '</td>';
@@ -30309,7 +30320,7 @@ function renderIptablesCard(iptables) {
     const rules = (iptables.rules || '').trim();
     const ruleCount = rules ? rules.split('\n').filter(l => l.trim()).length : 0;
     return `
-    <div class="card" style="background:linear-gradient(135deg, rgba(59,130,246,0.08), rgba(168,85,247,0.04)); border-color:rgba(59,130,246,0.2);">
+    <div class="card" style="background:linear-gradient(135deg, rgba(59,130,246,0.08), rgba(6, 182, 212,0.04)); border-color:rgba(59,130,246,0.2);">
         <div class="card-body">
             <div style="display:flex; align-items:flex-start; gap:16px;">
                 <div style="font-size:40px; line-height:1;"></div>
@@ -31435,7 +31446,7 @@ function renderSystemCheckResults(data) {
                     </div>
                     <div style="font-size:12px; color:var(--text-muted); margin-top:2px;">${escapeHtml(c.detail)}</div>
                     ${hint}
-                    <div id="${aiTarget}" style="display:none; margin-top:8px; background:rgba(168,85,247,0.08); border:1px solid rgba(168,85,247,0.3); border-radius:6px; padding:10px; font-size:12px; color:var(--text); white-space:pre-wrap;"></div>
+                    <div id="${aiTarget}" style="display:none; margin-top:8px; background:rgba(6, 182, 212,0.08); border:1px solid rgba(6, 182, 212,0.3); border-radius:6px; padding:10px; font-size:12px; color:var(--text); white-space:pre-wrap;"></div>
                     <div id="${installTarget}" style="display:none; margin-top:8px; background:rgba(34,197,94,0.08); border:1px solid rgba(34,197,94,0.3); border-radius:6px; padding:10px; font-size:12px; color:var(--text); white-space:pre-wrap;"></div>
                 </div>
                 <div style="flex-shrink:0; display:flex; flex-direction:column; gap:6px;">${installBtn}${aiBtn}</div>
@@ -32655,13 +32666,13 @@ async function wolfnoteFromCurrentView() {
     // Build a professional light-themed sysadmin report (print-friendly)
     const sectionCount = sections.length;
     const body = sections.map((s, i) =>
-        (s.heading ? `<h3 style="margin:28px 0 10px 0;font-size:14px;font-weight:600;color:#1e293b;letter-spacing:0.3px;text-transform:uppercase;border-left:3px solid #6366f1;padding-left:12px;">${escapeHtml(s.heading)}</h3>` : '') + s.html +
+        (s.heading ? `<h3 style="margin:28px 0 10px 0;font-size:14px;font-weight:600;color:#1e293b;letter-spacing:0.3px;text-transform:uppercase;border-left:3px solid #3b82f6;padding-left:12px;">${escapeHtml(s.heading)}</h3>` : '') + s.html +
         (i < sectionCount - 1 ? '<div style="border-bottom:1px solid #e2e8f0;margin:16px 0;"></div>' : '')
     ).join('');
 
     const content = `<div style="max-width:800px;margin:0 auto;padding:36px 44px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;color:#334155;background:#ffffff;border-radius:8px;line-height:1.6;border:1px solid #e2e8f0;overflow:hidden;box-sizing:border-box;word-wrap:break-word;">
     <div style="display:flex;align-items:center;gap:12px;margin-bottom:20px;">
-        <div style="width:40px;height:40px;border-radius:8px;background:linear-gradient(135deg,#6366f1,#8b5cf6);display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0;color:#fff;font-weight:700;">W</div>
+        <div style="width:40px;height:40px;border-radius:8px;background:linear-gradient(135deg,#3b82f6,#06b6d4);display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0;color:#fff;font-weight:700;">W</div>
         <div>
             <h1 style="margin:0;font-size:20px;font-weight:700;color:#0f172a;letter-spacing:-0.3px;">WolfStack &mdash; ${escapeHtml(pageTitle)}</h1>
             <p style="margin:2px 0 0 0;font-size:12px;color:#94a3b8;">Infrastructure Report${hostname ? ' &mdash; ' + escapeHtml(hostname) : ''}</p>
@@ -32678,7 +32689,7 @@ async function wolfnoteFromCurrentView() {
     ${body}
     <div style="margin-top:32px;padding-top:16px;border-top:1px solid #e2e8f0;display:flex;justify-content:space-between;align-items:center;">
         <span style="font-size:11px;color:#94a3b8;">This report was auto-generated by WolfStack. Data reflects the state at the time of capture.</span>
-        <span style="font-size:11px;color:#6366f1;font-weight:600;">wolfstack.org</span>
+        <span style="font-size:11px;color:#3b82f6;font-weight:600;">wolfstack.org</span>
     </div>
 </div>`;
 
@@ -33317,12 +33328,12 @@ async function loadSponsorHeaderBadge() {
                 var tierLabels = { homelab: 'Homelab', pro: 'Pro', enterprise: 'Enterprise' };
                 var tierGradients = {
                     homelab: 'linear-gradient(135deg, #2563eb, #3b82f6)',
-                    pro: 'linear-gradient(135deg, #7c3aed, #a855f7)',
+                    pro: 'linear-gradient(135deg, #3b82f6, #06b6d4)',
                     enterprise: 'linear-gradient(135deg, #dc2626, #ef4444)'
                 };
                 var tierBg = {
                     homelab: 'linear-gradient(135deg, rgba(37,99,235,0.12), rgba(59,130,246,0.08))',
-                    pro: 'linear-gradient(135deg, rgba(124,58,237,0.12), rgba(168,85,247,0.08))',
+                    pro: 'linear-gradient(135deg, rgba(124,58,237,0.12), rgba(6, 182, 212,0.08))',
                     enterprise: 'linear-gradient(135deg, rgba(220,38,38,0.12), rgba(239,68,68,0.08))'
                 };
                 var tierBorder = {
@@ -33378,7 +33389,7 @@ async function loadSponsorHeaderBadge() {
                 free: 'linear-gradient(135deg, #6b7280, #9ca3af)',
                 basic: 'linear-gradient(135deg, #16a34a, #22c55e)',
                 advanced: 'linear-gradient(135deg, #2563eb, #3b82f6)',
-                platinum: 'linear-gradient(135deg, #7c3aed, #a855f7)',
+                platinum: 'linear-gradient(135deg, #3b82f6, #06b6d4)',
                 enterprise: 'linear-gradient(135deg, #dc2626, #ef4444)'
             };
             badgeEl.style.background = tierColors[data.tier] || tierColors.basic;
@@ -33753,7 +33764,7 @@ function tiRenderClusterAwareBadge(rows) {
         if (m.paused)                    { label = 'PAUSED';    bg = 'rgba(220,38,38,0.18)';   fg = '#fca5a5'; }
         else if (m.enabled && !m.dry_run && m.applied) { label = 'ENFORCING'; bg = 'rgba(16,185,129,0.18)';  fg = '#6ee7b7'; }
         else if (m.enabled && m.dry_run) { label = 'DRY-RUN';   bg = 'rgba(234,179,8,0.18)';   fg = '#fde68a'; }
-        else if (m.enabled)              { label = 'ENABLED';   bg = 'rgba(99,102,241,0.18)';  fg = '#a5b4fc'; }
+        else if (m.enabled)              { label = 'ENABLED';   bg = 'rgba(59, 130, 246,0.18)';  fg = '#93c5fd'; }
         else                             { label = 'OFF';       bg = 'var(--bg-tertiary)';     fg = 'var(--text-muted)'; }
         title = 'All reachable nodes agree on this state.';
     }
@@ -33839,7 +33850,7 @@ function tiBadgeForNode(s) {
     if (s.paused) return '<span style="font-size:11px; padding:3px 8px; border-radius:4px; background:rgba(220,38,38,0.18); color:#fca5a5;">PAUSED</span>';
     if (s.enforcement_active && s.applied) return '<span style="font-size:11px; padding:3px 8px; border-radius:4px; background:rgba(16,185,129,0.18); color:#6ee7b7;">ENFORCING</span>';
     if (s.enabled && s.dry_run) return '<span style="font-size:11px; padding:3px 8px; border-radius:4px; background:rgba(234,179,8,0.18); color:#fde68a;">DRY-RUN</span>';
-    if (s.enabled) return '<span style="font-size:11px; padding:3px 8px; border-radius:4px; background:rgba(99,102,241,0.18); color:#a5b4fc;">ENABLED</span>';
+    if (s.enabled) return '<span style="font-size:11px; padding:3px 8px; border-radius:4px; background:rgba(59, 130, 246,0.18); color:#93c5fd;">ENABLED</span>';
     return '<span style="font-size:11px; padding:3px 8px; border-radius:4px; background:var(--bg-tertiary); color:var(--text-muted);">OFF</span>';
 }
 
@@ -35474,7 +35485,7 @@ function renderWolfRunServices(services) {
         // Service VIP (load balancer)
         const vip = svc.service_ip;
         const vipHtml = vip
-            ? `<code style="font-size:11px;padding:2px 6px;background:rgba(99,102,241,0.12);border-radius:4px;color:#818cf8;">${vip}</code>`
+            ? `<code style="font-size:11px;padding:2px 6px;background:rgba(59, 130, 246,0.12);border-radius:4px;color:#60a5fa;">${vip}</code>`
             : '<span style="color:var(--text-muted);font-size:12px;">—</span>';
 
         // Replica count with progress bar
@@ -35496,7 +35507,7 @@ function renderWolfRunServices(services) {
             const instNode = (window.allNodes || []).find(n => n.id === inst.node_id);
             const instHostname = instNode ? instNode.hostname : inst.node_id.substring(0, 12);
             const isStandby = inst.standby;
-            const statusColor = isStandby ? '#6366f1' : (inst.status === 'running' ? '#10b981' : (inst.status === 'pending' ? '#eab308' : '#ef4444'));
+            const statusColor = isStandby ? '#3b82f6' : (inst.status === 'running' ? '#10b981' : (inst.status === 'pending' ? '#eab308' : '#ef4444'));
             const statusLabel = isStandby ? 'standby' : inst.status;
             const ipHtml = inst.wolfnet_ip
                 ? `<code style="font-size:11px;padding:2px 6px;background:rgba(59,130,246,0.12);border-radius:4px;color:#60a5fa;">${inst.wolfnet_ip}</code>`
@@ -35510,7 +35521,7 @@ function renderWolfRunServices(services) {
                 <td style="padding-left:32px;font-size:12px;color:var(--text-secondary);">
                     <span style="color:var(--text-muted);">└</span> ${instIcon} <code style="font-size:11px;">${inst.container_name}</code>
                     <span style="font-size:10px;color:var(--text-muted);margin-left:4px;">${instType}</span>
-                    ${isStandby ? '<span style="font-size:9px;padding:1px 6px;border-radius:8px;background:rgba(99,102,241,0.15);color:#818cf8;border:1px solid rgba(99,102,241,0.3);margin-left:6px;">STANDBY</span>' : ''}
+                    ${isStandby ? '<span style="font-size:9px;padding:1px 6px;border-radius:8px;background:rgba(59, 130, 246,0.15);color:#60a5fa;border:1px solid rgba(59, 130, 246,0.3);margin-left:6px;">STANDBY</span>' : ''}
                 </td>
                 <td colspan="2" style="font-size:12px;">
                     <span style="padding:2px 8px;border-radius:6px;font-size:11px;background:var(--bg-secondary);border:1px solid var(--border);">${instHostname}</span>
@@ -35533,7 +35544,7 @@ function renderWolfRunServices(services) {
 
         // Failover badge
         const failoverBadge = svc.failover
-            ? `<span style="font-size:9px;padding:1px 6px;border-radius:8px;background:rgba(99,102,241,0.15);color:#818cf8;border:1px solid rgba(99,102,241,0.3);margin-left:6px;" title="Failover enabled — ${standbyInstances.length} standby">HA</span>`
+            ? `<span style="font-size:9px;padding:1px 6px;border-radius:8px;background:rgba(59, 130, 246,0.15);color:#60a5fa;border:1px solid rgba(59, 130, 246,0.3);margin-left:6px;" title="Failover enabled — ${standbyInstances.length} standby">HA</span>`
             : '';
 
         return `<tr style="cursor:pointer;" onclick="toggleWolfRunInstances('${svc.id}')">
@@ -35550,8 +35561,8 @@ function renderWolfRunServices(services) {
                 <button class="btn btn-sm" onclick="wolfrunAction('${svc.id}', 'restart')" title="Restart All" style="padding:4px 8px; font-size:12px; color:#3b82f6;"><span class="ws-icon-clean-wrap" data-icon="restart"></span></button>
                 <button class="btn btn-sm" onclick="wolfrunScale('${svc.id}', ${desired - 1})" ${desired <= minR ? 'disabled' : ''} title="Scale down" style="padding:4px 8px; font-size:12px;"><span class="ws-icon-clean-wrap" data-icon="minus"></span></button>
                 <button class="btn btn-sm" onclick="wolfrunScale('${svc.id}', ${desired + 1})" ${desired >= maxR ? 'disabled' : ''} title="Scale up" style="padding:4px 8px; font-size:12px;"></button>
-                <button class="btn btn-sm" onclick="wolfrunSettings('${svc.id}', '${svc.name}', ${desired}, ${minR}, ${maxR}, '${svc.lb_policy || 'round_robin'}', ${JSON.stringify(svc.allowed_nodes || [])}, '${svc.cluster_name || ''}', ${!!svc.failover})" title="Settings" style="padding:4px 8px; font-size:12px; color:#a78bfa;"><span class="ws-icon-clean-wrap" data-icon="settings"></span></button>
-                <button class="btn btn-sm" onclick="openWolfRunPortForward('${svc.id}', '${svc.name}', '${vip || ''}')" title="Port Forward" style="padding:4px 8px; font-size:12px; color:#818cf8;" ${!vip ? 'disabled' : ''}><span class="ws-icon-clean-wrap" data-icon="link"></span></button>
+                <button class="btn btn-sm" onclick="wolfrunSettings('${svc.id}', '${svc.name}', ${desired}, ${minR}, ${maxR}, '${svc.lb_policy || 'round_robin'}', ${JSON.stringify(svc.allowed_nodes || [])}, '${svc.cluster_name || ''}', ${!!svc.failover})" title="Settings" style="padding:4px 8px; font-size:12px; color:#60a5fa;"><span class="ws-icon-clean-wrap" data-icon="settings"></span></button>
+                <button class="btn btn-sm" onclick="openWolfRunPortForward('${svc.id}', '${svc.name}', '${vip || ''}')" title="Port Forward" style="padding:4px 8px; font-size:12px; color:#60a5fa;" ${!vip ? 'disabled' : ''}><span class="ws-icon-clean-wrap" data-icon="link"></span></button>
                 <button class="btn btn-sm" onclick="wolfrunDelete('${svc.id}', '${svc.name}')" title="Remove" style="padding:4px 8px; font-size:12px; color:#ef4444;"><span class="ws-icon-clean-wrap" data-icon="trash"></span></button>
             </td>
         </tr>${instanceRows}`;
@@ -36213,7 +36224,7 @@ function renderWolfRunAdoptItems(containers) {
         const statusColor = c.status === 'running' ? '#10b981' : (c.status === 'exited' || c.status === 'stopped') ? '#ef4444' : '#eab308';
         const selected = wolfrunAdoptSelected === idx;
         return `<div class="wolfrun-adopt-item" data-idx="${idx}" onclick="selectWolfrunAdopt(${idx})"
-            style="display:flex; align-items:center; gap:12px; padding:12px 16px; border:1px solid ${selected ? 'var(--accent)' : 'var(--border)'}; border-radius:8px; margin-bottom:8px; cursor:pointer; transition:all 0.15s;${selected ? ' background:rgba(99,102,241,0.06);' : ''}">
+            style="display:flex; align-items:center; gap:12px; padding:12px 16px; border:1px solid ${selected ? 'var(--accent)' : 'var(--border)'}; border-radius:8px; margin-bottom:8px; cursor:pointer; transition:all 0.15s;${selected ? ' background:rgba(59, 130, 246,0.06);' : ''}">
             <input type="radio" name="wolfrun-adopt" style="accent-color:var(--accent); flex-shrink:0;"${selected ? ' checked' : ''}>
             <span style="font-size:18px;">${runtimeIcon}</span>
             <div style="flex:1; min-width:0;">
@@ -36252,7 +36263,7 @@ function selectWolfrunAdopt(idx) {
     document.getElementById('wolfrun-adopt-btn').disabled = false;
     document.querySelectorAll('.wolfrun-adopt-item').forEach((el, i) => {
         el.style.borderColor = i === idx ? 'var(--accent)' : 'var(--border)';
-        el.style.background = i === idx ? 'rgba(99,102,241,0.06)' : '';
+        el.style.background = i === idx ? 'rgba(59, 130, 246,0.06)' : '';
         el.querySelector('input[type=radio]').checked = (i === idx);
     });
 }
@@ -36338,7 +36349,7 @@ async function loadWolfRunPortForwards(serviceId) {
                 return `<div style="display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--bg-secondary);border-radius:8px;margin-bottom:6px;border:1px solid var(--border);">
                     <span style="font-size:14px;">${f.protocol === 'tcp' ? '' : f.protocol === 'udp' ? '' : ''}</span>
                     <code style="font-size:12px; flex:1; color:var(--text-primary);">${f.public_ip}${srcPorts} → VIP${dstPorts}</code>
-                    <span style="font-size:10px; padding:2px 6px; border-radius:4px; background:rgba(99,102,241,0.12); color:#818cf8;">${f.protocol}</span>
+                    <span style="font-size:10px; padding:2px 6px; border-radius:4px; background:rgba(59, 130, 246,0.12); color:#60a5fa;">${f.protocol}</span>
                     <button class="btn btn-sm" onclick="deleteWolfRunPortForward('${serviceId}', '${f.id}')" style="padding:2px 6px; font-size:11px; color:#ef4444;"><span class="ws-icon-clean-wrap" data-icon="trash"></span></button>
                 </div>`;
             }).join('');
@@ -36420,7 +36431,7 @@ async function loadStorageProviders() {
             let wdHtml = '';
             if (wd) {
                 const roleLabels = { leader: 'Server (Leader)', follower: 'Server (Follower)', client: 'Client Only', auto: 'Auto' };
-                const roleColors = { leader: '#f59e0b', follower: '#3b82f6', client: '#8b5cf6', auto: '#6b7280' };
+                const roleColors = { leader: '#f59e0b', follower: '#3b82f6', client: '#06b6d4', auto: '#6b7280' };
                 const modeLabel = wd.replication_mode === 'replicated'
                     ? `Replicated (${wd.replication_factor}x)` : 'Shared';
                 const features = [];
@@ -36458,7 +36469,7 @@ async function loadStorageProviders() {
                         ${hasService && p.status !== 'running' ? `<button class="btn btn-sm" style="font-size:11px; color:#10b981;" onclick="providerAction('${p.name}','start')">▶ Start</button>` : ''}
                         ${hasService && p.status === 'running' ? `<button class="btn btn-sm" style="font-size:11px; color:#ef4444;" onclick="providerAction('${p.name}','stop')">Stop</button>` : ''}
                         ${hasService && p.status === 'running' ? `<button class="btn btn-sm" style="font-size:11px; color:#3b82f6;" onclick="providerAction('${p.name}','restart')">Restart</button>` : ''}
-                        ${p.installed ? `<button class="btn btn-sm" style="font-size:11px; color:#a78bfa;" onclick="openProviderSettings('${p.name}','${p.icon}','${p.label}','${p.config_path || ''}')">Settings</button>` : ''}
+                        ${p.installed ? `<button class="btn btn-sm" style="font-size:11px; color:#60a5fa;" onclick="openProviderSettings('${p.name}','${p.icon}','${p.label}','${p.config_path || ''}')">Settings</button>` : ''}
                     </div>
                 </div>
             </div>`;
@@ -39195,7 +39206,7 @@ function renderK8sPods(pods) {
     if (pods.length === 0) return '<div style="padding:20px; text-align:center; color:var(--text-muted);">No pods found.</div>';
     let html = '<table class="data-table" style="width:100%;"><thead><tr><th>Name</th><th>Namespace</th><th>Status</th><th>Ready</th><th>Restarts</th><th>Node</th><th>IP</th><th>Age</th><th style="text-align:right;">Actions</th></tr></thead><tbody>';
     pods.forEach(p => {
-        const statusColors = { Running: '#10b981', Pending: '#eab308', Succeeded: '#6366f1', Failed: '#ef4444', Unknown: '#9ca3af' };
+        const statusColors = { Running: '#10b981', Pending: '#eab308', Succeeded: '#3b82f6', Failed: '#ef4444', Unknown: '#9ca3af' };
         const color = statusColors[p.status] || '#9ca3af';
         const ns = p.namespace || 'default';
         const isRunning = p.status === 'Running';
@@ -39449,7 +39460,7 @@ async function showK8sPodDetail(name, namespace) {
         let html = `<div style="margin-bottom:12px;"><button class="btn btn-sm btn-secondary" onclick="k8sDetailOpen=false; switchK8sTab('pods')" style="font-size:11px;">&larr; Back to Pods</button></div>`;
 
         // Header
-        const statusColors = { Running: '#10b981', Pending: '#eab308', Succeeded: '#6366f1', Failed: '#ef4444', Unknown: '#9ca3af' };
+        const statusColors = { Running: '#10b981', Pending: '#eab308', Succeeded: '#3b82f6', Failed: '#ef4444', Unknown: '#9ca3af' };
         const sColor = statusColors[pod.status] || '#9ca3af';
         const isRunning = pod.status === 'Running';
         html += `<div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:16px;">
@@ -39910,7 +39921,7 @@ async function loadK8sPodResources(podName, namespace, pod) {
             </div>
             <div style="padding:16px; background:var(--bg-secondary); border-radius:8px; text-align:center;">
                 <div style="font-size:11px; color:var(--text-muted); text-transform:uppercase; letter-spacing:1px; margin-bottom:6px;">Memory Usage</div>
-                <div style="font-size:24px; font-weight:700; color:#6366f1;">${escapeHtml(topData.memory || 'N/A')}</div>
+                <div style="font-size:24px; font-weight:700; color:#3b82f6;">${escapeHtml(topData.memory || 'N/A')}</div>
             </div>
         </div>`;
 
@@ -40389,7 +40400,7 @@ function k8sStartProvisionTerminal(index, session, agentNodeIds) {
         else term.write(new Uint8Array(event.data));
     };
     ws.onclose = () => {
-        if (dot) dot.style.background = '#6366f1';
+        if (dot) dot.style.background = '#3b82f6';
 
         if (session.role === 'server' && agentNodeIds && agentNodeIds.length > 0) {
             // Server done — register cluster, then start agent phase
@@ -40736,7 +40747,7 @@ async function loadNodeK8sPods(clusters, node) {
         return;
     }
 
-    const statusColors = { Running: '#10b981', Pending: '#eab308', Succeeded: '#6366f1', Failed: '#ef4444', Unknown: '#9ca3af' };
+    const statusColors = { Running: '#10b981', Pending: '#eab308', Succeeded: '#3b82f6', Failed: '#ef4444', Unknown: '#9ca3af' };
     let rows = '';
     for (const p of allPods) {
         const color = statusColors[p.status] || '#9ca3af';
@@ -40957,7 +40968,7 @@ function renderK8sStorage(data) {
             <div style="font-size:12px; color:var(--text-muted);">Storage Classes</div>
         </div>
         <div class="card" style="text-align:center; padding:20px;">
-            <div style="font-size:24px; font-weight:700; color:#6366f1;">${pvs.length}</div>
+            <div style="font-size:24px; font-weight:700; color:#3b82f6;">${pvs.length}</div>
             <div style="font-size:12px; color:var(--text-muted);">Persistent Volumes</div>
         </div>
         <div class="card" style="text-align:center; padding:20px;">
@@ -40991,7 +41002,7 @@ function renderK8sStorage(data) {
         });
         html += `</tbody></table>`;
     }
-    html += `<div style="margin-top:12px; padding:10px 14px; background:rgba(99,102,241,0.06); border-radius:6px; border-left:3px solid #6366f1; font-size:12px; color:var(--text-secondary);">
+    html += `<div style="margin-top:12px; padding:10px 14px; background:rgba(59, 130, 246,0.06); border-radius:6px; border-left:3px solid #3b82f6; font-size:12px; color:var(--text-secondary);">
         <strong>What are Storage Classes?</strong> They define how storage is provisioned. The default class is used when you create a volume claim without specifying one. Common provisioners include <code>local-path</code> (k3s default), <code>rancher.io/local-path</code>, and cloud CSI drivers.
     </div>`;
     html += `</div></div>`;
@@ -41029,7 +41040,7 @@ function renderK8sStorage(data) {
         });
         html += `</tbody></table>`;
     }
-    html += `<div style="margin-top:12px; padding:10px 14px; background:rgba(99,102,241,0.06); border-radius:6px; border-left:3px solid #6366f1; font-size:12px; color:var(--text-secondary);">
+    html += `<div style="margin-top:12px; padding:10px 14px; background:rgba(59, 130, 246,0.06); border-radius:6px; border-left:3px solid #3b82f6; font-size:12px; color:var(--text-secondary);">
         <strong>What are Volume Claims?</strong> A PVC requests a piece of storage from the cluster. Once created, you can mount it into one or more deployments. Data persists even if pods restart. Use <strong>ReadWriteOnce</strong> for single-pod access or <strong>ReadWriteMany</strong> for shared storage across multiple pods.
     </div>`;
     html += `</div></div>`;
@@ -41054,7 +41065,7 @@ function renderK8sStorage(data) {
             </tr>`;
         });
         html += `</tbody></table>
-        <div style="margin-top:12px; padding:10px 14px; background:rgba(99,102,241,0.06); border-radius:6px; border-left:3px solid #6366f1; font-size:12px; color:var(--text-secondary);">
+        <div style="margin-top:12px; padding:10px 14px; background:rgba(59, 130, 246,0.06); border-radius:6px; border-left:3px solid #3b82f6; font-size:12px; color:var(--text-secondary);">
             <strong>What are Persistent Volumes?</strong> PVs are the actual storage resources in the cluster (created automatically by storage classes or manually by admins). They are bound to PVCs and represent the physical storage backend.
         </div>`;
         html += `</div></div>`;
@@ -41062,7 +41073,7 @@ function renderK8sStorage(data) {
 
     // ── How Kubernetes Storage Works ──
     html += `
-    <div class="card" style="border-color:rgba(99,102,241,0.15);">
+    <div class="card" style="border-color:rgba(59, 130, 246,0.15);">
         <div class="card-body" style="padding:20px;">
             <h4 style="margin:0 0 12px 0; font-size:15px; font-weight:700; color:var(--text-primary);">Kubernetes Storage &mdash; Quick Guide</h4>
             <div style="font-size:13px; color:var(--text-secondary); line-height:1.7;">
@@ -41393,10 +41404,10 @@ function renderK8sWolfNet(status, cluster, deployments) {
 
     // ── How It Works info card ──
     html += `
-    <div class="card" style="margin-bottom:20px; border-color:rgba(99,102,241,0.2); background:rgba(99,102,241,0.04);">
+    <div class="card" style="margin-bottom:20px; border-color:rgba(59, 130, 246,0.2); background:rgba(59, 130, 246,0.04);">
         <div class="card-body" style="padding:24px;">
             <div style="display:flex; align-items:center; gap:14px; margin-bottom:14px;">
-                <div style="width:42px; height:42px; background:linear-gradient(135deg,#6366f1,#818cf8); border-radius:10px; display:flex; align-items:center; justify-content:center; font-size:20px; color:#fff;">&#127760;</div>
+                <div style="width:42px; height:42px; background:linear-gradient(135deg,#3b82f6,#60a5fa); border-radius:10px; display:flex; align-items:center; justify-content:center; font-size:20px; color:#fff;">&#127760;</div>
                 <div>
                     <h4 style="margin:0; font-size:16px; font-weight:700;">WolfNet &mdash; Private Access to Kubernetes</h4>
                     <p style="margin:2px 0 0 0; font-size:12px; color:var(--text-muted);">WolfNet is your secure, private route into the Kubernetes cluster &mdash; no public internet exposure required.</p>
@@ -41410,8 +41421,8 @@ function renderK8sWolfNet(status, cluster, deployments) {
                     <li><strong>Traffic is routed automatically</strong> &mdash; any machine on your WolfNet can access the deployment using its WolfNet IP on standard ports (e.g. <code>10.10.10.50:80</code>). WolfStack routes that traffic to the correct Kubernetes pods behind the scenes.</li>
                     <li><strong>Load balanced across pods</strong> &mdash; Kubernetes spreads traffic across all running pods automatically. If you scale to 3 replicas, all 3 share the load.</li>
                 </ol>
-                <div style="margin-top:12px; padding:10px 14px; background:rgba(99,102,241,0.08); border-radius:6px; border-left:3px solid #6366f1;">
-                    <strong>Tip:</strong> Auto-assign WolfNet IP is enabled by default &mdash; every app you deploy automatically gets a private WolfNet IP. You can disable this in <a href="#" onclick="switchK8sTab('settings'); return false;" style="color:#818cf8;">Settings</a>, or assign IPs manually from this page.
+                <div style="margin-top:12px; padding:10px 14px; background:rgba(59, 130, 246,0.08); border-radius:6px; border-left:3px solid #3b82f6;">
+                    <strong>Tip:</strong> Auto-assign WolfNet IP is enabled by default &mdash; every app you deploy automatically gets a private WolfNet IP. You can disable this in <a href="#" onclick="switchK8sTab('settings'); return false;" style="color:#60a5fa;">Settings</a>, or assign IPs manually from this page.
                 </div>
             </div>
         </div>
@@ -41545,7 +41556,7 @@ function renderK8sWolfNet(status, cluster, deployments) {
 
     // ── Kubernetes Networking Concepts ──
     html += `
-    <div class="card" style="border-color:rgba(99,102,241,0.15);">
+    <div class="card" style="border-color:rgba(59, 130, 246,0.15);">
         <div class="card-body" style="padding:20px;">
             <h4 style="margin:0 0 12px 0; font-size:15px; font-weight:700; color:var(--text-primary);">Kubernetes Networking &mdash; Quick Reference</h4>
             <div style="font-size:13px; color:var(--text-secondary); line-height:1.7;">
@@ -41666,7 +41677,7 @@ async function showK8sDeploymentDetail(name, namespace) {
         } else {
             html += `<div style="padding:12px 16px; background:var(--bg-secondary); border-radius:8px; margin-bottom:16px; display:flex; align-items:center; justify-content:space-between;">
                 <div style="font-size:13px; color:var(--text-muted);">No WolfNet IP assigned &mdash; this deployment is only accessible within the cluster.</div>
-                <button class="btn btn-sm btn-primary" onclick="k8sAssignWolfNetRouteDirect('${escapeHtml(d.name)}', '${escapeHtml(d.namespace)}')" style="font-size:11px; background:#6366f1; border-color:#6366f1;">Assign IP</button>
+                <button class="btn btn-sm btn-primary" onclick="k8sAssignWolfNetRouteDirect('${escapeHtml(d.name)}', '${escapeHtml(d.namespace)}')" style="font-size:11px; background:#3b82f6; border-color:#3b82f6;">Assign IP</button>
             </div>`;
         }
 
@@ -41985,7 +41996,7 @@ function renderK8sSettings(cluster) {
     <div class="card" style="margin-bottom:20px;">
         <div class="card-body" style="padding:24px;">
             <div style="display:flex; align-items:center; gap:12px; margin-bottom:16px;">
-                <div style="width:36px; height:36px; background:linear-gradient(135deg,#6366f1,#818cf8); border-radius:10px; display:flex; align-items:center; justify-content:center; font-size:18px; color:#fff;">&#127760;</div>
+                <div style="width:36px; height:36px; background:linear-gradient(135deg,#3b82f6,#60a5fa); border-radius:10px; display:flex; align-items:center; justify-content:center; font-size:18px; color:#fff;">&#127760;</div>
                 <div>
                     <h4 style="margin:0; font-size:16px; font-weight:700;">WolfNet Integration</h4>
                     <p style="margin:2px 0 0 0; font-size:12px; color:var(--text-muted);">Configure WolfNet private networking for this Kubernetes cluster. WolfNet gives each deployment a private IP accessible only from your WolfNet.</p>
@@ -43213,7 +43224,7 @@ function topoUpdateTooltip() {
             `<div>${n.online ? '<span style="color:#22c55e;">&#9679;</span> Online' : '<span style="color:#ef4444;">&#9679;</span> Offline'}</div>` +
             `<div><span style="color:#22c55e;">&#9679;</span> CPU: ${cpu}%</div>` +
             `<div><span style="color:#3b82f6;">&#9679;</span> Memory: ${mem}%</div>` +
-            `<div><span style="color:#8b5cf6;">&#9679;</span> Disk: ${dsk}%</div></div>` +
+            `<div><span style="color:#06b6d4;">&#9679;</span> Disk: ${dsk}%</div></div>` +
             listHtml +
             `<div style="margin-top:10px;display:flex;gap:6px;">` +
             `<button onclick="topoOpenTerminal('${esc(nodeId)}')" style="flex:1;padding:7px 0;border:1px solid rgba(255,255,255,0.15);border-radius:6px;background:rgba(255,255,255,0.08);color:#fff;font-size:11px;cursor:pointer;font-family:inherit;">Terminal</button>` +
@@ -43954,10 +43965,10 @@ let wfEditorTarget = { scope: 'local' }; // Workflow-level target
 // Color mapping for action types (left border accent)
 const wfActionColors = {
     update_packages:    '#f59e0b',
-    update_wolfstack:   '#8b5cf6',
+    update_wolfstack:   '#06b6d4',
     restart_service:    '#3b82f6',
     run_command:        '#10b981',
-    clean_logs:         '#6366f1',
+    clean_logs:         '#3b82f6',
     check_disk_space:   '#06b6d4',
     restart_container:  '#ec4899',
     docker_prune:       '#ef4444',
@@ -43967,10 +43978,10 @@ const wfActionColors = {
     condition:          '#f97316',
     netbird_action:     '#06b6d4',
     truenas_action:     '#14b8a6',
-    unifi_action:       '#6366f1',
-    integration_action: '#a855f7',
+    unifi_action:       '#3b82f6',
+    integration_action: '#06b6d4',
     sql_query:          '#eab308',
-    send_email:         '#a78bfa',
+    send_email:         '#60a5fa',
 };
 const wfActionIcons = {
     update_packages:    '\u{1F4E6}',
@@ -44017,8 +44028,8 @@ async function triggerClusterServicesSweep({ silent = false } = {}) {
         // Cheap to re-add on every call; removed when we re-render.
         const banner = document.createElement('div');
         banner.id = 'cluster-services-sweep-banner';
-        banner.style.cssText = 'background:rgba(99,102,241,0.10);border:1px solid rgba(99,102,241,0.3);border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:12px;color:#a5b4fc;display:flex;align-items:center;gap:10px;';
-        banner.innerHTML = `<span style="display:inline-block;width:14px;height:14px;border:2px solid rgba(99,102,241,0.25);border-top-color:#818cf8;border-radius:50%;animation:spin 0.7s linear infinite;"></span> Scanning the cluster for web services…`;
+        banner.style.cssText = 'background:rgba(59, 130, 246,0.10);border:1px solid rgba(59, 130, 246,0.3);border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:12px;color:#93c5fd;display:flex;align-items:center;gap:10px;';
+        banner.innerHTML = `<span style="display:inline-block;width:14px;height:14px;border:2px solid rgba(59, 130, 246,0.25);border-top-color:#60a5fa;border-radius:50%;animation:spin 0.7s linear infinite;"></span> Scanning the cluster for web services…`;
         const old = document.getElementById('cluster-services-sweep-banner');
         if (old) old.remove();
         grid.parentElement?.insertBefore(banner, grid);
@@ -44226,7 +44237,7 @@ function clusterBrowserProgressModal() {
             </div>
             <div class="modal-body" style="font-size:13px;line-height:1.5;">
                 <div style="display:flex;align-items:center;gap:10px;background:var(--bg-secondary);padding:14px 16px;border-radius:8px;margin-bottom:12px;">
-                    <span class="cb-spinner" style="display:inline-block;width:18px;height:18px;border:2px solid rgba(255,255,255,0.18);border-top-color:#818cf8;border-radius:50%;animation:spin 0.7s linear infinite;"></span>
+                    <span class="cb-spinner" style="display:inline-block;width:18px;height:18px;border:2px solid rgba(255,255,255,0.18);border-top-color:#60a5fa;border-radius:50%;animation:spin 0.7s linear infinite;"></span>
                     <strong id="cb-status" style="flex:1;color:var(--text);">Preparing…</strong>
                 </div>
                 <p style="margin:0 0 8px;color:var(--text-muted);font-size:12px;">First time on this node? The browser image is ~700 MB and pulled once. Subsequent sessions start in seconds.</p>
@@ -44303,7 +44314,7 @@ function renderClusterServices(grouped) {
                     <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:10px;padding:12px;display:flex;align-items:flex-start;gap:10px;">
                         <div style="font-size:24px;line-height:1;">${escapeHtml(s.icon)}</div>
                         <div style="flex:1;min-width:0;">
-                            <div style="font-weight:600;font-size:13px;">${escapeHtml(s.name)}${s.manual ? ' <span style="font-size:9px;background:rgba(99,102,241,0.15);color:#818cf8;padding:1px 5px;border-radius:3px;">pinned</span>' : ''}</div>
+                            <div style="font-weight:600;font-size:13px;">${escapeHtml(s.name)}${s.manual ? ' <span style="font-size:9px;background:rgba(59, 130, 246,0.15);color:#60a5fa;padding:1px 5px;border-radius:3px;">pinned</span>' : ''}</div>
                             <div style="font-size:11px;color:var(--text-muted);font-family:'JetBrains Mono',monospace;word-break:break-all;">${escapeHtml(s.url)}</div>
                             <div style="margin-top:6px;font-size:10px;color:var(--text-muted);">Open in the Cluster Browser to reach this — your local browser isn't on WolfNet.</div>
                             ${s.manual ? `<div style="margin-top:6px;display:flex;gap:4px;">
@@ -44446,7 +44457,7 @@ function renderWfListTable(workflows) {
             <td>${statusBadge}</td>
             <td style="text-align:right;white-space:nowrap;">
                 <button class="btn btn-sm" onclick="triggerWolfFlow('${wf.id}')" title="Run now" style="padding:4px 8px;font-size:12px;color:#10b981;">&#9654;</button>
-                <button class="btn btn-sm" onclick="openWolfFlowEditor('${wf.id}')" title="Edit" style="padding:4px 8px;font-size:12px;color:#818cf8;">&#9998;</button>
+                <button class="btn btn-sm" onclick="openWolfFlowEditor('${wf.id}')" title="Edit" style="padding:4px 8px;font-size:12px;color:#60a5fa;">&#9998;</button>
                 <button class="btn btn-sm" onclick="deleteWolfFlow('${wf.id}','${escapeHtml(wf.name).replace(/'/g, "\\'")}')" title="Delete" style="padding:4px 8px;font-size:12px;color:#ef4444;">&#10005;</button>
             </td>
         </tr>`;
@@ -44468,7 +44479,7 @@ function renderWfRunsTable(runs) {
 
     tbody.innerHTML = runs.map(run => {
         const triggerBadge = run.trigger === 'scheduled'
-            ? '<span style="padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;background:rgba(99,102,241,0.15);color:#6366f1;">Scheduled</span>'
+            ? '<span style="padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;background:rgba(59, 130, 246,0.15);color:#3b82f6;">Scheduled</span>'
             : '<span style="padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;background:rgba(107,114,128,0.15);color:#9ca3af;">Manual</span>';
         const started = run.started_at ? wfFormatTime(run.started_at) : '\u2014';
         let dur = '\u2014';
@@ -45829,14 +45840,14 @@ function switchComposeTab(tab) {
     const envContent = document.getElementById('compose-tab-env-content');
 
     if (tab === 'yaml') {
-        yamlTab.style.borderBottom = '2px solid var(--primary-color, #6366f1)';
+        yamlTab.style.borderBottom = '2px solid var(--primary-color, #3b82f6)';
         yamlTab.style.opacity = '1';
         envTab.style.borderBottom = 'none';
         envTab.style.opacity = '0.6';
         yamlContent.style.display = 'block';
         envContent.style.display = 'none';
     } else {
-        envTab.style.borderBottom = '2px solid var(--primary-color, #6366f1)';
+        envTab.style.borderBottom = '2px solid var(--primary-color, #3b82f6)';
         envTab.style.opacity = '1';
         yamlTab.style.borderBottom = 'none';
         yamlTab.style.opacity = '0.6';
@@ -46555,7 +46566,7 @@ async function refreshWolfUsbDevices() {
                 var rowId = 'wolfusb-row-' + idx;
                 var sourceBadge = d.source_is_self
                     ? '<span style="background:rgba(59,130,246,0.15);color:#3b82f6;padding:2px 8px;border-radius:4px;font-size:11px;">' + escapeHtml(d.source_hostname) + ' (this node)</span>'
-                    : '<span style="background:rgba(139,92,246,0.12);color:#a78bfa;padding:2px 8px;border-radius:4px;font-size:11px;">' + escapeHtml(d.source_hostname) + '</span>';
+                    : '<span style="background:rgba(139,92,246,0.12);color:#60a5fa;padding:2px 8px;border-radius:4px;font-size:11px;">' + escapeHtml(d.source_hostname) + '</span>';
                 var statusCell = d.assigned_to
                     ? '<span style="background:rgba(34,197,94,0.15);color:#22c55e;padding:3px 10px;border-radius:6px;font-size:11px;font-weight:600;display:inline-block;">' + escapeHtml(d.assigned_to) + '</span>'
                     + '<br><button class="btn btn-sm" onclick="wolfusbUnassign(\'' + escapeAttr(d.busid) + '\',\'' + escapeAttr(d.source_node_id) + '\')" style="margin-top:4px;padding:2px 8px;font-size:10px;background:rgba(239,68,68,0.1);color:#ef4444;border:1px solid rgba(239,68,68,0.2);border-radius:4px;">Remove</button>'
@@ -46877,7 +46888,7 @@ function _wolfAgentsAvatarSrc(a) {
 function _wolfAgentsAvatarImg(a, size) {
     const px = size || 36;
     const src = _wolfAgentsAvatarSrc(a);
-    return `<img src="${escapeAttr(src)}" alt="" width="${px}" height="${px}" style="width:${px}px; height:${px}px; border-radius:${Math.round(px * 0.22)}px; object-fit:cover; background:linear-gradient(135deg,#a855f7,#6366f1); flex-shrink:0;" onerror="this.onerror=null; this.src='/images/agent-avatars/wolf-grey.svg';">`;
+    return `<img src="${escapeAttr(src)}" alt="" width="${px}" height="${px}" style="width:${px}px; height:${px}px; border-radius:${Math.round(px * 0.22)}px; object-fit:cover; background:linear-gradient(135deg,#06b6d4,#3b82f6); flex-shrink:0;" onerror="this.onerror=null; this.src='/images/agent-avatars/wolf-grey.svg';">`;
 }
 
 function wolfAgentsCardHtml(a) {
@@ -46889,7 +46900,7 @@ function wolfAgentsCardHtml(a) {
         ? `<span style="font-size:10px; background:rgba(88,101,242,0.15); color:#8a93f0; padding:2px 6px; border-radius:3px; margin-left:6px;">Discord</span>`
         : '';
     return `<div class="card" style="cursor:pointer; transition:transform 0.12s, border-color 0.12s;" onclick="wolfAgentsOpenChat('${escapeAttr(a.id)}')"
-                onmouseover="this.style.transform='translateY(-2px)'; this.style.borderColor='rgba(168,85,247,0.45)';"
+                onmouseover="this.style.transform='translateY(-2px)'; this.style.borderColor='rgba(6, 182, 212,0.45)';"
                 onmouseout="this.style.transform=''; this.style.borderColor='';">
         <div class="card-body">
             <div style="display:flex; align-items:center; gap:10px; margin-bottom:8px;">
@@ -47120,8 +47131,8 @@ function _wolfAgentsMarkdown(src) {
 function wolfAgentsMessageHtml(role, content, ts) {
     const isUser = role === 'user';
     const align = isUser ? 'flex-end' : 'flex-start';
-    const bg = isUser ? 'rgba(99,102,241,0.18)' : 'rgba(168,85,247,0.12)';
-    const border = isUser ? 'rgba(99,102,241,0.4)' : 'rgba(168,85,247,0.3)';
+    const bg = isUser ? 'rgba(59, 130, 246,0.18)' : 'rgba(6, 182, 212,0.12)';
+    const border = isUser ? 'rgba(59, 130, 246,0.4)' : 'rgba(6, 182, 212,0.3)';
     const tsLabel = ts ? new Date(ts * 1000).toLocaleTimeString() : '';
     // User messages stay as plain text so the user sees exactly what they
     // typed; agent replies get markdown rendering so **bold** / lists /
@@ -47322,7 +47333,7 @@ function _wolfAgentsRenderAvatarPicker(currentAvatar) {
             hidden.value = w.file;
             preview.src = `/images/agent-avatars/${w.file}`;
             for (const c of picker.children) c.style.borderColor = 'transparent';
-            btn.style.borderColor = 'rgba(168,85,247,0.7)';
+            btn.style.borderColor = 'rgba(6, 182, 212,0.7)';
         };
         picker.appendChild(btn);
     }
@@ -47333,7 +47344,7 @@ function _wolfAgentsRenderAvatarPicker(currentAvatar) {
         preview.src = `/images/agent-avatars/${currentAvatar}`;
         // Highlight the matching built-in.
         const idx = WOLF_AVATARS.findIndex(w => w.file === currentAvatar);
-        if (idx >= 0) picker.children[idx].style.borderColor = 'rgba(168,85,247,0.7)';
+        if (idx >= 0) picker.children[idx].style.borderColor = 'rgba(6, 182, 212,0.7)';
     } else {
         preview.src = '/images/agent-avatars/wolf-grey.svg';
     }
@@ -47597,7 +47608,7 @@ function wolfAgentsShowTab(tab) {
         const paneEl = document.getElementById(panes[key]);
         const tabEl = document.getElementById(tabs[key]);
         if (paneEl) paneEl.style.display = (key === tab) ? '' : 'none';
-        if (tabEl) tabEl.style.borderBottom = (key === tab) ? '2px solid var(--accent-primary,#6366f1)' : '';
+        if (tabEl) tabEl.style.borderBottom = (key === tab) ? '2px solid var(--accent-primary,#3b82f6)' : '';
     }
     if (tab === 'pending') wolfAgentsLoadPending();
     if (tab === 'audit')   wolfAgentsLoadAudit();
@@ -48035,7 +48046,7 @@ function cpBuildCustomRows(filteredItems) {
 // each row a quiet hue without fighting the dark theme.
 const _CP_ROW_SHADES = [
     'rgba(59,130,246,0.04)',   // blue
-    'rgba(168,85,247,0.04)',   // purple
+    'rgba(6, 182, 212,0.04)',   // purple
     'rgba(16,185,129,0.04)',   // emerald
     'rgba(234,179,8,0.05)',    // amber
     'rgba(239,68,68,0.04)',    // red
@@ -48786,7 +48797,7 @@ function sqlConnRow(c) {
         ? `<div style="font-size:11px; color:var(--text-muted); margin-top:2px;">${escapeHtml(c.cluster || '?')} / ${escapeHtml(nodeLabel || '?')}</div>`
         : '';
     const acl = (c.allowed_users && c.allowed_users.length)
-        ? `<div style="font-size:11px; color:var(--accent, #a855f7); margin-top:2px;">users: ${escapeHtml(c.allowed_users.join(', '))}</div>`
+        ? `<div style="font-size:11px; color:var(--accent, #06b6d4); margin-top:2px;">users: ${escapeHtml(c.allowed_users.join(', '))}</div>`
         : '';
     return `<div style="border:1px solid var(--border); border-radius:8px; padding:12px 14px; background:var(--bg-card);">
         <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px;">
@@ -49386,10 +49397,10 @@ function dbRenderConnections() {
                 const kindIcon = c.kind === 'postgres' ? '' : (c.kind === 'mariadb' ? '' : '');
                 const isActive = c.id === _dbCurrentId;
                 const acl = (c.allowed_users && c.allowed_users.length)
-                    ? '<span title="Enterprise ACL active" style="color:var(--accent,#a855f7);"></span> ' : '';
+                    ? '<span title="Enterprise ACL active" style="color:var(--accent,#06b6d4);"></span> ' : '';
                 html += `<div onclick="dbOpenConnection('${escapeHtml(c.id)}')"
-                    style="cursor:pointer; padding:8px 10px; margin:2px 0; border-radius:6px; background:${isActive ? 'var(--accent-bg, rgba(168,85,247,0.15))' : 'transparent'};
-                           border:1px solid ${isActive ? 'var(--accent, #a855f7)' : 'transparent'}; transition:background 0.15s;"
+                    style="cursor:pointer; padding:8px 10px; margin:2px 0; border-radius:6px; background:${isActive ? 'var(--accent-bg, rgba(6, 182, 212,0.15))' : 'transparent'};
+                           border:1px solid ${isActive ? 'var(--accent, #06b6d4)' : 'transparent'}; transition:background 0.15s;"
                     onmouseover="if (this.dataset.active !== '1') this.style.background='var(--bg-secondary)'"
                     onmouseout="if (this.dataset.active !== '1') this.style.background='transparent'"
                     data-active="${isActive ? '1' : '0'}">
@@ -49610,7 +49621,7 @@ function dbMgrRenderTree(tree) {
             const cached = _dbMgrTablesCache[schema];
             // Schema-level actions.
             html += `<div style="padding:2px 28px 4px; font-size:11px; display:flex; gap:12px; flex-wrap:wrap;">
-                <a href="#" onclick="event.preventDefault(); dbWizCreateTable('${safe}')" style="color:var(--accent, #a855f7);">+ New table</a>
+                <a href="#" onclick="event.preventDefault(); dbWizCreateTable('${safe}')" style="color:var(--accent, #06b6d4);">+ New table</a>
                 <a href="#" onclick="event.preventDefault(); dbDumpSchema('${safe}', false)" style="color:var(--text-muted);">Dump schema</a>
                 <a href="#" onclick="event.preventDefault(); dbDumpSchema('${safe}', true)" style="color:var(--text-muted);">Dump + data</a>
             </div>`;
@@ -49630,7 +49641,7 @@ function dbMgrRenderTree(tree) {
                         const active = _dbMgrCurrentDb === schema && _dbMgrCurrentTable === e.name;
                         const safeT = escapeHtml(e.name).replace(/'/g, "\\'");
                         html += `<div onclick="dbMgrPickTable('${safe}','${safeT}')"
-                            style="cursor:pointer; padding:4px 28px; font-size:13px; background:${active ? 'var(--accent-bg, rgba(168,85,247,0.15))' : 'transparent'};">
+                            style="cursor:pointer; padding:4px 28px; font-size:13px; background:${active ? 'var(--accent-bg, rgba(6, 182, 212,0.15))' : 'transparent'};">
                             ${escapeHtml(e.name)}
                         </div>`;
                     }
@@ -49641,7 +49652,7 @@ function dbMgrRenderTree(tree) {
                         const active = _dbMgrCurrentDb === schema && _dbMgrCurrentTable === e.name;
                         const safeT = escapeHtml(e.name).replace(/'/g, "\\'");
                         html += `<div onclick="dbMgrPickTable('${safe}','${safeT}')"
-                            style="cursor:pointer; padding:4px 28px; font-size:13px; background:${active ? 'var(--accent-bg, rgba(168,85,247,0.15))' : 'transparent'};">
+                            style="cursor:pointer; padding:4px 28px; font-size:13px; background:${active ? 'var(--accent-bg, rgba(6, 182, 212,0.15))' : 'transparent'};">
                             ${escapeHtml(e.name)}
                         </div>`;
                     }
@@ -50295,7 +50306,7 @@ async function dbDataEditRow(rowIdx) {
         fieldsHtml += `
             <div style="display:grid; grid-template-columns:180px 1fr auto; gap:8px; align-items:center; margin-bottom:8px;">
                 <label style="font-size:12px;">
-                    ${escapeHtml(colName)}${isPk ? ' <span style="color:var(--accent, #a855f7); font-size:10px;">(PK)</span>' : ''}
+                    ${escapeHtml(colName)}${isPk ? ' <span style="color:var(--accent, #06b6d4); font-size:10px;">(PK)</span>' : ''}
                 </label>
                 ${input}
                 <label style="font-size:11px; color:var(--text-muted); white-space:nowrap;">
@@ -50995,7 +51006,7 @@ function dbMgrSwitchTab(tab, skipRefresh) {
     _dbMgrTab = tab;
     document.querySelectorAll('.db-mgr-tab').forEach(b => {
         if (b.dataset.tab === tab) {
-            b.style.borderBottomColor = 'var(--accent, #a855f7)';
+            b.style.borderBottomColor = 'var(--accent, #06b6d4)';
             b.style.color = 'var(--text)';
         } else {
             b.style.borderBottomColor = 'transparent';
@@ -51410,7 +51421,7 @@ function dbDiagRender() {
         const tx = fromRight ? to.x : to.x + boxW;
         const dx = (tx - fx) * 0.5;
         const d = `M ${fx} ${fy} C ${fx + dx} ${fy}, ${tx - dx} ${ty}, ${tx} ${ty}`;
-        svgContent += `<path d="${d}" fill="none" stroke="#a855f7" stroke-width="1.5" marker-end="url(#db-diag-arrow)" opacity="0.75"/>`;
+        svgContent += `<path d="${d}" fill="none" stroke="#06b6d4" stroke-width="1.5" marker-end="url(#db-diag-arrow)" opacity="0.75"/>`;
     }
     // Tables
     for (const t of _dbDiagTables) {
@@ -51418,7 +51429,7 @@ function dbDiagRender() {
         const n = Math.min(t.columns.length, 20);
         const h = headerH + rowH * n;
         const active = (_dbMgrCurrentTable === t.name && _dbMgrCurrentDb === _dbDiagState.schema);
-        const stroke = active ? '#a855f7' : '#444';
+        const stroke = active ? '#06b6d4' : '#444';
         svgContent += `<g class="db-diag-box" data-table="${escapeHtml(t.name)}" style="cursor:move;" transform="translate(${p.x},${p.y})">`;
         svgContent += `<rect width="${boxW}" height="${h}" rx="6" fill="#1a1a24" stroke="${stroke}" stroke-width="${active ? 2 : 1}"/>`;
         svgContent += `<rect width="${boxW}" height="${headerH}" rx="6" fill="#2a2538" stroke="none"/>`;
@@ -51439,7 +51450,7 @@ function dbDiagRender() {
     svg.innerHTML = `
         <defs>
             <marker id="db-diag-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
-                <path d="M0,0 L10,5 L0,10 z" fill="#a855f7"/>
+                <path d="M0,0 L10,5 L0,10 z" fill="#06b6d4"/>
             </marker>
         </defs>
         ${svgContent}
@@ -51773,16 +51784,16 @@ function dbBldRenderJoinLines() {
     svg.setAttribute('viewBox', `0 0 2400 1400`);
     svg.style.width = '2400px';
     svg.style.height = '1400px';
-    let content = `<defs><marker id="db-bld-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="4" markerHeight="4" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#a855f7"/></marker></defs>`;
+    let content = `<defs><marker id="db-bld-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="4" markerHeight="4" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#06b6d4"/></marker></defs>`;
     for (let i = 0; i < _dbBldJoins.length; i++) {
         const j = _dbBldJoins[i];
         const from = dbBldColPoint(j.fromTable, j.fromCol);
         const to = dbBldColPoint(j.toTable, j.toCol);
         if (!from || !to) continue;
         const mx = (from.x + to.x) / 2;
-        content += `<path d="M ${from.x} ${from.y} C ${mx} ${from.y}, ${mx} ${to.y}, ${to.x} ${to.y}" fill="none" stroke="#a855f7" stroke-width="1.5" marker-end="url(#db-bld-arrow)"/>`;
+        content += `<path d="M ${from.x} ${from.y} C ${mx} ${from.y}, ${mx} ${to.y}, ${to.x} ${to.y}" fill="none" stroke="#06b6d4" stroke-width="1.5" marker-end="url(#db-bld-arrow)"/>`;
         // Clickable "X" label to remove the join.
-        content += `<g onclick="dbBldRemoveJoin(${i})" style="cursor:pointer;"><circle cx="${mx}" cy="${(from.y + to.y) / 2}" r="9" fill="#2a2538" stroke="#a855f7"/><text x="${mx}" y="${(from.y + to.y) / 2 + 4}" text-anchor="middle" font-size="11" fill="#ef4444"></text></g>`;
+        content += `<g onclick="dbBldRemoveJoin(${i})" style="cursor:pointer;"><circle cx="${mx}" cy="${(from.y + to.y) / 2}" r="9" fill="#2a2538" stroke="#06b6d4"/><text x="${mx}" y="${(from.y + to.y) / 2 + 4}" text-anchor="middle" font-size="11" fill="#ef4444"></text></g>`;
     }
     svg.innerHTML = content;
 }
@@ -52598,12 +52609,12 @@ function dbMgrRenderQueryTab(body) {
         const t = _dbQueryTabs[i];
         const isActive = i === _dbQueryActive;
         tabsHtml += `<div onclick="dbQuerySwitchTab(${i})" ondblclick="dbQueryRenameTab(${i})"
-            style="padding:5px 10px; cursor:pointer; display:flex; align-items:center; gap:6px; border-right:1px solid var(--border); background:${isActive ? 'var(--bg-card)' : 'transparent'}; font-size:12px; ${isActive ? 'border-bottom:2px solid var(--accent, #a855f7);' : ''}">
+            style="padding:5px 10px; cursor:pointer; display:flex; align-items:center; gap:6px; border-right:1px solid var(--border); background:${isActive ? 'var(--bg-card)' : 'transparent'}; font-size:12px; ${isActive ? 'border-bottom:2px solid var(--accent, #06b6d4);' : ''}">
             <span>${escapeHtml(t.title)}</span>
             <span onclick="dbQueryCloseTab(${i}, event)" style="color:var(--text-muted); font-size:11px; padding:0 2px;"></span>
         </div>`;
     }
-    tabsHtml += `<div onclick="dbQueryNewTab()" style="padding:5px 12px; cursor:pointer; font-size:12px; color:var(--accent, #a855f7);" title="New query tab">+</div>`;
+    tabsHtml += `<div onclick="dbQueryNewTab()" style="padding:5px 12px; cursor:pointer; font-size:12px; color:var(--accent, #06b6d4);" title="New query tab">+</div>`;
 
     body.innerHTML = `
         <div style="display:flex; border:1px solid var(--border); border-radius:6px 6px 0 0; overflow:auto; background:var(--bg-secondary); margin-bottom:0;">
@@ -52621,7 +52632,7 @@ function dbMgrRenderQueryTab(body) {
             <label style="font-size:13px; margin:0;">Timeout (s):
                 <input id="db-timeout" type="number" min="1" max="300" value="30" class="form-control" style="display:inline-block; width:90px; margin-left:6px;">
             </label>
-            <span id="db-schema-badge" title="This tab's working schema — snapshot when the tab was created. New tabs inherit the currently-selected tree schema; existing tabs stay with theirs so clicking around doesn't change their context. Click to rebind to the current tree selection." onclick="dbRebindTabSchema()" style="cursor:pointer; font-size:12px; padding:3px 8px; border-radius:5px; background:rgba(168,85,247,0.15); color:#c084fc; margin-left:auto;">${escapeHtml(active.schema || '(default)')}</span>
+            <span id="db-schema-badge" title="This tab's working schema — snapshot when the tab was created. New tabs inherit the currently-selected tree schema; existing tabs stay with theirs so clicking around doesn't change their context. Click to rebind to the current tree selection." onclick="dbRebindTabSchema()" style="cursor:pointer; font-size:12px; padding:3px 8px; border-radius:5px; background:rgba(6, 182, 212,0.15); color:#c084fc; margin-left:auto;">${escapeHtml(active.schema || '(default)')}</span>
             <span id="db-validate" style="font-size:12px; padding:3px 8px; border-radius:5px; background:var(--bg-tertiary); color:var(--text-muted);">type to validate…</span>
         </div>
         <div id="db-editor-wrap" style="position:relative; width:100%; height:${_dbEditorHeight || 260}px; min-height:120px;">
@@ -52796,7 +52807,7 @@ function dbHighlightSql() {
             while (j < src.length && /[A-Za-z0-9_]/.test(src[j])) j++;
             const word = src.slice(i, j);
             if (SQL_KEYWORDS.has(word.toUpperCase())) {
-                html += `<span style="color:#a855f7; font-weight:600;">${escapeHtml(word)}</span>`;
+                html += `<span style="color:#06b6d4; font-weight:600;">${escapeHtml(word)}</span>`;
             } else {
                 html += escapeHtml(word);
             }
@@ -52845,7 +52856,7 @@ async function dbRunValidate() {
         });
         const data = await resp.json();
         if (data.ok) {
-            const tierColor = data.tier === 'schema' ? '#a855f7'
+            const tierColor = data.tier === 'schema' ? '#06b6d4'
                 : data.tier === 'delete' ? '#ef4444'
                 : data.tier === 'update' ? '#eab308' : '#22c55e';
             badge.style.background = `${tierColor}22`;
@@ -53344,7 +53355,7 @@ function renderPredictiveInbox() {
                                 intended, not a bug.
                             </div>
                         </details>
-                        <details style="margin-top:8px;background:rgba(168,85,247,0.04);border:1px solid rgba(168,85,247,0.2);border-radius:8px;padding:0;margin-bottom:8px;">
+                        <details style="margin-top:8px;background:rgba(6, 182, 212,0.04);border:1px solid rgba(6, 182, 212,0.2);border-radius:8px;padding:0;margin-bottom:8px;">
                             <summary style="padding:10px 14px;cursor:pointer;font-size:12px;color:#c084fc;font-weight:600;">What's currently watched</summary>
                             <div style="padding:0 14px 12px 14px;font-size:12px;color:var(--text-secondary);line-height:1.55;">
                                 Every analyzer item from the original roadmap is live: host filesystem usage,
@@ -53976,7 +53987,7 @@ function predictiveRuntimeBadge(p) {
     const ft = p.finding_type || '';
     const rid = (p.scope && p.scope.resource_id) || '';
     if (ft.startsWith('docker_'))         return { label: 'DOCKER',   icon: '', color: '#06b6d4' };
-    if (ft.startsWith('lxc_'))            return { label: 'LXC',      icon: '', color: '#a855f7' };
+    if (ft.startsWith('lxc_'))            return { label: 'LXC',      icon: '', color: '#06b6d4' };
     if (ft === 'vm_disk_fill')            return { label: 'VM',       icon: '', color: '#f59e0b' };
     if (ft === 'cert_expiry_window')      return { label: 'CERT',     icon: '', color: '#10b981' };
     if (ft === 'backup_stale')            return { label: 'BACKUP',   icon: '', color: '#8b5cf6' };
@@ -54065,7 +54076,7 @@ function predictiveRowHtml(p) {
 /// it's now hidden behind a click on the compact row.
 function predictiveExpandedBody(p) {
     const sourceBadge = p.source === 'ai'
-        ? '<span style="background:rgba(168,85,247,0.18);color:#c084fc;padding:1px 7px;border-radius:4px;font-size:10px;font-weight:600;margin-left:6px;">AI</span>'
+        ? '<span style="background:rgba(6, 182, 212,0.18);color:#c084fc;padding:1px 7px;border-radius:4px;font-size:10px;font-weight:600;margin-left:6px;">AI</span>'
         : '';
     const runtime = predictiveRuntimeBadge(p);
     const evidence = (p.evidence || []).map(e => {

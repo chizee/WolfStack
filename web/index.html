@@ -16,7 +16,7 @@
     <meta name="description" content="WolfStack server management dashboard for the Wolf software suite">
     <link rel="icon" type="image/png" href="images/wolfstack-icon.png">
     <link rel="manifest" href="manifest.json">
-    <meta name="theme-color" content="#6366f1">
+    <meta name="theme-color" content="#3b82f6">
     <meta name="mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <link rel="apple-touch-icon" href="images/wolfstack-icon-192.png">
@@ -38,7 +38,7 @@
         @keyframes wolf-splash-fade-in { to { opacity: 1; } }
         #wolf-splash img {
             width: 220px; max-width: 60vw; height: auto;
-            filter: drop-shadow(0 8px 32px rgba(99, 102, 241, 0.35));
+            filter: drop-shadow(0 8px 32px rgba(59, 130, 246, 0.35));
             animation: wolf-splash-pulse 2s ease-in-out infinite;
         }
         #wolf-splash .wolf-splash-wordmark {
@@ -55,8 +55,8 @@
         #wolf-splash .wolf-splash-spinner {
             margin-top: 28px;
             width: 32px; height: 32px;
-            border: 3px solid rgba(99, 102, 241, 0.2);
-            border-top-color: #6366f1;
+            border: 3px solid rgba(59, 130, 246, 0.2);
+            border-top-color: #3b82f6;
             border-radius: 50%;
             animation: wolf-splash-spin 0.8s linear infinite;
         }
@@ -731,7 +731,7 @@
                                     style="display:flex; justify-content:space-between; align-items:center;">
                                     <h3>CPU History</h3>
                                     <span id="cpu-live-value" class="chart-live-value"
-                                        style="font-size:20px; font-weight:700; color:rgba(99,102,241,1); font-family:'JetBrains Mono',monospace;">—</span>
+                                        style="font-size:20px; font-weight:700; color:rgba(59, 130, 246,1); font-family:'JetBrains Mono',monospace;">—</span>
                                 </div>
                                 <div class="card-body" style="padding: 0; min-height: 200px; position: relative;">
                                     <canvas id="cpu-chart-canvas"
@@ -1095,7 +1095,7 @@
             </div>
 
             <!-- ═══ Brute-force lockout management ═══ -->
-            <div class="card" style="margin-bottom:24px; border:1px solid rgba(99,102,241,0.30);">
+            <div class="card" style="margin-bottom:24px; border:1px solid rgba(59, 130, 246,0.30);">
                 <div class="card-header" style="display:flex; align-items:center; justify-content:space-between;">
                     <div>
                         <h3 style="margin:0;">Brute-force lockout</h3>
@@ -1148,7 +1148,7 @@
             </div>
 
             <!-- Emergency response moved to the Fleet Security page (sidebar → Apps & Tools → Fleet Security). Per-node Security page now focuses on per-node concerns only. -->
-            <div style="margin-bottom:20px; padding:10px 14px; background:rgba(99,102,241,0.08); border:1px solid rgba(99,102,241,0.25); border-radius:8px; font-size:13px; color:var(--text-secondary);">
+            <div style="margin-bottom:20px; padding:10px 14px; background:rgba(59, 130, 246,0.08); border:1px solid rgba(59, 130, 246,0.25); border-radius:8px; font-size:13px; color:var(--text-secondary);">
                 Fleet-wide operations (rotate root passwords on every node, push lockout policy, view blocked IPs across the cluster, force-logout everyone) are now on the
                 <a href="#" onclick="selectView('fleet-security'); return false;" style="color:var(--accent-light); font-weight:600;">Fleet Security page</a>.
             </div>
@@ -1335,12 +1335,12 @@
         <div id="page-wolfrun" class="page-view" style="display:none;">
             <!-- Header -->
             <div class="card"
-                style="margin-bottom:20px; background:linear-gradient(135deg, rgba(16,185,129,0.12), rgba(99,102,241,0.08)); border-color:rgba(16,185,129,0.25);">
+                style="margin-bottom:20px; background:linear-gradient(135deg, rgba(16,185,129,0.12), rgba(59, 130, 246,0.08)); border-color:rgba(16,185,129,0.25);">
                 <div class="card-body"
                     style="display:flex; align-items:center; justify-content:space-between; padding:28px 32px; flex-wrap:wrap; gap:16px;">
                     <div style="display:flex; align-items:center; gap:20px;">
                         <div
-                            style="width:64px; height:64px; background:linear-gradient(135deg,#10b981,#6366f1); border-radius:16px; display:flex; align-items:center; justify-content:center; font-size:32px; box-shadow:0 4px 20px rgba(16,185,129,0.3);">
+                            style="width:64px; height:64px; background:linear-gradient(135deg,#10b981,#3b82f6); border-radius:16px; display:flex; align-items:center; justify-content:center; font-size:32px; box-shadow:0 4px 20px rgba(16,185,129,0.3);">
                             <span class="ws-icon-clean-wrap" data-icon="runner"></span></div>
                         <div>
                             <h2 style="font-size:24px; margin-bottom:4px; color:var(--text-primary); font-weight:700;">
@@ -1367,7 +1367,7 @@
                 <div class="stat-card">
                     <div class="stat-header">
                         <span class="stat-label">Services</span>
-                        <div class="stat-icon" style="background:rgba(99,102,241,0.15); color:#6366f1;"><span class="ws-icon-clean-wrap" data-icon="clipboard"></span></div>
+                        <div class="stat-icon" style="background:rgba(59, 130, 246,0.15); color:#3b82f6;"><span class="ws-icon-clean-wrap" data-icon="clipboard"></span></div>
                     </div>
                     <div class="stat-value" id="wolfrun-stat-services">0</div>
                 </div>
@@ -1450,7 +1450,7 @@
 
             <!-- What is WolfRun? -->
             <div class="card"
-                style="margin-bottom:20px; background:linear-gradient(135deg, rgba(99,102,241,0.06), rgba(16,185,129,0.04)); border-color:rgba(99,102,241,0.15);">
+                style="margin-bottom:20px; background:linear-gradient(135deg, rgba(59, 130, 246,0.06), rgba(16,185,129,0.04)); border-color:rgba(59, 130, 246,0.15);">
                 <div class="card-body" style="padding:28px 32px;">
                     <div style="display:flex; align-items:flex-start; gap:20px; flex-wrap:wrap;">
                         <div style="font-size:40px; line-height:1;"></div>
@@ -1475,7 +1475,7 @@
                                 <div
                                     style="display:flex; align-items:center; gap:8px; font-size:13px; color:var(--text-secondary);">
                                     <span
-                                        style="width:24px; height:24px; border-radius:6px; background:rgba(99,102,241,0.15); display:flex; align-items:center; justify-content:center; font-size:12px; flex-shrink:0;"><span class="ws-icon-clean-wrap" data-icon="chart"></span></span>
+                                        style="width:24px; height:24px; border-radius:6px; background:rgba(59, 130, 246,0.15); display:flex; align-items:center; justify-content:center; font-size:12px; flex-shrink:0;"><span class="ws-icon-clean-wrap" data-icon="chart"></span></span>
                                     <span><strong>Scheduling</strong> — spreads load across nodes</span>
                                 </div>
                                 <div
@@ -1691,7 +1691,7 @@
                 </div>
                 <div class="modal-body">
                     <p style="font-size:13px; color:var(--text-secondary); margin:0 0 12px;">
-                        Forward external traffic to Service VIP <code id="wolfrun-pf-vip" style="color:#818cf8;"></code>
+                        Forward external traffic to Service VIP <code id="wolfrun-pf-vip" style="color:#60a5fa;"></code>
                     </p>
 
                     <div id="wolfrun-pf-existing" style="margin-bottom:16px;">
@@ -2027,10 +2027,10 @@
 
         <!-- ═══ WolfAgents Page ═══ -->
         <div id="page-wolfagents" class="page-view" style="display:none;">
-            <div class="card" style="margin-bottom:16px; background:linear-gradient(135deg, rgba(168,85,247,0.12), rgba(99,102,241,0.08)); border-color:rgba(168,85,247,0.25);">
+            <div class="card" style="margin-bottom:16px; background:linear-gradient(135deg, rgba(6, 182, 212,0.12), rgba(59, 130, 246,0.08)); border-color:rgba(6, 182, 212,0.25);">
                 <div class="card-body" style="display:flex; align-items:center; justify-content:space-between; padding:28px 32px; flex-wrap:wrap; gap:16px;">
                     <div style="display:flex; align-items:center; gap:20px;">
-                        <div style="width:64px; height:64px; background:linear-gradient(135deg,#a855f7,#6366f1); border-radius:16px; display:flex; align-items:center; justify-content:center; font-size:32px; box-shadow:0 4px 20px rgba(168,85,247,0.3);"></div>
+                        <div style="width:64px; height:64px; background:linear-gradient(135deg,#06b6d4,#3b82f6); border-radius:16px; display:flex; align-items:center; justify-content:center; font-size:32px; box-shadow:0 4px 20px rgba(6, 182, 212,0.3);"></div>
                         <div>
                             <h2 style="font-size:24px; margin-bottom:4px; color:var(--text-primary); font-weight:700;">WolfAgents</h2>
                             <p style="color:var(--text-secondary); font-size:13px; margin:0;">Named AI agents with persistent memory. Each agent has its own system prompt, model, and conversation that survives restarts.</p>
@@ -2066,7 +2066,7 @@
                     </div>
                 </div>
                 <div style="display:flex; gap:4px; padding:6px 16px 0; border-bottom:1px solid var(--border);">
-                    <button id="wolfagents-tab-chat" class="btn btn-sm" onclick="wolfAgentsShowTab('chat')" style="border-bottom:2px solid var(--accent-primary,#6366f1);"><span class="ws-icon-clean-wrap" data-icon="chat"></span> Chat</button>
+                    <button id="wolfagents-tab-chat" class="btn btn-sm" onclick="wolfAgentsShowTab('chat')" style="border-bottom:2px solid var(--accent-primary,#3b82f6);"><span class="ws-icon-clean-wrap" data-icon="chat"></span> Chat</button>
                     <button id="wolfagents-tab-pending" class="btn btn-sm" onclick="wolfAgentsShowTab('pending')" style="position:relative;">
                         ⏳ Pending
                         <span id="wolfagents-tab-pending-badge" style="display:none; position:absolute; top:-4px; right:-4px; background:#ef4444; color:#fff; font-size:10px; font-weight:700; padding:1px 6px; border-radius:10px;">0</span>
@@ -2110,7 +2110,7 @@
                         <div>
                             <label style="font-size:12px; color:var(--text-muted);">Avatar</label>
                             <div style="display:flex; align-items:center; gap:14px; margin-top:4px;">
-                                <img id="wolfagents-field-avatar-preview" src="/images/agent-avatars/wolf-grey.svg" width="56" height="56" style="width:56px; height:56px; border-radius:12px; object-fit:cover; background:linear-gradient(135deg,#a855f7,#6366f1); flex-shrink:0;">
+                                <img id="wolfagents-field-avatar-preview" src="/images/agent-avatars/wolf-grey.svg" width="56" height="56" style="width:56px; height:56px; border-radius:12px; object-fit:cover; background:linear-gradient(135deg,#06b6d4,#3b82f6); flex-shrink:0;">
                                 <div id="wolfagents-field-avatar-picker" style="display:flex; flex-wrap:wrap; gap:6px; flex:1;"></div>
                             </div>
                             <div style="display:flex; align-items:center; gap:10px; margin-top:8px;">
@@ -2462,7 +2462,7 @@
                     <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
                         <span id="issues-ai-badge"
                             style="display:none; padding:4px 10px; border-radius:6px; font-size:11px; font-weight:600;
-                            background:rgba(99,102,241,0.15); color:rgba(129,140,248,1); border:1px solid rgba(99,102,241,0.3);">
+                            background:rgba(59, 130, 246,0.15); color:rgba(96, 165, 250,1); border:1px solid rgba(59, 130, 246,0.3);">
                             <span class="ws-icon-clean-wrap" data-icon="robot"></span> AI Enhanced</span>
                         <div
                             style="display:flex; align-items:center; gap:6px; background:var(--bg-input); border:1px solid var(--border); border-radius:8px; padding:4px 10px;">
@@ -2547,7 +2547,7 @@
 
             <!-- AI Analysis (populated after scan) -->
             <div id="issues-ai-section" style="display:none; margin-top:20px;">
-                <div class="card" style="border-color:rgba(99,102,241,0.3);">
+                <div class="card" style="border-color:rgba(59, 130, 246,0.3);">
                     <div class="card-header">
                         <h3>AI Analysis</h3>
                     </div>
@@ -2617,7 +2617,7 @@
                 <div class="stat-card">
                     <div class="stat-header">
                         <span class="stat-label">Docker</span>
-                        <div class="stat-icon" style="background:rgba(99,102,241,0.15); color:#6366f1;"><span class="ws-icon-clean-wrap" data-icon="docker"></span></div>
+                        <div class="stat-icon" style="background:rgba(59, 130, 246,0.15); color:#3b82f6;"><span class="ws-icon-clean-wrap" data-icon="docker"></span></div>
                     </div>
                     <div class="stat-value" id="gwn-count-docker">0</div>
                 </div>
@@ -3474,12 +3474,12 @@
         <div id="page-cluster-backups" class="page-view" style="display:none;">
             <!-- Header -->
             <div class="card"
-                style="margin-bottom:20px; background:linear-gradient(135deg, rgba(99,102,241,0.12), rgba(16,185,129,0.08)); border-color:rgba(99,102,241,0.25);">
+                style="margin-bottom:20px; background:linear-gradient(135deg, rgba(59, 130, 246,0.12), rgba(16,185,129,0.08)); border-color:rgba(59, 130, 246,0.25);">
                 <div class="card-body"
                     style="display:flex; align-items:center; justify-content:space-between; padding:28px 32px; flex-wrap:wrap; gap:16px;">
                     <div style="display:flex; align-items:center; gap:20px;">
                         <div
-                            style="width:64px; height:64px; background:linear-gradient(135deg,#6366f1,#10b981); border-radius:16px; display:flex; align-items:center; justify-content:center; font-size:32px; box-shadow:0 4px 20px rgba(99,102,241,0.3);">
+                            style="width:64px; height:64px; background:linear-gradient(135deg,#3b82f6,#10b981); border-radius:16px; display:flex; align-items:center; justify-content:center; font-size:32px; box-shadow:0 4px 20px rgba(59, 130, 246,0.3);">
                             <span class="ws-icon-clean-wrap" data-icon="save"></span></div>
                         <div>
                             <h2 style="font-size:24px; margin-bottom:4px; color:var(--text-primary); font-weight:700;">
@@ -3501,7 +3501,7 @@
                 <div class="stat-card">
                     <div class="stat-header">
                         <span class="stat-label">Total Backups</span>
-                        <div class="stat-icon" style="background:rgba(99,102,241,0.15); color:#6366f1;"><span class="ws-icon-clean-wrap" data-icon="save"></span></div>
+                        <div class="stat-icon" style="background:rgba(59, 130, 246,0.15); color:#3b82f6;"><span class="ws-icon-clean-wrap" data-icon="save"></span></div>
                     </div>
                     <div class="stat-value" id="cb-stat-backups">0</div>
                 </div>
@@ -3625,7 +3625,7 @@
                     <div style="margin-bottom:16px;">
                         <label style="font-size:13px; font-weight:600; color:var(--text-primary); display:block; margin-bottom:8px;">What to Back Up</label>
                         <div style="display:flex; gap:10px; margin-bottom:12px;">
-                            <label style="display:flex; align-items:center; gap:6px; padding:8px 16px; background:var(--bg-input); border:2px solid var(--primary-color, #6366f1); border-radius:var(--radius-sm); cursor:pointer; font-size:13px; font-weight:500;"
+                            <label style="display:flex; align-items:center; gap:6px; padding:8px 16px; background:var(--bg-input); border:2px solid var(--primary-color, #3b82f6); border-radius:var(--radius-sm); cursor:pointer; font-size:13px; font-weight:500;"
                                 id="cb-scope-all-label">
                                 <input type="radio" name="cb-schedule-scope" value="all" checked onchange="toggleClusterScheduleScope('all')"> Everything on each node
                             </label>
@@ -3813,6 +3813,28 @@
 
         <!-- ═══ Certificates Page ═══ -->
         <div id="page-certificates" class="page-view" style="display:none;">
+            <!--
+                v23.12.4 — surface the cluster-wide cert manager from
+                the top-level Certificates page so operators can find
+                it without drilling through WolfProxy → SSL Certificates.
+                Reddit / Discord users 2026-05-17 reported they couldn't
+                see the new manager because the only existing link was
+                buried under the WolfProxy configurator.
+            -->
+            <div class="card" style="margin-bottom:14px;">
+                <div class="card-body" style="display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap;">
+                    <div>
+                        <strong style="font-size:14px;">SSL Certificate Manager</strong>
+                        <div style="color:var(--text-muted);font-size:12px;margin-top:2px;">
+                            Manage every Let's Encrypt cert across every node in the cluster from one screen.
+                            Issue, renew, delete, and monitor expiry — keys stay on the node that owns them.
+                        </div>
+                    </div>
+                    <button class="btn btn-primary" onclick="openClusterCertManager()" style="white-space:nowrap;">
+                        Open Cert Manager
+                    </button>
+                </div>
+            </div>
             <div class="card">
                 <div class="card-header">
                     <h3>Let's Encrypt (Certbot)</h3>
@@ -4257,7 +4279,7 @@
                 </div>
                 <div class="modal-body" style="padding:0;">
                     <div style="display:flex; border-bottom:1px solid var(--border);">
-                        <button id="compose-tab-yaml" class="btn btn-sm" onclick="switchComposeTab('yaml')" style="border-radius:0; border-bottom:2px solid var(--primary-color, #6366f1); font-weight:600;">docker-compose.yml</button>
+                        <button id="compose-tab-yaml" class="btn btn-sm" onclick="switchComposeTab('yaml')" style="border-radius:0; border-bottom:2px solid var(--primary-color, #3b82f6); font-weight:600;">docker-compose.yml</button>
                         <button id="compose-tab-env" class="btn btn-sm" onclick="switchComposeTab('env')" style="border-radius:0; opacity:0.6;">.env</button>
                     </div>
                     <div id="compose-tab-yaml-content">
@@ -6160,7 +6182,7 @@ dns_cloudflare_api_token = your_token_here"
                                 </div>
                                 <div style="min-width:160px;">
                                     <label style="font-size:12px;font-weight:600;display:block;margin-bottom:4px;">Color</label>
-                                    <input id="wolfnote-new-folder-color" class="form-control" type="color" value="#6366f1" style="width:100%;height:34px;">
+                                    <input id="wolfnote-new-folder-color" class="form-control" type="color" value="#3b82f6" style="width:100%;height:34px;">
                                 </div>
                                 <button class="btn btn-primary" onclick="wolfnoteCreateFolder()" style="white-space:nowrap;">Create Folder</button>
                             </div>
@@ -7108,7 +7130,7 @@ dns_cloudflare_api_token = your_token_here"
             <div class="card" style="margin-bottom:16px;">
                 <div class="card-header" style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
                     <h3 style="display:flex; align-items:center; gap:8px;">WolfRouter
-                        <span class="badge" style="background:rgba(168,85,247,0.15); color:#a855f7; font-size:10px; padding:2px 8px; border-radius:10px;">beta</span>
+                        <span class="badge" style="background:rgba(6, 182, 212,0.15); color:#06b6d4; font-size:10px; padding:2px 8px; border-radius:10px;">beta</span>
                         <span style="font-size:11px; color:var(--text-muted); font-weight:normal;">Cluster-wide firewall, DHCP, DNS</span>
                     </h3>
                     <div style="display:flex; gap:6px;">
@@ -7268,7 +7290,7 @@ dns_cloudflare_api_token = your_token_here"
                             <label style="display:flex; gap:4px; align-items:center; cursor:pointer;"><input type="checkbox" data-wr-filter="deny" checked/> <span style="color:#ef4444;">● Deny</span></label>
                             <label style="display:flex; gap:4px; align-items:center; cursor:pointer;"><input type="checkbox" data-wr-filter="reject" checked/> <span style="color:#f97316;">● Reject</span></label>
                             <label style="display:flex; gap:4px; align-items:center; cursor:pointer;"><input type="checkbox" data-wr-filter="log" checked/> <span style="color:#60a5fa;">● Log</span></label>
-                            <label style="display:flex; gap:4px; align-items:center; cursor:pointer;"><input type="checkbox" data-wr-filter="dnat" checked/> <span style="color:#a855f7;">● DNAT</span></label>
+                            <label style="display:flex; gap:4px; align-items:center; cursor:pointer;"><input type="checkbox" data-wr-filter="dnat" checked/> <span style="color:#06b6d4;">● DNAT</span></label>
                             <label style="display:flex; gap:4px; align-items:center; cursor:pointer; color:var(--text-muted);"><input type="checkbox" data-wr-filter="disabled"/> Show disabled</label>
                             <label style="display:flex; gap:4px; align-items:center; color:var(--text-muted);">Node:
                                 <select id="wr-policy-node-select" style="background:var(--bg-input); border:1px solid var(--border); color:var(--text); padding:4px 6px; border-radius:4px; font-size:12px; min-width:120px;"><option value="">All cluster nodes</option></select>
@@ -7285,8 +7307,8 @@ dns_cloudflare_api_token = your_token_here"
                         <!-- Traffic simulator — pick src/dst + proto + port, walk the
                              rule list in order, show which rule matched and the
                              final verdict with an animated packet path. -->
-                        <div id="wr-policy-sim" style="display:flex; gap:8px; align-items:center; margin-bottom:8px; padding:8px 12px; background:rgba(168,85,247,0.05); border:1px solid rgba(168,85,247,0.25); border-radius:6px; font-size:12px; flex-wrap:wrap;">
-                            <span style="color:#a855f7; font-weight:600;"><span class="ws-icon-clean-wrap" data-icon="satellite"></span> Traffic simulator</span>
+                        <div id="wr-policy-sim" style="display:flex; gap:8px; align-items:center; margin-bottom:8px; padding:8px 12px; background:rgba(6, 182, 212,0.05); border:1px solid rgba(6, 182, 212,0.25); border-radius:6px; font-size:12px; flex-wrap:wrap;">
+                            <span style="color:#06b6d4; font-weight:600;"><span class="ws-icon-clean-wrap" data-icon="satellite"></span> Traffic simulator</span>
                             <select id="wr-sim-from" style="background:var(--bg-input); border:1px solid var(--border); color:var(--text); padding:4px 6px; border-radius:4px; font-size:12px; min-width:140px;"></select>
                             <span style="color:var(--text-muted);">→</span>
                             <select id="wr-sim-to" style="background:var(--bg-input); border:1px solid var(--border); color:var(--text); padding:4px 6px; border-radius:4px; font-size:12px; min-width:140px;"></select>
@@ -7294,7 +7316,7 @@ dns_cloudflare_api_token = your_token_here"
                                 <option value="any">any</option><option value="tcp" selected>TCP</option><option value="udp">UDP</option><option value="icmp">ICMP</option>
                             </select>
                             <input type="text" id="wr-sim-port" placeholder="port" style="width:70px; background:var(--bg-input); border:1px solid var(--border); color:var(--text); padding:4px 6px; border-radius:4px; font-size:12px;"/>
-                            <button id="wr-sim-go" style="background:#a855f7; border:none; color:#fff; padding:5px 12px; border-radius:4px; cursor:pointer; font-weight:600; font-size:12px;">Simulate ▶</button>
+                            <button id="wr-sim-go" style="background:#06b6d4; border:none; color:#fff; padding:5px 12px; border-radius:4px; cursor:pointer; font-weight:600; font-size:12px;">Simulate ▶</button>
                             <div id="wr-sim-result" style="flex:1; min-width:200px; color:var(--text-muted); font-family:var(--font-mono,monospace); font-size:11px;"></div>
                         </div>
                         <!-- Per-cluster-node throughput strip — at a glance which
