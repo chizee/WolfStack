@@ -34602,8 +34602,37 @@ async function dnsProviderShowUpdateForm(id) {
 async function dnsProviderShowTestPrompt(id) {
     var provider = dnsProvidersCache.find(function (p) { return p.id === id; });
     if (!provider) return;
+
+    // The test calls Let's Encrypt staging, which requires a contact
+    // email to register the staging-CA account. Pre-fetch the saved
+    // CertbotConfig so the operator doesn't have to retype it; if no
+    // default email is saved, bounce them into Certbot Settings to set
+    // one rather than letting the backend bubble up certbot's
+    // inscrutable "an email address is required" error with no place
+    // for them to fix it. (PapaSchlumpf, 2026-05-17.)
+    var savedEmail = '';
+    try {
+        var cfgResp = await fetch('/api/certs');
+        if (cfgResp.ok) {
+            var cfgData = await cfgResp.json();
+            savedEmail = ((cfgData && cfgData.config && cfgData.config.email) || '').trim();
+        }
+    } catch (_) { /* network blip \u2014 handled below by the empty-email branch */ }
+
+    if (!savedEmail) {
+        var openSettings = await wolfConfirm(
+            'Let\'s Encrypt needs a contact email to register the staging-CA account, ' +
+            'and no default email is saved yet.\n\n' +
+            'Open Certbot Settings to add one?',
+            'Email required'
+        );
+        if (openSettings) certConfigDialog();
+        return;
+    }
+
     var domain = await showPrompt(
         'Enter a domain to use for the staging-CA dry-run (e.g. example.com).\n\n' +
+        'Using saved contact email: ' + savedEmail + '\n' +
         'This calls Let\'s Encrypt staging \u2014 no production rate limits consumed.',
         'Test DNS Provider'
     );
@@ -34614,7 +34643,7 @@ async function dnsProviderShowTestPrompt(id) {
         var resp = await fetch('/api/dns-providers/' + encodeURIComponent(id) + '/test', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ domain: domain.trim() })
+            body: JSON.stringify({ domain: domain.trim(), email: savedEmail })
         });
         var data = await resp.json();
         if (resp.ok) {
