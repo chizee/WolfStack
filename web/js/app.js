@@ -15996,11 +15996,166 @@ async function fleetLoadBlockedIps() {
                 <td style="padding:6px 10px; font-size:11px;">${x.nodes.map(n => vlanEsc(n.hostname)).join(', ')} <span style="color:var(--text-muted);">(${x.nodes.length}/${sourceTotal})</span></td>
                 <td style="padding:6px 10px; color:#fbbf24;">${fmtTime(x.max_remaining)}</td>
                 <td style="padding:6px 10px; color:var(--text-muted); font-size:11px;">${vlanEsc(x.last_username || '—')}</td>
-                <td style="padding:6px 10px;"><button class="btn btn-sm" onclick="fleetUnblockIp('${vlanEsc(x.ip)}')" style="font-size:11px;">Unblock everywhere</button></td>
+                <td style="padding:6px 10px; white-space:nowrap;">
+                    <button class="btn btn-sm" onclick="abuseReportOpen('${vlanEsc(x.ip)}')" style="font-size:11px; margin-right:4px;" title="Compose an abuse report to the IP owner via whois">📮 Report abuse</button>
+                    <button class="btn btn-sm" onclick="fleetUnblockIp('${vlanEsc(x.ip)}')" style="font-size:11px;">Unblock everywhere</button>
+                </td>
             </tr>`).join('')}</tbody>
         </table>
         ${recentHtml}`;
 }
+
+// ─── Abuse-report composer modal ──────────────────────────────────
+//
+// One modal shared by every "Report abuse" button in the Fleet
+// Security page. Loads /preview on open, lets the operator edit
+// the recipient / subject / body, then POSTs to /send. 7-day
+// cool-down per IP — the modal shows the time remaining and offers
+// an override checkbox for repeat offenders.
+
+let _abuseReportCurrentIp = null;
+
+async function abuseReportOpen(ip) {
+    _abuseReportCurrentIp = ip;
+    const m = document.getElementById('abuse-report-modal');
+    if (!m) return;
+    m.style.display = 'flex';
+    document.getElementById('abuse-report-modal-subtitle').textContent = `Loading whois + evidence for ${ip}…`;
+    document.getElementById('abuse-report-whois').innerHTML = '<span style="color:var(--text-muted);">Looking up whois…</span>';
+    document.getElementById('abuse-report-to').value = '';
+    document.getElementById('abuse-report-subject').value = '';
+    document.getElementById('abuse-report-body').value = '';
+    document.getElementById('abuse-report-cooldown-warning').style.display = 'none';
+    document.getElementById('abuse-report-override-cooldown').checked = false;
+    document.getElementById('abuse-report-status').textContent = '';
+
+    let data;
+    try {
+        const r = await fetch(apiUrl(`/api/security/abuse-report/preview?ip=${encodeURIComponent(ip)}`));
+        if (!r.ok) {
+            const e = await r.json().catch(() => ({}));
+            document.getElementById('abuse-report-whois').innerHTML = `<span style="color:#ef4444;">Failed to load preview: ${vlanEsc(e.error || ('HTTP ' + r.status))}</span>`;
+            return;
+        }
+        data = await r.json();
+    } catch (e) {
+        document.getElementById('abuse-report-whois').innerHTML = `<span style="color:#ef4444;">Error: ${vlanEsc(e.message || e)}</span>`;
+        return;
+    }
+
+    const w = data.whois || {};
+    const ev = data.evidence || [];
+    const draft = data.draft || {};
+    const last = data.last_report;
+    const cooldown = data.cooldown_remaining_secs || 0;
+
+    // Render whois summary.
+    const whoisHtml = `
+        <div style="display:grid; grid-template-columns:max-content 1fr; gap:4px 14px; font-size:12px;">
+            <span style="color:var(--text-muted);">Target IP:</span><strong style="font-family:var(--font-mono);">${vlanEsc(ip)}</strong>
+            ${w.abuse_email ? `<span style="color:var(--text-muted);">Abuse contact:</span><span style="font-family:var(--font-mono); color:#22c55e;">${vlanEsc(w.abuse_email)}</span>` : `<span style="color:var(--text-muted);">Abuse contact:</span><span style="color:#ef4444;">none published in whois — set recipient manually</span>`}
+            ${w.org ? `<span style="color:var(--text-muted);">Owner:</span><span>${vlanEsc(w.org)}</span>` : ''}
+            ${w.net_range ? `<span style="color:var(--text-muted);">Net range:</span><span style="font-family:var(--font-mono);">${vlanEsc(w.net_range)}</span>` : ''}
+            ${w.asn ? `<span style="color:var(--text-muted);">ASN:</span><span style="font-family:var(--font-mono);">${vlanEsc(w.asn)}</span>` : ''}
+            ${w.country ? `<span style="color:var(--text-muted);">Country:</span><span>${vlanEsc(w.country)}</span>` : ''}
+            <span style="color:var(--text-muted);">Evidence lines:</span><span>${ev.length} failed-auth attempt${ev.length === 1 ? '' : 's'} in audit log</span>
+        </div>
+    `;
+    document.getElementById('abuse-report-whois').innerHTML = whoisHtml;
+
+    // Cool-down warning if applicable.
+    if (cooldown > 0 && last) {
+        const days = Math.ceil(cooldown / 86400);
+        const lastDate = last.sent_at ? last.sent_at.slice(0, 19) : 'unknown';
+        document.getElementById('abuse-report-cooldown-warning').style.display = 'block';
+        document.getElementById('abuse-report-cooldown-warning').innerHTML = `⚠ This IP was reported ${vlanEsc(lastDate)} to <strong>${vlanEsc(last.recipient || '?')}</strong>. Cool-down ~${days} day${days === 1 ? '' : 's'} remaining. Tick the override box below to send again.`;
+    } else if (last) {
+        // Reported before but cool-down expired — informational only.
+        const lastDate = last.sent_at ? last.sent_at.slice(0, 19) : 'unknown';
+        document.getElementById('abuse-report-cooldown-warning').style.display = 'block';
+        document.getElementById('abuse-report-cooldown-warning').style.background = 'rgba(34,197,94,0.06)';
+        document.getElementById('abuse-report-cooldown-warning').style.borderColor = 'rgba(34,197,94,0.3)';
+        document.getElementById('abuse-report-cooldown-warning').style.color = '#22c55e';
+        document.getElementById('abuse-report-cooldown-warning').innerHTML = `✓ Previously reported on ${vlanEsc(lastDate)} (cool-down expired — safe to send again).`;
+    }
+
+    // Pre-fill the editable fields.
+    document.getElementById('abuse-report-to').value = draft.to || '';
+    document.getElementById('abuse-report-subject').value = draft.subject || '';
+    document.getElementById('abuse-report-body').value = draft.body || '';
+    document.getElementById('abuse-report-modal-subtitle').textContent = ev.length > 0
+        ? `${ev.length} evidence line${ev.length === 1 ? '' : 's'} pre-filled in the body. Review and Send.`
+        : 'No audit-log evidence for this IP — reporting on operator authority alone.';
+
+    // Stash the evidence count so the send endpoint can record it.
+    document.getElementById('abuse-report-modal').dataset.evidenceCount = String(ev.length);
+}
+
+function abuseReportClose() {
+    const m = document.getElementById('abuse-report-modal');
+    if (m) m.style.display = 'none';
+    _abuseReportCurrentIp = null;
+}
+
+async function abuseReportSend() {
+    const ip = _abuseReportCurrentIp;
+    if (!ip) return;
+    const to = document.getElementById('abuse-report-to').value.trim();
+    const subject = document.getElementById('abuse-report-subject').value.trim();
+    const body = document.getElementById('abuse-report-body').value;
+    const override = document.getElementById('abuse-report-override-cooldown').checked;
+    const evidenceCount = parseInt(document.getElementById('abuse-report-modal').dataset.evidenceCount || '0', 10);
+
+    if (!to || !subject || !body.trim()) {
+        showToast('Recipient, subject and body are all required', 'error');
+        return;
+    }
+    if (!await wolfConfirm(
+        `Send abuse report for ${ip} to ${to}?\n\nThe email goes via your configured SMTP (Settings → AI Alerting). The recipient gets the editable body shown above. This is logged in /etc/wolfstack/abuse-reports.json.`,
+        'Send abuse report'
+    )) return;
+
+    const btn = document.getElementById('abuse-report-send-btn');
+    const status = document.getElementById('abuse-report-status');
+    if (btn) { btn.disabled = true; btn.style.opacity = '0.6'; }
+    if (status) status.textContent = 'Sending…';
+
+    try {
+        const r = await fetch(apiUrl('/api/security/abuse-report/send'), {
+            method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({
+                ip, to, subject, body,
+                override_cooldown: override,
+                evidence_count: evidenceCount,
+            }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (r.status === 409) {
+            if (status) status.textContent = '';
+            showToast(`Cool-down active — tick the override box to send anyway. ${d.error || ''}`, 'warning');
+            return;
+        }
+        if (!r.ok) {
+            if (status) status.textContent = '';
+            showToast(`Send failed: ${d.error || ('HTTP ' + r.status)}`, 'error');
+            return;
+        }
+        if (status) status.textContent = '✓ Sent';
+        showToast(`Abuse report sent to ${to}`, 'success');
+        // Brief delay so the user sees the success message, then close.
+        setTimeout(() => abuseReportClose(), 1200);
+        // Re-render the lockouts table so the "last reported" timestamps refresh.
+        if (typeof fleetLoadBlockedIps === 'function') fleetLoadBlockedIps();
+    } catch (e) {
+        showToast(`Send failed: ${e.message || e}`, 'error');
+    } finally {
+        if (btn) { btn.disabled = false; btn.style.opacity = '1'; }
+    }
+}
+
+window.abuseReportOpen = abuseReportOpen;
+window.abuseReportClose = abuseReportClose;
+window.abuseReportSend = abuseReportSend;
 
 async function fleetUnblockIp(ip) {
     if (!await wolfConfirm(`Unblock ${ip} on EVERY node in the cluster?`, 'Fleet unblock')) return;

@@ -72,6 +72,7 @@ mod threat_intel;
 mod security_audit;
 mod scan_detector;
 mod antivirus;
+mod abuse_report;
 #[allow(dead_code)]
 mod integrations;
 

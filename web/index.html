@@ -1033,6 +1033,51 @@
                 </div>
             </div>
 
+            <!-- Abuse-report composer modal — shared by the Fleet
+                 Security blocked-IPs table. Opened by abuseReportOpen(ip).
+                 Pre-fills with whois + audit evidence + an editable
+                 RFC-style email body. Operator can edit before send. -->
+            <div id="abuse-report-modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.7); z-index:2010; align-items:center; justify-content:center; padding:20px;">
+                <div style="background:var(--bg-secondary); border:1px solid var(--border); border-radius:10px; width:min(820px, 100%); max-height:90vh; display:flex; flex-direction:column; box-shadow:0 20px 60px rgba(0,0,0,0.5);">
+                    <div style="padding:14px 18px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:center;">
+                        <div>
+                            <div style="font-size:15px; font-weight:700;">📮 Abuse report</div>
+                            <div id="abuse-report-modal-subtitle" style="font-size:12px; color:var(--text-muted); margin-top:2px;">Loading whois + evidence…</div>
+                        </div>
+                        <button class="btn btn-sm" onclick="abuseReportClose()">✕ Close</button>
+                    </div>
+                    <div style="padding:14px 18px; overflow-y:auto; flex:1;">
+                        <div id="abuse-report-whois" style="margin-bottom:14px; padding:10px 12px; background:var(--bg-input); border:1px solid var(--border); border-radius:6px; font-size:12px; line-height:1.55;">
+                            <span style="color:var(--text-muted);">whois…</span>
+                        </div>
+                        <div id="abuse-report-cooldown-warning" style="display:none; margin-bottom:12px; padding:8px 12px; background:rgba(251,191,36,0.1); border:1px solid rgba(251,191,36,0.4); border-radius:6px; font-size:12px; color:#fbbf24;"></div>
+                        <div style="display:grid; gap:10px;">
+                            <div class="form-group" style="margin:0;">
+                                <label style="font-size:12px;">Recipient (whois abuse contact — editable)</label>
+                                <input type="email" class="form-control" id="abuse-report-to" placeholder="abuse@example.com" style="font-family:var(--font-mono); font-size:13px;">
+                            </div>
+                            <div class="form-group" style="margin:0;">
+                                <label style="font-size:12px;">Subject</label>
+                                <input type="text" class="form-control" id="abuse-report-subject" style="font-size:13px;">
+                            </div>
+                            <div class="form-group" style="margin:0;">
+                                <label style="font-size:12px;">Body (review &amp; edit before sending)</label>
+                                <textarea class="form-control" id="abuse-report-body" rows="14" style="font-family:var(--font-mono); font-size:12px; resize:vertical;"></textarea>
+                            </div>
+                        </div>
+                    </div>
+                    <div style="padding:12px 18px; border-top:1px solid var(--border); display:flex; gap:8px; align-items:center; justify-content:flex-end;">
+                        <label style="font-size:11px; color:var(--text-muted); display:flex; align-items:center; gap:6px;">
+                            <input type="checkbox" id="abuse-report-override-cooldown"> Override 7-day cool-down
+                        </label>
+                        <span style="flex:1;"></span>
+                        <span id="abuse-report-status" style="font-size:11px; color:var(--text-muted);"></span>
+                        <button class="btn" onclick="abuseReportClose()">Cancel</button>
+                        <button class="btn btn-primary" id="abuse-report-send-btn" onclick="abuseReportSend()">Send report</button>
+                    </div>
+                </div>
+            </div>
+
             <!-- ── Antivirus / rootkit scanning (fleet-wide) ── -->
             <div class="card" style="margin-bottom:20px;">
                 <div class="card-header">

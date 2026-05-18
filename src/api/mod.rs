@@ -813,6 +813,142 @@ pub async fn security_fleet_kernel_block_ip(
     }))
 }
 
+// ════════════════════════════════════════════════════════════════════
+// Abuse reporting — compose + send via SMTP
+// See src/abuse_report/mod.rs.
+// ════════════════════════════════════════════════════════════════════
+
+#[derive(Deserialize)]
+pub struct AbuseReportPreviewQuery { pub ip: String }
+
+/// GET /api/security/abuse-report/preview?ip=X — return whois data,
+/// evidence audit lines, and a pre-composed draft email so the UI
+/// can render the editable report modal. Cool-down state is also
+/// returned so the UI can warn if we recently reported this IP.
+pub async fn abuse_report_preview(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    query: web::Query<AbuseReportPreviewQuery>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let ip = query.ip.clone();
+    if ip.trim().is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "missing required query parameter: ip",
+        }));
+    }
+    // whois shells out — wrap in web::block so the actix runtime
+    // doesn't stall on slow whois servers.
+    let ip_for_whois = ip.clone();
+    let whois = web::block(move || crate::abuse_report::whois_lookup(&ip_for_whois))
+        .await
+        .unwrap_or_default();
+    let evidence = crate::abuse_report::collect_evidence(&state.login_limiter, &ip, 100);
+    let our_hostname = hostname::get()
+        .map(|h| h.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "this node".into());
+    let from_email = state.ai_agent.config.lock()
+        .map(|c| c.smtp_user.clone())
+        .unwrap_or_default();
+    let draft = crate::abuse_report::compose_report(
+        &ip, &whois, &evidence, &our_hostname, &from_email);
+    let history = crate::abuse_report::ReportHistory::load();
+    let last = history.last_for(&ip).cloned();
+    let cooldown_remaining = history.cooldown_remaining_secs(
+        &ip, crate::abuse_report::default_cooldown_days());
+    HttpResponse::Ok().json(serde_json::json!({
+        "ip": ip,
+        "whois": whois,
+        "evidence": evidence,
+        "draft": draft,
+        "last_report": last,
+        "cooldown_remaining_secs": cooldown_remaining,
+        "cooldown_days": crate::abuse_report::default_cooldown_days(),
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct AbuseReportSendBody {
+    pub ip: String,
+    pub to: String,
+    pub subject: String,
+    pub body: String,
+    /// When true, send even if the cool-down window hasn't elapsed
+    /// since the previous report for this IP. Operator-driven escape
+    /// hatch for repeat offenders the abuse desk hasn't actioned.
+    #[serde(default)]
+    pub override_cooldown: bool,
+    /// Number of evidence lines included in the body — recorded in
+    /// history for audit purposes (the body itself isn't kept).
+    #[serde(default)]
+    pub evidence_count: usize,
+}
+
+/// POST /api/security/abuse-report/send — send the abuse-report email.
+/// 409 if cool-down is active and `override_cooldown` is false.
+pub async fn abuse_report_send(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<AbuseReportSendBody>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let body = body.into_inner();
+    if body.ip.trim().is_empty() || body.to.trim().is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "ip and to are required",
+        }));
+    }
+    if !body.override_cooldown {
+        let history = crate::abuse_report::ReportHistory::load();
+        let remaining = history.cooldown_remaining_secs(
+            &body.ip, crate::abuse_report::default_cooldown_days());
+        if remaining > 0 {
+            return HttpResponse::Conflict().json(serde_json::json!({
+                "error": "cool-down active for this IP — set override_cooldown=true to send anyway",
+                "cooldown_remaining_secs": remaining,
+            }));
+        }
+    }
+    let ai_config = match state.ai_agent.config.lock() {
+        Ok(g) => g.clone(),
+        Err(_) => return HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": "AI config lock poisoned",
+        })),
+    };
+    let draft = crate::abuse_report::ReportDraft {
+        to: body.to.clone(), subject: body.subject.clone(), body: body.body.clone(),
+    };
+    let ip = body.ip.clone();
+    let evidence_count = body.evidence_count;
+    let result = web::block(move || {
+        crate::abuse_report::send_report(&ai_config, &ip, &draft, evidence_count)
+    }).await;
+    match result {
+        Ok(Ok(rec)) => HttpResponse::Ok().json(serde_json::json!({
+            "ok": true, "record": rec,
+        })),
+        Ok(Err(e)) => HttpResponse::BadRequest().json(serde_json::json!({
+            "error": e,
+        })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("send task panicked: {}", e),
+        })),
+    }
+}
+
+/// GET /api/security/abuse-report/history — last N abuse reports we sent.
+pub async fn abuse_report_history(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let hist = crate::abuse_report::ReportHistory::load();
+    HttpResponse::Ok().json(serde_json::json!({
+        "reports": hist.reports,
+        "cooldown_days": crate::abuse_report::default_cooldown_days(),
+    }))
+}
+
 /// GET /api/security/auth-config — current lockout settings.
 pub async fn security_auth_config_get(
     req: HttpRequest,
@@ -30225,6 +30361,9 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/security/auth-unblock-peer", web::post().to(security_auth_unblock_peer))
         .route("/api/security/kernel-block-ip", web::post().to(security_kernel_block_ip))
         .route("/api/security/fleet-kernel-block-ip", web::post().to(security_fleet_kernel_block_ip))
+        .route("/api/security/abuse-report/preview", web::get().to(abuse_report_preview))
+        .route("/api/security/abuse-report/send", web::post().to(abuse_report_send))
+        .route("/api/security/abuse-report/history", web::get().to(abuse_report_history))
         .route("/api/security/listening-ports-local", web::get().to(security_listening_ports_local))
         .route("/api/security/sessions-destroy-all", web::post().to(security_sessions_destroy_all))
         // Fleet-wide aggregation and operations
