@@ -216,30 +216,63 @@ pub fn disable_site(target: &ExecTarget, name: &str) -> Result<String, String> {
     }
 }
 
-/// Run config test — tries nginx -t first, falls back to wolfproxy --test
+/// Run config test — tries whichever of nginx/wolfproxy is actually
+/// installed on the target. The earlier version returned the
+/// `nginx: not found` message verbatim because `exec_full` returns
+/// Ok even when the shell reports a missing binary (exit 127). We
+/// now `which` first so a host with only wolfproxy installed reaches
+/// the wolfproxy test path.
 pub fn test_config(target: &ExecTarget) -> ConfigTestResult {
-    // Try nginx -t first
-    if let Ok((output, stderr, success)) = target.exec_full("nginx -t 2>&1") {
-        let combined = if stderr.is_empty() { output } else { format!("{}\n{}", output, stderr) };
-        return ConfigTestResult {
-            success,
-            output: combined.trim().to_string(),
-        };
+    let nginx_present = target.exec("which nginx 2>/dev/null")
+        .map(|s| !s.trim().is_empty()).unwrap_or(false);
+    let wolfproxy_present = target.exec("which wolfproxy 2>/dev/null")
+        .map(|s| !s.trim().is_empty()).unwrap_or(false);
+
+    // Try nginx -t when nginx is actually installed.
+    if nginx_present {
+        if let Ok((output, stderr, success)) = target.exec_full("nginx -t 2>&1") {
+            let combined = if stderr.is_empty() { output }
+                           else { format!("{}\n{}", output, stderr) };
+            // If success, we're done. If failure AND the error is the
+            // classic "command not found" race (binary disappeared
+            // between `which` and exec — e.g. mid-uninstall), fall
+            // through to wolfproxy. Otherwise return the real nginx
+            // failure to the user.
+            if success || !looks_like_command_not_found(&combined) {
+                return ConfigTestResult { success, output: combined.trim().to_string() };
+            }
+        }
     }
 
-    // Fall back to wolfproxy --test
-    if let Ok((output, stderr, success)) = target.exec_full("wolfproxy --test 2>&1") {
-        let combined = if stderr.is_empty() { output } else { format!("{}\n{}", output, stderr) };
-        return ConfigTestResult {
-            success,
-            output: combined.trim().to_string(),
-        };
+    if wolfproxy_present {
+        if let Ok((output, stderr, success)) = target.exec_full("wolfproxy --test 2>&1") {
+            let combined = if stderr.is_empty() { output }
+                           else { format!("{}\n{}", output, stderr) };
+            return ConfigTestResult { success, output: combined.trim().to_string() };
+        }
     }
 
+    // Neither installed — surface a clear message rather than the
+    // shell's raw `command not found` so the operator knows what to do.
+    let hint = match (nginx_present, wolfproxy_present) {
+        (false, false) => "Neither nginx nor wolfproxy is installed on this node. Install one before running a config test.",
+        (true,  _)     => "nginx is installed but `nginx -t` could not be executed. Check service permissions.",
+        (false, true)  => "wolfproxy is installed but `wolfproxy --test` could not be executed. Check binary permissions.",
+    };
     ConfigTestResult {
         success: false,
-        output: "Neither nginx nor wolfproxy found to test configuration".to_string(),
+        output: hint.to_string(),
     }
+}
+
+/// Heuristic: did the shell output indicate the requested binary
+/// wasn't found? Different shells phrase this slightly differently —
+/// dash says "sh: 1: nginx: not found", bash says "nginx: command
+/// not found", busybox says "nginx: not found". All include "not
+/// found".
+fn looks_like_command_not_found(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    lower.contains("not found") || lower.contains("no such file or directory")
 }
 
 /// Reload nginx/wolfproxy — runs test first, only reloads if test passes

@@ -24906,6 +24906,36 @@ pub async fn toml_bootstrap(req: HttpRequest, state: web::Data<AppState>, path: 
     }
 }
 
+/// POST /api/configurator/toml/{component}/repair — fill in any
+/// required keys missing from the on-disk config using the default
+/// template. User-set values are preserved untouched. The UI offers
+/// this when /validate-fields returns a non-empty list.
+pub async fn toml_repair(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>, query: web::Query<ConfiguratorTarget>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let target = match parse_exec_target(&query) { Ok(t) => t, Err(r) => return r };
+    let component = path.into_inner();
+    match web::block(move || crate::configurator::toml_editor::repair_config(&target, &component)).await {
+        Ok(Ok(msg)) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
+        Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("{}", e) })),
+    }
+}
+
+/// GET /api/configurator/toml/{component}/validate-fields — list any
+/// keys present in the default template but absent from the on-disk
+/// config. The editor calls this alongside /structured on every load
+/// so it can surface a warning + Repair button.
+pub async fn toml_validate_fields(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>, query: web::Query<ConfiguratorTarget>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let target = match parse_exec_target(&query) { Ok(t) => t, Err(r) => return r };
+    let component = path.into_inner();
+    match web::block(move || crate::configurator::toml_editor::validate_config(&target, &component)).await {
+        Ok(Ok(missing)) => HttpResponse::Ok().json(serde_json::json!({ "missing_required": missing })),
+        Ok(Err(e)) => HttpResponse::Ok().json(serde_json::json!({ "missing_required": [], "error": e })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("{}", e) })),
+    }
+}
+
 // ─── Patreon Integration ─────────────────────────────────────────────────────
 
 /// GET /api/patreon/connect — start OAuth flow, redirect to Patreon
@@ -30436,6 +30466,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/configurator/toml/{component}/structured", web::post().to(toml_save_structured))
         .route("/api/configurator/toml/{component}/validate", web::post().to(toml_validate))
         .route("/api/configurator/toml/{component}/bootstrap", web::post().to(toml_bootstrap))
+        .route("/api/configurator/toml/{component}/repair", web::post().to(toml_repair))
+        .route("/api/configurator/toml/{component}/validate-fields", web::get().to(toml_validate_fields))
         // Node proxy — forward API calls to remote nodes (must be last — wildcard path)
         .route("/api/nodes/{id}/proxy/{path:.*}", web::get().to(node_proxy))
         .route("/api/nodes/{id}/proxy/{path:.*}", web::post().to(node_proxy))

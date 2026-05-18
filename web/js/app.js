@@ -12988,9 +12988,41 @@ async function loadTomlConfigurator(component, displayName) {
             document.getElementById('configurator-header-actions').innerHTML = '';
             return;
         }
-        renderTomlForm(component, data);
+        // Validate against the default template — if required keys are
+        // missing (e.g. the wolfproxy `host` field that wasn't in any
+        // earlier wizard save) surface a warning banner + a Repair
+        // button. Validation failures are non-fatal: the form still
+        // renders so the user can edit what's there.
+        let missingRequired = [];
+        try {
+            const valResp = await fetch(configuratorApiUrl(`/api/configurator/toml/${component}/validate-fields`));
+            if (valResp.ok) {
+                const valData = await valResp.json();
+                missingRequired = Array.isArray(valData.missing_required) ? valData.missing_required : [];
+            }
+        } catch (_) { /* non-fatal */ }
+        renderTomlForm(component, data, { missingRequired, displayName });
     } catch (e) {
         body.innerHTML = `<div style="color:var(--danger);">Failed to load config: ${escapeHtml(e.message)}</div>`;
+    }
+}
+
+async function tomlRepair(component, displayName) {
+    if (!await wolfConfirm(
+        `Fill in missing required fields in ${displayName} configuration from the default template?\n\nUser-set values are preserved untouched — only keys that are MISSING from your current file get added.`,
+        `Repair ${displayName} config`
+    )) return;
+    try {
+        const resp = await fetch(configuratorApiUrl(`/api/configurator/toml/${component}/repair`), { method: 'POST' });
+        const data = await resp.json();
+        if (resp.ok) {
+            showToast(data.message || 'Configuration repaired', 'success');
+        } else {
+            showToast(data.error || 'Repair failed', 'error');
+        }
+        loadTomlConfigurator(component, displayName);
+    } catch (e) {
+        showToast('Repair failed: ' + e.message, 'error');
     }
 }
 
@@ -13012,7 +13044,8 @@ async function tomlBootstrap(component, displayName) {
     }
 }
 
-function renderTomlForm(component, config) {
+function renderTomlForm(component, config, opts) {
+    opts = opts || {};
     const body = document.getElementById('configurator-body');
     const sections = getTomlSchema(component);
 
@@ -13022,6 +13055,23 @@ function renderTomlForm(component, config) {
     }
 
     let html = '';
+    // Missing-required warning banner — shown when the on-disk config
+    // is missing keys the default template defines. Includes a Repair
+    // button that fills in the gaps without overwriting user values.
+    const missing = Array.isArray(opts.missingRequired) ? opts.missingRequired : [];
+    if (missing.length > 0) {
+        const displayName = opts.displayName || component;
+        const missingList = missing.map(k => `<code style="font-family:var(--font-mono); font-size:11px;">${escapeHtml(k)}</code>`).join(', ');
+        html += `<div style="margin-bottom:20px; padding:12px 14px; background:rgba(239,68,68,0.08); border:1px solid rgba(239,68,68,0.35); border-radius:8px;">
+            <div style="font-weight:600; color:#ef4444; margin-bottom:6px;">⚠ ${escapeHtml(displayName)} configuration is incomplete</div>
+            <div style="font-size:12px; color:var(--text-secondary); margin-bottom:8px;">
+                ${missing.length} required field${missing.length === 1 ? '' : 's'} missing from the on-disk config: ${missingList}.
+                The service may refuse to start until these are filled in.
+            </div>
+            <button class="btn btn-sm btn-primary" onclick="tomlRepair('${component}', '${escapeHtml(displayName)}')">🔧 Repair from defaults</button>
+            <span style="font-size:11px; color:var(--text-muted); margin-left:8px;">User-set values are preserved.</span>
+        </div>`;
+    }
     for (const section of sections) {
         const sectionDesc = section.description
             ? `<p style="color:var(--text-muted); font-size:12px; margin:4px 0 12px 0;">${escapeHtml(section.description)}</p>`
