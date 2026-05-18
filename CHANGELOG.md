@@ -8,6 +8,8 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v23.12.7: fix 405 on per-node antivirus ops via node-proxy** _(2026-05-18 — [`016695c`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/016695c64670b9aa22e5ebed4124d8c8ac41a6d0))_
+- **v23.12.6: per-node antivirus UI, live install terminal, firewall-hole coordination** _(2026-05-18 — [`85aa116`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/85aa1165b0cea0a37c8afd8f7266b019b020c075))_
 - **v23.12.5: fleet antivirus + rootkit scanning (ClamAV / rkhunter / chkrootkit) with auto-quarantine and process kill** _(2026-05-18 — [`f6f81d9`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/f6f81d9ba7a86023493b57cd7377c4bca3a213cd))_
 - **v23.12.4: Cert Manager link on Certificates page + de-purple the UI** _(2026-05-17 — [`c5dba3e`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/c5dba3ea7f31fea4356119da4bc9029db805ba83))_
 - **v23.12.3: scan detector OFF by default + essential-safety list + strict enable confirmation** _(2026-05-17 — [`e906701`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/e9067019fa92d3ca65a526216b9df4ae6e124e10))_
