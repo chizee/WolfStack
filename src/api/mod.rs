@@ -12234,26 +12234,44 @@ pub async fn antivirus_status(req: HttpRequest, state: web::Data<AppState>) -> H
     HttpResponse::Ok().json(build_antivirus_status_view(&state))
 }
 
-/// POST /api/antivirus/install — install ClamAV/rkhunter/chkrootkit
-/// on this node via the host's native package manager. Blocking work
-/// (apt-get / dnf / pacman / zypper) is offloaded to web::block so the
-/// actix runtime stays responsive.
+/// POST /api/antivirus/install — start an install in the background.
+/// Returns 202 immediately so the UI can open a terminal modal and
+/// poll `/api/antivirus/install-log` for live output as apt-get / dnf /
+/// pacman / zypper run. 409 if an install is already in progress on
+/// this node.
 pub async fn antivirus_install(
     req: HttpRequest, state: web::Data<AppState>,
 ) -> HttpResponse {
     if let Err(e) = require_auth(&req, &state) { return e; }
+    {
+        let g = state.antivirus.install_progress.read().unwrap();
+        if g.running {
+            return HttpResponse::Conflict().json(serde_json::json!({
+                "error": "install already in progress on this node",
+                "started_at": g.started_at,
+            }));
+        }
+    }
     let av = state.antivirus.clone();
-    let result = match web::block(move || {
-        let r = crate::antivirus::install_tools();
+    std::thread::spawn(move || {
+        let _ = crate::antivirus::install_tools(&av);
         av.refresh_install_status();
-        r
-    }).await {
-        Ok(r) => r,
-        Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({
-            "error": format!("install task panicked: {}", e),
-        })),
-    };
-    HttpResponse::Ok().json(result)
+    });
+    HttpResponse::Accepted().json(serde_json::json!({
+        "ok": true,
+        "message": "install started; poll /api/antivirus/install-log for progress",
+    }))
+}
+
+/// GET /api/antivirus/install-log — live install progress + output.
+/// The UI polls this every ~1s while an install is running to populate
+/// a terminal-style log box.
+pub async fn antivirus_install_log(
+    req: HttpRequest, state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let p = state.antivirus.install_progress.read().unwrap().clone();
+    HttpResponse::Ok().json(p)
 }
 
 /// POST /api/antivirus/scan — fire a full scan in a background thread.
@@ -12401,17 +12419,32 @@ pub async fn fleet_antivirus_status(
     }))
 }
 
-/// POST /api/fleet/antivirus/install — install antivirus tools on
-/// every node in the cluster.
+/// POST /api/fleet/antivirus/install — kick off install on every node
+/// in the cluster. Each per-node install is async (returns 202
+/// immediately, runs in a background thread on that node, capturing
+/// log lines into /api/antivirus/install-log). The frontend drives the
+/// node-by-node sequence directly so it can render per-node terminal
+/// output as each install proceeds; this endpoint is the "fan all the
+/// triggers out at once" shortcut for unattended scripted runs.
 pub async fn fleet_antivirus_install(
     req: HttpRequest, state: web::Data<AppState>,
 ) -> HttpResponse {
     if let Err(e) = require_auth(&req, &state) { return e; }
     let state_for_local = state.clone();
     let local = move || {
-        let r = crate::antivirus::install_tools();
-        state_for_local.antivirus.refresh_install_status();
-        serde_json::to_value(r).unwrap_or(serde_json::Value::Null)
+        // Already-running short-circuit so a double-click doesn't
+        // start two installs.
+        let already_running = state_for_local.antivirus.install_progress.read()
+            .map(|g| g.running).unwrap_or(false);
+        if already_running {
+            return serde_json::json!({ "ok": false, "skipped": "install already in progress" });
+        }
+        let av = state_for_local.antivirus.clone();
+        std::thread::spawn(move || {
+            let _ = crate::antivirus::install_tools(&av);
+            av.refresh_install_status();
+        });
+        serde_json::json!({ "ok": true, "started": true })
     };
     let results = fleet_fanout_post::<serde_json::Value, _>(
         &state, "/api/antivirus/install", serde_json::json!({}), local,
@@ -29902,6 +29935,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         // Antivirus / rootkit scanning — per-node primitives
         .route("/api/antivirus/status", web::get().to(antivirus_status))
         .route("/api/antivirus/install", web::post().to(antivirus_install))
+        .route("/api/antivirus/install-log", web::get().to(antivirus_install_log))
         .route("/api/antivirus/scan", web::post().to(antivirus_scan_start))
         .route("/api/antivirus/config", web::get().to(antivirus_config_get))
         .route("/api/antivirus/config", web::put().to(antivirus_config_set))

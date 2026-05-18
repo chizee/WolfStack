@@ -16496,31 +16496,27 @@ function renderFleetAvQuarantine(data) {
 }
 
 async function fleetAntivirusInstall() {
+    // Get the current node list so we can drive sequential per-node
+    // installs with live terminal output.
+    let statusResp;
+    try {
+        statusResp = await fetch(apiUrl('/api/fleet/antivirus/status')).then(r => r.json());
+    } catch (e) {
+        showToast(`Could not load node list: ${e.message || e}`, 'error');
+        return;
+    }
+    const nodes = (statusResp.nodes || [])
+        .filter(n => n.status === 'ok' || n.status === 'failed')
+        .map(n => ({ id: n.node_id, hostname: n.hostname || n.node_id }));
+    if (nodes.length === 0) {
+        showToast('No nodes available to install on', 'warning');
+        return;
+    }
     if (!await wolfConfirm(
-        'Install ClamAV + rkhunter + chkrootkit on EVERY WolfStack node in this cluster?\n\nThis will run apt-get / dnf / pacman / zypper install on each node. Initial signature download can take a few minutes per node.',
+        `Install ClamAV + rkhunter + chkrootkit on ${nodes.length} node(s) in this cluster?\n\nNodes are processed one at a time. A live terminal will show the apt/dnf/pacman/zypper output as it runs. You can close the terminal at any time; installs that are already underway continue on the backend.`,
         'Fleet install'
     )) return;
-    const btn = document.getElementById('fleet-av-install-btn');
-    const status = document.getElementById('fleet-av-action-status');
-    if (btn) { btn.disabled = true; btn.style.opacity = '0.6'; }
-    if (status) status.innerHTML = '<span style="color:#fbbf24;">Installing on every node — this can take a few minutes…</span>';
-    try {
-        const r = await fetch(apiUrl('/api/fleet/antivirus/install'), { method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}' });
-        const d = await r.json();
-        const nodes = d.nodes || [];
-        const ok = nodes.filter(n => n.status === 'ok' && n.data && n.data.ok).length;
-        const failed = nodes.filter(n => n.status !== 'ok' || (n.data && !n.data.ok)).length;
-        if (status) status.innerHTML = ok > 0
-            ? `<span style="color:#22c55e;">✓ Installed on ${ok} node(s)</span>${failed > 0 ? ` <span style="color:#ef4444;">· ${failed} failed</span>` : ''}`
-            : `<span style="color:#ef4444;">✗ Install failed on every node — check the per-node details.</span>`;
-        showToast(`Install complete: ${ok} OK, ${failed} failed`, ok > 0 ? 'success' : 'error');
-        await fleetLoadAntivirus();
-    } catch (e) {
-        if (status) status.innerHTML = `<span style="color:#ef4444;">${vlanEsc(e.message || e)}</span>`;
-        showToast(`Install failed: ${e.message || e}`, 'error');
-    } finally {
-        if (btn) { btn.disabled = false; btn.style.opacity = '1'; }
-    }
+    runAvInstallSequence(nodes, statusResp.self_id || null);
 }
 
 async function fleetAntivirusScan() {
@@ -16638,6 +16634,449 @@ window.fleetAntivirusScan = fleetAntivirusScan;
 window.fleetAntivirusSaveConfig = fleetAntivirusSaveConfig;
 window.fleetAntivirusRestore = fleetAntivirusRestore;
 window.fleetAntivirusDelete = fleetAntivirusDelete;
+
+// ─── Per-node antivirus (rendered on the per-node Security page) ───
+// All calls go through apiUrl() which auto-routes via /api/nodes/{id}/proxy
+// for remote nodes and direct for self. No special-casing needed here.
+
+async function loadNodeAntivirus() {
+    const statusEl     = document.getElementById('node-av-status');
+    const findingsEl   = document.getElementById('node-av-findings');
+    const quarantineEl = document.getElementById('node-av-quarantine');
+    if (!statusEl) return; // card not present (we're not on the Security page)
+    statusEl.innerHTML = '<div style="color:var(--text-muted); font-size:13px;">Loading…</div>';
+
+    const [statusResp, findingsResp, quarantineResp] = await Promise.all([
+        fetch(apiUrl('/api/antivirus/status')).then(r => r.ok ? r.json() : null).catch(() => null),
+        fetch(apiUrl('/api/antivirus/findings')).then(r => r.ok ? r.json() : null).catch(() => null),
+        fetch(apiUrl('/api/antivirus/quarantine')).then(r => r.ok ? r.json() : null).catch(() => null),
+    ]);
+
+    renderNodeAvStatus(statusResp);
+    renderNodeAvFindings(findingsResp && findingsResp.findings ? findingsResp.findings : []);
+    renderNodeAvQuarantine(quarantineResp && quarantineResp.quarantine ? quarantineResp.quarantine : []);
+
+    // Prefill policy form from this node's config.
+    if (statusResp && statusResp.config) {
+        const c = statusResp.config;
+        const el = id => document.getElementById(id);
+        if (el('node-av-enabled'))         el('node-av-enabled').value = c.enabled ? 'true' : 'false';
+        if (el('node-av-schedule'))        el('node-av-schedule').value = c.schedule_hours ?? 24;
+        if (el('node-av-auto-quarantine')) el('node-av-auto-quarantine').value = c.auto_quarantine ? 'true' : 'false';
+        if (el('node-av-auto-kill'))       el('node-av-auto-kill').value = c.auto_kill ? 'true' : 'false';
+        if (el('node-av-run-clamav'))      el('node-av-run-clamav').value = c.run_clamav ? 'true' : 'false';
+        if (el('node-av-run-rkhunter'))    el('node-av-run-rkhunter').value = c.run_rkhunter ? 'true' : 'false';
+        if (el('node-av-run-chkrootkit'))  el('node-av-run-chkrootkit').value = c.run_chkrootkit ? 'true' : 'false';
+    }
+}
+
+function renderNodeAvStatus(d) {
+    const el = document.getElementById('node-av-status');
+    if (!el) return;
+    if (!d) {
+        el.innerHTML = '<div style="color:#ef4444; font-size:13px;">Failed to load antivirus status.</div>';
+        return;
+    }
+    const inst = d.install || {};
+    const scan = d.scan || {};
+    const tool = (t, name) => {
+        if (!t) return `<span style="color:var(--text-muted);">${name}: ?</span>`;
+        if (t.not_available_on_distro) return `<span style="color:var(--text-muted);" title="not available on this distro">${name}: n/a</span>`;
+        if (!t.installed) return `<span style="color:#ef4444;">${name}: ✗ not installed</span>`;
+        return `<span style="color:#22c55e;" title="${vlanEsc(t.version || '')}${t.last_db_update ? ' · sigs ' + vlanEsc(t.last_db_update) : ''}">${name}: ✓</span>`;
+    };
+    const scanLine = scan.running
+        ? `<span style="color:#fbbf24;">⏳ ${vlanEsc(scan.active_scanner || 'scanning')} — ${vlanEsc(scan.progress_message || '')}</span>`
+        : `Last scan: ClamAV ${scan.last_clamav_run ? vlanEsc(scan.last_clamav_run.slice(0,19)) : '—'} · rkhunter ${scan.last_rkhunter_run ? vlanEsc(scan.last_rkhunter_run.slice(0,19)) : '—'} · chkrootkit ${scan.last_chkrootkit_run ? vlanEsc(scan.last_chkrootkit_run.slice(0,19)) : '—'}`;
+    el.innerHTML = `
+        <div style="display:flex; flex-wrap:wrap; gap:12px; align-items:center; font-size:13px; margin-bottom:8px;">
+            <span style="color:var(--text-muted);">Distro: <strong>${vlanEsc(inst.distro || '?')}</strong> (${vlanEsc(inst.package_manager || '?')})</span>
+            ${tool(inst.clamav, 'ClamAV')}
+            ${tool(inst.rkhunter, 'rkhunter')}
+            ${tool(inst.chkrootkit, 'chkrootkit')}
+        </div>
+        <div style="font-size:12px; color:var(--text-secondary);">${scanLine}</div>
+        <div style="font-size:12px; color:var(--text-muted); margin-top:4px;">
+            ${d.finding_count || 0} finding(s) · ${d.quarantine_count || 0} quarantined file(s)
+        </div>
+        ${scan.last_error ? `<div style="margin-top:6px; padding:6px 10px; background:rgba(239,68,68,0.08); border:1px solid rgba(239,68,68,0.3); border-radius:6px; font-size:12px; color:#ef4444;">Last scan error: ${vlanEsc(scan.last_error)}</div>` : ''}
+    `;
+}
+
+function renderNodeAvFindings(findings) {
+    const el = document.getElementById('node-av-findings');
+    if (!el) return;
+    if (!findings || findings.length === 0) {
+        el.innerHTML = '<div style="padding:12px; font-size:12px; color:var(--text-muted);">No findings on this node.</div>';
+        return;
+    }
+    el.innerHTML = `<table style="width:100%; border-collapse:collapse; font-size:12px;">
+        <thead><tr style="text-align:left; border-bottom:1px solid var(--border); background:var(--bg-input);">
+            <th style="padding:6px 10px;">When</th>
+            <th style="padding:6px 10px;">Scanner</th>
+            <th style="padding:6px 10px;">Severity</th>
+            <th style="padding:6px 10px;">Threat / message</th>
+            <th style="padding:6px 10px;">Action</th>
+        </tr></thead><tbody>${findings.slice(0, 200).map(f => {
+            const sevColour = f.severity === 'critical' ? '#ef4444' : f.severity === 'warning' ? '#fbbf24' : '#3b82f6';
+            return `<tr style="border-bottom:1px solid var(--border);">
+                <td style="padding:5px 10px; color:var(--text-muted); font-family:var(--font-mono); font-size:11px;">${vlanEsc((f.detected_at || '').slice(0,19))}</td>
+                <td style="padding:5px 10px; color:var(--text-muted);">${vlanEsc(f.scanner)}</td>
+                <td style="padding:5px 10px;"><span style="color:${sevColour}; font-weight:600; font-size:11px;">${vlanEsc(f.severity)}</span></td>
+                <td style="padding:5px 10px; font-size:11px;">${vlanEsc(f.title)}${f.path ? `<div style="color:var(--text-muted); font-size:10px; margin-top:2px; font-family:var(--font-mono);">${vlanEsc(f.path)}</div>` : ''}</td>
+                <td style="padding:5px 10px; font-size:11px; color:var(--text-muted);">${vlanEsc((f.action_taken || '').replace(/_/g, ' '))}${(f.killed_pids && f.killed_pids.length) ? ` (PIDs: ${f.killed_pids.join(',')})` : ''}</td>
+            </tr>`;
+        }).join('')}</tbody></table>`;
+}
+
+function renderNodeAvQuarantine(quarantine) {
+    const el = document.getElementById('node-av-quarantine');
+    if (!el) return;
+    if (!quarantine || quarantine.length === 0) {
+        el.innerHTML = '<div style="padding:12px; font-size:12px; color:var(--text-muted);">No quarantined files on this node.</div>';
+        return;
+    }
+    const fmtSize = b => b < 1024 ? `${b} B` : b < 1024*1024 ? `${(b/1024).toFixed(1)} KB` : `${(b/(1024*1024)).toFixed(2)} MB`;
+    el.innerHTML = `<table style="width:100%; border-collapse:collapse; font-size:12px;">
+        <thead><tr style="text-align:left; border-bottom:1px solid var(--border); background:var(--bg-input);">
+            <th style="padding:6px 10px;">When</th>
+            <th style="padding:6px 10px;">Threat</th>
+            <th style="padding:6px 10px;">Original path</th>
+            <th style="padding:6px 10px;">Size</th>
+            <th style="padding:6px 10px;">Actions</th>
+        </tr></thead><tbody>${quarantine.map(q => `<tr style="border-bottom:1px solid var(--border);">
+            <td style="padding:5px 10px; color:var(--text-muted); font-family:var(--font-mono); font-size:11px;">${vlanEsc((q.quarantined_at || '').slice(0,19))}</td>
+            <td style="padding:5px 10px; color:#ef4444; font-size:11px;">${vlanEsc(q.threat_name || '?')}</td>
+            <td style="padding:5px 10px; font-family:var(--font-mono); font-size:10px;">${vlanEsc(q.original_path || '')}</td>
+            <td style="padding:5px 10px; font-size:11px; color:var(--text-muted);">${fmtSize(q.size_bytes || 0)}</td>
+            <td style="padding:5px 10px;">
+                <button class="btn btn-sm" onclick="nodeAntivirusRestore('${vlanEsc(q.id)}')" style="font-size:11px; margin-right:4px;">Restore</button>
+                <button class="btn btn-sm btn-danger" onclick="nodeAntivirusDelete('${vlanEsc(q.id)}')" style="font-size:11px;">Delete</button>
+            </td>
+        </tr>`).join('')}</tbody></table>`;
+}
+
+async function nodeAntivirusInstall() {
+    if (!await wolfConfirm(
+        'Install ClamAV + rkhunter + chkrootkit on THIS node?\n\nA live terminal will show the apt/dnf/pacman/zypper output as it runs. You can close the terminal at any time; the install continues on the backend.',
+        'Install on this node'
+    )) return;
+    // Identify which node "this" is. On a per-node Security page,
+    // currentNodeId is the node we're viewing. If we're on the
+    // datacenter view (no current node) we install on self.
+    const node = (typeof allNodes !== 'undefined' && allNodes && currentNodeId)
+        ? allNodes.find(n => n.id === currentNodeId) : null;
+    let targetId, targetHost, selfId;
+    if (node) {
+        targetId = node.id;
+        targetHost = node.hostname || node.id;
+        selfId = node.is_self ? node.id : (allNodes.find(n => n.is_self)?.id || null);
+    } else {
+        // Datacenter view: install on self. Pull self_id + hostname
+        // from /api/fleet/antivirus/status so the modal labels correctly.
+        try {
+            const s = await fetch(apiUrl('/api/fleet/antivirus/status')).then(r => r.json());
+            selfId = s.self_id;
+            const selfNode = (s.nodes || []).find(n => n.node_id === selfId);
+            targetId = selfId;
+            targetHost = selfNode ? (selfNode.hostname || selfId) : 'this node';
+        } catch (e) {
+            showToast(`Could not determine target node: ${e.message || e}`, 'error');
+            return;
+        }
+    }
+    runAvInstallSequence([{ id: targetId, hostname: targetHost }], selfId);
+}
+
+async function nodeAntivirusScan() {
+    if (!await wolfConfirm(
+        'Start a full antivirus scan on THIS node?\n\nClamAV walks the host filesystem (excluding /sys, /proc, /dev, network mounts, and live VM disk images). Typically takes 10-60 minutes depending on disk size.',
+        'Scan this node'
+    )) return;
+    const btn = document.getElementById('node-av-scan-btn');
+    const status = document.getElementById('node-av-action-status');
+    if (btn) { btn.disabled = true; btn.style.opacity = '0.6'; }
+    if (status) status.innerHTML = '<span style="color:#fbbf24;">Starting scan…</span>';
+    try {
+        const r = await fetch(apiUrl('/api/antivirus/scan'), { method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}' });
+        const d = await r.json();
+        if (r.status === 409) {
+            if (status) status.innerHTML = '<span style="color:var(--text-muted);">Scan already running</span>';
+            showToast('A scan is already running on this node', 'warning');
+        } else if (r.ok) {
+            if (status) status.innerHTML = '<span style="color:#22c55e;">✓ Scan started</span>';
+            showToast('Scan started — refresh to see progress', 'success');
+        } else {
+            if (status) status.innerHTML = `<span style="color:#ef4444;">${vlanEsc(d.error || 'scan failed')}</span>`;
+            showToast(`Scan failed: ${d.error || 'unknown'}`, 'error');
+        }
+        await loadNodeAntivirus();
+    } catch (e) {
+        if (status) status.innerHTML = `<span style="color:#ef4444;">${vlanEsc(e.message || e)}</span>`;
+        showToast(`Scan failed: ${e.message || e}`, 'error');
+    } finally {
+        if (btn) { btn.disabled = false; btn.style.opacity = '1'; }
+    }
+}
+
+async function nodeAntivirusSaveConfig() {
+    const cfg = {
+        enabled:          document.getElementById('node-av-enabled').value === 'true',
+        schedule_hours:   parseInt(document.getElementById('node-av-schedule').value, 10) || 24,
+        auto_quarantine:  document.getElementById('node-av-auto-quarantine').value === 'true',
+        auto_kill:        document.getElementById('node-av-auto-kill').value === 'true',
+        run_clamav:       document.getElementById('node-av-run-clamav').value === 'true',
+        run_rkhunter:     document.getElementById('node-av-run-rkhunter').value === 'true',
+        run_chkrootkit:   document.getElementById('node-av-run-chkrootkit').value === 'true',
+        scan_roots:       ['/'],
+        extra_excludes:   [],
+    };
+    const status = document.getElementById('node-av-config-status');
+    if (status) status.innerHTML = '<span style="color:#fbbf24;">Saving…</span>';
+    try {
+        const r = await fetch(apiUrl('/api/antivirus/config'), {
+            method: 'PUT', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify(cfg),
+        });
+        const d = await r.json();
+        if (!r.ok) {
+            if (status) status.innerHTML = `<span style="color:#ef4444;">${vlanEsc(d.error || 'save failed')}</span>`;
+            showToast(`Save failed: ${d.error || 'unknown'}`, 'error');
+            return;
+        }
+        if (status) status.innerHTML = '<span style="color:#22c55e;">✓ Saved</span>';
+        showToast('Policy saved on this node', 'success');
+    } catch (e) {
+        if (status) status.innerHTML = `<span style="color:#ef4444;">${vlanEsc(e.message || e)}</span>`;
+        showToast(`Save failed: ${e.message || e}`, 'error');
+    }
+}
+
+async function nodeAntivirusRestore(qid) {
+    if (!await wolfConfirm(
+        'Restore this quarantined file to its original path?\n\nDo this ONLY if you have confirmed the detection was a false positive.',
+        'Restore from quarantine'
+    )) return;
+    try {
+        const r = await fetch(apiUrl('/api/antivirus/quarantine/restore'), {
+            method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({ id: qid }),
+        });
+        const d = await r.json();
+        if (!r.ok) { showToast(d.error || 'Restore failed', 'error'); return; }
+        showToast('Restored from quarantine', 'success');
+        await loadNodeAntivirus();
+    } catch (e) {
+        showToast(`Restore failed: ${e.message || e}`, 'error');
+    }
+}
+
+async function nodeAntivirusDelete(qid) {
+    if (!await wolfConfirm(
+        'PERMANENTLY DELETE this quarantined file?\n\nShredded (or unlinked) and cannot be recovered.',
+        'Delete from quarantine'
+    )) return;
+    try {
+        const r = await fetch(apiUrl('/api/antivirus/quarantine/delete'), {
+            method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({ id: qid }),
+        });
+        const d = await r.json();
+        if (!r.ok) { showToast(d.error || 'Delete failed', 'error'); return; }
+        showToast('Quarantined file deleted', 'success');
+        await loadNodeAntivirus();
+    } catch (e) {
+        showToast(`Delete failed: ${e.message || e}`, 'error');
+    }
+}
+
+window.loadNodeAntivirus = loadNodeAntivirus;
+window.nodeAntivirusInstall = nodeAntivirusInstall;
+window.nodeAntivirusScan = nodeAntivirusScan;
+window.nodeAntivirusSaveConfig = nodeAntivirusSaveConfig;
+window.nodeAntivirusRestore = nodeAntivirusRestore;
+window.nodeAntivirusDelete = nodeAntivirusDelete;
+
+// ─── Antivirus install terminal modal ──────────────────────────────
+// One modal, shared between per-node and fleet install flows. Runs
+// nodes one at a time, polling /api/antivirus/install-log for each,
+// rendering output as it arrives. If the user closes the modal the
+// install keeps running on the backend (just stops the polling).
+
+let _avInstallAbort = false;          // user closed modal — stop polling
+let _avInstallPolling = false;        // a poll loop is currently active
+
+function openAvInstallModal() {
+    const m = document.getElementById('av-install-modal');
+    if (!m) return;
+    _avInstallAbort = false;
+    m.style.display = 'flex';
+    document.getElementById('av-install-modal-term').textContent = '';
+    document.getElementById('av-install-modal-subtitle').textContent = 'Starting…';
+    document.getElementById('av-install-modal-progress').textContent = '';
+    document.getElementById('av-install-modal-status').textContent = '';
+}
+
+function closeAvInstallModal() {
+    _avInstallAbort = true;
+    const m = document.getElementById('av-install-modal');
+    if (m) m.style.display = 'none';
+}
+
+function _avTermAppend(text) {
+    const term = document.getElementById('av-install-modal-term');
+    if (!term) return;
+    // Highlight stderr lines.
+    const lines = text.split('\n');
+    const html = lines.map(l => {
+        const escaped = vlanEsc(l);
+        if (l.startsWith('[stderr] ')) return `<span style="color:#fbbf24;">${escaped}</span>`;
+        if (l.startsWith('==> ')) return `<span style="color:#22d3ee; font-weight:600;">${escaped}</span>`;
+        if (l.startsWith('$ ')) return `<span style="color:#a3e635;">${escaped}</span>`;
+        if (l.startsWith('[') && l.includes('] ERROR')) return `<span style="color:#ef4444; font-weight:600;">${escaped}</span>`;
+        return escaped;
+    }).join('\n');
+    if (term.textContent === '' && term.innerHTML === '') {
+        term.innerHTML = html;
+    } else {
+        term.innerHTML += '\n' + html;
+    }
+    // Autoscroll if user is near the bottom (so they don't lose their
+    // place if they scrolled up to inspect something).
+    const nearBottom = term.scrollTop + term.clientHeight >= term.scrollHeight - 40;
+    if (nearBottom) term.scrollTop = term.scrollHeight;
+}
+
+// Pick the right URL for a node: local API for self, node-proxy for peers.
+function _avNodeUrl(nodeId, selfId, subpath) {
+    if (selfId && nodeId === selfId) return apiUrl(subpath);
+    return apiUrl(`/api/nodes/${encodeURIComponent(nodeId)}/proxy${subpath}`);
+}
+
+async function _avDriveOneNode(nodeId, hostname, selfId) {
+    const subtitle = document.getElementById('av-install-modal-subtitle');
+    const statusEl = document.getElementById('av-install-modal-status');
+    if (subtitle) subtitle.textContent = `Installing on ${hostname}…`;
+    if (statusEl) statusEl.textContent = `${hostname}: starting…`;
+
+    _avTermAppend(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+    _avTermAppend(`▶ ${hostname}`);
+    _avTermAppend(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+
+    // POST to start the install.
+    let startResp;
+    try {
+        const r = await fetch(_avNodeUrl(nodeId, selfId, '/api/antivirus/install'), {
+            method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}',
+        });
+        startResp = r;
+    } catch (e) {
+        _avTermAppend(`[error] failed to start install: ${e.message || e}`);
+        return { ok: false, error: e.message || String(e) };
+    }
+    if (startResp.status === 409) {
+        // Already running — that's fine; we just attach the polling
+        // loop and watch it finish.
+        _avTermAppend(`(install was already in progress — attaching to existing run)`);
+    } else if (!startResp.ok) {
+        const body = await startResp.text().catch(() => '');
+        _avTermAppend(`[error] start failed: HTTP ${startResp.status} ${body.slice(0, 200)}`);
+        return { ok: false, error: `HTTP ${startResp.status}` };
+    }
+
+    // Poll the install-log endpoint. Track how many lines we've already
+    // shown so we only append new ones (the backend keeps the full
+    // ring buffer; we don't want to redraw on every tick).
+    let shownLines = 0;
+    const POLL_INTERVAL_MS = 1000;
+    while (!_avInstallAbort) {
+        let logResp;
+        try {
+            const r = await fetch(_avNodeUrl(nodeId, selfId, '/api/antivirus/install-log'));
+            if (!r.ok) {
+                _avTermAppend(`[error] log fetch HTTP ${r.status}`);
+                return { ok: false, error: `log HTTP ${r.status}` };
+            }
+            logResp = await r.json();
+        } catch (e) {
+            _avTermAppend(`[error] log fetch failed: ${e.message || e}`);
+            return { ok: false, error: e.message || String(e) };
+        }
+
+        const lines = logResp.lines || [];
+        if (lines.length > shownLines) {
+            const newLines = lines.slice(shownLines).join('\n');
+            _avTermAppend(newLines);
+            shownLines = lines.length;
+        }
+
+        if (statusEl) {
+            statusEl.textContent = logResp.running
+                ? `${hostname}: running (${lines.length} lines)`
+                : `${hostname}: ${logResp.ok ? 'OK' : 'FAILED'}`;
+        }
+
+        if (!logResp.running) {
+            return { ok: !!logResp.ok, error: logResp.error || null };
+        }
+        await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+    }
+    // User closed the modal — install continues on the backend.
+    return { ok: null, aborted: true };
+}
+
+/// Drive an install across a sequence of nodes. `nodes` is an array of
+/// { id, hostname }. `selfId` is the local-node id from the status
+/// payload so URL routing picks local API vs proxy.
+async function runAvInstallSequence(nodes, selfId) {
+    if (_avInstallPolling) {
+        showToast('An install sequence is already running', 'warning');
+        return;
+    }
+    _avInstallPolling = true;
+    openAvInstallModal();
+    const subtitle = document.getElementById('av-install-modal-subtitle');
+    const progress = document.getElementById('av-install-modal-progress');
+    if (subtitle) subtitle.textContent = `Installing on ${nodes.length} node${nodes.length === 1 ? '' : 's'}…`;
+    _avTermAppend(`WolfStack antivirus install — ${nodes.length} node(s)`);
+    _avTermAppend(`Started ${new Date().toISOString()}`);
+    let okCount = 0, failCount = 0;
+    try {
+        for (let i = 0; i < nodes.length; i++) {
+            if (_avInstallAbort) break;
+            const n = nodes[i];
+            if (progress) progress.textContent = `Node ${i + 1} of ${nodes.length}`;
+            const r = await _avDriveOneNode(n.id, n.hostname, selfId);
+            if (r.aborted) break;
+            if (r.ok) okCount++; else failCount++;
+        }
+    } finally {
+        _avInstallPolling = false;
+    }
+    _avTermAppend(``);
+    _avTermAppend(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+    if (_avInstallAbort) {
+        _avTermAppend(`Sequence aborted by user. Installs that were running continue on the backend.`);
+    } else {
+        _avTermAppend(`SUMMARY:  ${okCount} OK,  ${failCount} failed,  ${nodes.length - okCount - failCount} skipped`);
+    }
+    _avTermAppend(`Finished ${new Date().toISOString()}`);
+    if (subtitle) subtitle.textContent = _avInstallAbort
+        ? 'Sequence aborted (installs continue on backend)'
+        : `Done — ${okCount} OK, ${failCount} failed`;
+
+    // Refresh the relevant status panels so the user sees the new state
+    // when they close the modal.
+    if (typeof loadNodeAntivirus === 'function') loadNodeAntivirus().catch(() => {});
+    if (typeof fleetLoadAntivirus === 'function') fleetLoadAntivirus().catch(() => {});
+    showToast(_avInstallAbort
+        ? 'Install sequence aborted'
+        : `Install complete: ${okCount} OK, ${failCount} failed`,
+        failCount === 0 && !_avInstallAbort ? 'success' : (okCount === 0 ? 'error' : 'warning'));
+}
+
+window.closeAvInstallModal = closeAvInstallModal;
+window.runAvInstallSequence = runAvInstallSequence;
 window.vlanProviderChanged = vlanProviderChanged;
 window.vlanSyncBridgeName = vlanSyncBridgeName;
 window.vlanSave = vlanSave;
@@ -30534,6 +30973,11 @@ async function loadNodeSecurity() {
         // security-components grid; renders into its own fixed IDs).
         if (typeof securityRefreshLockouts === 'function') {
             securityRefreshLockouts();
+        }
+        // Per-node antivirus card — loads in parallel; failure here
+        // doesn't take down the rest of the Security page.
+        if (typeof loadNodeAntivirus === 'function') {
+            loadNodeAntivirus().catch(() => {});
         }
     } catch (e) {
         container.innerHTML = `<div class="card" style="border-color:rgba(239,68,68,0.3); grid-column:1/-1;"><div class="card-body" style="padding:24px;"><div style="color:#ef4444; font-size:14px;">Failed to retrieve security status: ${escapeHtml(e.message)}</div></div></div>`;

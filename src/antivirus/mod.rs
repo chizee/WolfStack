@@ -61,6 +61,10 @@ const FINDINGS_PATH: &str = "/etc/wolfstack/antivirus-findings.json";
 const QUARANTINE_INDEX_PATH: &str = "/etc/wolfstack/antivirus-quarantine.json";
 const QUARANTINE_ROOT: &str = "/var/quarantine/wolfstack";
 const MAX_FINDINGS_RETAINED: usize = 500;
+/// Live-output ring buffer cap for install runs. apt-get install with a
+/// fresh ClamAV signature download emits a few hundred lines; 800 gives
+/// plenty of headroom without unbounded growth if something goes wrong.
+const MAX_INSTALL_LINES: usize = 800;
 
 /// Filesystem subtrees never worth scanning. Kernel-virtual or
 /// WolfStack-owned. ClamAV's `--exclude-dir` accepts regex anchored
@@ -398,104 +402,453 @@ pub struct InstallResult {
 /// packages are skipped by the package manager itself. After install,
 /// kicks off `freshclam` once to seed signature DB (best-effort,
 /// failures are surfaced but don't fail the install).
-pub fn install_tools() -> InstallResult {
+/// Run a command with stdout+stderr streamed line-by-line into the
+/// install_progress ring buffer. Returns true if the command exited 0.
+/// Lines are pushed as they arrive (interactive feel for the UI) and
+/// every line is prefixed with the command's short label so the operator
+/// can tell apart `apt-get update` output from `freshclam` output in
+/// the combined log.
+fn run_streaming(
+    state: &AntivirusState,
+    label: &str,
+    argv: &[&str],
+    env: &[(&str, &str)],
+) -> bool {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+
+    if argv.is_empty() {
+        state.push_install_line(format!("[{}] ERROR: empty argv", label));
+        return false;
+    }
+    state.push_install_line(format!("$ {}", argv.join(" ")));
+
+    let mut cmd = Command::new(argv[0]);
+    cmd.args(&argv[1..])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, v) in env { cmd.env(k, v); }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            state.push_install_line(format!("[{}] ERROR: failed to spawn: {}", label, e));
+            return false;
+        }
+    };
+    let stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => { state.push_install_line(format!("[{}] ERROR: no stdout pipe", label)); return false; }
+    };
+    let stderr = match child.stderr.take() {
+        Some(s) => s,
+        None => { state.push_install_line(format!("[{}] ERROR: no stderr pipe", label)); return false; }
+    };
+
+    // Read stdout + stderr concurrently. Using std::thread::scope so we
+    // can borrow `state` and `label` directly — no Arc cloning needed
+    // because the scope joins both threads before returning.
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            for line in BufReader::new(stdout).lines().map_while(|r| r.ok()) {
+                state.push_install_line(line);
+            }
+        });
+        s.spawn(|| {
+            for line in BufReader::new(stderr).lines().map_while(|r| r.ok()) {
+                // Tag stderr lines so the UI can colour them differently.
+                // apt + dnf emit progress on stderr; rkhunter writes
+                // warnings to stderr — keeping them visible is the
+                // whole point of streaming.
+                state.push_install_line(format!("[stderr] {}", line));
+            }
+        });
+    });
+
+    match child.wait() {
+        Ok(s) => s.success(),
+        Err(e) => {
+            state.push_install_line(format!("[{}] wait() failed: {}", label, e));
+            false
+        }
+    }
+}
+
+pub fn install_tools(state: &AntivirusState) -> InstallResult {
+    // Mark running and clear any previous log.
+    {
+        let mut g = state.install_progress.write().unwrap();
+        *g = InstallProgress {
+            running: true,
+            started_at: Some(now_rfc3339()),
+            finished_at: None,
+            ok: None,
+            error: None,
+            lines: Vec::new(),
+        };
+    }
+
     let (distro, id_like) = parse_os_release();
     let family = distro_family_with_idlike(&distro, &id_like);
+    state.push_install_line(format!("==> Detected distro: {} (family: {})", distro, family));
+
+    // Open the firewall holes the install path needs (no-op if the
+    // block-outbound.sh lockdown isn't active). We MUST remove these
+    // again in finalize_install — caller's responsibility.
+    open_install_holes(state);
+
     let pkgs = packages_for_family(family);
     if pkgs.is_empty() {
+        let err = format!(
+            "Unsupported distro '{}' (ID_LIKE='{}'). Supported: apt (Debian/Ubuntu/Proxmox), dnf (Fedora/RHEL/Rocky/Alma), pacman (Arch/CachyOS), zypper (openSUSE).",
+            distro, id_like);
+        state.push_install_line(format!("==> ERROR: {}", err));
+        finalize_install(state, false, Some(err.clone()));
         return InstallResult {
-            ok: false,
-            distro: distro.clone(),
-            command: String::new(),
-            stdout: String::new(),
-            stderr: format!(
-                "Unsupported distro '{}' (ID_LIKE='{}'). WolfStack antivirus install supports apt/dnf/pacman/zypper-based distros (Debian, Ubuntu, Proxmox, Fedora, RHEL, Rocky, Alma, Arch, CachyOS, openSUSE).",
-                distro, id_like),
+            ok: false, distro, command: String::new(),
+            stdout: String::new(), stderr: err,
             status: detect_install_status(),
         };
     }
+
     let argv = match build_install_cmd_family(family, &pkgs) {
         Some(v) => v,
         None => {
+            let err = "no package manager command for distro family".to_string();
+            state.push_install_line(format!("==> ERROR: {}", err));
+            finalize_install(state, false, Some(err.clone()));
             return InstallResult {
-                ok: false,
-                distro: distro.clone(),
-                command: String::new(),
-                stdout: String::new(),
-                stderr: "no package manager command for distro family".into(),
+                ok: false, distro, command: String::new(),
+                stdout: String::new(), stderr: err,
                 status: detect_install_status(),
             };
         }
     };
     let cmdline = argv.join(" ");
 
-    // Refresh repo index first on apt (otherwise install fails on stale
-    // sources). dnf/pacman/zypper handle this implicitly.
+    // apt-get update first (apt only — dnf/pacman/zypper handle this
+    // implicitly on install).
     if family == "debian" {
-        let _ = Command::new("apt-get")
-            .arg("update")
-            .env("DEBIAN_FRONTEND", "noninteractive")
-            .output();
+        state.push_install_line("==> apt-get update".into());
+        run_streaming(
+            state, "apt-update",
+            &["apt-get", "update"],
+            &[("DEBIAN_FRONTEND", "noninteractive")],
+        );
     }
 
-    let mut cmd = Command::new(&argv[0]);
-    cmd.args(&argv[1..]);
-    if family == "debian" {
-        cmd.env("DEBIAN_FRONTEND", "noninteractive");
-    }
-    let output = match cmd.output() {
-        Ok(o) => o,
-        Err(e) => {
-            return InstallResult {
-                ok: false, distro: distro.clone(),
-                command: cmdline.clone(), stdout: String::new(),
-                stderr: format!("failed to exec {}: {}", argv[0], e),
-                status: detect_install_status(),
-            };
-        }
-    };
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let ok = output.status.success();
+    // Actual install.
+    state.push_install_line(format!("==> Installing: {}", pkgs.join(" ")));
+    let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+    let install_env: &[(&str, &str)] = if family == "debian" {
+        &[("DEBIAN_FRONTEND", "noninteractive")]
+    } else { &[] };
+    let ok = run_streaming(state, "install", &argv_refs, install_env);
 
-    // Seed ClamAV signature DB if freshclam landed. This is best-effort
-    // — the daemon (clamav-freshclam.service) does it on a timer
-    // anyway. We just want a first scan after install to find something
-    // instead of erroring "no DB".
-    if ok {
-        if which("freshclam").is_some() {
-            // On Debian the freshclam systemd service holds the DB lock
-            // — stop it for the one-shot update, then re-enable.
-            let svc_was_active = systemd_is_active("clamav-freshclam.service")
-                || systemd_is_active("clamav-freshclam-daemon.service");
-            if svc_was_active {
-                let _ = Command::new("systemctl").args(["stop", "clamav-freshclam.service"]).output();
-            }
-            let _ = Command::new("freshclam").output();
-            if svc_was_active {
-                let _ = Command::new("systemctl").args(["start", "clamav-freshclam.service"]).output();
-            } else {
-                // Enable the timer/service so signatures stay current going forward.
-                let _ = Command::new("systemctl")
-                    .args(["enable", "--now", "clamav-freshclam.service"]).output();
-            }
+    if !ok {
+        state.push_install_line("==> Install command FAILED — see lines above for details.".into());
+        finalize_install(state, false, Some("package manager exited non-zero".into()));
+        return InstallResult {
+            ok: false, distro, command: cmdline,
+            stdout: String::new(), stderr: "package manager failed".into(),
+            status: detect_install_status(),
+        };
+    }
+
+    // Seed ClamAV signatures (best-effort).
+    if which("freshclam").is_some() {
+        state.push_install_line("==> freshclam (seeding ClamAV signatures)".into());
+        // On Debian the daemon holds the DB lock — stop, run one-shot, restore.
+        let svc_was_active = systemd_is_active("clamav-freshclam.service")
+            || systemd_is_active("clamav-freshclam-daemon.service");
+        if svc_was_active {
+            run_streaming(state, "systemctl", &["systemctl", "stop", "clamav-freshclam.service"], &[]);
         }
-        // rkhunter signature update + property baseline (idempotent).
-        if which("rkhunter").is_some() {
-            let _ = Command::new("rkhunter").args(["--update", "--nocolors"]).output();
-            let _ = Command::new("rkhunter").args(["--propupd", "--nocolors"]).output();
+        run_streaming(state, "freshclam", &["freshclam"], &[]);
+        if svc_was_active {
+            run_streaming(state, "systemctl", &["systemctl", "start", "clamav-freshclam.service"], &[]);
+        } else {
+            run_streaming(state, "systemctl", &["systemctl", "enable", "--now", "clamav-freshclam.service"], &[]);
         }
     }
+
+    // rkhunter signature + property baseline (idempotent).
+    if which("rkhunter").is_some() {
+        state.push_install_line("==> rkhunter --update".into());
+        run_streaming(state, "rkhunter", &["rkhunter", "--update", "--nocolors"], &[]);
+        state.push_install_line("==> rkhunter --propupd".into());
+        run_streaming(state, "rkhunter", &["rkhunter", "--propupd", "--nocolors"], &[]);
+    }
+
+    state.push_install_line("==> Install complete.".into());
+    finalize_install(state, true, None);
 
     InstallResult {
-        ok, distro: distro.clone(), command: cmdline, stdout, stderr,
+        ok: true, distro, command: cmdline,
+        stdout: String::new(), stderr: String::new(),
         status: detect_install_status(),
+    }
+}
+
+fn finalize_install(state: &AntivirusState, ok: bool, error: Option<String>) {
+    // Always close the firewall holes — even on failure paths. The
+    // close is idempotent so calling it when no holes were opened
+    // is a cheap no-op.
+    close_install_holes(state);
+    if let Ok(mut g) = state.install_progress.write() {
+        g.running = false;
+        g.finished_at = Some(now_rfc3339());
+        g.ok = Some(ok);
+        g.error = error;
     }
 }
 
 fn systemd_is_active(unit: &str) -> bool {
     Command::new("systemctl").args(["is-active", "--quiet", unit])
         .status().map(|s| s.success()).unwrap_or(false)
+}
+
+// ══════════════════════════════════════════════════════════
+// Firewall hole coordination for the block-outbound lockdown
+// ══════════════════════════════════════════════════════════
+//
+// Operators run block-outbound.sh on their Proxmox hosts to default-deny
+// outbound. That lockdown breaks apt-get install and freshclam unless
+// we open the right holes. We coordinate this here so the operator
+// doesn't have to manually run allow-updates.sh + an as-yet-unwritten
+// allow-clamav.sh before clicking Install.
+//
+// Rules we add are tagged `IR-allow-av-install` so they're cleanly
+// removable even if WolfStack crashes mid-install (operator can grep
+// the tag and delete by hand).
+
+const FIREWALL_TAG: &str = "IR-allow-av-install";
+
+/// Hostnames the antivirus install path reaches beyond apt mirrors —
+/// these are NOT in /etc/apt/sources.list and need explicit allowance.
+const AV_EXTRA_HOSTS: &[&str] = &[
+    // ClamAV signature CDN (freshclam fetches from these).
+    "database.clamav.net",
+    "db.local.clamav.net",
+    "current.cvd.clamav.net",
+    // rkhunter signature checks (SourceForge-hosted, redirects across
+    // a CDN; the canonical host is enough for the initial connect, and
+    // the redirect destinations come back via DNS so they're resolved
+    // through our DNS allow rule).
+    "rkhunter.sourceforge.net",
+    "sourceforge.net",
+];
+
+/// True when the block-outbound.sh "default deny" rule is present.
+fn lockdown_active() -> bool {
+    let out = match Command::new("iptables-save").output() {
+        Ok(o) => o, Err(_) => return false,
+    };
+    String::from_utf8_lossy(&out.stdout).contains("IR-block: default deny")
+}
+
+/// Hostnames discovered from /etc/apt/sources.list and sources.list.d.
+/// Same parsing logic as allow-updates.sh so we cover ceph.list,
+/// docker.list, kcare.list, pve-enterprise.list, etc., without
+/// hard-coding.
+fn apt_mirror_hosts() -> Vec<String> {
+    let mut hosts: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Main sources.list
+    if let Ok(s) = std::fs::read_to_string("/etc/apt/sources.list") {
+        for url in extract_urls_from(&s) { hosts.insert(url); }
+    }
+    // .list and .sources under sources.list.d/
+    if let Ok(entries) = std::fs::read_dir("/etc/apt/sources.list.d") {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if ext != "list" && ext != "sources" { continue; }
+            if let Ok(s) = std::fs::read_to_string(&path) {
+                for url in extract_urls_from(&s) { hosts.insert(url); }
+            }
+        }
+    }
+    // Proxmox-specific extras even if not currently in sources (some
+    // helpers fetch from these directly).
+    hosts.insert("download.proxmox.com".into());
+    hosts.insert("enterprise.proxmox.com".into());
+    hosts.into_iter().collect()
+}
+
+fn extract_urls_from(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') { continue; }
+        // Find http:// or https:// and extract the host portion (up to / or whitespace).
+        for proto in ["http://", "https://"] {
+            let mut start = 0;
+            while let Some(idx) = trimmed[start..].find(proto) {
+                let abs = start + idx + proto.len();
+                let rest = &trimmed[abs..];
+                let end = rest.find(|c: char| c == '/' || c.is_whitespace()).unwrap_or(rest.len());
+                let host = &rest[..end];
+                if !host.is_empty() {
+                    // Strip :port if present.
+                    let host = host.split(':').next().unwrap_or(host);
+                    out.push(host.to_string());
+                }
+                start = abs + end;
+            }
+        }
+    }
+    out
+}
+
+fn dns_resolvers() -> Vec<String> {
+    let text = match std::fs::read_to_string("/etc/resolv.conf") {
+        Ok(t) => t, Err(_) => return Vec::new(),
+    };
+    text.lines()
+        .filter_map(|l| l.strip_prefix("nameserver"))
+        .map(|r| r.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn resolve_host_ips(host: &str) -> Vec<String> {
+    let out = match Command::new("getent").args(["ahosts", host]).output() {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    let mut ips = std::collections::HashSet::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if let Some(ip) = line.split_whitespace().next() {
+            ips.insert(ip.to_string());
+        }
+    }
+    ips.into_iter().collect()
+}
+
+/// Insert a single ACCEPT rule with the IR-allow-av-install tag.
+/// `family` is "v4" or "v6"; the right binary is selected accordingly.
+fn add_accept_rule(family: &str, dest: &str, proto: &str, dport: u16, label: &str) -> bool {
+    let bin = if family == "v6" { "ip6tables" } else { "iptables" };
+    let comment = format!("{}: {}", FIREWALL_TAG, label);
+    let status = Command::new(bin)
+        .args(["-I", "OUTPUT", "1", "-d", dest, "-p", proto, "--dport", &dport.to_string(),
+               "-j", "ACCEPT", "-m", "comment", "--comment", &comment])
+        .status();
+    status.map(|s| s.success()).unwrap_or(false)
+}
+
+/// Open every outbound hole the install path needs. No-op if the
+/// IR-block lockdown isn't active.
+pub fn open_install_holes(state: &AntivirusState) {
+    if !lockdown_active() {
+        state.push_install_line("==> No block-outbound lockdown detected — skipping firewall hole coordination.".into());
+        return;
+    }
+    state.push_install_line(format!("==> block-outbound lockdown detected — opening temporary holes (tag '{}')", FIREWALL_TAG));
+
+    // 1. DNS to configured resolvers — needed to resolve everything else.
+    let resolvers = dns_resolvers();
+    if resolvers.is_empty() {
+        state.push_install_line("[firewall] WARNING: no nameservers in /etc/resolv.conf — install will fail to resolve mirrors.".into());
+    }
+    for ns in &resolvers {
+        let family = if ns.contains(':') { "v6" } else { "v4" };
+        add_accept_rule(family, ns, "udp", 53, "DNS");
+        add_accept_rule(family, ns, "tcp", 53, "DNS");
+        state.push_install_line(format!("[firewall] +DNS to {}", ns));
+    }
+
+    // 2. apt mirror hosts.
+    let mirrors = apt_mirror_hosts();
+    state.push_install_line(format!("[firewall] Found {} apt mirror hostname(s) to whitelist", mirrors.len()));
+    for host in &mirrors {
+        let ips = resolve_host_ips(host);
+        if ips.is_empty() {
+            state.push_install_line(format!("[firewall] WARN could not resolve {} — skipping", host));
+            continue;
+        }
+        for ip in &ips {
+            let family = if ip.contains(':') { "v6" } else { "v4" };
+            add_accept_rule(family, ip, "tcp", 443, &format!("{}:443", host));
+            add_accept_rule(family, ip, "tcp", 80,  &format!("{}:80",  host));
+        }
+        state.push_install_line(format!("[firewall] +{} -> {} IP(s)", host, ips.len()));
+    }
+
+    // 3. AV-specific hostnames (ClamAV CDN, rkhunter mirrors).
+    for host in AV_EXTRA_HOSTS {
+        let ips = resolve_host_ips(host);
+        if ips.is_empty() {
+            state.push_install_line(format!("[firewall] WARN could not resolve {} — skipping", host));
+            continue;
+        }
+        for ip in &ips {
+            let family = if ip.contains(':') { "v6" } else { "v4" };
+            add_accept_rule(family, ip, "tcp", 443, &format!("{}:443", host));
+            add_accept_rule(family, ip, "tcp", 80,  &format!("{}:80",  host));
+        }
+        state.push_install_line(format!("[firewall] +{} -> {} IP(s)", host, ips.len()));
+    }
+}
+
+/// Remove every rule tagged IR-allow-av-install. Safe to call even if
+/// `open_install_holes` was never invoked (or already closed) — both
+/// iptables-save and the per-rule delete are idempotent here.
+pub fn close_install_holes(state: &AntivirusState) {
+    let match_str = format!("--comment \"{}", FIREWALL_TAG);
+    let mut removed = 0usize;
+    for bin in ["iptables", "ip6tables"] {
+        let save_bin = format!("{}-save", bin);
+        loop {
+            let saved = match Command::new(&save_bin).output() {
+                Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+                _ => break,
+            };
+            let line = match saved.lines().find(|l| l.contains(&match_str)) {
+                Some(l) => l.to_string(), None => break,
+            };
+            // Convert "-A OUTPUT ..." to "-D OUTPUT ..." and pass each
+            // token as a separate arg (iptables doesn't accept a single
+            // pre-quoted string).
+            let delete_line = line.replacen("-A ", "-D ", 1);
+            let argv = match shell_split(&delete_line) {
+                Some(v) => v, None => break,
+            };
+            let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+            let status = Command::new(bin).args(&argv_refs).status();
+            if status.map(|s| s.success()).unwrap_or(false) {
+                removed += 1;
+            } else {
+                // If iptables refuses to delete a rule we just located,
+                // bail to avoid an infinite loop.
+                break;
+            }
+        }
+    }
+    if removed > 0 {
+        state.push_install_line(format!("==> Removed {} firewall hole(s) tagged '{}'", removed, FIREWALL_TAG));
+    }
+}
+
+/// Tiny shell-style splitter for iptables-save rule lines. They use
+/// regular space-separated tokens with `--comment "quoted text"` as the
+/// only quoting case. Returns None if quoting is malformed.
+fn shell_split(s: &str) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quote = false;
+    for ch in s.chars() {
+        match ch {
+            '"' => in_quote = !in_quote,
+            ' ' if !in_quote => {
+                if !cur.is_empty() { out.push(std::mem::take(&mut cur)); }
+            }
+            _ => cur.push(ch),
+        }
+    }
+    if in_quote { return None; }
+    if !cur.is_empty() { out.push(cur); }
+    Some(out)
 }
 
 // ══════════════════════════════════════════════════════════
@@ -605,12 +958,31 @@ impl Default for ScanState {
     }
 }
 
+/// Live install-run state. The endpoint `GET /api/antivirus/install-log`
+/// returns this; the UI polls it to render a terminal-style log box.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct InstallProgress {
+    pub running: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+    /// `None` while running, then `Some(true|false)` after exit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ok: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Ring-buffered log lines (oldest first). Capped at MAX_INSTALL_LINES.
+    pub lines: Vec<String>,
+}
+
 pub struct AntivirusState {
     pub config: RwLock<AntivirusConfig>,
     pub scan_state: RwLock<ScanState>,
     pub findings: RwLock<Vec<Finding>>,
     pub quarantine: RwLock<Vec<QuarantineEntry>>,
     pub install_status: RwLock<InstallStatus>,
+    pub install_progress: RwLock<InstallProgress>,
 }
 
 impl AntivirusState {
@@ -636,12 +1008,26 @@ impl AntivirusState {
             findings: RwLock::new(findings),
             quarantine: RwLock::new(quarantine),
             install_status: RwLock::new(install_status),
+            install_progress: RwLock::new(InstallProgress::default()),
         }
     }
 
     pub fn refresh_install_status(&self) {
         let s = detect_install_status();
         if let Ok(mut g) = self.install_status.write() { *g = s; }
+    }
+
+    /// Append a line to the rolling install log. Caller is responsible
+    /// for not flooding (we trim to MAX_INSTALL_LINES from the front to
+    /// keep memory bounded even on a misbehaving subprocess).
+    pub fn push_install_line(&self, line: String) {
+        if let Ok(mut g) = self.install_progress.write() {
+            g.lines.push(line);
+            if g.lines.len() > MAX_INSTALL_LINES {
+                let drop = g.lines.len() - MAX_INSTALL_LINES;
+                g.lines.drain(..drop);
+            }
+        }
     }
 }
 
@@ -1482,6 +1868,41 @@ mod tests {
         assert!(debian_pkgs.contains(&"chkrootkit"));
         let redhat_pkgs = packages_for_family("redhat");
         assert!(redhat_pkgs.contains(&"chkrootkit"));
+    }
+
+    #[test]
+    fn shell_split_handles_quoted_comments() {
+        // Real iptables-save line for one of our rules.
+        let line = "-A OUTPUT -d 1.2.3.4/32 -p tcp -m tcp --dport 443 -j ACCEPT -m comment --comment \"IR-allow-av-install: deb.debian.org:443\"";
+        let parts = shell_split(line).unwrap();
+        // The quoted comment must be a single token.
+        let comment_idx = parts.iter().position(|p| p.starts_with("IR-allow-av-install:")).unwrap();
+        assert!(parts[comment_idx].contains("deb.debian.org:443"));
+        // No empty tokens.
+        for p in &parts { assert!(!p.is_empty()); }
+    }
+
+    #[test]
+    fn shell_split_rejects_unterminated_quote() {
+        assert!(shell_split("-A OUTPUT -m comment --comment \"unterminated").is_none());
+    }
+
+    #[test]
+    fn extract_urls_finds_https_and_http_and_strips_port() {
+        let s = "
+            # comment
+            deb https://download.docker.com/linux/debian bookworm stable
+            deb http://archive.ubuntu.com/ubuntu jammy main
+            deb https://repo.tuxcare.com/kernelcare/ubuntu jammy main
+            deb https://mirror.example.com:8443/path foo bar
+        ";
+        let hosts = extract_urls_from(s);
+        assert!(hosts.contains(&"download.docker.com".to_string()));
+        assert!(hosts.contains(&"archive.ubuntu.com".to_string()));
+        assert!(hosts.contains(&"repo.tuxcare.com".to_string()));
+        assert!(hosts.contains(&"mirror.example.com".to_string()));
+        // Comment line ignored.
+        assert!(!hosts.iter().any(|h| h.starts_with("comment")));
     }
 
     #[test]

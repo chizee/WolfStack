@@ -1008,6 +1008,31 @@
                 </div>
             </div>
 
+            <!-- Antivirus install terminal modal — shared between the
+                 per-node Security page and the Fleet Security page.
+                 Renders live stdout/stderr from apt/dnf/pacman/zypper
+                 (and freshclam, rkhunter --update) by polling
+                 /api/antivirus/install-log every second. -->
+            <div id="av-install-modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.7); z-index:2000; align-items:center; justify-content:center; padding:20px;">
+                <div style="background:var(--bg-secondary); border:1px solid var(--border); border-radius:10px; width:min(960px, 100%); max-height:90vh; display:flex; flex-direction:column; box-shadow:0 20px 60px rgba(0,0,0,0.5);">
+                    <div style="padding:14px 18px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:center;">
+                        <div>
+                            <div style="font-size:15px; font-weight:700;">🦠 Antivirus install</div>
+                            <div id="av-install-modal-subtitle" style="font-size:12px; color:var(--text-muted); margin-top:2px;">Starting…</div>
+                        </div>
+                        <div style="display:flex; gap:8px; align-items:center;">
+                            <span id="av-install-modal-progress" style="font-size:12px; color:var(--text-secondary);"></span>
+                            <button class="btn btn-sm" onclick="closeAvInstallModal()">✕ Close</button>
+                        </div>
+                    </div>
+                    <pre id="av-install-modal-term" style="margin:0; padding:14px 18px; background:#0b0b0c; color:#e5e7eb; font-family:var(--font-mono, ui-monospace, Menlo, monospace); font-size:12px; line-height:1.45; flex:1; overflow:auto; white-space:pre-wrap; word-break:break-all; min-height:320px; max-height:60vh;">Initializing…</pre>
+                    <div style="padding:10px 18px; border-top:1px solid var(--border); font-size:11px; color:var(--text-muted); display:flex; justify-content:space-between; align-items:center;">
+                        <span>Output streams live. Closing this dialog does NOT stop the install on the backend.</span>
+                        <span id="av-install-modal-status"></span>
+                    </div>
+                </div>
+            </div>
+
             <!-- ── Antivirus / rootkit scanning (fleet-wide) ── -->
             <div class="card" style="margin-bottom:20px;">
                 <div class="card-header">
@@ -1248,6 +1273,98 @@
             <div style="margin-bottom:20px; padding:10px 14px; background:rgba(59, 130, 246,0.08); border:1px solid rgba(59, 130, 246,0.25); border-radius:8px; font-size:13px; color:var(--text-secondary);">
                 Fleet-wide operations (rotate root passwords on every node, push lockout policy, view blocked IPs across the cluster, force-logout everyone) are now on the
                 <a href="#" onclick="selectView('fleet-security'); return false;" style="color:var(--accent-light); font-weight:600;">Fleet Security page</a>.
+            </div>
+
+            <!-- ── Per-node antivirus / rootkit scanning ── -->
+            <div class="card" style="margin-bottom:20px;">
+                <div class="card-header">
+                    <h3 style="margin:0;">🦠 Antivirus &amp; rootkit scanning (this node)</h3>
+                    <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">
+                        Host-installed <strong>ClamAV</strong> + <strong>rkhunter</strong> + <strong>chkrootkit</strong> on this specific node.
+                        ClamAV hits are quarantined (chmod 000 + moved to <code>/var/quarantine/wolfstack/</code>) and any processes using the file are killed.
+                        Covers the host filesystem and every LXC/Docker container's rootfs on this node.
+                        For fleet-wide controls use the <a href="#" onclick="selectView('fleet-security'); return false;" style="color:var(--accent-light); font-weight:600;">Fleet Security page</a>.
+                    </div>
+                </div>
+                <div class="card-body">
+                    <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:14px;">
+                        <button class="btn btn-primary" onclick="nodeAntivirusInstall()" id="node-av-install-btn">📥 Install on this node</button>
+                        <button class="btn btn-primary" onclick="nodeAntivirusScan()" id="node-av-scan-btn">▶ Run scan on this node</button>
+                        <button class="btn btn-secondary" onclick="loadNodeAntivirus()">↻ Refresh</button>
+                        <span id="node-av-action-status" style="font-size:12px; color:var(--text-muted); margin-left:4px;"></span>
+                    </div>
+
+                    <details style="margin:0 0 14px; padding:8px 12px; background:var(--bg-input); border:1px solid var(--border); border-radius:6px;">
+                        <summary style="cursor:pointer; font-size:13px; color:var(--text-secondary); user-select:none;">Schedule &amp; auto-action policy (this node only)</summary>
+                        <div style="margin-top:10px; display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:12px;">
+                            <div class="form-group">
+                                <label for="node-av-enabled">Enabled</label>
+                                <select class="form-control" id="node-av-enabled">
+                                    <option value="false" selected>No (manual scans only)</option>
+                                    <option value="true">Yes (run on schedule)</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label for="node-av-schedule">Schedule (hours)</label>
+                                <input type="number" class="form-control" id="node-av-schedule" min="1" max="168" value="24">
+                            </div>
+                            <div class="form-group">
+                                <label for="node-av-auto-quarantine">Auto-quarantine ClamAV hits</label>
+                                <select class="form-control" id="node-av-auto-quarantine">
+                                    <option value="true" selected>Yes</option>
+                                    <option value="false">No (alert only)</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label for="node-av-auto-kill">Auto-kill processes</label>
+                                <select class="form-control" id="node-av-auto-kill">
+                                    <option value="true" selected>Yes</option>
+                                    <option value="false">No</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label for="node-av-run-clamav">Run ClamAV</label>
+                                <select class="form-control" id="node-av-run-clamav">
+                                    <option value="true" selected>Yes</option>
+                                    <option value="false">No</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label for="node-av-run-rkhunter">Run rkhunter</label>
+                                <select class="form-control" id="node-av-run-rkhunter">
+                                    <option value="true" selected>Yes</option>
+                                    <option value="false">No</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label for="node-av-run-chkrootkit">Run chkrootkit</label>
+                                <select class="form-control" id="node-av-run-chkrootkit">
+                                    <option value="true" selected>Yes</option>
+                                    <option value="false">No</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div style="margin-top:10px; display:flex; gap:8px; align-items:center;">
+                            <button class="btn btn-primary" onclick="nodeAntivirusSaveConfig()">💾 Save policy on this node</button>
+                            <span id="node-av-config-status" style="font-size:12px; color:var(--text-muted);"></span>
+                        </div>
+                    </details>
+
+                    <h4 style="margin:14px 0 6px; font-size:13px; color:var(--text-secondary);">Status</h4>
+                    <div id="node-av-status">
+                        <div style="color:var(--text-muted); font-size:13px;">Loading…</div>
+                    </div>
+
+                    <h4 style="margin:18px 0 6px; font-size:13px; color:var(--text-secondary);">Recent findings (this node)</h4>
+                    <div id="node-av-findings" style="max-height:300px; overflow-y:auto; border:1px solid var(--border); border-radius:6px;">
+                        <div style="padding:12px; font-size:12px; color:var(--text-muted);">Loading…</div>
+                    </div>
+
+                    <h4 style="margin:18px 0 6px; font-size:13px; color:var(--text-secondary);">Quarantined files (this node)</h4>
+                    <div id="node-av-quarantine" style="max-height:300px; overflow-y:auto; border:1px solid var(--border); border-radius:6px;">
+                        <div style="padding:12px; font-size:12px; color:var(--text-muted);">Loading…</div>
+                    </div>
+                </div>
             </div>
 
             <!-- Security Components Grid -->
