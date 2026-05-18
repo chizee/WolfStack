@@ -8,6 +8,8 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v23.12.15: abuse-report is MANUAL ONLY — locked in with build-time test** _(2026-05-18 — [`443664b`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/443664b55c0c09e6cd943ed1babbdc80ed0d0d8e))_
+- **v23.12.14: in-app abuse reporting — whois lookup, evidence, SMTP send** _(2026-05-18 — [`d1927f9`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/d1927f9224141bd36eba3dd090f7ad46a6012478))_
 - **v23.12.13: auto-block at 3 strikes, federation propagation, FORWARD-chain, last-20 view** _(2026-05-18 — [`8021128`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/8021128c0a8967304b8334b9ce54a54d2f8859b8))_
 - **v23.12.12: antivirus findings — quieter parsers, Dismiss button, FP warning** _(2026-05-18 — [`d8f878b`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/d8f878b1e2342ab6c1553bf2f7b9e2bc9ce7064d))_
 - **v23.12.11: sweep /proxy/api/ double-prefix bug — fixes threat-intel preflight 405** _(2026-05-18 — [`e257ff0`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/e257ff0555e8454b542ecc7d5f3de11a4a2d53ef))_
