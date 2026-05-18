@@ -31,12 +31,29 @@
 //!    we can show a "Last reported X days ago" badge and refuse to
 //!    re-report the same IP within 7 days (configurable).
 //!
-//! ## What we deliberately DON'T do
+//! ## What we deliberately DON'T do — **DO NOT CHANGE**
 //!
-//! - **Auto-report on every block.** Aggressive abuse reporting is
-//!   how you get your SMTP server flagged as a spammer. Operator must
-//!   click "Send" each time. The cool-down further protects against
-//!   double-sends.
+//! - **Auto-report is FORBIDDEN.** This module must ONLY be triggered
+//!   by an authenticated operator clicking "Send report" in the UI.
+//!   Reasons (each one alone is sufficient):
+//!     1. Mail-reputation damage — auto-sending similar emails to
+//!        abuse desks gets your SMTP flagged. Your real alerts stop
+//!        arriving and nobody notices.
+//!     2. False positives become public + permanent the moment they
+//!        leave the SMTP server. A human reading the draft catches
+//!        "wait, that's our own monitoring" before send.
+//!     3. Abuse desks pattern-match auto-mail and deprioritise it.
+//!        A short hand-reviewed report from a real person is
+//!        dramatically more likely to get the customer suspended.
+//!     4. Legal exposure — making a written accusation against a
+//!        third party carries some weight. A human must stand behind
+//!        the claim.
+//!     5. Volume amplification across the fleet — one attacker
+//!        hitting 12 nodes becomes 12 auto-reports for one incident.
+//!     6. Replies need a human. Auto-send + no follow-up = case dies
+//!        in the desk's queue.
+//!   The regression test `only_api_handler_calls_send_report` enforces
+//!   this at build time.
 //! - **Try to discover NEW abuse contacts beyond whois.** No RIPE
 //!   API, no AbuseIPDB-as-reporter, no IPinfo. whois is the canonical
 //!   source and the operator can edit the recipient before sending if
@@ -365,6 +382,22 @@ impl ReportHistory {
 
 /// Send the abuse report and persist a history record.
 ///
+/// # ⚠ MANUAL-ONLY — DO NOT AUTOMATE
+///
+/// This function MUST ONLY be called from the API handler
+/// `abuse_report_send` in `src/api/mod.rs`, which itself is only
+/// reachable via an authenticated operator POSTing through the UI
+/// Send button. **Never** wire this into:
+///   - the LoginRateLimiter's `install_propagation_hooks`
+///   - any `tokio::spawn` or `std::thread::spawn` triggered by a
+///     block/scan event
+///   - the alerting loop in `alerting.rs`
+///   - a `cron`-style scheduled task
+///   - a tailing loop / log monitor
+/// The regression test `only_api_handler_calls_send_report` will fail
+/// the build if a second caller appears anywhere in the source tree.
+/// See the module-level doc for the six reasons this is forbidden.
+///
 /// Reuses the AI config's SMTP transport (`ai::send_alert_email`) so
 /// the operator doesn't have to configure a separate mail server.
 /// The function writes to history regardless of cool-down — the
@@ -414,6 +447,65 @@ pub fn default_cooldown_days() -> u64 { DEFAULT_COOLDOWN_DAYS }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Manual-only enforcement: `send_report` may ONLY be called from
+    /// the `abuse_report_send` API handler in `src/api/mod.rs`. This
+    /// test walks the source tree and fails the build if a second
+    /// caller appears anywhere — preventing accidental wiring into a
+    /// limiter hook, alerting loop, scheduled task, or anything else
+    /// that would auto-send. See the module-level doc for the six
+    /// reasons auto-reporting is forbidden.
+    #[test]
+    fn only_api_handler_calls_send_report() {
+        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut callers: Vec<String> = Vec::new();
+        walk_rs(&src_root, &mut |path, contents| {
+            // Skip this file itself — the doc comment + definition
+            // both mention `send_report` and would falsely trigger.
+            let rel = path.strip_prefix(&src_root).unwrap_or(path);
+            if rel == std::path::Path::new("abuse_report/mod.rs") { return; }
+            for (lineno, line) in contents.lines().enumerate() {
+                let trimmed = line.trim_start();
+                // Comment lines aren't callers.
+                if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with("*") {
+                    continue;
+                }
+                if line.contains("abuse_report::send_report")
+                    || (line.contains("send_report") && line.contains("crate::abuse_report"))
+                {
+                    callers.push(format!("{}:{}: {}",
+                        rel.display(), lineno + 1, trimmed));
+                }
+            }
+        });
+        assert_eq!(callers.len(), 1,
+            "abuse_report::send_report MUST have exactly one caller \
+             (src/api/mod.rs::abuse_report_send). Found {}:\n  {}\n\n\
+             Auto-reporting is FORBIDDEN — see the module-level doc for \
+             the six reasons. If you genuinely need a new code path that \
+             reaches send_report, raise it with the human owner first.",
+            callers.len(), callers.join("\n  "));
+        // Belt-and-braces: the one caller MUST be in src/api/mod.rs.
+        assert!(callers[0].starts_with("api/mod.rs"),
+            "the only caller of send_report must be the API handler in api/mod.rs, \
+             found: {}", callers[0]);
+    }
+
+    /// Tiny recursive directory walker used by the audit test above.
+    /// Stays at the test scope so we don't ship it as a public helper.
+    fn walk_rs<F: FnMut(&std::path::Path, &str)>(dir: &std::path::Path, f: &mut F) {
+        let entries = match std::fs::read_dir(dir) { Ok(e) => e, Err(_) => return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk_rs(&path, f);
+            } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+                if let Ok(c) = std::fs::read_to_string(&path) {
+                    f(&path, &c);
+                }
+            }
+        }
+    }
 
     #[test]
     fn parse_whois_extracts_alibaba_fields() {
