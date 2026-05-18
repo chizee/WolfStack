@@ -12419,6 +12419,33 @@ pub async fn antivirus_quarantine_restore(
     }
 }
 
+/// POST /api/antivirus/findings/dismiss — remove a finding from the
+/// list. Used to clear off rkhunter/chkrootkit alert-only findings
+/// the operator has reviewed and confirmed benign. Returns 404 if
+/// the id is unknown (already dismissed or never existed). Does NOT
+/// touch any quarantined file — only the in-memory + persisted
+/// findings table.
+pub async fn antivirus_findings_dismiss(
+    req: HttpRequest, state: web::Data<AppState>,
+    body: web::Json<serde_json::Value>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let id = match body.get("id").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "missing required field: id",
+        })),
+    };
+    let removed = crate::antivirus::dismiss_finding(&state.antivirus, &id);
+    if removed {
+        HttpResponse::Ok().json(serde_json::json!({ "ok": true, "dismissed": id }))
+    } else {
+        HttpResponse::NotFound().json(serde_json::json!({
+            "error": format!("no finding with id '{}' on this node", id),
+        }))
+    }
+}
+
 /// POST /api/antivirus/quarantine/delete — permanently delete a
 /// quarantined payload (shred if available, else unlink).
 pub async fn antivirus_quarantine_delete(
@@ -30016,6 +30043,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/antivirus/quarantine", web::get().to(antivirus_quarantine_list))
         .route("/api/antivirus/quarantine/restore", web::post().to(antivirus_quarantine_restore))
         .route("/api/antivirus/quarantine/delete", web::post().to(antivirus_quarantine_delete))
+        .route("/api/antivirus/findings/dismiss", web::post().to(antivirus_findings_dismiss))
         // Antivirus — fleet aggregation + fanout
         .route("/api/fleet/antivirus/status", web::get().to(fleet_antivirus_status))
         .route("/api/fleet/antivirus/install", web::post().to(fleet_antivirus_install))

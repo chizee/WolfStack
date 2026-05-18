@@ -16488,7 +16488,8 @@ function renderFleetAvFindings(data) {
         el.innerHTML = '<div style="padding:12px; font-size:12px; color:var(--text-muted);">No findings on any node. (Either nothing has been detected, or no scans have been run yet.)</div>';
         return;
     }
-    el.innerHTML = `<table style="width:100%; border-collapse:collapse; font-size:12px;">
+    el.innerHTML = `${avFindingsFalsePositiveBanner()}
+    <table style="width:100%; border-collapse:collapse; font-size:12px;">
         <thead><tr style="text-align:left; border-bottom:1px solid var(--border); background:var(--bg-input);">
             <th style="padding:6px 10px;">When</th>
             <th style="padding:6px 10px;">Node</th>
@@ -16496,6 +16497,7 @@ function renderFleetAvFindings(data) {
             <th style="padding:6px 10px;">Severity</th>
             <th style="padding:6px 10px;">Threat / message</th>
             <th style="padding:6px 10px;">Action</th>
+            <th style="padding:6px 10px; text-align:right;"></th>
         </tr></thead><tbody>${rows.slice(0, 200).map(f => {
             const sevColour = f.severity === 'critical' ? '#ef4444' : f.severity === 'warning' ? '#fbbf24' : '#3b82f6';
             return `<tr style="border-bottom:1px solid var(--border);">
@@ -16505,6 +16507,7 @@ function renderFleetAvFindings(data) {
                 <td style="padding:5px 10px;"><span style="color:${sevColour}; font-weight:600; font-size:11px;">${vlanEsc(f.severity)}</span></td>
                 <td style="padding:5px 10px; font-size:11px;">${vlanEsc(f.title)}${f.path ? `<div style="color:var(--text-muted); font-size:10px; margin-top:2px; font-family:var(--font-mono);">${vlanEsc(f.path)}</div>` : ''}</td>
                 <td style="padding:5px 10px; font-size:11px; color:var(--text-muted);">${vlanEsc((f.action_taken || '').replace(/_/g, ' '))}${(f.killed_pids && f.killed_pids.length) ? ` (PIDs: ${f.killed_pids.join(',')})` : ''}</td>
+                <td style="padding:5px 10px; text-align:right;"><button class="btn btn-sm" onclick="fleetAntivirusDismiss('${vlanEsc(f.node_id)}','${vlanEsc(f.id)}')" style="font-size:10px; padding:2px 8px;" title="Remove this finding from the list on ${vlanEsc(f.hostname || '?')} — does NOT delete any file">Dismiss</button></td>
             </tr>`;
         }).join('')}</tbody></table>`;
 }
@@ -16773,23 +16776,38 @@ function renderNodeAvFindings(findings) {
         el.innerHTML = '<div style="padding:12px; font-size:12px; color:var(--text-muted);">No findings on this node.</div>';
         return;
     }
-    el.innerHTML = `<table style="width:100%; border-collapse:collapse; font-size:12px;">
+    el.innerHTML = `${avFindingsFalsePositiveBanner()}
+    <table style="width:100%; border-collapse:collapse; font-size:12px;">
         <thead><tr style="text-align:left; border-bottom:1px solid var(--border); background:var(--bg-input);">
             <th style="padding:6px 10px;">When</th>
             <th style="padding:6px 10px;">Scanner</th>
             <th style="padding:6px 10px;">Severity</th>
             <th style="padding:6px 10px;">Threat / message</th>
             <th style="padding:6px 10px;">Action</th>
+            <th style="padding:6px 10px; text-align:right;"></th>
         </tr></thead><tbody>${findings.slice(0, 200).map(f => {
             const sevColour = f.severity === 'critical' ? '#ef4444' : f.severity === 'warning' ? '#fbbf24' : '#3b82f6';
-            return `<tr style="border-bottom:1px solid var(--border);">
+            return `<tr style="border-bottom:1px solid var(--border);" data-finding-id="${vlanEsc(f.id)}">
                 <td style="padding:5px 10px; color:var(--text-muted); font-family:var(--font-mono); font-size:11px;">${vlanEsc((f.detected_at || '').slice(0,19))}</td>
                 <td style="padding:5px 10px; color:var(--text-muted);">${vlanEsc(f.scanner)}</td>
                 <td style="padding:5px 10px;"><span style="color:${sevColour}; font-weight:600; font-size:11px;">${vlanEsc(f.severity)}</span></td>
                 <td style="padding:5px 10px; font-size:11px;">${vlanEsc(f.title)}${f.path ? `<div style="color:var(--text-muted); font-size:10px; margin-top:2px; font-family:var(--font-mono);">${vlanEsc(f.path)}</div>` : ''}</td>
                 <td style="padding:5px 10px; font-size:11px; color:var(--text-muted);">${vlanEsc((f.action_taken || '').replace(/_/g, ' '))}${(f.killed_pids && f.killed_pids.length) ? ` (PIDs: ${f.killed_pids.join(',')})` : ''}</td>
+                <td style="padding:5px 10px; text-align:right;"><button class="btn btn-sm" onclick="nodeAntivirusDismiss('${vlanEsc(f.id)}')" style="font-size:10px; padding:2px 8px;" title="Remove this finding from the list — does NOT delete any file">Dismiss</button></td>
             </tr>`;
         }).join('')}</tbody></table>`;
+}
+
+/// Reusable banner shown above the findings table to remind the
+/// operator that not every alert is a real attack. rkhunter and
+/// chkrootkit are particularly noisy on stock distros — we filter
+/// known false positives in the parser but new package versions can
+/// introduce new ones.
+function avFindingsFalsePositiveBanner() {
+    return `<div style="margin:0 0 10px; padding:8px 12px; background:rgba(251,191,36,0.08); border:1px solid rgba(251,191,36,0.3); border-radius:6px; font-size:11px; color:var(--text-secondary);">
+        <strong style="color:#fbbf24;">⚠ Some findings may be false positives.</strong>
+        rkhunter and chkrootkit warn on stock distro quirks (package-shipped scripts, systemd /dev nodes, hidden config files etc.) — we filter the most common known-benign ones automatically but new package versions sometimes introduce new noise. <strong>Always verify before quarantining or acting</strong>. ClamAV signature hits (scanner = <code>clamav</code> / <code>clamonacc</code>) are higher confidence than rkhunter/chkrootkit warnings. Use Dismiss to clear reviewed entries.
+    </div>`;
 }
 
 function renderNodeAvQuarantine(quarantine) {
@@ -16931,6 +16949,39 @@ async function nodeAntivirusRestore(qid) {
         await loadNodeAntivirus();
     } catch (e) {
         showToast(`Restore failed: ${e.message || e}`, 'error');
+    }
+}
+
+async function nodeAntivirusDismiss(id) {
+    try {
+        const r = await fetch(apiUrl('/api/antivirus/findings/dismiss'), {
+            method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({ id }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) { showToast(d.error || 'Dismiss failed', 'error'); return; }
+        await loadNodeAntivirus();
+    } catch (e) {
+        showToast(`Dismiss failed: ${e.message || e}`, 'error');
+    }
+}
+
+async function fleetAntivirusDismiss(nodeId, id) {
+    // Routes via node_proxy for remote nodes (selfId-aware).
+    const selfId = _fleetAvSelfId;
+    const url = (selfId && nodeId === selfId)
+        ? apiUrl('/api/antivirus/findings/dismiss')
+        : apiUrl(`/api/nodes/${encodeURIComponent(nodeId)}/proxy/antivirus/findings/dismiss`);
+    try {
+        const r = await fetch(url, {
+            method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({ id }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) { showToast(d.error || 'Dismiss failed', 'error'); return; }
+        await fleetLoadAntivirus();
+    } catch (e) {
+        showToast(`Dismiss failed: ${e.message || e}`, 'error');
     }
 }
 
@@ -17123,6 +17174,8 @@ async function runAvOnAccessSequence(nodes, selfId, enable) {
 window.nodeAntivirusOnAccess = nodeAntivirusOnAccess;
 window.fleetAntivirusOnAccess = fleetAntivirusOnAccess;
 window.runAvOnAccessSequence = runAvOnAccessSequence;
+window.nodeAntivirusDismiss = nodeAntivirusDismiss;
+window.fleetAntivirusDismiss = fleetAntivirusDismiss;
 
 // ─── Antivirus install terminal modal ──────────────────────────────
 // One modal, shared between per-node and fleet install flows. Runs

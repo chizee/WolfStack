@@ -1939,10 +1939,62 @@ fn run_rkhunter_scan() -> Result<Vec<Finding>, String> {
     Ok(parse_rkhunter_output(&stdout))
 }
 
-/// Parse rkhunter --report-warnings-only stdout. Warning lines:
-///   Warning: <text>
-/// Sometimes wrapped:
-///   [13:42:01] Warning: <text>
+/// Substring patterns that mark a rkhunter "Warning:" line as a
+/// known false positive across mainstream distros. Matched
+/// case-insensitively against the warning's detail text. Operators
+/// can layer additional patterns via the `extra_excludes` config
+/// (which is regex for clamscan but works as substring for rkhunter
+/// — kept deliberately simple).
+///
+/// Sources for each pattern:
+/// - Debian/Proxmox: official rkhunter false-positive issue tracker
+/// - RHEL/Fedora: the systemd / prelink / Java false positives all
+///   distros inherit
+/// - Arch: pacman-created files in /etc that rkhunter flags
+const RKHUNTER_FALSE_POSITIVE_PATTERNS: &[&str] = &[
+    // Debian / Proxmox / Ubuntu — scripts shipped as commands in
+    // packages rkhunter expects to be ELF binaries.
+    "/usr/bin/lwp-request",
+    "/usr/share/ifupdown2/__main__.py",
+    "/usr/bin/egrep",        // grep shipped as a wrapper script on some Debian versions
+    "/usr/bin/fgrep",
+    // Hidden files created by stock packages on every modern Debian.
+    "Hidden file found: /etc/.updated",
+    "Hidden file found: /etc/.pwd.lock",
+    "Hidden file found: /etc/.java",
+    "Hidden directory found: /etc/.java",
+    "Hidden file found: /usr/share/man/man5/.k5identity.5.gz",
+    "Hidden file found: /usr/share/man/man5/.k5login.5.gz",
+    "Hidden file found: /usr/share/man/man1/..1.gz",
+    "Hidden file found: /usr/bin/.fipscheck.hmac",
+    "Hidden directory found: /etc/.git",  // installer scripts on some images
+    // Systemd creates these on every modern Linux box.
+    "Suspicious file types found in /dev",
+    // Informational comparisons, not security warnings.
+    "The SSH and rkhunter configuration options should be the same",
+    "The SSH configuration option 'AllowRootLogin'",  // older rkhunter checks a deprecated option name
+    // Prelink false positives on RHEL/Fedora — prelink rewrites ELF
+    // entry addresses so rkhunter's hash check disagrees with its
+    // earlier baseline. Benign on any host where prelink ran.
+    "differs from the prelink dependency",
+    "is not on the prelink path",
+    // SSH protocol 1 check — modern sshd defaults to v2-only so the
+    // "v1 not disabled" warning is informational on every recent box.
+    "Checking if SSH protocol v1 is allowed",
+    // Properties-changed warnings from package upgrades — rkhunter
+    // doesn't auto-refresh its property database, so legitimate apt
+    // upgrades trigger these. We can't tell apart "package upgraded"
+    // from "binary swapped by attacker" without --propupd having run
+    // recently, so this is a documented limitation; advise via the
+    // hint instead of spamming the operator.
+    "File properties have changed:",
+];
+
+/// Parse rkhunter `--report-warnings-only` stdout into findings,
+/// dropping lines that match RKHUNTER_FALSE_POSITIVE_PATTERNS so the
+/// operator's findings list isn't drowned in distro-shipped quirks.
+/// Lines look like:
+///   `Warning: <text>` or `[13:42:01] Warning: <text>`
 fn parse_rkhunter_output(s: &str) -> Vec<Finding> {
     let mut out = Vec::new();
     let now = now_rfc3339();
@@ -1957,6 +2009,8 @@ fn parse_rkhunter_output(s: &str) -> Vec<Finding> {
             .or_else(|| stripped.strip_prefix("WARNING:")) else { continue; };
         let detail = rest.trim();
         if detail.is_empty() { continue; }
+        // Drop the known false positives.
+        if is_rkhunter_false_positive(detail) { continue; }
         out.push(Finding {
             id: new_id(),
             scanner: "rkhunter".into(),
@@ -1973,6 +2027,12 @@ fn parse_rkhunter_output(s: &str) -> Vec<Finding> {
     out
 }
 
+fn is_rkhunter_false_positive(detail: &str) -> bool {
+    let lower = detail.to_ascii_lowercase();
+    RKHUNTER_FALSE_POSITIVE_PATTERNS.iter()
+        .any(|pat| lower.contains(&pat.to_ascii_lowercase()))
+}
+
 // ══════════════════════════════════════════════════════════
 // chkrootkit scan
 // ══════════════════════════════════════════════════════════
@@ -1987,55 +2047,34 @@ fn run_chkrootkit_scan() -> Result<Vec<Finding>, String> {
     Ok(parse_chkrootkit_output(&stdout))
 }
 
-/// chkrootkit output is a sequence of "Checking `name'... result" lines.
-/// Findings are lines where the result is NOT one of the known-clean
-/// stock strings.
+/// Parse chkrootkit output. ONLY emit findings for lines containing
+/// literal uppercase `INFECTED` — that's chkrootkit's documented hit
+/// marker. The old "everything not in CLEAN_TOKENS is a finding"
+/// heuristic was generating dozens of false-positive entries from
+/// progress markers like:
+///   - `Checking 'aliens'... started`
+///   - `Checking 'aliens'... finished`
+///   - `Searching for X... not tested`
+/// chkrootkit emits these between every real check; they're status,
+/// not results. Real hits look like:
+///   - `Checking 'bindshell'... INFECTED (PORTS: 31337)`
+///   - `eth0: PACKET SNIFFER(/path/to/proc)` (no '...' separator but contains INFECTED later)
 fn parse_chkrootkit_output(s: &str) -> Vec<Finding> {
-    const CLEAN_TOKENS: &[&str] = &[
-        "not infected", "not found", "nothing found", "no suspect",
-        "not promiscuous", "no suspicious files", "clean",
-    ];
     let now = now_rfc3339();
     let mut out = Vec::new();
     for line in s.lines() {
-        let line = line.trim();
-        if line.is_empty() { continue; }
-        // Filter to result lines.
-        let Some(idx) = line.find("...") else {
-            // chkrootkit also prints standalone "INFECTED" hits.
-            if line.contains("INFECTED") || line.contains("infected") {
-                if !CLEAN_TOKENS.iter().any(|t| line.contains(t)) {
-                    out.push(Finding {
-                        id: new_id(),
-                        scanner: "chkrootkit".into(),
-                        severity: "critical".into(),
-                        title: line.chars().take(120).collect(),
-                        detail: line.into(),
-                        path: None, threat_name: None,
-                        detected_at: now.clone(),
-                        action_taken: "alert_only".into(),
-                        quarantine_id: None,
-                        killed_pids: Vec::new(),
-                    });
-                }
-            }
-            continue;
-        };
-        let result = line[idx + 3..].trim().to_ascii_lowercase();
-        if result.is_empty() { continue; }
-        if CLEAN_TOKENS.iter().any(|t| result.contains(t)) { continue; }
-        // Anything else is a hit worth surfacing.
-        let severity = if result.contains("infected") || result.contains("found") {
-            "critical"
-        } else {
-            "warning"
-        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() { continue; }
+        // chkrootkit's hit token is always uppercase INFECTED; we match
+        // case-sensitively to avoid catching the word "infected" in
+        // descriptive prose (e.g. "checking for non-infected files").
+        if !trimmed.contains("INFECTED") { continue; }
         out.push(Finding {
             id: new_id(),
             scanner: "chkrootkit".into(),
-            severity: severity.into(),
-            title: line.chars().take(120).collect(),
-            detail: line.into(),
+            severity: "critical".into(),
+            title: trimmed.chars().take(120).collect(),
+            detail: trimmed.into(),
             path: None, threat_name: None,
             detected_at: now.clone(),
             action_taken: "alert_only".into(),
@@ -2465,6 +2504,19 @@ fn handle_clamav_hits(
     append_findings(state, new_findings);
 }
 
+/// Remove a finding by id from both the in-memory list and the
+/// persisted JSON. Returns true if a finding was found and removed.
+/// Used by the UI Dismiss button to clear alert-only findings the
+/// operator has confirmed benign.
+pub fn dismiss_finding(state: &AntivirusState, id: &str) -> bool {
+    let mut g = match state.findings.write() { Ok(g) => g, Err(_) => return false };
+    let before = g.len();
+    g.retain(|f| f.id != id);
+    let removed = g.len() < before;
+    if removed { let _ = save_findings(&g); }
+    removed
+}
+
 /// Prepend new findings to the in-memory + on-disk list, capped at
 /// `MAX_FINDINGS_RETAINED`. New findings appear at the top so the
 /// UI shows the latest run first.
@@ -2604,25 +2656,82 @@ mod tests {
     }
 
     #[test]
-    fn rkhunter_output_parsing() {
+    fn rkhunter_output_parsing_includes_real_warnings() {
+        // Real-looking warning that ISN'T in the false-positive list.
         let s = "[13:42:00] Info: Starting test\n\
-                 [13:42:01] Warning: /usr/bin/ssh-keysign property changed\n\
-                 [13:42:02] Warning: Hidden file found: /etc/.pwd.lock\n\
-                 [13:42:03] Info: All clean\n";
+                 [13:42:01] Warning: Suspicious binary at /tmp/x.bin\n\
+                 [13:42:02] Info: All clean\n";
         let f = parse_rkhunter_output(s);
-        assert_eq!(f.len(), 2);
+        assert_eq!(f.len(), 1);
         assert_eq!(f[0].severity, "warning");
-        assert!(f[0].detail.contains("ssh-keysign"));
+        assert!(f[0].detail.contains("/tmp/x.bin"));
     }
 
     #[test]
-    fn chkrootkit_output_parsing_clean_lines_ignored() {
-        let s = "Checking `aliens'... no suspicious files\n\
+    fn rkhunter_false_positives_filtered_across_distros() {
+        // One example per OS family the operator might run, all
+        // pulled from real-world reports.
+        let inputs = &[
+            // Debian/Proxmox
+            "Warning: The command '/usr/bin/lwp-request' has been replaced by a script: /usr/bin/lwp-request: Perl script text executable",
+            "Warning: The command '/usr/share/ifupdown2/__main__.py' has been replaced by a script",
+            "Warning: Hidden file found: /etc/.updated: ASCII text",
+            "Warning: Suspicious file types found in /dev:",
+            // Universal (every modern distro)
+            "Warning: Hidden file found: /etc/.pwd.lock",
+            "Warning: The SSH and rkhunter configuration options should be the same:",
+            // RHEL/Fedora prelink quirk
+            "Warning: /usr/bin/foo differs from the prelink dependency",
+            // Older sshd v1-check noise
+            "Warning: Checking if SSH protocol v1 is allowed: it is",
+        ];
+        for line in inputs {
+            let f = parse_rkhunter_output(line);
+            assert!(f.is_empty(),
+                "expected line to be filtered as false positive: {}\n got: {:?}",
+                line, f);
+        }
+    }
+
+    #[test]
+    fn rkhunter_false_positive_alongside_real_warning() {
+        let s = "Warning: Hidden file found: /etc/.updated: ASCII text\n\
+                 Warning: Unsigned ELF in /tmp/dropper\n";
+        let f = parse_rkhunter_output(s);
+        // First line filtered as known FP, second line is a real warning.
+        assert_eq!(f.len(), 1);
+        assert!(f[0].detail.contains("/tmp/dropper"));
+    }
+
+    #[test]
+    fn chkrootkit_only_infected_lines_become_findings() {
+        // Real chkrootkit output mixes progress markers ("started" /
+        // "finished" / "not tested") with the actual results. Only
+        // lines containing INFECTED should surface.
+        let s = "Checking `aliens'... started\n\
+                 Checking `aliens'... no suspicious files\n\
+                 Checking `aliens'... finished\n\
+                 Checking `lkm'... started\n\
+                 Searching for Adore LKM... not tested\n\
+                 Checking `lkm'... finished\n\
                  Checking `asp'... not infected\n\
+                 Searching for Linux BPF Door... WARNING\n\
                  Checking `bindshell'... INFECTED (PORTS:  31337)\n";
         let f = parse_chkrootkit_output(s);
-        assert_eq!(f.len(), 1);
+        assert_eq!(f.len(), 1, "expected only 1 INFECTED finding, got {}: {:?}", f.len(), f);
         assert!(f[0].detail.contains("INFECTED"));
+        assert!(f[0].detail.contains("bindshell"));
+    }
+
+    #[test]
+    fn chkrootkit_infected_match_is_case_sensitive() {
+        // chkrootkit uses uppercase INFECTED. The word "infected" can
+        // appear in normal output ("not infected"); we don't want to
+        // catch that.
+        let s = "Checking `foo'... not infected\n\
+                 Some background note about infected files in general\n";
+        let f = parse_chkrootkit_output(s);
+        assert!(f.is_empty());
     }
 
     #[test]
