@@ -9352,9 +9352,11 @@
             // For the local node hit the endpoint directly; remote nodes
             // go through the cluster proxy.
             const isSelf = selfId && t.node_id === selfId;
+            // node_proxy re-prepends /api/ to the captured path —
+            // drop the leading /api/ when going via the cluster proxy.
             const url = isSelf
                 ? '/api/edge/cloudflare-tunnel/install/' + encodeURIComponent(proxyId)
-                : '/api/nodes/' + encodeURIComponent(t.node_id) + '/proxy/api/edge/cloudflare-tunnel/install/' + encodeURIComponent(proxyId);
+                : '/api/nodes/' + encodeURIComponent(t.node_id) + '/proxy/edge/cloudflare-tunnel/install/' + encodeURIComponent(proxyId);
             try {
                 const resp = await fetch(url, { method: 'POST' });
                 const data = await resp.json().catch(() => ({}));

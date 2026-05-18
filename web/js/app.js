@@ -12208,8 +12208,8 @@ function renderCertList(data) {
 
 // Cluster-scope view: flat table of every cert on every node, plus a
 // banner for nodes that failed to respond. Actions are routed through
-// the existing /api/nodes/{id}/proxy/api/certs/... by certRenew /
-// certDelete when called with a node_id second argument.
+// /api/nodes/{id}/proxy/certs/... (node_proxy re-prepends /api/) by
+// certRenew / certDelete when called with a node_id second argument.
 function renderCertClusterList(data) {
     const body = document.getElementById('configurator-body');
     const nodes = data.nodes || [];
@@ -12359,8 +12359,10 @@ async function certIssueSubmit() {
     const dryRun = document.getElementById('cert-dry-run')?.checked || false;
     const targetNode = (document.getElementById('cert-target-node')?.value || '').trim();
     document.getElementById('cert-issue-modal')?.remove();
+    // node_proxy re-prepends /api/ to the captured path — proxy path
+    // must NOT include the leading /api/.
     const url = targetNode
-        ? `/api/nodes/${encodeURIComponent(targetNode)}/proxy/api/certs`
+        ? `/api/nodes/${encodeURIComponent(targetNode)}/proxy/certs`
         : '/api/certs';
     showToast(targetNode ? 'Requesting cert on remote node… this can take up to a minute' : 'Requesting certificate… this can take up to a minute', 'info');
     try {
@@ -12387,7 +12389,7 @@ async function certIssueSubmit() {
 async function certRenew(name, nodeId) {
     if (!(await wolfConfirm(`Force-renew ${name}? This bypasses certbot's 30-day freshness window.`, 'Renew'))) return;
     const url = nodeId
-        ? `/api/nodes/${encodeURIComponent(nodeId)}/proxy/api/certs/${encodeURIComponent(name)}/renew`
+        ? `/api/nodes/${encodeURIComponent(nodeId)}/proxy/certs/${encodeURIComponent(name)}/renew`
         : `/api/certs/${encodeURIComponent(name)}/renew`;
     try {
         const resp = await fetch(url, { method: 'POST' });
@@ -12404,7 +12406,7 @@ async function certRenew(name, nodeId) {
 async function certDelete(name, nodeId) {
     if (!(await wolfConfirm(`Delete ${name}? This revokes the cert and removes it from /etc/letsencrypt.`, 'Delete'))) return;
     const url = nodeId
-        ? `/api/nodes/${encodeURIComponent(nodeId)}/proxy/api/certs/${encodeURIComponent(name)}`
+        ? `/api/nodes/${encodeURIComponent(nodeId)}/proxy/certs/${encodeURIComponent(name)}`
         : `/api/certs/${encodeURIComponent(name)}`;
     try {
         const resp = await fetch(url, { method: 'DELETE' });
@@ -49675,19 +49677,20 @@ async function cpActionRaw(it, action) {
         if (!it.vmid) throw new Error('PVE guest missing vmid');
         resp = await fetch(`/api/nodes/${encodeURIComponent(it.node_id)}/pve/${encodeURIComponent(it.vmid)}/${encodeURIComponent(action)}`, { method: 'POST' });
     } else if (it.kind === 'docker') {
-        resp = await fetch(`/api/nodes/${encodeURIComponent(it.node_id)}/proxy/api/containers/docker/${encodeURIComponent(it.name)}/action`, {
+        // node_proxy re-prepends /api/ — proxy path drops the leading /api/.
+        resp = await fetch(`/api/nodes/${encodeURIComponent(it.node_id)}/proxy/containers/docker/${encodeURIComponent(it.name)}/action`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ action }),
         });
     } else if (it.kind === 'lxc') {
-        resp = await fetch(`/api/nodes/${encodeURIComponent(it.node_id)}/proxy/api/containers/lxc/${encodeURIComponent(it.name)}/action`, {
+        resp = await fetch(`/api/nodes/${encodeURIComponent(it.node_id)}/proxy/containers/lxc/${encodeURIComponent(it.name)}/action`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ action }),
         });
     } else if (it.kind === 'vm') {
-        resp = await fetch(`/api/nodes/${encodeURIComponent(it.node_id)}/proxy/api/vms/${encodeURIComponent(it.name)}/${encodeURIComponent(action)}`, { method: 'POST' });
+        resp = await fetch(`/api/nodes/${encodeURIComponent(it.node_id)}/proxy/vms/${encodeURIComponent(it.name)}/${encodeURIComponent(action)}`, { method: 'POST' });
     }
     if (!resp || !resp.ok) {
         const err = resp ? await resp.json().catch(() => ({})) : {};
@@ -56792,7 +56795,7 @@ async function threatIntelOpenPanel() {
         const results = await Promise.all(clusterNodes.map(async (n) => {
             const url = n.is_self
                 ? '/api/predictive/threat-intel/status'
-                : `/api/nodes/${encodeURIComponent(n.node_id)}/proxy/api/predictive/threat-intel/status`;
+                : `/api/nodes/${encodeURIComponent(n.node_id)}/proxy/predictive/threat-intel/status`;
             try {
                 const r = await fetch(url);
                 if (!r.ok) return { node_id: n.node_id, error: `HTTP ${r.status}` };
@@ -57089,9 +57092,14 @@ async function threatIntelRunPreflight(cluster) {
         return;
     }
     const results = await Promise.all(nodes.map(async (n) => {
+        // node_proxy's handler re-prepends "/api/" to {path:.*}, so the
+        // proxy path must NOT include the leading /api/ — otherwise the
+        // remote receives /api/api/predictive/... which falls through to
+        // the static-files handler (HTTP 405 on POST). Same bug pattern
+        // as the antivirus 405 fixed in v23.12.7.
         const url = n.is_self
             ? '/api/predictive/threat-intel/preflight'
-            : `/api/nodes/${encodeURIComponent(n.node_id)}/proxy/api/predictive/threat-intel/preflight`;
+            : `/api/nodes/${encodeURIComponent(n.node_id)}/proxy/predictive/threat-intel/preflight`;
         try {
             const r = await fetch(url, { method: 'POST' });
             if (!r.ok) {
