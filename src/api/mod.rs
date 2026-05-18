@@ -12274,6 +12274,48 @@ pub async fn antivirus_install_log(
     HttpResponse::Ok().json(p)
 }
 
+#[derive(Deserialize)]
+pub struct OnAccessToggleBody { pub enabled: bool }
+
+/// POST /api/antivirus/on-access — toggle real-time on-access scanning.
+/// Returns 202 immediately; the apply runs in a background thread,
+/// streaming output to the same install_progress buffer the UI's
+/// terminal modal polls. 409 if an install/apply is already running.
+pub async fn antivirus_on_access(
+    req: HttpRequest, state: web::Data<AppState>,
+    body: web::Json<OnAccessToggleBody>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    {
+        let g = state.antivirus.install_progress.read().unwrap();
+        if g.running {
+            return HttpResponse::Conflict().json(serde_json::json!({
+                "error": "an install/apply is already running on this node",
+                "started_at": g.started_at,
+            }));
+        }
+    }
+    let target = body.enabled;
+    let av = state.antivirus.clone();
+    // Persist the user's choice in config so it survives restart and
+    // the status endpoint reflects intent. Actual systemd state is
+    // refreshed separately.
+    {
+        let mut g = av.config.write().unwrap();
+        g.enable_on_access = target;
+        let _ = g.save();
+    }
+    std::thread::spawn(move || {
+        crate::antivirus::apply_on_access(av.clone(), target);
+        av.refresh_install_status();
+    });
+    HttpResponse::Accepted().json(serde_json::json!({
+        "ok": true,
+        "target": target,
+        "message": "on-access apply started; poll /api/antivirus/install-log for progress",
+    }))
+}
+
 /// POST /api/antivirus/scan — fire a full scan in a background thread.
 /// Returns immediately with 202 + the scan state so the UI can poll
 /// /api/antivirus/status for progress.
@@ -29936,6 +29978,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/antivirus/status", web::get().to(antivirus_status))
         .route("/api/antivirus/install", web::post().to(antivirus_install))
         .route("/api/antivirus/install-log", web::get().to(antivirus_install_log))
+        .route("/api/antivirus/on-access", web::post().to(antivirus_on_access))
         .route("/api/antivirus/scan", web::post().to(antivirus_scan_start))
         .route("/api/antivirus/config", web::get().to(antivirus_config_get))
         .route("/api/antivirus/config", web::put().to(antivirus_config_set))

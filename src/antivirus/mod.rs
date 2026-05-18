@@ -239,6 +239,15 @@ pub struct AntivirusConfig {
     /// Appended to `SCAN_EXCLUDE_REGEX`.
     #[serde(default)]
     pub extra_excludes: Vec<String>,
+    /// Real-time on-access scanning via clamonacc + clamd. When true,
+    /// every file open is scanned via the kernel's fanotify API and
+    /// matches are auto-quarantined (--move to /var/quarantine/wolfstack).
+    /// OFF by default — opt-in because:
+    /// (a) requires installing clamav-daemon / clamd (extra package)
+    /// (b) adds latency to every file open on the host
+    /// (c) eats memory (clamd loads the full signature DB resident)
+    #[serde(default)]
+    pub enable_on_access: bool,
 }
 
 fn default_true() -> bool { true }
@@ -257,6 +266,7 @@ impl Default for AntivirusConfig {
             run_chkrootkit: true,
             scan_roots: default_scan_roots(),
             extra_excludes: Vec::new(),
+            enable_on_access: false,
         }
     }
 }
@@ -312,19 +322,106 @@ pub struct InstallStatus {
     pub chkrootkit: ToolStatus,
     pub distro: String,
     pub package_manager: String,
+    /// On-access scanning daemon + service status. "disabled" |
+    /// "enabling" | "enabled" | "disabling" | "failed". Derived from
+    /// systemd unit state — refreshed by detect_install_status.
+    #[serde(default = "default_on_access_state")]
+    pub on_access_state: String,
+    /// Last failure reason if on_access_state == "failed".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_access_error: Option<String>,
 }
+
+fn default_on_access_state() -> String { "disabled".into() }
+
+/// Per-distro-family knowledge for on-access scanning. Captures the
+/// package name, systemd unit names, config file path, and clamd log
+/// path — all of which differ between distros for the same upstream
+/// software.
+#[derive(Debug, Clone)]
+struct OnAccessProfile {
+    /// Package providing clamd + clamonacc binaries.
+    pkg_daemon: &'static str,
+    /// systemd service that runs clamd.
+    svc_daemon: &'static str,
+    /// systemd service that runs clamonacc. None means we manage it
+    /// ourselves via a generated unit (no distro-provided service).
+    svc_onacc: Option<&'static str>,
+    /// Path to the clamd.conf the daemon reads.
+    clamd_conf: &'static str,
+    /// Path to the clamd log file we tail for FOUND events.
+    clamd_log: &'static str,
+}
+
+fn on_access_profile_for(family: &str) -> Option<OnAccessProfile> {
+    match family {
+        "debian" => Some(OnAccessProfile {
+            pkg_daemon: "clamav-daemon",
+            svc_daemon: "clamav-daemon.service",
+            svc_onacc: Some("clamav-clamonacc.service"),
+            clamd_conf: "/etc/clamav/clamd.conf",
+            clamd_log:  "/var/log/clamav/clamav.log",
+        }),
+        "redhat" => Some(OnAccessProfile {
+            pkg_daemon: "clamd",
+            svc_daemon: "clamd@scan.service",
+            svc_onacc: None, // RHEL/Fedora typically don't ship a clamonacc unit
+            clamd_conf: "/etc/clamd.d/scan.conf",
+            clamd_log:  "/var/log/clamd.scan",
+        }),
+        "arch" => Some(OnAccessProfile {
+            pkg_daemon: "clamav",
+            svc_daemon: "clamav-daemon.service",
+            svc_onacc: None,
+            clamd_conf: "/etc/clamav/clamd.conf",
+            clamd_log:  "/var/log/clamav/clamav.log",
+        }),
+        "suse" => Some(OnAccessProfile {
+            pkg_daemon: "clamd",
+            svc_daemon: "clamd.service",
+            svc_onacc: None,
+            clamd_conf: "/etc/clamd.conf",
+            clamd_log:  "/var/log/clamav/clamav.log",
+        }),
+        _ => None,
+    }
+}
+
+const ON_ACCESS_BLOCK_BEGIN: &str = "# === WolfStack on-access begin (do not edit between markers) ===";
+const ON_ACCESS_BLOCK_END:   &str = "# === WolfStack on-access end ===";
+const ON_ACCESS_UNIT_PATH:   &str = "/etc/systemd/system/wolfstack-clamonacc.service";
 
 pub fn detect_install_status() -> InstallStatus {
     let (distro, id_like) = parse_os_release();
     let family = distro_family_with_idlike(&distro, &id_like);
     let pm = pkg_manager_family(family);
+    let on_access_state = detect_on_access_state(family);
     InstallStatus {
         clamav: detect_clamav(),
         rkhunter: detect_simple_binary("rkhunter", "--version"),
         chkrootkit: detect_chkrootkit_family(family),
         distro,
         package_manager: pm.unwrap_or_default(),
+        on_access_state,
+        on_access_error: None,
     }
+}
+
+/// Inspect systemd to decide whether on-access scanning is currently
+/// active on this host. The result is purely advisory — apply_on_access
+/// is the source of truth while a state transition is in flight.
+fn detect_on_access_state(family: &str) -> String {
+    let prof = match on_access_profile_for(family) {
+        Some(p) => p, None => return "disabled".into(),
+    };
+    let daemon_active = systemd_is_active(prof.svc_daemon);
+    let onacc_active = match prof.svc_onacc {
+        Some(svc) => systemd_is_active(svc),
+        // No distro-provided clamonacc unit — check the one we manage.
+        None => systemd_is_active("wolfstack-clamonacc.service"),
+    };
+    if daemon_active && onacc_active { "enabled".into() }
+    else { "disabled".into() }
 }
 
 fn detect_clamav() -> ToolStatus {
@@ -764,6 +861,426 @@ pub fn install_tools(state: &AntivirusState) -> InstallResult {
     }
 }
 
+// ══════════════════════════════════════════════════════════
+// On-access (real-time) scanning — clamonacc + clamd
+// ══════════════════════════════════════════════════════════
+
+/// Build the managed clamd.conf block. Lists every excludable path
+/// we know about (static defaults + non-local mounts discovered at
+/// apply time) so fanotify doesn't loop on /proc, /sys, or eat S3FS
+/// shares.
+fn build_on_access_clamd_block() -> String {
+    let mut out = String::new();
+    out.push_str(ON_ACCESS_BLOCK_BEGIN);
+    out.push('\n');
+    out.push_str("# Managed by WolfStack — toggled via the Security page.\n");
+    out.push_str("ScanOnAccess yes\n");
+    out.push_str("OnAccessMountPath /\n");
+    // Default exclusions matching the scheduled-scan filter.
+    let static_excludes = [
+        "/proc", "/sys", "/dev", "/run",
+        "/var/quarantine/wolfstack",
+        "/var/lib/wolfstack",
+        "/var/lib/vz/images",
+        "/var/lib/libvirt/images",
+        "/var/log/clamav",
+    ];
+    for p in &static_excludes {
+        out.push_str(&format!("OnAccessExcludePath {}\n", p));
+    }
+    // Discovered non-local mounts (NFS, S3FS, sshfs, overlay, tmpfs, etc.).
+    for mp in discover_skippable_mountpoints() {
+        if mp == "/" { continue; }
+        out.push_str(&format!("OnAccessExcludePath {}\n", mp));
+    }
+    // Don't trigger on our own scanner reading files (prevents the
+    // file-A-was-just-scanned-which-reads-file-B feedback loop).
+    out.push_str("OnAccessExcludeUname clamav\n");
+    // Conservative: alert + (clamonacc --move) quarantine, no read-block.
+    out.push_str("OnAccessPrevention no\n");
+    out.push_str("OnAccessDisableDDD no\n");
+    // Scan directory metadata changes too — catches malware moving
+    // files into a watched dir.
+    out.push_str("OnAccessExtraScanning yes\n");
+    out.push_str(ON_ACCESS_BLOCK_END);
+    out.push('\n');
+    out
+}
+
+/// Inject or update the managed block in clamd.conf. Idempotent — if
+/// the markers are already present, the block between them is
+/// replaced. Existing settings outside the markers are untouched.
+fn install_clamd_conf_block(conf_path: &str) -> std::io::Result<()> {
+    let existing = std::fs::read_to_string(conf_path).unwrap_or_default();
+    let block = build_on_access_clamd_block();
+    let updated = if existing.contains(ON_ACCESS_BLOCK_BEGIN)
+        && existing.contains(ON_ACCESS_BLOCK_END)
+    {
+        // Replace existing block.
+        let begin = existing.find(ON_ACCESS_BLOCK_BEGIN).unwrap();
+        let end = existing.find(ON_ACCESS_BLOCK_END).unwrap()
+            + ON_ACCESS_BLOCK_END.len();
+        // Consume up to and including the newline after END.
+        let after_end = existing[end..].find('\n').map(|n| end + n + 1).unwrap_or(end);
+        format!("{}{}{}", &existing[..begin], block, &existing[after_end..])
+    } else {
+        // Append (with a separator newline if needed).
+        let mut s = existing;
+        if !s.ends_with('\n') { s.push('\n'); }
+        s.push('\n');
+        s.push_str(&block);
+        s
+    };
+    if let Some(parent) = Path::new(conf_path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(conf_path, updated)
+}
+
+/// Remove the managed block but leave any other lines alone.
+fn remove_clamd_conf_block(conf_path: &str) -> std::io::Result<()> {
+    let existing = match std::fs::read_to_string(conf_path) {
+        Ok(s) => s, Err(_) => return Ok(()),  // file gone, nothing to do
+    };
+    if !existing.contains(ON_ACCESS_BLOCK_BEGIN) {
+        return Ok(());
+    }
+    let begin = existing.find(ON_ACCESS_BLOCK_BEGIN).unwrap();
+    let end = existing.find(ON_ACCESS_BLOCK_END)
+        .map(|i| i + ON_ACCESS_BLOCK_END.len())
+        .unwrap_or(begin);
+    let after_end = existing[end..].find('\n').map(|n| end + n + 1).unwrap_or(end);
+    // Trim a single leading blank line if we created one on insertion.
+    let mut leading = begin;
+    if leading > 0 && existing.as_bytes().get(leading - 1) == Some(&b'\n')
+        && existing.as_bytes().get(leading.saturating_sub(2)) == Some(&b'\n')
+    {
+        leading -= 1;
+    }
+    let updated = format!("{}{}", &existing[..leading], &existing[after_end..]);
+    std::fs::write(conf_path, updated)
+}
+
+/// systemd unit we drop in when the distro doesn't ship a clamonacc
+/// service. Runs clamonacc in the foreground with --move to our
+/// quarantine dir so detections auto-quarantine the same way clamscan
+/// does.
+const WOLFSTACK_CLAMONACC_UNIT: &str = "\
+[Unit]
+Description=WolfStack-managed clamonacc on-access scanner
+After=clamav-daemon.service clamd.service clamd@scan.service
+Wants=clamav-daemon.service
+
+[Service]
+Type=simple
+ExecStartPre=/bin/mkdir -p /var/quarantine/wolfstack
+ExecStart=/usr/bin/clamonacc --foreground --move=/var/quarantine/wolfstack
+Restart=on-failure
+RestartSec=10
+# CAP_SYS_ADMIN required for fanotify with FAN_CLASS_CONTENT/PRE_CONTENT
+AmbientCapabilities=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH
+
+[Install]
+WantedBy=multi-user.target
+";
+
+fn write_managed_onacc_unit(state: &AntivirusState) -> bool {
+    state.push_install_line(format!("==> Writing systemd unit at {}", ON_ACCESS_UNIT_PATH));
+    if let Err(e) = std::fs::write(ON_ACCESS_UNIT_PATH, WOLFSTACK_CLAMONACC_UNIT) {
+        state.push_install_line(format!("[on-access] ERROR writing unit: {}", e));
+        return false;
+    }
+    run_streaming(state, "systemctl", &["systemctl", "daemon-reload"], &[]);
+    true
+}
+
+fn remove_managed_onacc_unit(state: &AntivirusState) {
+    if Path::new(ON_ACCESS_UNIT_PATH).exists() {
+        run_streaming(state, "systemctl", &["systemctl", "disable", "wolfstack-clamonacc.service"], &[]);
+        run_streaming(state, "systemctl", &["systemctl", "stop", "wolfstack-clamonacc.service"], &[]);
+        let _ = std::fs::remove_file(ON_ACCESS_UNIT_PATH);
+        run_streaming(state, "systemctl", &["systemctl", "daemon-reload"], &[]);
+    }
+}
+
+use std::sync::atomic::Ordering;
+
+/// Toggle on-access scanning. Takes an `Arc<AntivirusState>` so it
+/// can clone for the tailer thread that lives past this call.
+/// Streams every step into the existing install_progress log so the
+/// operator sees apt install / config edits / service start lines in
+/// the install terminal modal.
+///
+/// Idempotent — calling apply_on_access(arc, true) when already
+/// enabled re-runs the config injection and restarts the daemon
+/// (useful after distro upgrades / signature changes).
+pub fn apply_on_access(state: std::sync::Arc<AntivirusState>, target: bool) {
+    // Re-use the install_progress ring buffer so the same UI terminal
+    // shows what's happening.
+    {
+        let mut g = state.install_progress.write().unwrap();
+        *g = InstallProgress {
+            running: true,
+            started_at: Some(now_rfc3339()),
+            finished_at: None,
+            ok: None,
+            error: None,
+            lines: Vec::new(),
+        };
+    }
+
+    let (distro, id_like) = parse_os_release();
+    let family = distro_family_with_idlike(&distro, &id_like);
+    let prof = match on_access_profile_for(family) {
+        Some(p) => p,
+        None => {
+            let err = format!("on-access scanning not supported on distro '{}'", distro);
+            state.push_install_line(format!("==> ERROR: {}", err));
+            finalize_install(&state, false, Some(err));
+            return;
+        }
+    };
+    state.push_install_line(format!(
+        "==> on-access scanning: target={} (distro={} family={})",
+        if target { "ENABLE" } else { "disable" }, distro, family));
+
+    if target {
+        // 1. Install the daemon package if neither binary is present.
+        //    The clamav-daemon package (Debian) or clamd (RHEL/SUSE)
+        //    typically bundles both clamd AND clamonacc, but we check
+        //    both binaries to handle the rare split.
+        if which("clamd").is_none() || which("clamonacc").is_none() {
+            state.push_install_line(format!("==> Installing {}", prof.pkg_daemon));
+            let apt_env: &[(&str, &str)] = &[
+                ("DEBIAN_FRONTEND", "noninteractive"),
+                ("DEBCONF_NONINTERACTIVE_SEEN", "true"),
+                ("APT_LISTCHANGES_FRONTEND", "none"),
+                ("NEEDRESTART_MODE", "a"),
+            ];
+            let argv = match build_install_cmd_family(family, &[prof.pkg_daemon]) {
+                Some(v) => v,
+                None => {
+                    let err = "no package manager command for distro family".to_string();
+                    state.push_install_line(format!("==> ERROR: {}", err));
+                    finalize_install(&state, false, Some(err));
+                    return;
+                }
+            };
+            let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+            open_install_holes(&state);
+            let ok = run_streaming(
+                &state, "pkg-install", &argv_refs,
+                if family == "debian" { apt_env } else { &[] },
+            );
+            close_install_holes(&state);
+            if !ok {
+                let err = "package install for clamav-daemon/clamd failed".to_string();
+                finalize_install(&state, false, Some(err));
+                return;
+            }
+        } else {
+            state.push_install_line("==> clamd + clamonacc already installed — skipping package install.".into());
+        }
+
+        // 2. Write managed clamd.conf block.
+        state.push_install_line(format!("==> Injecting managed block into {}", prof.clamd_conf));
+        if let Err(e) = install_clamd_conf_block(prof.clamd_conf) {
+            let err = format!("write {}: {}", prof.clamd_conf, e);
+            state.push_install_line(format!("==> ERROR: {}", err));
+            finalize_install(&state, false, Some(err));
+            return;
+        }
+        state.push_install_line(format!(
+            "==> clamd.conf updated. Managed block lists {} non-local mount(s) to exclude.",
+            discover_skippable_mountpoints().len()));
+
+        // 3. Restart clamd to pick up the new config. enable --now is
+        //    idempotent; restart is required because the unit may
+        //    already be running with the old config.
+        state.push_install_line(format!("==> Restarting {}", prof.svc_daemon));
+        run_streaming(&state, "systemctl",
+            &["systemctl", "enable", "--now", prof.svc_daemon], &[]);
+        run_streaming(&state, "systemctl",
+            &["systemctl", "restart", prof.svc_daemon], &[]);
+        // Wait for clamd to load the signature DB. On a busy server
+        // with the full freshclam set this can be 10-30 seconds.
+        state.push_install_line("==> Waiting for clamd to finish loading signatures…".into());
+        std::thread::sleep(std::time::Duration::from_secs(5));
+
+        // 4. Start clamonacc — distro service or our managed unit.
+        let onacc_svc: String = match prof.svc_onacc {
+            Some(s) => s.to_string(),
+            None => {
+                if !write_managed_onacc_unit(&state) {
+                    let err = "failed to write wolfstack-clamonacc.service".to_string();
+                    finalize_install(&state, false, Some(err));
+                    return;
+                }
+                "wolfstack-clamonacc.service".to_string()
+            }
+        };
+        state.push_install_line(format!("==> Starting {}", onacc_svc));
+        run_streaming(&state, "systemctl",
+            &["systemctl", "enable", "--now", &onacc_svc], &[]);
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        if !systemd_is_active(&onacc_svc) {
+            let err = format!(
+                "{} failed to stay running — check `journalctl -u {}` for details",
+                onacc_svc, onacc_svc);
+            state.push_install_line(format!("==> ERROR: {}", err));
+            finalize_install(&state, false, Some(err));
+            return;
+        }
+
+        // 5. Start the findings tailer.
+        start_on_access_tailer(state.clone(), prof.clamd_log.to_string());
+
+        state.push_install_line("==> On-access scanning ENABLED. New findings will appear in the Security page.".into());
+        finalize_install(&state, true, None);
+    } else {
+        // Disable path.
+        if let Some(svc) = prof.svc_onacc {
+            state.push_install_line(format!("==> Stopping {}", svc));
+            run_streaming(&state, "systemctl",
+                &["systemctl", "disable", "--now", svc], &[]);
+        } else {
+            remove_managed_onacc_unit(&state);
+        }
+        state.push_install_line(format!("==> Removing managed block from {}", prof.clamd_conf));
+        if let Err(e) = remove_clamd_conf_block(prof.clamd_conf) {
+            state.push_install_line(format!(
+                "[on-access] WARN: could not strip managed block: {}", e));
+        }
+        // Restart clamd so the on-access directives stop taking effect.
+        // We leave it RUNNING because clamdscan + clamonacc-as-occasional-
+        // tool are still useful. If the user wants the daemon stopped
+        // they can do that separately.
+        run_streaming(&state, "systemctl",
+            &["systemctl", "restart", prof.svc_daemon], &[]);
+        // Signal tailer thread to exit.
+        state.on_access_tailer_stop.store(true, Ordering::SeqCst);
+        state.push_install_line("==> On-access scanning DISABLED.".into());
+        finalize_install(&state, true, None);
+    }
+}
+
+// ─── Background tailer for clamd.log → findings ──────────────
+
+/// Re-attach the log tailer at startup if on-access scanning was
+/// enabled in the persisted config AND systemd shows the daemon +
+/// clamonacc actually running. Without this, a wolfstack restart
+/// silently stops surfacing on-access findings even though clamonacc
+/// itself keeps running.
+pub fn resume_on_access_tailer_if_enabled(state: std::sync::Arc<AntivirusState>) {
+    let want = state.config.read().map(|g| g.enable_on_access).unwrap_or(false);
+    if !want { return; }
+    let (distro, id_like) = parse_os_release();
+    let family = distro_family_with_idlike(&distro, &id_like);
+    let prof = match on_access_profile_for(family) { Some(p) => p, None => return };
+    // Verify systemd state matches intent — don't start a tailer if
+    // clamonacc isn't actually running.
+    let onacc_active = match prof.svc_onacc {
+        Some(svc) => systemd_is_active(svc),
+        None => systemd_is_active("wolfstack-clamonacc.service"),
+    };
+    if !onacc_active {
+        tracing::warn!(
+            "antivirus: enable_on_access=true in config but clamonacc service is not active; tailer not started"
+        );
+        return;
+    }
+    tracing::info!("antivirus: resuming on-access log tailer (log={})", prof.clamd_log);
+    start_on_access_tailer(state, prof.clamd_log.to_string());
+}
+
+/// Spawn the on-access log tailer thread. Replaces any existing
+/// tailer by flipping the stop flag (existing thread notices on its
+/// next 2-second tick and exits) then re-arming and launching a new
+/// thread.
+fn start_on_access_tailer(state: std::sync::Arc<AntivirusState>, log_path: String) {
+    // Stop any existing tailer first.
+    state.on_access_tailer_stop.store(true, Ordering::SeqCst);
+    // Give the old tailer a tick to notice. 500ms > our 200ms poll
+    // resolution so the previous instance is guaranteed to see the
+    // flag before we re-arm it.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    state.on_access_tailer_stop.store(false, Ordering::SeqCst);
+
+    state.push_install_line(format!("==> Tailing {} for FOUND events (background)", log_path));
+    let stop = state.on_access_tailer_stop.clone();
+    let state_for_thread = state.clone();
+    std::thread::spawn(move || {
+        on_access_tailer_loop(state_for_thread, log_path, stop);
+    });
+}
+
+/// Tailer body — polls the clamd log file every 2s, reads any new
+/// content from the last offset, parses FOUND lines, and pushes them
+/// into the findings list as `scanner="clamonacc"` entries.
+///
+/// Behaviour notes:
+/// - Starts at EOF on first poll so we don't replay historical FOUNDs
+///   from prior sessions (those are already recorded).
+/// - Detects log rotation by checking if file size shrank since last
+///   poll; resets offset to 0.
+/// - The file at `path` is the one quarantined by clamonacc's --move
+///   to `/var/quarantine/wolfstack/`. We don't (yet) reconcile that
+///   into our quarantine index — the file IS quarantined on disk but
+///   won't appear in the per-node Quarantine table. That's a
+///   documented v1 limitation.
+fn on_access_tailer_loop(
+    state: std::sync::Arc<AntivirusState>,
+    log_path: String,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut offset: u64 = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+    let mut buf = String::new();
+    while !stop.load(Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let mut f = match std::fs::File::open(&log_path) { Ok(f) => f, Err(_) => continue };
+        let meta = match f.metadata() { Ok(m) => m, Err(_) => continue };
+        let len = meta.len();
+        if len < offset { offset = 0; }   // log rotated
+        if len == offset { continue; }
+        if f.seek(SeekFrom::Start(offset)).is_err() { continue; }
+        buf.clear();
+        if f.read_to_string(&mut buf).is_err() { continue; }
+        offset = len;
+        for line in buf.lines() {
+            let trimmed = line.trim();
+            if !trimmed.ends_with("FOUND") { continue; }
+            // clamd log line format:
+            //   "Mon Jan  1 12:34:56 2024 -> /path: ThreatName FOUND"
+            let payload = match trimmed.find(" -> ") {
+                Some(idx) => &trimmed[idx + 4..],
+                None => trimmed,
+            };
+            if let Some(hit) = parse_one_clamav_hit(payload) {
+                let finding = Finding {
+                    id: new_id(),
+                    scanner: "clamonacc".into(),
+                    severity: "critical".into(),
+                    title: format!("clamonacc: {}", hit.threat),
+                    detail: format!(
+                        "On-access detection: '{}' in {}. File auto-moved to /var/quarantine/wolfstack/ by clamonacc.",
+                        hit.threat, hit.path),
+                    path: Some(hit.path.clone()),
+                    threat_name: Some(hit.threat.clone()),
+                    detected_at: now_rfc3339(),
+                    // clamonacc with --move handles the quarantine itself —
+                    // no process kill (different from clamscan flow).
+                    action_taken: "quarantined_by_clamonacc".into(),
+                    quarantine_id: None,
+                    killed_pids: Vec::new(),
+                };
+                append_findings(&state, vec![finding]);
+            }
+        }
+    }
+}
+
 fn finalize_install(state: &AntivirusState, ok: bool, error: Option<String>) {
     // Always close the firewall holes — even on failure paths. The
     // close is idempotent so calling it when no holes were opened
@@ -1157,6 +1674,9 @@ pub struct AntivirusState {
     pub quarantine: RwLock<Vec<QuarantineEntry>>,
     pub install_status: RwLock<InstallStatus>,
     pub install_progress: RwLock<InstallProgress>,
+    /// Signal for the on-access log tailer thread to stop. Flipped to
+    /// true on disable; the tailer checks it every 2s and exits.
+    pub on_access_tailer_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AntivirusState {
@@ -1183,6 +1703,7 @@ impl AntivirusState {
             quarantine: RwLock::new(quarantine),
             install_status: RwLock::new(install_status),
             install_progress: RwLock::new(InstallProgress::default()),
+            on_access_tailer_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -2152,6 +2673,42 @@ mod tests {
         assert!(debian_pkgs.contains(&"chkrootkit"));
         let redhat_pkgs = packages_for_family("redhat");
         assert!(redhat_pkgs.contains(&"chkrootkit"));
+    }
+
+    #[test]
+    fn clamd_conf_block_inject_replace_remove_roundtrip() {
+        // Use a temp file so we don't touch the real clamd.conf.
+        let tmp = std::env::temp_dir().join(format!(
+            "wolfstack-clamd-{}.conf", std::process::id()));
+        let path = tmp.to_string_lossy().to_string();
+        // Start with a user's existing config.
+        let initial = "# User settings\nLogVerbose yes\nUser clamav\n";
+        std::fs::write(&path, initial).unwrap();
+        // First injection appends the block.
+        install_clamd_conf_block(&path).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.starts_with("# User settings"), "user content must be preserved at the top");
+        assert!(after.contains(ON_ACCESS_BLOCK_BEGIN));
+        assert!(after.contains(ON_ACCESS_BLOCK_END));
+        assert!(after.contains("ScanOnAccess yes"));
+        assert!(after.contains("OnAccessExcludePath /proc"));
+        // Re-injection must replace the block in place (no duplicate markers).
+        install_clamd_conf_block(&path).unwrap();
+        let after2 = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after2.matches(ON_ACCESS_BLOCK_BEGIN).count(), 1, "begin marker must appear exactly once");
+        assert_eq!(after2.matches(ON_ACCESS_BLOCK_END).count(), 1, "end marker must appear exactly once");
+        assert!(after2.contains("LogVerbose yes"), "user content survives re-injection");
+        // Removal strips the block + leaves user content intact.
+        remove_clamd_conf_block(&path).unwrap();
+        let after3 = std::fs::read_to_string(&path).unwrap();
+        assert!(!after3.contains(ON_ACCESS_BLOCK_BEGIN));
+        assert!(!after3.contains(ON_ACCESS_BLOCK_END));
+        assert!(after3.contains("LogVerbose yes"));
+        assert!(after3.contains("User clamav"));
+        // Idempotent: removing again is a no-op.
+        remove_clamd_conf_block(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), after3);
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

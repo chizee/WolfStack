@@ -1089,6 +1089,12 @@ async fn main() -> std::io::Result<()> {
             }
         });
 
+        // If on-access scanning was previously enabled, clamonacc keeps
+        // running across a wolfstack restart (it's a systemd service)
+        // but the log tailer thread doesn't (in-process). Re-attach
+        // the tailer at startup so findings keep flowing to the UI.
+        crate::antivirus::resume_on_access_tailer_if_enabled(app_state.antivirus.clone());
+
         // Security scanner background loop — runs posture + active-attack
         // checks on a timer and fires alerts via Discord/Slack/Telegram/
         // email when a critical-severity finding appears (SSH brute-force,

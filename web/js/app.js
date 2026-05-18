@@ -16704,6 +16704,14 @@ function renderNodeAvStatus(d) {
         </div>
         ${scan.last_error ? `<div style="margin-top:6px; padding:6px 10px; background:rgba(239,68,68,0.08); border:1px solid rgba(239,68,68,0.3); border-radius:6px; font-size:12px; color:#ef4444;">Last scan error: ${vlanEsc(scan.last_error)}</div>` : ''}
     `;
+    // Update the on-access badge (next to the Enable/Disable buttons).
+    const onaccBadge = document.getElementById('node-av-onacc-state');
+    if (onaccBadge) {
+        const s = (inst.on_access_state || 'disabled').toLowerCase();
+        const colour = s === 'enabled' ? '#22c55e' : s === 'failed' ? '#ef4444' : 'var(--text-muted)';
+        onaccBadge.style.color = colour;
+        onaccBadge.textContent = s;
+    }
 }
 
 function renderNodeAvFindings(findings) {
@@ -16899,6 +16907,170 @@ window.nodeAntivirusScan = nodeAntivirusScan;
 window.nodeAntivirusSaveConfig = nodeAntivirusSaveConfig;
 window.nodeAntivirusRestore = nodeAntivirusRestore;
 window.nodeAntivirusDelete = nodeAntivirusDelete;
+
+// ─── On-access scanning toggles ────────────────────────────────────
+
+async function nodeAntivirusOnAccess(enable) {
+    const verb = enable ? 'Enable' : 'Disable';
+    if (!await wolfConfirm(
+        `${verb} real-time on-access scanning on THIS node?\n\nClamonacc scans every file open via fanotify. Findings are auto-moved to /var/quarantine/wolfstack/. ${enable ? "Adds latency to every file open and loads the full ClamAV signature DB into memory (~300 MB resident). Don't enable on database or log-heavy hosts without testing." : "Stops the clamd + clamonacc services and strips the managed clamd.conf block."}`,
+        `${verb} on-access scanning`
+    )) return;
+    // Reuse the install terminal modal to show the live work.
+    openAvInstallModal();
+    document.getElementById('av-install-modal-subtitle').textContent =
+        `${verb}ing on-access scanning on this node…`;
+    _avTermAppend(`WolfStack on-access ${verb.toLowerCase()} — ${new Date().toISOString()}`);
+    try {
+        const r = await fetch(apiUrl('/api/antivirus/on-access'), {
+            method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({ enabled: enable }),
+        });
+        if (r.status === 409) {
+            const d = await r.json().catch(() => ({}));
+            _avTermAppend(`[error] another install is already in progress: ${d.error || ''}`);
+            return;
+        }
+        if (!r.ok) {
+            const d = await r.json().catch(() => ({}));
+            _avTermAppend(`[error] HTTP ${r.status}: ${d.error || ''}`);
+            return;
+        }
+    } catch (e) {
+        _avTermAppend(`[error] request failed: ${e.message || e}`);
+        return;
+    }
+    // Poll install-log until the apply finishes (same shape as install).
+    let shown = 0;
+    while (!_avInstallAbort) {
+        let resp;
+        try {
+            resp = await fetch(apiUrl('/api/antivirus/install-log')).then(r => r.json());
+        } catch (e) {
+            _avTermAppend(`[error] poll: ${e.message || e}`); break;
+        }
+        const lines = resp.lines || [];
+        if (lines.length > shown) {
+            _avTermAppend(lines.slice(shown).join('\n'));
+            shown = lines.length;
+        }
+        if (!resp.running) {
+            _avTermAppend(`\nResult: ${resp.ok ? 'OK' : 'FAILED' + (resp.error ? ` (${resp.error})` : '')}`);
+            break;
+        }
+        await new Promise(r => setTimeout(r, 1000));
+    }
+    // Refresh the local card so the new status is visible.
+    if (typeof loadNodeAntivirus === 'function') loadNodeAntivirus().catch(() => {});
+}
+
+async function fleetAntivirusOnAccess(enable) {
+    const verb = enable ? 'Enable' : 'Disable';
+    // Get the node list.
+    let statusResp;
+    try {
+        statusResp = await fetch(apiUrl('/api/fleet/antivirus/status')).then(r => r.json());
+    } catch (e) {
+        showToast(`Could not load node list: ${e.message || e}`, 'error');
+        return;
+    }
+    const nodes = (statusResp.nodes || [])
+        .filter(n => n.status === 'ok' || n.status === 'failed')
+        .map(n => ({ id: n.node_id, hostname: n.hostname || n.node_id }));
+    if (nodes.length === 0) {
+        showToast('No nodes available', 'warning');
+        return;
+    }
+    if (!await wolfConfirm(
+        `${verb} real-time on-access scanning on ${nodes.length} node(s)?\n\nNodes are processed one at a time in the install terminal. ${enable ? "Will install clamav-daemon/clamd if missing. Adds file-open latency on every node and loads ~300MB signature DB into memory per node. NOT recommended for database or log-heavy hosts." : "Stops clamd + clamonacc and removes the managed clamd.conf block."}\n\nContinue?`,
+        `Fleet on-access ${verb.toLowerCase()}`
+    )) return;
+    runAvOnAccessSequence(nodes, statusResp.self_id || null, enable);
+}
+
+async function runAvOnAccessSequence(nodes, selfId, enable) {
+    if (_avInstallPolling) {
+        showToast('An install/apply sequence is already running', 'warning');
+        return;
+    }
+    _avInstallPolling = true;
+    openAvInstallModal();
+    const verb = enable ? 'Enable' : 'Disable';
+    document.getElementById('av-install-modal-subtitle').textContent =
+        `${verb}ing on-access scanning on ${nodes.length} node${nodes.length === 1 ? '' : 's'}…`;
+    _avTermAppend(`WolfStack on-access ${verb.toLowerCase()} — ${nodes.length} node(s)`);
+    _avTermAppend(`Started ${new Date().toISOString()}`);
+    let okCount = 0, failCount = 0;
+    try {
+        for (let i = 0; i < nodes.length; i++) {
+            if (_avInstallAbort) break;
+            const n = nodes[i];
+            const progressEl = document.getElementById('av-install-modal-progress');
+            if (progressEl) progressEl.textContent = `Node ${i + 1} of ${nodes.length}`;
+            _avTermAppend(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+            _avTermAppend(`▶ ${n.hostname}`);
+            _avTermAppend(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+            // Start the apply on this node.
+            const url = _avNodeUrl(n.id, selfId, '/api/antivirus/on-access');
+            let startResp;
+            try {
+                startResp = await fetch(url, {
+                    method: 'POST', headers: {'Content-Type':'application/json'},
+                    body: JSON.stringify({ enabled: enable }),
+                });
+            } catch (e) {
+                _avTermAppend(`[error] start failed: ${e.message || e}`);
+                failCount++; continue;
+            }
+            if (startResp.status === 409) {
+                _avTermAppend(`(an install was already in progress — attaching)`);
+            } else if (!startResp.ok) {
+                const txt = await startResp.text().catch(() => '');
+                _avTermAppend(`[error] start HTTP ${startResp.status}: ${txt.slice(0, 200)}`);
+                failCount++; continue;
+            }
+            // Poll install-log until finished.
+            let shown = 0; let nodeOk = false;
+            while (!_avInstallAbort) {
+                let resp;
+                try {
+                    const logUrl = _avNodeUrl(n.id, selfId, '/api/antivirus/install-log');
+                    resp = await fetch(logUrl).then(r => r.json());
+                } catch (e) {
+                    _avTermAppend(`[error] log poll: ${e.message || e}`); break;
+                }
+                const lines = resp.lines || [];
+                if (lines.length > shown) {
+                    _avTermAppend(lines.slice(shown).join('\n'));
+                    shown = lines.length;
+                }
+                if (!resp.running) {
+                    nodeOk = !!resp.ok;
+                    _avTermAppend(`\n${n.hostname}: ${nodeOk ? '✓ OK' : '✗ FAILED' + (resp.error ? ` (${resp.error})` : '')}`);
+                    break;
+                }
+                await new Promise(r => setTimeout(r, 1000));
+            }
+            if (nodeOk) okCount++; else failCount++;
+        }
+    } finally {
+        _avInstallPolling = false;
+    }
+    _avTermAppend(``);
+    _avTermAppend(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+    _avTermAppend(`SUMMARY: ${okCount} OK, ${failCount} failed`);
+    _avTermAppend(`Finished ${new Date().toISOString()}`);
+    document.getElementById('av-install-modal-subtitle').textContent =
+        `Done — ${okCount} OK, ${failCount} failed`;
+    if (typeof fleetLoadAntivirus === 'function') fleetLoadAntivirus().catch(() => {});
+    if (typeof loadNodeAntivirus === 'function') loadNodeAntivirus().catch(() => {});
+    showToast(`On-access ${verb.toLowerCase()}: ${okCount} OK, ${failCount} failed`,
+        failCount === 0 ? 'success' : (okCount === 0 ? 'error' : 'warning'));
+}
+
+window.nodeAntivirusOnAccess = nodeAntivirusOnAccess;
+window.fleetAntivirusOnAccess = fleetAntivirusOnAccess;
+window.runAvOnAccessSequence = runAvOnAccessSequence;
 
 // ─── Antivirus install terminal modal ──────────────────────────────
 // One modal, shared between per-node and fleet install flows. Runs
