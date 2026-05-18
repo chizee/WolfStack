@@ -69,6 +69,13 @@ const MAX_INSTALL_LINES: usize = 800;
 /// Filesystem subtrees never worth scanning. Kernel-virtual or
 /// WolfStack-owned. ClamAV's `--exclude-dir` accepts regex anchored
 /// at the start.
+///
+/// These are the *static* defaults. At scan time we ALSO read
+/// `/proc/mounts` via `discover_skippable_mountpoints` and add an
+/// explicit exclude for every mountpoint whose fs type is network /
+/// FUSE / overlay / virtual — that's how we keep clamscan out of
+/// S3FS-mounted buckets, NFS shares, sshfs, etc. wherever they are
+/// in the tree (not just /mnt).
 const SCAN_EXCLUDE_REGEX: &[&str] = &[
     "^/sys",
     "^/proc",
@@ -80,10 +87,114 @@ const SCAN_EXCLUDE_REGEX: &[&str] = &[
     // produce false reads.
     "^/var/lib/vz/images",
     "^/var/lib/libvirt/images",
-    // Network mounts — typically huge + scanned by their server, not us.
+    // Conventional remote-mount roots — defensive even though the
+    // /proc/mounts walk usually catches the actual mountpoints below.
     "^/mnt",
     "^/media",
 ];
+
+/// Filesystem types that should NEVER be scanned. We always exclude
+/// these regardless of where they're mounted.
+///
+/// - Network filesystems (nfs/cifs/9p/ceph/etc.) — files belong to the
+///   server, which has its own scanner; walking them from a client
+///   either hangs (stale mount) or burns hours on millions of files.
+/// - FUSE-backed mounts (`fuse.*`) — typical case is s3fs, rclone-mount,
+///   gocryptfs, sshfs. Same arguments as network mounts.
+/// - Virtual / pseudo filesystems — proc/sys/devpts/cgroup/etc. Nothing
+///   to scan; some have files that block forever on read().
+/// - Overlay — Docker container layer storage. Scanned via the underlying
+///   block fs at /var/lib/docker; the overlay mount itself is a
+///   duplicate view.
+/// - squashfs / iso9660 — read-only image mounts; the image file is
+///   scanned by its host filesystem.
+fn is_skippable_fstype(t: &str) -> bool {
+    if t.starts_with("fuse") { return true; }      // fuse, fuse.sshfs, fuse.s3fs, fuseblk…
+    matches!(t,
+        // Network
+        "nfs" | "nfs4" | "cifs" | "smb" | "smbfs" |
+        "ceph" | "9p" | "gfs2" | "ocfs2" | "lustre" | "afs" | "coda" |
+        // Virtual / pseudo
+        "proc" | "sysfs" | "devpts" | "devtmpfs" | "tmpfs" |
+        "cgroup" | "cgroup2" | "pstore" | "bpf" | "autofs" |
+        "securityfs" | "debugfs" | "configfs" | "fusectl" |
+        "mqueue" | "hugetlbfs" | "tracefs" | "ramfs" |
+        "rpc_pipefs" | "nsfs" | "binfmt_misc" | "efivarfs" |
+        // Container overlay / read-only image mounts
+        "overlay" | "overlay2" | "squashfs" | "iso9660"
+    )
+}
+
+/// Read `/proc/mounts` and return every mountpoint whose fs type is
+/// in [`is_skippable_fstype`]. Mountpoints come back *un-escaped*
+/// — `/proc/mounts` uses `\nnn` octal for spaces / tabs / newlines and
+/// we restore those so the path matches what clamscan sees on disk.
+fn discover_skippable_mountpoints() -> Vec<String> {
+    let text = match std::fs::read_to_string("/proc/mounts") {
+        Ok(t) => t, Err(_) => return Vec::new(),
+    };
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 3 { continue; }
+        let mp = parts[1];
+        let ty = parts[2];
+        if !is_skippable_fstype(ty) { continue; }
+        let unescaped = unescape_mount_path(mp);
+        // Never exclude "/" — that would silently skip the whole scan.
+        // (Shouldn't happen in practice; tmpfs is sometimes mounted at
+        // odd places but never at /.)
+        if unescaped == "/" { continue; }
+        out.push(unescaped);
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Decode `/proc/mounts` octal-escape sequences. `\\040` is space,
+/// `\\011` is tab, `\\012` is newline, `\\134` is literal backslash.
+fn unescape_mount_path(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 3 < bytes.len()
+            && bytes[i+1].is_ascii_digit()
+            && bytes[i+2].is_ascii_digit()
+            && bytes[i+3].is_ascii_digit()
+        {
+            let a = (bytes[i+1] - b'0') as u32;
+            let b = (bytes[i+2] - b'0') as u32;
+            let c = (bytes[i+3] - b'0') as u32;
+            // Octal — digits 0-7 only.
+            if a < 8 && b < 8 && c < 8 {
+                let byte = (a * 64 + b * 8 + c) as u8;
+                out.push(byte);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+/// Escape regex metacharacters in a literal path so it can be embedded
+/// in a ClamAV `--exclude-dir` regex without false matches. ClamAV
+/// uses POSIX extended regex; the metacharacters we escape are the
+/// usual suspects.
+fn regex_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        if "\\.+*?^$()[]{}|".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
 
 /// Default scan root. Single `/` walks everything else through the
 /// excludes above. Operators can override via config.
@@ -345,23 +456,62 @@ fn build_install_cmd_family(family: &str, packages: &[&str]) -> Option<Vec<Strin
     match family {
         "debian" => {
             // DEBIAN_FRONTEND=noninteractive is set by the caller via env.
-            let mut v = vec!["apt-get".into(), "install".into(), "-y".into(),
-                             "--no-install-recommends".into()];
+            // -q                       : quieter output (still useful, less noise)
+            // -y                       : assume yes
+            // --no-install-recommends  : keep the install minimal
+            // Dpkg::Options force-conf*: never prompt about modified
+            //                            config files; keep the
+            //                            currently-installed version
+            //                            on conflict (safe default).
+            let mut v = vec![
+                "apt-get".into(), "install".into(),
+                "-q".into(), "-y".into(),
+                "--no-install-recommends".into(),
+                "-o".into(), "Dpkg::Options::=--force-confdef".into(),
+                "-o".into(), "Dpkg::Options::=--force-confold".into(),
+            ];
             v.extend(packages.iter().map(|s| s.to_string()));
             Some(v)
         }
         "redhat" => {
-            let mut v = vec!["dnf".into(), "install".into(), "-y".into()];
+            // -y                              : assume yes (incl. GPG key import in modern dnf)
+            // --setopt=install_weak_deps=False: equivalent of apt's --no-install-recommends
+            // -q                              : less noise; full progress still visible in our log
+            let mut v = vec![
+                "dnf".into(), "install".into(),
+                "-y".into(), "-q".into(),
+                "--setopt=install_weak_deps=False".into(),
+            ];
             v.extend(packages.iter().map(|s| s.to_string()));
             Some(v)
         }
         "arch" => {
-            let mut v = vec!["pacman".into(), "-S".into(), "--noconfirm".into(), "--needed".into()];
+            // --noconfirm   : answer yes to every prompt (incl. "remove conflict?")
+            // --needed      : skip already-installed packages (idempotent)
+            // --noprogressbar: pacman's progress bar uses carriage returns
+            //                 that produce binary-looking output in our
+            //                 line-streamed log. Disabling it keeps lines
+            //                 clean. Final pkg-by-pkg progress still
+            //                 visible.
+            let mut v = vec![
+                "pacman".into(), "-S".into(),
+                "--noconfirm".into(), "--needed".into(),
+                "--noprogressbar".into(),
+            ];
             v.extend(packages.iter().map(|s| s.to_string()));
             Some(v)
         }
         "suse" => {
-            let mut v = vec!["zypper".into(), "--non-interactive".into(), "install".into(), "--no-recommends".into()];
+            // --non-interactive : assume default answer to every prompt
+            // --quiet           : less noise (errors still surfaced)
+            // --no-recommends   : equivalent of --no-install-recommends
+            let mut v = vec![
+                "zypper".into(),
+                "--non-interactive".into(),
+                "--quiet".into(),
+                "install".into(),
+                "--no-recommends".into(),
+            ];
             v.extend(packages.iter().map(|s| s.to_string()));
             Some(v)
         }
@@ -425,6 +575,11 @@ fn run_streaming(
 
     let mut cmd = Command::new(argv[0]);
     cmd.args(&argv[1..])
+        // Redirect stdin from /dev/null so anything that tries to
+        // prompt (rkhunter's press-a-key, debconf low-priority asks,
+        // shell `read`) gets EOF and either skips the prompt or
+        // fails fast — never blocks forever.
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for (k, v) in env { cmd.env(k, v); }
@@ -526,23 +681,35 @@ pub fn install_tools(state: &AntivirusState) -> InstallResult {
     };
     let cmdline = argv.join(" ");
 
+    // Environment to suppress every prompt path on apt:
+    //  - DEBIAN_FRONTEND=noninteractive    — main switch
+    //  - DEBCONF_NONINTERACTIVE_SEEN=true  — treat all questions as
+    //                                         already-answered
+    //  - APT_LISTCHANGES_FRONTEND=none     — apt-listchanges may pop
+    //                                         a pager on package
+    //                                         upgrade; this blocks it
+    //  - NEEDRESTART_MODE=a                — needrestart on Debian 12
+    //                                         prompts about service
+    //                                         restarts; 'a'utomatic
+    //                                         skips the question.
+    let apt_env: &[(&str, &str)] = &[
+        ("DEBIAN_FRONTEND", "noninteractive"),
+        ("DEBCONF_NONINTERACTIVE_SEEN", "true"),
+        ("APT_LISTCHANGES_FRONTEND", "none"),
+        ("NEEDRESTART_MODE", "a"),
+    ];
+
     // apt-get update first (apt only — dnf/pacman/zypper handle this
     // implicitly on install).
     if family == "debian" {
         state.push_install_line("==> apt-get update".into());
-        run_streaming(
-            state, "apt-update",
-            &["apt-get", "update"],
-            &[("DEBIAN_FRONTEND", "noninteractive")],
-        );
+        run_streaming(state, "apt-update", &["apt-get", "update", "-q"], apt_env);
     }
 
     // Actual install.
     state.push_install_line(format!("==> Installing: {}", pkgs.join(" ")));
     let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
-    let install_env: &[(&str, &str)] = if family == "debian" {
-        &[("DEBIAN_FRONTEND", "noninteractive")]
-    } else { &[] };
+    let install_env: &[(&str, &str)] = if family == "debian" { apt_env } else { &[] };
     let ok = run_streaming(state, "install", &argv_refs, install_env);
 
     if !ok {
@@ -573,11 +740,18 @@ pub fn install_tools(state: &AntivirusState) -> InstallResult {
     }
 
     // rkhunter signature + property baseline (idempotent).
+    // --skip-keypress: rkhunter pauses for keyboard input between
+    // sections by default. Without this flag the subprocess would hang
+    // forever waiting for a key press that never comes (we close stdin
+    // already, but the flag makes the intent explicit and stops
+    // rkhunter even emitting the prompt line).
     if which("rkhunter").is_some() {
         state.push_install_line("==> rkhunter --update".into());
-        run_streaming(state, "rkhunter", &["rkhunter", "--update", "--nocolors"], &[]);
+        run_streaming(state, "rkhunter",
+            &["rkhunter", "--update", "--nocolors", "--skip-keypress"], &[]);
         state.push_install_line("==> rkhunter --propupd".into());
-        run_streaming(state, "rkhunter", &["rkhunter", "--propupd", "--nocolors"], &[]);
+        run_streaming(state, "rkhunter",
+            &["rkhunter", "--propupd", "--nocolors", "--skip-keypress"], &[]);
     }
 
     state.push_install_line("==> Install complete.".into());
@@ -1043,67 +1217,177 @@ struct ClamHit {
 }
 
 /// Run clamscan over the configured scan roots. Returns the list of
-/// hits. Never panics — clamscan returning non-zero (which it does
-/// when it finds anything) is treated as a normal "has hits" path.
-fn run_clamav_scan(cfg: &AntivirusConfig) -> Result<Vec<ClamHit>, String> {
+/// hits. Streams stdout line-by-line so we can:
+///
+/// 1. Update `scan_state.progress_message` every N files with the
+///    current file path — gives the UI a live signal that work is
+///    happening and lets the operator confirm clamscan isn't stuck
+///    on a hung mount.
+/// 2. Capture the FOUND lines for the findings list.
+///
+/// We auto-derive a list of mountpoints to exclude from `/proc/mounts`
+/// (anything network / FUSE / overlay / virtual). That keeps clamscan
+/// out of S3FS/NFS/sshfs mounts wherever they're attached — not just
+/// the conventional /mnt and /media paths.
+fn run_clamav_scan(
+    state: &AntivirusState,
+    cfg: &AntivirusConfig,
+) -> Result<Vec<ClamHit>, String> {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+
     if which("clamscan").is_none() {
         return Err("clamscan binary not found — install ClamAV first".into());
     }
+
     let mut args: Vec<String> = vec![
         "-r".into(),         // recursive
-        "--infected".into(), // only print hits
         "--no-summary".into(),
-        // Stay on one filesystem boundary per root? No — we WANT to
-        // descend into bind mounts because that's where container
-        // rootfs trees live.
+        "--max-filesize=200M".into(),
+        "--max-scansize=2000M".into(),
+        "--cross-fs=yes".into(),
+        // Notably NO --infected here: we want every "path: OK" line so
+        // the progress sampler can see what file clamscan is currently
+        // working on. We filter for FOUND in the line loop below.
     ];
     for ex in cfg.effective_excludes() {
         args.push(format!("--exclude-dir={}", ex));
     }
-    // Skip files clamscan can't read (locked, deleted under us).
-    args.push("--max-filesize=200M".into());
-    args.push("--max-scansize=2000M".into());
-    args.push("--cross-fs=yes".into());
-    for root in &cfg.scan_roots { args.push(root.clone()); }
-
-    let output = Command::new("clamscan").args(&args).output()
-        .map_err(|e| format!("failed to exec clamscan: {}", e))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-    // clamscan exit codes:
-    //   0 = no virus
-    //   1 = virus found
-    //   2 = error
-    let code = output.status.code().unwrap_or(-1);
-    if code == 2 {
-        return Err(format!(
-            "clamscan reported errors (code 2). stderr={}",
-            stderr.chars().take(400).collect::<String>()));
-    }
-
-    Ok(parse_clamav_output(&stdout))
-}
-
-/// Parse `clamscan --infected` output. Lines look like:
-///   /path/to/file: Threat.Name.Variant FOUND
-/// The path may contain ": " in theory but in practice clamscan emits
-/// only one ": " — the separator before the threat name. We split on
-/// the LAST " FOUND" suffix and the LAST ": " before it to be safe.
-fn parse_clamav_output(s: &str) -> Vec<ClamHit> {
-    let mut out = Vec::new();
-    for line in s.lines() {
-        let line = line.trim();
-        if !line.ends_with(" FOUND") { continue; }
-        let body = &line[..line.len() - " FOUND".len()];
-        if let Some(idx) = body.rfind(": ") {
-            let path = body[..idx].trim().to_string();
-            let threat = body[idx + 2..].trim().to_string();
-            if path.is_empty() || threat.is_empty() { continue; }
-            out.push(ClamHit { path, threat });
+    // Dynamic mount-based excludes. Discovered every scan so a freshly-
+    // attached NFS share is honoured without restarting WolfStack.
+    let skip_mounts = discover_skippable_mountpoints();
+    if !skip_mounts.is_empty() {
+        if let Ok(mut s) = state.scan_state.write() {
+            s.progress_message = format!(
+                "Excluding {} non-local mount(s) (NFS / CIFS / FUSE / S3FS / overlay / tmpfs / etc.)",
+                skip_mounts.len());
         }
     }
-    out
+    for mp in &skip_mounts {
+        // ClamAV --exclude-dir is a POSIX regex tested against directory
+        // pathnames. `^<escaped>(/|$)` excludes the mountpoint itself
+        // AND anything beneath it.
+        args.push(format!("--exclude-dir=^{}(/|$)", regex_escape(mp)));
+    }
+    for root in &cfg.scan_roots { args.push(root.clone()); }
+
+    let mut child = Command::new("clamscan")
+        .args(&args)
+        // No stdin — clamscan never prompts but belt-and-braces in
+        // case some future flag does.
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to exec clamscan: {}", e))?;
+    let stdout = child.stdout.take()
+        .ok_or_else(|| "clamscan: no stdout pipe".to_string())?;
+    let stderr = child.stderr.take()
+        .ok_or_else(|| "clamscan: no stderr pipe".to_string())?;
+
+    // Sample-rate for progress updates: every N file lines, refresh
+    // scan_state.progress_message with the current path + total count.
+    // Picking 100 keeps the lock acquisition cost negligible while
+    // still updating the UI roughly every second on a typical scan
+    // throughput (a few hundred files/sec).
+    const PROGRESS_SAMPLE_EVERY: u64 = 100;
+
+    let hits: std::sync::Mutex<Vec<ClamHit>> = std::sync::Mutex::new(Vec::new());
+    let stderr_tail: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+    std::thread::scope(|s| {
+        // Parse the live stream from stdout.
+        s.spawn(|| {
+            let mut files_seen: u64 = 0;
+            for line in BufReader::new(stdout).lines().map_while(|r| r.ok()) {
+                let trimmed = line.trim();
+                if trimmed.is_empty() { continue; }
+                // Classify the line.
+                if trimmed.ends_with(" FOUND") {
+                    // Real hit. Parse it and stash for the caller.
+                    if let Some(h) = parse_one_clamav_hit(trimmed) {
+                        if let Ok(mut g) = hits.lock() { g.push(h); }
+                    }
+                    files_seen += 1;
+                    if let Ok(mut ss) = state.scan_state.write() {
+                        ss.progress_message = format!(
+                            "ClamAV scanned {} files · last finding: {}",
+                            files_seen, trimmed);
+                    }
+                } else if trimmed.ends_with(": OK") {
+                    files_seen += 1;
+                    if files_seen % PROGRESS_SAMPLE_EVERY == 0 {
+                        // Trim the path-only part for display; clamscan
+                        // emits "/path/to/file: OK" so strip the suffix.
+                        let path = trimmed.rsplit_once(": OK").map(|(p, _)| p).unwrap_or(trimmed);
+                        if let Ok(mut ss) = state.scan_state.write() {
+                            ss.progress_message = format!(
+                                "ClamAV scanned {} files · currently: {}",
+                                files_seen, path);
+                        }
+                    }
+                }
+                // Other line shapes (engine startup, library load,
+                // summary lines we get with --no-summary off, etc.)
+                // — ignored on purpose.
+            }
+            // Final progress update so the UI shows the total even
+            // for very fast scans that didn't hit the sample rate.
+            if let Ok(mut ss) = state.scan_state.write() {
+                ss.progress_message = format!("ClamAV scanned {} files", files_seen);
+            }
+        });
+        // Collect stderr in case clamscan exits non-zero with an error.
+        // Bounded — 4KB tail is enough to surface "DB load failed" etc.
+        s.spawn(|| {
+            const STDERR_TAIL_CAP: usize = 4096;
+            for line in BufReader::new(stderr).lines().map_while(|r| r.ok()) {
+                if let Ok(mut g) = stderr_tail.lock() {
+                    g.push_str(&line);
+                    g.push('\n');
+                    if g.len() > STDERR_TAIL_CAP {
+                        let drop = g.len() - STDERR_TAIL_CAP;
+                        g.drain(..drop);
+                    }
+                }
+            }
+        });
+    });
+
+    let status = child.wait()
+        .map_err(|e| format!("clamscan wait failed: {}", e))?;
+    let code = status.code().unwrap_or(-1);
+    // clamscan exit codes:
+    //   0 = clean, 1 = hits found, 2 = error
+    if code == 2 {
+        let tail = stderr_tail.lock().map(|g| g.clone()).unwrap_or_default();
+        return Err(format!("clamscan exited with errors (code 2). stderr={}",
+            tail.chars().take(400).collect::<String>()));
+    }
+
+    Ok(hits.into_inner().unwrap_or_default())
+}
+
+/// Parse a single `path: ThreatName.Variant FOUND` line into a ClamHit.
+/// Shared by `run_clamav_scan` (live streaming) and
+/// `parse_clamav_output` (bulk parsing of a captured buffer).
+fn parse_one_clamav_hit(line: &str) -> Option<ClamHit> {
+    let line = line.trim();
+    if !line.ends_with(" FOUND") { return None; }
+    let body = &line[..line.len() - " FOUND".len()];
+    let idx = body.rfind(": ")?;
+    let path = body[..idx].trim().to_string();
+    let threat = body[idx + 2..].trim().to_string();
+    if path.is_empty() || threat.is_empty() { return None; }
+    Some(ClamHit { path, threat })
+}
+
+/// Parse a full clamscan output buffer into hits. Used by the unit
+/// test for the parsing logic; the live scanner now uses
+/// `parse_one_clamav_hit` directly on each streamed line.
+#[cfg(test)]
+fn parse_clamav_output(s: &str) -> Vec<ClamHit> {
+    s.lines().filter_map(parse_one_clamav_hit).collect()
 }
 
 // ══════════════════════════════════════════════════════════
@@ -1509,7 +1793,7 @@ pub fn run_full_scan(state: &AntivirusState) -> ScanRunSummary {
             s.active_scanner = Some("clamav".into());
             s.progress_message = "Running ClamAV signature scan…".into();
         }
-        match run_clamav_scan(&cfg) {
+        match run_clamav_scan(state, &cfg) {
             Ok(hits) => {
                 summary.clamav_hits = hits.len();
                 handle_clamav_hits(state, &cfg, &hits, &mut summary);
@@ -1868,6 +2152,51 @@ mod tests {
         assert!(debian_pkgs.contains(&"chkrootkit"));
         let redhat_pkgs = packages_for_family("redhat");
         assert!(redhat_pkgs.contains(&"chkrootkit"));
+    }
+
+    #[test]
+    fn unescape_mount_path_decodes_octal_escapes() {
+        // /proc/mounts encodes space as \040, tab as \011, newline as \012.
+        assert_eq!(unescape_mount_path("/mnt/space\\040here"), "/mnt/space here");
+        assert_eq!(unescape_mount_path("/no/escapes"), "/no/escapes");
+        // Non-octal digit (8 or 9) should NOT be treated as an escape.
+        assert_eq!(unescape_mount_path("/path\\189/end"), "/path\\189/end");
+    }
+
+    #[test]
+    fn skippable_fstypes_cover_network_fuse_and_virtual() {
+        // Network
+        assert!(is_skippable_fstype("nfs"));
+        assert!(is_skippable_fstype("nfs4"));
+        assert!(is_skippable_fstype("cifs"));
+        assert!(is_skippable_fstype("ceph"));
+        // FUSE family — wildcard via starts_with("fuse")
+        assert!(is_skippable_fstype("fuse"));
+        assert!(is_skippable_fstype("fuse.s3fs"));
+        assert!(is_skippable_fstype("fuse.sshfs"));
+        assert!(is_skippable_fstype("fuseblk"));
+        // Virtual
+        assert!(is_skippable_fstype("tmpfs"));
+        assert!(is_skippable_fstype("proc"));
+        assert!(is_skippable_fstype("cgroup2"));
+        // Overlay / image
+        assert!(is_skippable_fstype("overlay"));
+        assert!(is_skippable_fstype("squashfs"));
+        // Local block fs — must NOT be skipped, those are what we
+        // actually want scanned.
+        assert!(!is_skippable_fstype("ext4"));
+        assert!(!is_skippable_fstype("xfs"));
+        assert!(!is_skippable_fstype("zfs"));
+        assert!(!is_skippable_fstype("btrfs"));
+        assert!(!is_skippable_fstype("vfat"));
+        assert!(!is_skippable_fstype("ntfs"));
+    }
+
+    #[test]
+    fn regex_escape_escapes_metacharacters() {
+        assert_eq!(regex_escape("/mnt/foo"), "/mnt/foo");
+        assert_eq!(regex_escape("/mnt/with (parens)"), "/mnt/with \\(parens\\)");
+        assert_eq!(regex_escape("/a.b+c"), "/a\\.b\\+c");
     }
 
     #[test]
