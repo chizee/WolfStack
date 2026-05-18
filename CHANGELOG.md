@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **ci: harden release workflow against GHCR docker-pull flakes** _(2026-05-18 — [`e9dbe99`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/e9dbe995b9165be7b5d77830b6a62e5279b75759))_
 - **v23.12.15: abuse-report is MANUAL ONLY — locked in with build-time test** _(2026-05-18 — [`443664b`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/443664b55c0c09e6cd943ed1babbdc80ed0d0d8e))_
 - **v23.12.14: in-app abuse reporting — whois lookup, evidence, SMTP send** _(2026-05-18 — [`d1927f9`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/d1927f9224141bd36eba3dd090f7ad46a6012478))_
 - **v23.12.13: auto-block at 3 strikes, federation propagation, FORWARD-chain, last-20 view** _(2026-05-18 — [`8021128`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/8021128c0a8967304b8334b9ce54a54d2f8859b8))_
