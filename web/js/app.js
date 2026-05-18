@@ -16313,7 +16313,10 @@ function _fleetAvOpUrl(nodeId, subpath) {
     if (_fleetAvSelfId && nodeId === _fleetAvSelfId) {
         return apiUrl(subpath);
     }
-    return apiUrl(`/api/nodes/${encodeURIComponent(nodeId)}/proxy${subpath}`);
+    // node_proxy re-prepends "/api/" to the captured {path:.*}, so we
+    // must strip the leading /api/ from subpath to avoid /api/api/…
+    const cleanPath = subpath.replace(/^\/api\//, '');
+    return apiUrl(`/api/nodes/${encodeURIComponent(nodeId)}/proxy/${cleanPath}`);
 }
 
 async function fleetLoadAntivirus() {
@@ -16948,9 +16951,15 @@ function _avTermAppend(text) {
 }
 
 // Pick the right URL for a node: local API for self, node-proxy for peers.
+// node_proxy's route is /api/nodes/{id}/proxy/{path:.*} and the handler
+// re-prepends "/api/" to the captured path — so we MUST strip the
+// leading /api/ from subpath here, otherwise the remote receives
+// /api/api/… which falls through to the static-files handler and
+// returns 405 on POST.
 function _avNodeUrl(nodeId, selfId, subpath) {
     if (selfId && nodeId === selfId) return apiUrl(subpath);
-    return apiUrl(`/api/nodes/${encodeURIComponent(nodeId)}/proxy${subpath}`);
+    const cleanPath = subpath.replace(/^\/api\//, '');
+    return apiUrl(`/api/nodes/${encodeURIComponent(nodeId)}/proxy/${cleanPath}`);
 }
 
 async function _avDriveOneNode(nodeId, hostname, selfId) {
