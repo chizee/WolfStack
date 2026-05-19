@@ -15793,9 +15793,96 @@ async function renderFleetSecurity() {
         wrap(fleetLoadScanDetector()),
         wrap(fleetLoadHostAudit()),
         wrap(fleetLoadAntivirus()),
+        wrap(fleetLoadThreatIntel()),
     ]);
     fleetSecMarkRefreshDone();
 }
+
+// v23.12.18 — fleet-wide Threat Intel status. Klas's spot-check view:
+// one row per node, the misbehaving node is visible at a glance (feed
+// entries = 0, missing rules, stale feed, etc.).
+async function fleetLoadThreatIntel() {
+    const el = document.getElementById('fleet-threat-intel');
+    if (!el) return;
+    el.innerHTML = '<div style="color:var(--text-muted); font-size:13px;">Loading…</div>';
+    let data;
+    try {
+        const r = await fetch(apiUrl('/api/threat-intel/fleet-status'));
+        if (!r.ok) {
+            el.innerHTML = `<div style="color:#ef4444; font-size:13px;">Failed to load fleet threat-intel status (HTTP ${r.status}).</div>`;
+            return;
+        }
+        data = await r.json();
+    } catch (e) {
+        el.innerHTML = `<div style="color:#ef4444; font-size:13px;">Error: ${escapeHtml(e.message || e)}</div>`;
+        return;
+    }
+    const nodes = data.nodes || [];
+    if (nodes.length === 0) {
+        el.innerHTML = '<div style="color:var(--text-muted); font-size:13px;">No nodes reported.</div>';
+        return;
+    }
+    const fmtAge = (s) => s == null ? 'never'
+        : s < 60 ? 'just now'
+        : s < 3600 ? `${(s/60)|0}m ago`
+        : s < 86400 ? `${(s/3600)|0}h ago`
+        : `${(s/86400)|0}d ago`;
+    const rows = nodes.map(n => {
+        if (n.status !== 'ok' || !n.data) {
+            const reason = n.error || `(${n.status})`;
+            return `<tr>
+                <td style="padding:6px 10px;">${escapeHtml(n.hostname || n.node_id)}</td>
+                <td colspan="6" style="padding:6px 10px; color:#ef4444; font-size:12px;">${escapeHtml(n.status)} — ${escapeHtml(reason)}</td>
+            </tr>`;
+        }
+        const s = n.data;
+        const stateLabel = s.state === 'enforce' ? 'Enforcing'
+                        : s.state === 'dry-run' ? 'Dry-run'
+                        : 'Off';
+        const stateColor = s.state === 'enforce' ? '#22c55e'
+                        : s.state === 'dry-run' ? '#eab308'
+                        : '#94a3b8';
+        const rulesOk = s.state !== 'enforce' || s.iptables_rules_present;
+        const rulesIcon = s.state === 'enforce' ? (s.iptables_rules_present ? '✓' : '✗') : '—';
+        const rulesColor = rulesOk ? (s.state === 'enforce' ? '#22c55e' : '#94a3b8') : '#ef4444';
+        const feedColor = s.feed_entry_count === 0 ? '#ef4444'
+                        : (s.feed_age_secs == null || s.feed_age_secs > 6*3600) ? '#eab308'
+                        : '#22c55e';
+        // Most common failure causes, ranked. First match wins.
+        let issue = '';
+        if (!s.ipset_available) issue = 'ipset missing';
+        else if (s.feed_entry_count === 0) issue = 'feed not downloaded';
+        else if (s.state === 'enforce' && !s.iptables_rules_present) issue = 'rules not installed';
+        else if (s.state === 'enforce' && s.ipset_entry_count === 0) issue = 'ipset empty';
+        else if (s.feed_age_secs != null && s.feed_age_secs > 24*3600) issue = `feed ${fmtAge(s.feed_age_secs)} (stale)`;
+        const issueCell = issue
+            ? `<td style="padding:6px 10px; color:#ef4444; font-size:12px;">⚠ ${escapeHtml(issue)}</td>`
+            : `<td style="padding:6px 10px; color:#22c55e; font-size:12px;">✓ healthy</td>`;
+        return `<tr>
+            <td style="padding:6px 10px; font-weight:500;">${escapeHtml(n.hostname || n.node_id)}</td>
+            <td style="padding:6px 10px; color:var(--text-muted); font-size:12px;">${escapeHtml(s.cluster || '—')}</td>
+            <td style="padding:6px 10px;"><span style="background:${stateColor}22; color:${stateColor}; padding:2px 8px; border-radius:6px; font-size:11px; font-weight:600;">${stateLabel}</span></td>
+            <td style="padding:6px 10px; color:${rulesColor}; font-size:12px; font-weight:600;">${rulesIcon} ${s.state === 'enforce' ? (s.iptables_rules_present ? 'installed' : 'missing') : 'n/a'}</td>
+            <td style="padding:6px 10px; color:${feedColor}; font-family:var(--font-mono); font-size:12px;">${s.feed_entry_count.toLocaleString()}</td>
+            <td style="padding:6px 10px; color:var(--text-muted); font-size:12px;">${fmtAge(s.feed_age_secs)}</td>
+            ${issueCell}
+        </tr>`;
+    }).join('');
+    el.innerHTML = `
+        <table style="width:100%; border-collapse:collapse; font-size:13px;">
+            <thead><tr style="text-align:left; border-bottom:2px solid var(--border); color:var(--text-muted); font-size:11px; text-transform:uppercase;">
+                <th style="padding:8px 10px;">Hostname</th>
+                <th style="padding:8px 10px;">Cluster</th>
+                <th style="padding:8px 10px;">State</th>
+                <th style="padding:8px 10px;">iptables rules</th>
+                <th style="padding:8px 10px;">Feed entries</th>
+                <th style="padding:8px 10px;">Feed age</th>
+                <th style="padding:8px 10px;">Health</th>
+            </tr></thead>
+            <tbody>${rows}</tbody>
+        </table>`;
+}
+window.fleetLoadThreatIntel = fleetLoadThreatIntel;
 
 function fleetSecMarkRefreshStart() {
     const btn = document.querySelector('button[onclick="renderFleetSecurity()"]');
@@ -31536,8 +31623,163 @@ function renderSecurityComponents(node, data) {
     const ufwCard = renderUfwCard(node, data.ufw, nodePrefix);
     const updCard = renderUpdatesCard(node, data.updates, nodePrefix);
     const iptCard = renderIptablesCard(data.iptables);
-    return f2bCard + ufwCard + updCard + iptCard;
+    // Threat-intel card renders into a placeholder; populated by an
+    // async call to /api/predictive/threat-intel/status because the
+    // /api/security/status response doesn't (and shouldn't) include
+    // threat-intel internals — that data lives in its own subsystem.
+    // The async load fires immediately after the security grid renders.
+    const tiCard = renderThreatIntelCardPlaceholder(node);
+    queueMicrotask(() => loadNodeThreatIntel(node).catch(() => {}));
+    return f2bCard + ufwCard + updCard + iptCard + tiCard;
 }
+
+function renderThreatIntelCardPlaceholder(node) {
+    return `
+    <div class="card" id="threat-intel-card" style="background:linear-gradient(135deg, rgba(239,68,68,0.06), rgba(168,85,247,0.04)); border-color:rgba(239,68,68,0.18);">
+        <div class="card-body">
+            <div style="display:flex; align-items:flex-start; gap:16px;">
+                <div style="font-size:40px; line-height:1;">🛡️</div>
+                <div style="flex:1;">
+                    <div style="display:flex; align-items:center; gap:12px; margin-bottom:12px;">
+                        <h3 style="margin:0; font-size:16px; font-weight:700;">Threat Intelligence</h3>
+                        <span id="ti-card-badge" style="background:rgba(148,163,184,0.2); color:var(--text-muted); padding:3px 10px; border-radius:6px; font-size:11px; font-weight:600;">Loading…</span>
+                    </div>
+                    <div id="ti-card-body" style="font-size:13px; color:var(--text-secondary);">
+                        Loading threat-intel diagnostics…
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>`;
+}
+
+async function loadNodeThreatIntel(node) {
+    const url = node.is_self
+        ? '/api/predictive/threat-intel/status'
+        : `/api/nodes/${node.id}/proxy/predictive/threat-intel/status`;
+    const badge = document.getElementById('ti-card-badge');
+    const body = document.getElementById('ti-card-body');
+    if (!body) return;
+    let s;
+    try {
+        const r = await fetch(url);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        s = await r.json();
+    } catch (e) {
+        if (badge) { badge.textContent = 'Error'; badge.style.color = '#ef4444'; badge.style.background = 'rgba(239,68,68,0.15)'; }
+        body.innerHTML = `<div style="color:#ef4444;">Failed to load: ${escapeHtml(e.message || String(e))}</div>`;
+        return;
+    }
+    const stateLabel = s.state === 'enforce' ? 'Enforcing'
+                    : s.state === 'dry-run' ? 'Dry-run'
+                    : 'Off';
+    const stateColor = s.state === 'enforce' ? '#22c55e'
+                    : s.state === 'dry-run' ? '#eab308'
+                    : '#94a3b8';
+    if (badge) {
+        badge.textContent = `${stateLabel} · ${escapeHtml(s.cluster || 'WolfStack')}`;
+        badge.style.color = stateColor;
+        badge.style.background = `${stateColor}22`;
+    }
+    if (s.state === 'off') {
+        body.innerHTML = `
+            <p style="margin:0 0 12px;">Threat-intel enforcement is <strong>Off</strong> for this cluster — no upstream blocklist is downloaded or applied here.</p>
+            <p style="margin:0; color:var(--text-muted); font-size:12px;">Enable it from the cluster's Threat Intel panel (Networking → WolfRouter → Threat Intel).</p>`;
+        return;
+    }
+    // State is DryRun or Enforce — render the diagnostic grid.
+    const ipsetIcon = s.ipset_available ? '✓' : '✗';
+    const ipsetColor = s.ipset_available ? '#22c55e' : '#ef4444';
+    const rulesIcon = s.iptables_rules_present ? '✓' : (s.state === 'dry-run' ? '—' : '✗');
+    const rulesColor = s.iptables_rules_present ? '#22c55e' : (s.state === 'dry-run' ? '#94a3b8' : '#ef4444');
+    const rulesLabel = s.state === 'dry-run' ? 'Skipped (dry-run)' : (s.iptables_rules_present ? 'Installed' : 'NOT installed');
+    const feedAge = s.feed_age_secs == null ? 'never downloaded'
+                  : s.feed_age_secs < 60 ? 'just now'
+                  : s.feed_age_secs < 3600 ? `${Math.floor(s.feed_age_secs/60)}m ago`
+                  : s.feed_age_secs < 86400 ? `${Math.floor(s.feed_age_secs/3600)}h ago`
+                  : `${Math.floor(s.feed_age_secs/86400)}d ago`;
+    const feedStale = s.feed_age_secs == null || s.feed_age_secs > 3600 * 6;
+    const feedColor = s.feed_entry_count === 0 ? '#ef4444'
+                    : feedStale ? '#eab308'
+                    : '#22c55e';
+    const ipsetEntriesColor = (s.state === 'enforce' && s.ipset_entry_count === 0 && s.feed_entry_count > 0)
+                            ? '#ef4444' : (s.state === 'enforce' ? '#22c55e' : '#94a3b8');
+    // Identify the most likely root cause and surface it as a banner
+    // so the operator doesn't have to read every row of the table.
+    // Klas's pain: "can't find the place where I can check why and fix
+    // it" — this banner IS that place.
+    let diagnosis = '';
+    if (!s.ipset_available) {
+        diagnosis = `<div style="background:rgba(239,68,68,0.1); border:1px solid rgba(239,68,68,0.3); border-radius:6px; padding:10px 12px; margin-bottom:12px; font-size:12px;">
+            <strong style="color:#ef4444;">✗ ipset is not installed.</strong> Enforcement cannot work without it. Run:
+            <code style="background:rgba(0,0,0,0.3); padding:2px 6px; border-radius:4px; display:inline-block; margin-left:4px;">apt install ipset</code> (or your distro's equivalent), then refresh this page.
+        </div>`;
+    } else if (s.feed_entry_count === 0) {
+        diagnosis = `<div style="background:rgba(239,68,68,0.1); border:1px solid rgba(239,68,68,0.3); border-radius:6px; padding:10px 12px; margin-bottom:12px; font-size:12px;">
+            <strong style="color:#ef4444;">✗ The feed has not been downloaded yet on this node.</strong> Either the predictive tick hasn't run yet (give it 5 minutes after enable), or this node can't reach the FireHOL feed URL. Click <em>Test feed connectivity</em> below to find out which.
+        </div>`;
+    } else if (s.state === 'enforce' && !s.iptables_rules_present) {
+        diagnosis = `<div style="background:rgba(234,179,8,0.1); border:1px solid rgba(234,179,8,0.3); border-radius:6px; padding:10px 12px; margin-bottom:12px; font-size:12px;">
+            <strong style="color:#eab308;">⚠ Enforcement is on but iptables rules are missing.</strong> The next predictive tick (≤5min) will re-install them, or click <em>Refresh now</em> on the Threat Intel panel.
+        </div>`;
+    } else if (s.state === 'enforce' && s.ipset_entry_count === 0) {
+        diagnosis = `<div style="background:rgba(234,179,8,0.1); border:1px solid rgba(234,179,8,0.3); border-radius:6px; padding:10px 12px; margin-bottom:12px; font-size:12px;">
+            <strong style="color:#eab308;">⚠ Feed parsed but ipset is empty.</strong> The kernel set didn't get populated this tick — check journalctl for `wolfstack` errors around ipset, and retry on the next tick.
+        </div>`;
+    } else if (feedStale) {
+        diagnosis = `<div style="background:rgba(234,179,8,0.1); border:1px solid rgba(234,179,8,0.3); border-radius:6px; padding:10px 12px; margin-bottom:12px; font-size:12px;">
+            <strong style="color:#eab308;">⚠ Feed is stale (last download ${feedAge}).</strong> The predictive analyzer should refresh it every 6 hours; if it's stuck, click <em>Test feed connectivity</em> below.
+        </div>`;
+    }
+    body.innerHTML = `
+        ${diagnosis}
+        <table style="width:100%; border-collapse:collapse; font-size:12px;">
+            <tbody>
+                <tr><td style="padding:4px 0; color:var(--text-muted); width:55%;">ipset binary</td>
+                    <td style="padding:4px 0; color:${ipsetColor}; font-weight:600;">${ipsetIcon} ${s.ipset_available ? 'Installed' : 'Missing'}</td></tr>
+                <tr><td style="padding:4px 0; color:var(--text-muted);">iptables DROP rules</td>
+                    <td style="padding:4px 0; color:${rulesColor}; font-weight:600;">${rulesIcon} ${rulesLabel}</td></tr>
+                <tr><td style="padding:4px 0; color:var(--text-muted);">Feed entries (parsed)</td>
+                    <td style="padding:4px 0; color:${feedColor}; font-weight:600;">${s.feed_entry_count.toLocaleString()}</td></tr>
+                <tr><td style="padding:4px 0; color:var(--text-muted);">Feed age</td>
+                    <td style="padding:4px 0; color:${feedColor};">${escapeHtml(feedAge)}</td></tr>
+                <tr><td style="padding:4px 0; color:var(--text-muted);">ipset entries (kernel)</td>
+                    <td style="padding:4px 0; color:${ipsetEntriesColor}; font-weight:600;">${s.ipset_entry_count.toLocaleString()}</td></tr>
+                <tr><td style="padding:4px 0; color:var(--text-muted);">Migration completed</td>
+                    <td style="padding:4px 0; color:${s.migration_completed ? '#22c55e' : '#94a3b8'};">${s.migration_completed ? '✓ Yes' : '— Not run yet'}</td></tr>
+            </tbody>
+        </table>
+        <div style="display:flex; gap:8px; margin-top:14px;">
+            <button class="btn btn-sm" onclick="threatIntelTestFeed('${node.is_self ? '' : 'nodes/'+node.id+'/proxy/'}', this)" style="flex:1;">Test feed connectivity</button>
+        </div>
+        <div id="ti-feed-test-result" style="margin-top:10px; font-size:12px;" role="status" aria-live="polite"></div>`;
+}
+
+async function threatIntelTestFeed(nodePrefix, btn) {
+    const result = document.getElementById('ti-feed-test-result');
+    const orig = btn ? btn.innerHTML : '';
+    if (btn) { btn.disabled = true; btn.innerHTML = 'Testing…'; }
+    if (result) result.innerHTML = '<span style="color:var(--text-muted);">Running HEAD against the upstream feed URL…</span>';
+    try {
+        const r = await fetch(`/api/${nodePrefix}threat-intel/test-feed`, { method: 'POST' });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const d = await r.json();
+        if (d.reachable) {
+            if (result) result.innerHTML = `<span style="color:#22c55e;">✓ Reachable</span> <span style="color:var(--text-muted);">— ${escapeHtml(d.url)} returned ${d.status_code} in ${d.duration_ms} ms.</span>`;
+            showToast('Threat-intel feed is reachable from this node', 'success');
+        } else {
+            const err = d.error || `status ${d.status_code}`;
+            if (result) result.innerHTML = `<span style="color:#ef4444;">✗ NOT reachable</span> <span style="color:var(--text-muted);">(${d.duration_ms} ms) — </span><code style="color:#ef4444; background:rgba(0,0,0,0.25); padding:2px 6px; border-radius:4px; word-break:break-all;">${escapeHtml(err)}</code>`;
+            showToast('Threat-intel feed test failed — see card for details', 'error');
+        }
+    } catch (e) {
+        if (result) result.innerHTML = `<span style="color:#ef4444;">Test request failed: ${escapeHtml(e.message || String(e))}</span>`;
+        showToast('Feed test request failed: ' + (e.message || e), 'error');
+    } finally {
+        if (btn) { btn.disabled = false; btn.innerHTML = orig; }
+    }
+}
+window.threatIntelTestFeed = threatIntelTestFeed;
 
 function renderFail2banCard(node, f2b, nodePrefix) {
     const installed = f2b.installed;

@@ -112,7 +112,7 @@ use crate::predictive::{
     proposal::{Proposal, ProposalScope, ProposalSource, RemediationPlan, Severity},
 };
 
-const FEED_URL: &str = "https://iplists.firehol.org/files/firehol_level1.netset";
+pub const FEED_URL: &str = "https://iplists.firehol.org/files/firehol_level1.netset";
 const FEED_LOCAL_PATH: &str = "/var/lib/wolfstack/threat-intel/firehol_level1.netset";
 /// Legacy v23.2.0/v23.2.1 flag file. Presence on first boot of
 /// v23.2.2 triggers the safety migration (rules torn down). Never
@@ -690,6 +690,91 @@ fn refresh_feed() -> RemediationOutcome {
     }
 }
 
+/// Operator-triggered diagnostic: HEAD `FEED_URL` with a short
+/// timeout and report whether the upstream FireHOL feed is
+/// reachable from this node. Surfaces DNS / TCP / TLS / HTTP failure
+/// layers in the `error` string so the operator can tell apart
+/// "this node has no network" from "FireHOL is rate-limiting us".
+///
+/// Returns a JSON-able struct rather than `RemediationOutcome` because
+/// it's user-facing (not part of the auto-remediation audit trail).
+/// Synchronous + blocking — call from `web::block` or
+/// `spawn_blocking`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FeedTestResult {
+    pub reachable: bool,
+    pub url: String,
+    pub status_code: Option<u16>,
+    pub duration_ms: u64,
+    pub error: Option<String>,
+}
+
+pub fn test_feed_blocking() -> FeedTestResult {
+    let url = FEED_URL.to_string();
+    let started = std::time::Instant::now();
+    // Use the same curl pathway the analyzer uses for actual feed
+    // fetches, so the diagnostic measures the SAME network/DNS/TLS
+    // path the auto-remediation loop would have hit. `-I` is HEAD,
+    // `-w "%{http_code}"` prints status to stdout, `--fail` makes
+    // 4xx/5xx propagate as exit-code != 0 so we can split layers.
+    let out = std::process::Command::new("curl")
+        .args([
+            "-s", "-S", "-I",
+            "--max-time", "10",
+            "--connect-timeout", "5",
+            "-w", "%{http_code}",
+            "-o", "/dev/null",
+            &url,
+        ])
+        .output();
+    let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    match out {
+        Ok(o) if o.status.success() => {
+            let body = String::from_utf8_lossy(&o.stdout).to_string();
+            let status_code = body.trim().parse::<u16>().ok();
+            // Treat 2xx/3xx as reachable; anything else is a failure
+            // (curl --fail would have returned non-zero for 4xx/5xx,
+            // so this branch typically only fires on 2xx HEAD).
+            let reachable = matches!(status_code, Some(c) if (200..400).contains(&c));
+            FeedTestResult {
+                reachable,
+                url,
+                status_code,
+                duration_ms,
+                error: if reachable { None } else {
+                    Some(format!("HEAD returned status {}", status_code.map(|c| c.to_string()).unwrap_or_else(|| "?".into())))
+                },
+            }
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+            // curl prints layer-specific errors to stderr: "Could not
+            // resolve host" (DNS), "Connection refused" (TCP), "SSL
+            // certificate problem" (TLS), "HTTP/1.1 404 Not Found"
+            // (HTTP). Preserved verbatim so the operator can spot
+            // which layer broke.
+            FeedTestResult {
+                reachable: false,
+                url,
+                status_code: None,
+                duration_ms,
+                error: Some(format!(
+                    "curl exit {} — {}",
+                    o.status.code().unwrap_or(-1),
+                    stderr.trim()
+                )),
+            }
+        }
+        Err(e) => FeedTestResult {
+            reachable: false,
+            url,
+            status_code: None,
+            duration_ms,
+            error: Some(format!("curl spawn failed: {}", e)),
+        },
+    }
+}
+
 /// Atomic ipset replacement: build a fresh set in a tmp name then
 /// `ipset swap` to switch it in. Prevents the multi-second window
 /// where the kernel set is empty mid-rebuild.
@@ -980,7 +1065,7 @@ fn forensics_dir() -> PathBuf {
 /// Operator-visible status snapshot for the local node. Returned by
 /// the GET /status endpoint so the UI panel can render current
 /// state for *this* node's cluster.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreatIntelStatus {
     /// True iff state != Off — convenience for older UI bindings.
     pub enabled: bool,

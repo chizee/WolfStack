@@ -938,6 +938,19 @@
                 </div>
             </div>
 
+            <!-- ── Threat Intel — fleet status (v23.12.18) ── -->
+            <div class="card" style="margin-bottom:20px;">
+                <div class="card-header">
+                    <h3 style="margin:0;">Threat Intel — fleet status</h3>
+                    <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">Per-node threat-intel enforcement state, feed freshness, and rule presence. If a node isn't blocking what its cluster-mates are, the misbehaviour shows up here — feed entries = 0, missing rules, stale feed. Open the node's Security page for the per-node diagnosis + "Test feed connectivity".</div>
+                </div>
+                <div class="card-body">
+                    <div id="fleet-threat-intel">
+                        <div style="color:var(--text-muted); font-size:13px;">Loading…</div>
+                    </div>
+                </div>
+            </div>
+
             <!-- ── Outbound scan detector ── -->
             <div class="card" style="margin-bottom:20px;">
                 <div class="card-header">

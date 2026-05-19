@@ -22932,6 +22932,66 @@ pub async fn predictive_threat_intel_status(
     }
 }
 
+/// POST /api/threat-intel/test-feed — operator-clickable diagnostic
+/// that HEADs the upstream FireHOL feed URL with a short timeout and
+/// reports DNS/TCP/TLS/HTTP failure layer. Surfaces *why* a node's
+/// threat-intel isn't working when the analyzer can't fetch the feed:
+/// "Could not resolve host" → DNS misconfig; "Connection refused" →
+/// firewall; "SSL certificate problem" → time/cert issue. Without
+/// this endpoint operators had no way to tell which layer broke.
+pub async fn threat_intel_test_feed(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    match tokio::task::spawn_blocking(ti::test_feed_blocking).await {
+        Ok(r) => HttpResponse::Ok().json(r),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("test-feed task: {}", e),
+        })),
+    }
+}
+
+/// GET /api/threat-intel/fleet-status — aggregates every cluster peer's
+/// `/api/predictive/threat-intel/status` into one envelope so the Fleet
+/// Security page can render a per-node table. Same shape as
+/// `/api/fleet/security/lockouts`: `{ nodes: [{ hostname, address,
+/// status, data, error }] }`. Klas's exact ask — "a node that doesn't
+/// want to work with threat intel and i can't find the place where i
+/// can check why and fix it" — landed here as the spot-check view: one
+/// glance and the misbehaving node is visible (feed entries = 0,
+/// missing rules, stale feed, etc).
+pub async fn threat_intel_fleet_status(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    // `status_snapshot` is blocking (runs `which`, `iptables -C`,
+    // `ipset list`, and parses the feed file on disk). Compute it on
+    // the blocking pool BEFORE entering the fanout so the local
+    // closure inside `fleet_fanout_get` is a trivial move that
+    // doesn't stall the async reactor — the fanout still does its
+    // own per-peer 8s timeouts for remote calls.
+    let local_snapshot = tokio::task::spawn_blocking(ti::status_snapshot)
+        .await
+        .unwrap_or_else(|_| ti::ThreatIntelStatus {
+            enabled: false,
+            state: ti::EnforceState::Off,
+            cluster: ti::this_node_cluster(),
+            ipset_available: false,
+            iptables_rules_present: false,
+            feed_entry_count: 0,
+            ipset_entry_count: 0,
+            feed_age_secs: None,
+            migration_completed: false,
+        });
+    let nodes = fleet_fanout_get::<ti::ThreatIntelStatus, _>(
+        &state, "/api/predictive/threat-intel/status",
+        move || local_snapshot,
+    ).await;
+    HttpResponse::Ok().json(serde_json::json!({ "nodes": nodes }))
+}
+
 /// Legacy enable shortcut — now equivalent to "set this node's
 /// cluster to DryRun". Will never install iptables rules on its own;
 /// the operator must explicitly Promote afterwards.
@@ -30014,6 +30074,12 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/threat-intel/status", web::get().to(threat_intel_status))
         .route("/api/threat-intel/cluster-status", web::get().to(threat_intel_cluster_status))
         .route("/api/threat-intel/lookup/{ip}", web::get().to(threat_intel_lookup))
+        // Diagnostics — v23.12.18. test-feed is operator-clickable
+        // ("is FireHOL reachable from this node right now?"); fleet-status
+        // aggregates per-node TI snapshots so multi-node operators can spot
+        // the misbehaving box without SSHing into each one.
+        .route("/api/threat-intel/test-feed", web::post().to(threat_intel_test_feed))
+        .route("/api/threat-intel/fleet-status", web::get().to(threat_intel_fleet_status))
         .route("/api/settings/login-disabled", web::get().to(login_disabled_status))
         .route("/api/settings/login-disabled", web::post().to(set_login_disabled))
         .route("/api/auth/smtp-configured", web::get().to(smtp_configured))
