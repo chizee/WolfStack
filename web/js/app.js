@@ -1926,11 +1926,6 @@ function selectView(page) {
         renderTenants();
     } else if (page === 'fleet-security') {
         renderFleetSecurity();
-    } else if (page === 'alerts') {
-        // v24.0.0 unified Alerts page — opens to Overview by default.
-        // Each sub-panel paints itself lazily on first activation, so
-        // switching here doesn't pay the cost of rendering every panel.
-        switchAlertsSub('overview');
     }
 
     // Restore task log toggle button when leaving topology
@@ -13666,11 +13661,14 @@ async function maybeShowDockerUpdatesNudge() {
 }
 
 function dockerUpdatesNudgeGo() {
-    // Switch to Settings → Docker Updates tab.
+    // Switch to Settings → Alerts → Docker Updates sub-panel.
     selectView('settings');
     setTimeout(() => {
         if (typeof switchSettingsTab === 'function') {
-            switchSettingsTab('dockerupdates');
+            switchSettingsTab('alerts');
+        }
+        if (typeof switchAlertsSub === 'function') {
+            switchAlertsSub('dockerupdates');
         }
         if (typeof loadDockerUpdatesSettings === 'function') {
             loadDockerUpdatesSettings();
@@ -14110,7 +14108,7 @@ function ensureNotificationsRelocated() {
         <div style="padding:18px; background:rgba(59,130,246,0.08); border:1px solid rgba(59,130,246,0.3); border-radius:10px;">
             <div style="font-size:14px; font-weight:600; margin-bottom:6px;">Alerting settings have moved.</div>
             <div style="font-size:13px; color:var(--text-secondary); margin-bottom:12px;">Channels, verbosity, and per-rule toggles now live on the unified <strong>Alerts</strong> page so everything that influences notifications is in one place.</div>
-            <button class="btn btn-primary" onclick="selectView('alerts'); setTimeout(() => switchAlertsSub('notifications'), 50);">Open Alerts → Notifications</button>
+            <button class="btn btn-primary" onclick="selectView('settings'); setTimeout(() => { switchSettingsTab('alerts'); switchAlertsSub('notifications'); }, 50);">Open Settings → Alerts → Notifications</button>
         </div>`;
     window[ALERTS_NOTIF_MOVED] = true;
 }
@@ -14137,7 +14135,7 @@ function ensureDockerUpdatesRelocated() {
         <div style="padding:18px; background:rgba(59,130,246,0.08); border:1px solid rgba(59,130,246,0.3); border-radius:10px;">
             <div style="font-size:14px; font-weight:600; margin-bottom:6px;">Docker Updates settings have moved.</div>
             <div style="font-size:13px; color:var(--text-secondary); margin-bottom:12px;">All alerting-adjacent settings are now under the unified <strong>Alerts</strong> page.</div>
-            <button class="btn btn-primary" onclick="selectView('alerts'); setTimeout(() => { switchAlertsSub('dockerupdates'); loadDockerUpdatesSettings(); }, 50);">Open Alerts → Docker Updates</button>
+            <button class="btn btn-primary" onclick="selectView('settings'); setTimeout(() => { switchSettingsTab('alerts'); switchAlertsSub('dockerupdates'); loadDockerUpdatesSettings(); }, 50);">Open Settings → Alerts → Docker Updates</button>
         </div>`;
     window[ALERTS_DU_MOVED] = true;
 }
@@ -33653,8 +33651,12 @@ function switchSettingsTab(tabName) {
         loadAiConfig();
         loadAiStatus();
         loadAiAlerts();
-    } else if (tabName === 'alerting') {
-        loadAlertingConfig();
+    } else if (tabName === 'alerts') {
+        // Unified Alerts surface (Overview / History / Notifications /
+        // Schedule / Docker Updates). Default to Overview; each sub-panel
+        // paints itself lazily so we don't pay the render cost for tabs
+        // the operator never opens.
+        if (typeof switchAlertsSub === 'function') switchAlertsSub('overview');
     } else if (tabName === 'security') {
         loadClusterSecretStatus();
         loadLeaveClusterContext();
