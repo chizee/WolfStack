@@ -10660,25 +10660,6 @@ pub async fn net_set_mtu(
     }
 }
 
-#[derive(Deserialize)]
-pub struct CreateVlanRequest {
-    pub parent: String,
-    pub vlan_id: u32,
-    pub name: Option<String>,
-}
-
-/// POST /api/networking/vlans — create a VLAN
-pub async fn net_create_vlan(
-    req: HttpRequest, state: web::Data<AppState>,
-    body: web::Json<CreateVlanRequest>,
-) -> HttpResponse {
-    if let Err(e) = require_auth(&req, &state) { return e; }
-    match networking::create_vlan(&body.parent, body.vlan_id, body.name.as_deref()) {
-        Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
-        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
-    }
-}
-
 /// DELETE /api/networking/vlans/{name} — delete a VLAN
 pub async fn net_delete_vlan(
     req: HttpRequest, state: web::Data<AppState>,
@@ -13043,6 +13024,11 @@ pub struct VlanAttachRequest {
     /// Operator-facing label. Optional.
     #[serde(default)]
     pub label: String,
+    /// VM target kinds only: reboot the guest after staging cloud-init
+    /// so the IP applies immediately. Ignored for containers/Docker
+    /// (which restart as part of the attach) and Manual.
+    #[serde(default)]
+    pub reboot: bool,
 }
 
 /// POST /api/networking/vlan/attach — allocate an IP on a VLAN and
@@ -13090,6 +13076,8 @@ pub async fn vlan_attach(
         ip_cidr: &ip_cidr,
         mtu: vlan.mtu,
         gateway,
+        routes: &vlan.routes,
+        reboot: body.reboot,
         target_id: &body.target_id,
     };
 
@@ -30690,7 +30678,6 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/networking/interfaces/{name}/ip", web::delete().to(net_remove_ip))
         .route("/api/networking/interfaces/{name}/state", web::post().to(net_set_state))
         .route("/api/networking/interfaces/{name}/mtu", web::post().to(net_set_mtu))
-        .route("/api/networking/vlans", web::post().to(net_create_vlan))
         .route("/api/networking/vlans/{name}", web::delete().to(net_delete_vlan))
         // IP Mappings
         .route("/api/networking/ip-mappings", web::get().to(net_list_ip_mappings))

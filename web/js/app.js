@@ -14609,44 +14609,6 @@ async function removeIpAddress(iface, address, prefix) {
     }
 }
 
-function showCreateVlanModal() {
-    const select = document.getElementById('vlan-parent');
-    // Populate with physical interfaces (non-VLAN, non-docker, non-virtual)
-    const physicalIfaces = cachedInterfaces.filter(i =>
-        !i.is_vlan && !i.name.startsWith('docker') && !i.name.startsWith('br-')
-        && !i.name.startsWith('veth') && !i.name.startsWith('wn') && !i.name.startsWith('virbr')
-    );
-    select.innerHTML = physicalIfaces.map(i => `<option value="${i.name}">${i.name}</option>`).join('');
-    document.getElementById('vlan-id').value = '';
-    document.getElementById('vlan-name').value = '';
-    document.getElementById('create-vlan-modal').classList.add('active');
-}
-function closeCreateVlanModal() {
-    document.getElementById('create-vlan-modal').classList.remove('active');
-}
-
-async function createVlan() {
-    const parent = document.getElementById('vlan-parent').value;
-    const vlan_id = parseInt(document.getElementById('vlan-id').value);
-    const name = document.getElementById('vlan-name').value.trim() || null;
-    if (!parent || !vlan_id || vlan_id < 1 || vlan_id > 4094) { showModal('Please select a parent and enter a valid VLAN ID (1-4094)'); return; }
-
-    try {
-        const resp = await fetch(apiUrl('/api/networking/vlans'), {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ parent, vlan_id, name }),
-        });
-        const data = await resp.json();
-        if (!resp.ok) throw new Error(data.error || 'Failed');
-        closeCreateVlanModal();
-        showToast(data.message, 'success');
-        loadNetworking();
-    } catch (e) {
-        showModal('Error: ' + e.message);
-    }
-}
-
 async function deleteVlan(name) {
     if (!(await showConfirm(`Delete VLAN interface ${name}? This will remove the interface immediately.`))) return;
     try {
@@ -15168,8 +15130,8 @@ function vlanShowAddDialog(existing) {
                     </details>
 
                     <div class="form-group">
-                        <label for="vlan-provider">Provider preset</label>
-                        <select class="form-control" id="vlan-provider" onchange="vlanProviderChanged()">
+                        <label for="vlanatt-provider">Provider preset</label>
+                        <select class="form-control" id="vlanatt-provider" onchange="vlanProviderChanged()">
                             <option value="hetzner" ${ex.provider==='hetzner'?'selected':''}>Hetzner vSwitch (VLAN 4000-4091, MTU 1400)</option>
                             <option value="ovh" ${ex.provider==='ovh'?'selected':''}>OVH vRack (any VLAN, MTU 1500)</option>
                             <option value="equinix" ${ex.provider==='equinix'?'selected':''}>Equinix Metal (any VLAN, MTU 1500)</option>
@@ -15178,55 +15140,55 @@ function vlanShowAddDialog(existing) {
                     </div>
 
                     <div class="form-group">
-                        <label for="vlan-name">Name</label>
-                        <input class="form-control" id="vlan-name" value="${vlanEsc(ex.name)}" placeholder="production-vswitch">
+                        <label for="vlanatt-name">Name</label>
+                        <input class="form-control" id="vlanatt-name" value="${vlanEsc(ex.name)}" placeholder="production-vswitch">
                     </div>
 
                     <div class="form-group">
-                        <label for="vlan-parent">Parent NIC</label>
-                        <select class="form-control" id="vlan-parent">${nicOptions || '<option value="">— no physical NICs detected —</option>'}</select>
+                        <label for="vlanatt-parent">Parent NIC</label>
+                        <select class="form-control" id="vlanatt-parent">${nicOptions || '<option value="">— no physical NICs detected —</option>'}</select>
                         <small style="${helperStyle}">The physical NIC connected to your provider's switch. Don't pick a virtual interface (docker, wolfnet, etc.).</small>
                     </div>
 
                     <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
                         <div class="form-group" style="margin-bottom:8px;">
-                            <label for="vlan-id">VLAN ID</label>
-                            <input class="form-control" id="vlan-id" type="number" min="1" max="4094" value="${ex.vlan_id}" oninput="vlanSyncBridgeName()">
+                            <label for="vlanatt-id">VLAN ID</label>
+                            <input class="form-control" id="vlanatt-id" type="number" min="1" max="4094" value="${ex.vlan_id}" oninput="vlanSyncBridgeName()">
                         </div>
                         <div class="form-group" style="margin-bottom:8px;">
-                            <label for="vlan-mtu">MTU</label>
-                            <input class="form-control" id="vlan-mtu" type="number" min="576" max="9216" value="${ex.mtu}">
+                            <label for="vlanatt-mtu">MTU</label>
+                            <input class="form-control" id="vlanatt-mtu" type="number" min="576" max="9216" value="${ex.mtu}">
                         </div>
                     </div>
                     <small style="${helperStyle} margin-top:0; margin-bottom:16px;">VLAN ID: the number your provider gave you. Hetzner: Robot &gt; vSwitches &gt; <em>your vSwitch</em>. OVH: Manager &gt; Bare Metal Cloud &gt; vRack.</small>
 
                     <div class="form-group">
-                        <label for="vlan-bridge">Bridge name</label>
-                        <input class="form-control" id="vlan-bridge" value="${vlanEsc(ex.bridge_name)}" placeholder="vmbr4000">
+                        <label for="vlanatt-bridge">Bridge name</label>
+                        <input class="form-control" id="vlanatt-bridge" value="${vlanEsc(ex.bridge_name)}" placeholder="vmbr4000">
                         <small style="${helperStyle}">What containers/VMs attach to. Default <code>vmbr&lt;VLAN&gt;</code> matches Proxmox naming.</small>
                     </div>
 
                     <div class="form-group">
-                        <label for="vlan-subnet">Subnet (CIDR)</label>
-                        <input class="form-control" id="vlan-subnet" value="${vlanEsc(ex.subnet)}" placeholder="10.0.1.0/24">
+                        <label for="vlanatt-subnet">Subnet (CIDR)</label>
+                        <input class="form-control" id="vlanatt-subnet" value="${vlanEsc(ex.subnet)}" placeholder="10.0.1.0/24">
                         <small style="${helperStyle}">RFC1918 range for this VLAN. All servers on the same VLAN must agree.</small>
                     </div>
 
                     <div class="form-group">
-                        <label for="vlan-self-ip">This server's IP on the subnet</label>
-                        <input class="form-control" id="vlan-self-ip" value="${vlanEsc(ex.self_ip)}" placeholder="10.0.1.5">
+                        <label for="vlanatt-self-ip">This server's IP on the subnet</label>
+                        <input class="form-control" id="vlanatt-self-ip" value="${vlanEsc(ex.self_ip)}" placeholder="10.0.1.5">
                         <small style="${helperStyle}">A unique IP in the subnet (avoid network/broadcast). Convention: <code>.1</code> = gateway, <code>.2-.254</code> for servers. Each WolfStack peer on this VLAN needs a different self IP. The auto-picker on attach respects allocations across this admin cluster — separate WolfStack installs on the same vSwitch are invisible unless added as external reservations.</small>
                     </div>
 
                     <div class="form-group">
-                        <label for="vlan-routes">Optional gateway routes</label>
-                        <textarea class="form-control" id="vlan-routes" rows="2" placeholder="10.0.0.0/16 via 10.0.1.1">${(ex.routes||[]).map(r => `${vlanEsc(r.destination)} via ${vlanEsc(r.via)}`).join('\n')}</textarea>
+                        <label for="vlanatt-routes">Optional gateway routes</label>
+                        <textarea class="form-control" id="vlanatt-routes" rows="2" placeholder="10.0.0.0/16 via 10.0.1.1">${(ex.routes||[]).map(r => `${vlanEsc(r.destination)} via ${vlanEsc(r.via)}`).join('\n')}</textarea>
                         <small style="${helperStyle}">One per line, format <code>DEST_CIDR via VIA_IP</code>. Hetzner Cloud-Network bridging: <code>10.0.0.0/16 via 10.0.1.1</code>.</small>
                     </div>
 
                     <div class="form-group" style="margin-bottom:0;">
-                        <label for="vlan-notes">Notes</label>
-                        <input class="form-control" id="vlan-notes" value="${vlanEsc(ex.notes)}" placeholder="Used by region servers">
+                        <label for="vlanatt-notes">Notes</label>
+                        <input class="form-control" id="vlanatt-notes" value="${vlanEsc(ex.notes)}" placeholder="Used by region servers">
                     </div>
                 </div>
                 <div class="modal-footer">
@@ -15242,8 +15204,8 @@ function vlanShowAddDialog(existing) {
 }
 
 function vlanProviderChanged() {
-    const prov = (document.getElementById('vlan-provider') || {}).value || 'custom';
-    const mtuEl = document.getElementById('vlan-mtu');
+    const prov = (document.getElementById('vlanatt-provider') || {}).value || 'custom';
+    const mtuEl = document.getElementById('vlanatt-mtu');
     // Only update MTU if it still matches a known default — preserves
     // operator-customised MTUs across provider changes.
     if (mtuEl) {
@@ -15256,24 +15218,24 @@ function vlanProviderChanged() {
 }
 
 function vlanSyncBridgeName() {
-    const id = parseInt((document.getElementById('vlan-id') || {}).value, 10) || 0;
-    const bridgeEl = document.getElementById('vlan-bridge');
+    const id = parseInt((document.getElementById('vlanatt-id') || {}).value, 10) || 0;
+    const bridgeEl = document.getElementById('vlanatt-bridge');
     if (bridgeEl && (!bridgeEl.value || /^vmbr\d+$/.test(bridgeEl.value))) {
         bridgeEl.value = id > 0 ? `vmbr${id}` : '';
     }
 }
 
 async function vlanSave(existingId) {
-    const provider = document.getElementById('vlan-provider').value;
-    const name = document.getElementById('vlan-name').value.trim();
-    const parent = document.getElementById('vlan-parent').value;
-    const vlanId = parseInt(document.getElementById('vlan-id').value, 10);
-    const mtu = parseInt(document.getElementById('vlan-mtu').value, 10);
-    let bridge = document.getElementById('vlan-bridge').value.trim();
-    const subnet = document.getElementById('vlan-subnet').value.trim();
-    const selfIp = document.getElementById('vlan-self-ip').value.trim();
-    const notes = document.getElementById('vlan-notes').value.trim();
-    const routes = document.getElementById('vlan-routes').value.trim().split('\n')
+    const provider = document.getElementById('vlanatt-provider').value;
+    const name = document.getElementById('vlanatt-name').value.trim();
+    const parent = document.getElementById('vlanatt-parent').value;
+    const vlanId = parseInt(document.getElementById('vlanatt-id').value, 10);
+    const mtu = parseInt(document.getElementById('vlanatt-mtu').value, 10);
+    let bridge = document.getElementById('vlanatt-bridge').value.trim();
+    const subnet = document.getElementById('vlanatt-subnet').value.trim();
+    const selfIp = document.getElementById('vlanatt-self-ip').value.trim();
+    const notes = document.getElementById('vlanatt-notes').value.trim();
+    const routes = document.getElementById('vlanatt-routes').value.trim().split('\n')
         .map(l => l.trim()).filter(Boolean)
         .map(line => {
             // Format: "DEST via VIA"
@@ -15286,7 +15248,7 @@ async function vlanSave(existingId) {
     // — better than failing validation for a field we can derive.
     if (!bridge && vlanId > 0) {
         bridge = `vmbr${vlanId}`;
-        const bridgeEl = document.getElementById('vlan-bridge');
+        const bridgeEl = document.getElementById('vlanatt-bridge');
         if (bridgeEl) bridgeEl.value = bridge;
     }
     // Validate every required field individually so the operator knows
@@ -15861,7 +15823,7 @@ function vlanUseAsTemplate(parsed) {
     vlanShowAddDialog(ex);
     // Briefly highlight the self-IP field so the operator notices it.
     setTimeout(() => {
-        const ipEl = document.getElementById('vlan-self-ip');
+        const ipEl = document.getElementById('vlanatt-self-ip');
         if (ipEl) {
             ipEl.style.borderColor = '#fbbf24';
             ipEl.style.boxShadow = '0 0 0 3px rgba(234,179,8,0.20)';
@@ -15965,13 +15927,20 @@ async function vlanShowAttachDialog(vlan) {
                         <label for="va-label">Label (optional)</label>
                         <input class="form-control" id="va-label" placeholder="regions80-vswitch">
                     </div>
-                    <div class="form-group" style="margin-bottom:0;">
+                    <div class="form-group">
                         <label for="va-ip">IP address</label>
                         <div style="display:flex; gap:6px;">
                             <input class="form-control" id="va-ip" placeholder="leave blank for auto-pick" style="flex:1;">
                             <button class="btn btn-sm" type="button" onclick='vlanAutoPickIp(${JSON.stringify(vlan).replace(/'/g, "&#39;")})'>Pick next free</button>
                         </div>
                         <small style="${helperStyle}">Must be inside <code>${vlanEsc(vlan.subnet)}</code>. Leave blank to let WolfStack pick the next free IP on save.</small>
+                    </div>
+                    <div class="form-group" id="va-reboot-group" style="margin-bottom:0; display:none;">
+                        <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-weight:normal;">
+                            <input type="checkbox" id="va-reboot" style="width:auto; margin:0;">
+                            <span>Reboot the VM now to apply the IP</span>
+                        </label>
+                        <small style="${helperStyle}">A VM only picks up a cloud-init-staged IP when it boots. Leave this unticked to stage the config and reboot the VM yourself later.</small>
                     </div>
                 </div>
                 <div class="modal-footer">
@@ -16005,6 +15974,18 @@ function vlanAttachBackendChanged() {
     const h = hints[kind] || hints.lxc_native;
     targetEl.placeholder = h.ph;
     hintEl.textContent = h.hint;
+    // The "reboot now" checkbox only applies to VMs — a cloud-init-
+    // staged IP needs a boot to land. Containers/Docker restart inline
+    // as part of the attach; Manual touches no backend at all.
+    const rebootGroup = document.getElementById('va-reboot-group');
+    if (rebootGroup) {
+        const isVm = kind === 'vm_proxmox' || kind === 'vm_native';
+        rebootGroup.style.display = isVm ? '' : 'none';
+        if (!isVm) {
+            const rb = document.getElementById('va-reboot');
+            if (rb) rb.checked = false;
+        }
+    }
 }
 
 async function vlanAutoPickIp(vlan) {
@@ -16071,6 +16052,7 @@ async function vlanDoAttach(vlanId) {
         target_id: document.getElementById('va-target').value.trim(),
         ip: document.getElementById('va-ip').value.trim(),
         label: document.getElementById('va-label').value.trim(),
+        reboot: document.getElementById('va-reboot')?.checked || false,
     };
     if (!body.target_id) {
         showToast('Target ID is required', 'error');

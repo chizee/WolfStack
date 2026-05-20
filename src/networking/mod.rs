@@ -1810,29 +1810,6 @@ pub fn set_interface_state(interface: &str, up: bool) -> Result<String, String> 
     }
 }
 
-/// Create a VLAN interface
-pub fn create_vlan(parent: &str, vlan_id: u32, name: Option<&str>) -> Result<String, String> {
-    let vlan_name = name.map(|s| s.to_string())
-        .unwrap_or_else(|| format!("{}.{}", parent, vlan_id));
-
-    let output = Command::new("ip")
-        .args(["link", "add", "link", parent, "name", &vlan_name, "type", "vlan", "id", &vlan_id.to_string()])
-        .output()
-        .map_err(|e| format!("Failed to create VLAN: {}", e))?;
-
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).to_string());
-    }
-
-    // Bring up the VLAN interface
-    let _ = Command::new("ip")
-        .args(["link", "set", &vlan_name, "up"])
-        .output();
-
-
-    Ok(format!("Created VLAN {} (ID {}) on {}", vlan_name, vlan_id, parent))
-}
-
 /// Delete a VLAN interface
 pub fn delete_vlan(name: &str) -> Result<String, String> {
     let output = Command::new("ip")

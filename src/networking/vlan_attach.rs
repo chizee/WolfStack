@@ -25,12 +25,24 @@
 //! - **Docker**: creates a docker macvlan/bridge network on top of the
 //!   VLAN bridge (so multiple containers can share it without IP
 //!   collision) and attaches via `docker network connect`.
-//! - **Native VMs (libvirt)**: requires libvirt + qemu present. Uses
-//!   `virsh attach-interface` for live attach + a config file edit
-//!   for persistence.
-//! - **Proxmox VMs**: same `pct`-style — `qm set` then reboot prompt.
+//! - **Native VMs (libvirt)**: requires libvirt + qemu present.
+//!   `virsh attach-interface` (persistent, explicit MAC) attaches the
+//!   NIC; the in-guest IP is staged via a NoCloud cloud-init seed ISO
+//!   (`cloud-localds`) attached as a CD-ROM. The guest applies it on
+//!   the next boot — requires cloud-init present in the guest.
+//! - **Proxmox VMs**: `qm set -netN` attaches the NIC; the in-guest IP
+//!   is staged via Proxmox cloud-init (`qm set --ipconfigN`), adding a
+//!   cloud-init drive if the VM lacks one. Applied on the next boot.
+//!
+//! ## VM IP — the cloud-init constraint
+//!
+//! A VM's IP lives inside the guest OS; it cannot be set from the
+//! hypervisor at runtime. Both VM backends therefore *stage* the IP
+//! via cloud-init and the guest applies it on its **next boot**. The
+//! caller can request an immediate reboot (`AttachParams.reboot`).
 
 use std::process::Command;
+use crate::networking::vlan::RouteEntry;
 
 /// Common operation parameters; same shape regardless of backend.
 pub struct AttachParams<'a> {
@@ -39,7 +51,20 @@ pub struct AttachParams<'a> {
     pub ip_cidr: &'a str,
     pub mtu: u32,
     /// Optional gateway. None = static IP without default route.
+    /// Used by the container backends (a container's VLAN NIC is
+    /// usually its only NIC, so a default route is correct). VM
+    /// backends ignore this: a vSwitch NIC on a VM is a *secondary*
+    /// interface and must not hijack the guest's existing default
+    /// route.
     pub gateway: Option<&'a str>,
+    /// Operator-configured VLAN routes. The libvirt VM backend emits
+    /// these as specific, non-default routes in the guest's cloud-init
+    /// network config. Empty = address only.
+    pub routes: &'a [RouteEntry],
+    /// VM backends only: reboot the guest after staging cloud-init so
+    /// the IP applies immediately. False = stage only; the operator
+    /// reboots when ready.
+    pub reboot: bool,
     /// Backend-specific identifier (container name, VMID, etc.).
     pub target_id: &'a str,
 }
@@ -54,10 +79,6 @@ pub struct AttachOutcome {
 /// backends that take a separate IP and netmask.
 fn ip_only(cidr: &str) -> String {
     cidr.split('/').next().unwrap_or(cidr).to_string()
-}
-
-fn prefix_only(cidr: &str) -> Option<u8> {
-    cidr.split('/').nth(1).and_then(|s| s.parse().ok())
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -353,88 +374,239 @@ pub fn detach_lxc_proxmox(target_id: &str, bridge: &str) -> Result<AttachOutcome
 }
 
 // ────────────────────────────────────────────────────────────────────
-// VMs on Proxmox (`qm set`)
+// VMs on Proxmox (`qm set` + cloud-init)
 // ────────────────────────────────────────────────────────────────────
 
-/// Attach a Proxmox QEMU VM. Hot-plug only works if the guest OS
-/// supports virtio hot-add — otherwise the operator needs to reboot
-/// the VM. We don't auto-reboot VMs (data loss risk); we surface that
-/// in the message.
+/// Attach a Proxmox QEMU VM to the bridge and stage its IP via
+/// Proxmox cloud-init.
+///
+/// Flow: `qm set -netN` attaches the NIC; `qm set --ipconfigN` stages
+/// the IP on the matching index; `qm cloudinit update` regenerates the
+/// drive. If the VM has no cloud-init drive we add one on a free IDE
+/// slot. The guest applies the IP on its next boot — we reboot here
+/// only if the caller asked.
+///
+/// Verified syntax (Proxmox `qm.1` man page): `--ipconfig[n]` carries
+/// `gw=<GatewayIPv4>` / `ip=<IPv4Format/CIDR>` and configures the
+/// correspondingly-indexed `net[n]` device; `qm cloudinit update`
+/// regenerates the cloud-init drive; `qm reboot` applies pending
+/// changes. Verified syntax (Proxmox `Cloud-Init_Support` wiki):
+/// `qm set <vmid> --ide2 <storage>:cloudinit` adds a cloud-init drive.
 pub fn attach_vm_proxmox(p: &AttachParams) -> Result<AttachOutcome, String> {
     let vmid = p.target_id;
-    let next_idx = next_qm_net_index(vmid)?;
-    let spec = format!("model=virtio,bridge={br},mtu={mtu}",
-        br = p.bridge, mtu = p.mtu);
-    // qm doesn't accept ip= directly on VMs (the IP is inside the guest);
-    // we set it via cloud-init if the VM is cloud-init-enabled, otherwise
-    // we just attach the NIC and the operator configures the IP inside.
-    let arg = format!("-net{}", next_idx);
-    let out = Command::new("qm").args(["set", vmid, &arg, &spec]).output()
-        .map_err(|e| format!("spawn qm: {}", e))?;
-    if !out.status.success() {
-        return Err(format!("qm set failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+    let cfg = qm_config(vmid)?;
+    let next_idx = (max_cfg_index(&cfg, "net") + 1) as u32;
+
+    // 1. Attach the NIC. No ip= here — the IP goes via cloud-init.
+    let spec = format!("model=virtio,bridge={br},mtu={mtu}", br = p.bridge, mtu = p.mtu);
+    run_qm(&["set", vmid, &format!("-net{}", next_idx), &spec])?;
+
+    // 2. Ensure the VM has a cloud-init drive — add one if not.
+    let mut ci_note = String::new();
+    if !cfg_has_cloudinit_drive(&cfg) {
+        match (free_ide_slot(&cfg), os_disk_storage(&cfg)) {
+            (Some(slot), Some(storage)) => {
+                if let Err(e) = run_qm(&["set", vmid,
+                    &format!("--ide{}", slot), &format!("{}:cloudinit", storage)])
+                {
+                    return Ok(AttachOutcome {
+                        message: format!(
+                            "Attached net{} on {}, but adding a cloud-init drive failed: {}. \
+                             Add one in Proxmox (Hardware → Add → CloudInit Drive), then \
+                             re-attach, or set IP {} inside the guest.",
+                            next_idx, p.bridge, e, p.ip_cidr),
+                        restarted: false,
+                    });
+                }
+                ci_note = format!(" Added a cloud-init drive on ide{}.", slot);
+            }
+            _ => {
+                return Ok(AttachOutcome {
+                    message: format!(
+                        "Attached net{} on {}, but the VM has no cloud-init drive and WolfStack \
+                         could not add one (no free IDE slot, or the VM's disk storage is \
+                         unknown). Add a cloud-init drive in Proxmox, then re-attach — or set \
+                         IP {} inside the guest.",
+                        next_idx, p.bridge, p.ip_cidr),
+                    restarted: false,
+                });
+            }
+        }
+    }
+
+    // 3. Stage the IP on the matching ipconfig index. Proxmox
+    //    ipconfigN carries only ip + gw; a vSwitch NIC is a secondary
+    //    interface, so we set ip only — never a gw, which would
+    //    hijack the guest's existing default route.
+    run_qm(&["set", vmid, &format!("--ipconfig{}", next_idx),
+        &format!("ip={}", p.ip_cidr)])?;
+    let routes_note = if p.routes.is_empty() { "" } else {
+        " This VLAN has custom routes — Proxmox cloud-init carries only \
+          the IP, so add those routes inside the guest."
+    };
+
+    // 4. Regenerate the cloud-init drive so it carries the new config.
+    let _ = run_qm(&["cloudinit", "update", vmid]);
+
+    // 5. Reboot only if asked. `qm reboot` applies pending changes.
+    if p.reboot {
+        if let Err(e) = run_qm(&["reboot", vmid]) {
+            return Ok(AttachOutcome {
+                message: format!(
+                    "Attached net{} on {} and staged IP {} via cloud-init{}, but the reboot \
+                     failed: {}. Reboot the VM manually to apply the IP.{}",
+                    next_idx, p.bridge, p.ip_cidr, ci_note, e, routes_note),
+                restarted: false,
+            });
+        }
+        return Ok(AttachOutcome {
+            message: format!(
+                "Attached net{} on {}, staged IP {} via cloud-init{}, and rebooted the VM to \
+                 apply it.{}",
+                next_idx, p.bridge, p.ip_cidr, ci_note, routes_note),
+            restarted: true,
+        });
     }
     Ok(AttachOutcome {
         message: format!(
-            "Attached net{} on {}. The VM still needs the IP {} configured INSIDE the guest OS — \
-             VM-side configuration cannot be set from outside without cloud-init. \
-             Reboot the VM if the new NIC doesn't appear (depends on guest's hot-plug support).",
-            next_idx, p.bridge, p.ip_cidr,
-        ),
+            "Attached net{} on {} and staged IP {} via cloud-init{}. Reboot the VM to apply \
+             the IP.{}",
+            next_idx, p.bridge, p.ip_cidr, ci_note, routes_note),
         restarted: false,
     })
 }
 
-fn next_qm_net_index(vmid: &str) -> Result<u32, String> {
+/// Run `qm` with the given args; map a non-zero exit to an Err.
+fn run_qm(args: &[&str]) -> Result<(), String> {
+    let out = Command::new("qm").args(args).output()
+        .map_err(|e| format!("spawn qm: {}", e))?;
+    if !out.status.success() {
+        return Err(format!("qm {} failed: {}",
+            args.first().copied().unwrap_or(""),
+            String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    Ok(())
+}
+
+/// Fetch `qm config <vmid>` as a string.
+fn qm_config(vmid: &str) -> Result<String, String> {
     let out = Command::new("qm").args(["config", vmid]).output()
         .map_err(|e| format!("spawn qm: {}", e))?;
     if !out.status.success() {
-        return Err(format!("qm config failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+        return Err(format!("qm config failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()));
     }
-    let cfg = String::from_utf8_lossy(&out.stdout);
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// Highest `<prefix><N>:` index in a `qm`/`pct` config dump, or -1 if
+/// none present. Next free index is the return value + 1.
+fn max_cfg_index(cfg: &str, prefix: &str) -> i32 {
     let mut max_seen: i32 = -1;
     for line in cfg.lines() {
-        if let Some(rest) = line.trim().strip_prefix("net") {
-            if let Some((num_str, _)) = rest.split_once(':') {
-                if let Ok(n) = num_str.parse::<i32>() {
-                    if n > max_seen { max_seen = n; }
-                }
-            }
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix(prefix)
+            && let Some((num, _)) = rest.split_once(':')
+            && let Ok(n) = num.parse::<i32>()
+            && n > max_seen
+        {
+            max_seen = n;
         }
     }
-    Ok((max_seen + 1) as u32)
+    max_seen
+}
+
+/// True if the `qm config` dump already lists a cloud-init drive.
+/// Proxmox cloud-init drives hold a `vm-<vmid>-cloudinit` volume on a
+/// cdrom-media bus slot, so a `cloudinit` substring on a disk-bus line
+/// is the reliable marker.
+fn cfg_has_cloudinit_drive(cfg: &str) -> bool {
+    cfg.lines().any(|line| {
+        let t = line.trim();
+        is_disk_bus_key(t) && t.contains("cloudinit")
+    })
+}
+
+/// True if a `qm config` line's key is a disk-bus slot
+/// (`ideN:` / `sataN:` / `scsiN:` / `virtioN:`) — i.e. `<bus><digits>:`.
+/// Excludes non-disk keys that share a prefix (e.g. `scsihw:`).
+fn is_disk_bus_key(line: &str) -> bool {
+    let Some((key, _)) = line.split_once(':') else { return false };
+    for bus in ["ide", "sata", "scsi", "virtio"] {
+        if let Some(rest) = key.strip_prefix(bus)
+            && !rest.is_empty()
+            && rest.chars().all(|c| c.is_ascii_digit())
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Pick a free IDE slot (0-3) for a new cloud-init drive. Prefers
+/// ide2 then ide3 (Proxmox's own wizard uses ide2 for cloud-init),
+/// falling back to ide0/ide1. None = all four IDE slots are in use.
+fn free_ide_slot(cfg: &str) -> Option<u32> {
+    let used: std::collections::HashSet<u32> = cfg.lines()
+        .filter_map(|l| {
+            let key = l.trim().split_once(':')?.0;
+            key.strip_prefix("ide")?.parse::<u32>().ok()
+        })
+        .collect();
+    [2u32, 3, 0, 1].into_iter().find(|s| !used.contains(s))
+}
+
+/// Storage id backing the VM's OS disk — used as the storage for a
+/// newly-added cloud-init drive (it definitely supports images).
+/// Returns the storage of the first real disk, skipping cdrom media
+/// and any existing cloud-init volume.
+fn os_disk_storage(cfg: &str) -> Option<String> {
+    for line in cfg.lines() {
+        let t = line.trim();
+        if !is_disk_bus_key(t) { continue; }
+        let val = match t.split_once(':') { Some((_, v)) => v.trim(), None => continue };
+        if val.contains("media=cdrom") || val.contains("cloudinit") { continue; }
+        let storage = val.split(':').next().unwrap_or("").trim();
+        if !storage.is_empty() && storage != "none" {
+            return Some(storage.to_string());
+        }
+    }
+    None
 }
 
 pub fn detach_vm_proxmox(target_id: &str, bridge: &str) -> Result<AttachOutcome, String> {
-    let cfg_out = Command::new("qm").args(["config", target_id]).output()
-        .map_err(|e| format!("spawn qm: {}", e))?;
-    if !cfg_out.status.success() {
-        return Err(format!("qm config failed: {}", String::from_utf8_lossy(&cfg_out.stderr).trim()));
-    }
-    let cfg = String::from_utf8_lossy(&cfg_out.stdout);
-    let mut to_remove: Vec<String> = Vec::new();
+    let cfg = qm_config(target_id)?;
+    // Collect the indexes of every netN device on this bridge.
+    let mut indexes: Vec<u32> = Vec::new();
     for line in cfg.lines() {
         let t = line.trim();
-        if let Some(rest) = t.strip_prefix("net") {
-            if let Some((num_str, val)) = rest.split_once(':') {
-                if val.contains(&format!("bridge={}", bridge)) {
-                    to_remove.push(format!("net{}", num_str));
-                }
-            }
+        if let Some(rest) = t.strip_prefix("net")
+            && let Some((num_str, val)) = rest.split_once(':')
+            && val.contains(&format!("bridge={}", bridge))
+            && let Ok(n) = num_str.parse::<u32>()
+        {
+            indexes.push(n);
         }
     }
-    if to_remove.is_empty() {
+    if indexes.is_empty() {
         return Ok(AttachOutcome {
             message: format!("No net device on VM {} referenced {}.", target_id, bridge),
             restarted: false,
         });
     }
-    for dev in &to_remove {
-        let arg = format!("--delete={}", dev);
-        let _ = Command::new("qm").args(["set", target_id, &arg]).output();
+    // Drop the NIC and its matching ipconfig (cloud-init) entry. The
+    // ipconfig delete is best-effort — the key may not exist if the
+    // NIC was attached before cloud-init IP staging shipped.
+    for n in &indexes {
+        let _ = run_qm(&["set", target_id, &format!("--delete=net{}", n)]);
+        let _ = run_qm(&["set", target_id, &format!("--delete=ipconfig{}", n)]);
     }
+    let _ = run_qm(&["cloudinit", "update", target_id]);
     Ok(AttachOutcome {
-        message: format!("Removed {} net device(s) on VM {}. Reboot the VM if it doesn't drop the NIC live.", to_remove.len(), target_id),
+        message: format!(
+            "Removed {} net device(s) and their cloud-init IP config on VM {}. \
+             Reboot the VM if it doesn't drop the NIC live.",
+            indexes.len(), target_id),
         restarted: false,
     })
 }
@@ -582,21 +754,41 @@ pub fn detach_docker(target_id: &str, bridge: &str) -> Result<AttachOutcome, Str
 // Native VMs (libvirt)
 // ────────────────────────────────────────────────────────────────────
 
-/// Attach a libvirt VM by editing the domain XML (persistent) AND
-/// hot-plugging the interface (live). If the VM is offline we skip
-/// the live step. We don't auto-restart VMs.
+/// Attach a libvirt VM to the bridge and stage its IP via a NoCloud
+/// cloud-init seed.
+///
+/// libvirt cannot set an in-guest IP, so:
+///   1. `virsh attach-interface` adds the NIC persistently with an
+///      explicit stable MAC (so the seed's network-config can match
+///      exactly this interface).
+///   2. A NoCloud seed ISO carrying only a network-config (matched by
+///      MAC) is built with `cloud-localds` and attached as a CD-ROM.
+///   3. On the next boot the guest's cloud-init reads the seed and
+///      applies the static IP. Requires cloud-init + the NoCloud
+///      datasource enabled in the guest.
+///
+/// Every step degrades honestly: if the seed can't be built or
+/// attached, the NIC is still attached and the message says so.
 pub fn attach_vm_libvirt(p: &AttachParams) -> Result<AttachOutcome, String> {
     let domain = p.target_id;
-    let prefix = prefix_only(p.ip_cidr).unwrap_or(24);
-    let _ = prefix;  // libvirt's attach-interface doesn't take a netmask;
-                    // the IP is configured inside the guest OS.
+    // Index the MAC by how many NICs the VM already has on this
+    // bridge, so attaching the same VM to the same vSwitch twice
+    // yields distinct, deterministic MACs.
+    let nic_index = Command::new("virsh").args(["domiflist", domain]).output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| parse_libvirt_macs_for_bridge(
+            &String::from_utf8_lossy(&o.stdout), p.bridge).len())
+        .unwrap_or(0) as u32;
+    let mac = stable_hwaddr(domain, p.bridge, nic_index);
 
-    // Hot-attach (persistent across reboots via --persistent).
+    // 1. Attach the NIC, persistent across reboots.
     let out = Command::new("virsh").args([
         "attach-interface", domain,
         "--type", "bridge",
         "--source", p.bridge,
         "--model", "virtio",
+        "--mac", &mac,
         "--mtu", &p.mtu.to_string(),
         "--persistent",
     ]).output()
@@ -607,13 +799,270 @@ pub fn attach_vm_libvirt(p: &AttachParams) -> Result<AttachOutcome, String> {
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
+
+    // Honest-degradation helper: the NIC is attached, but a later
+    // cloud-init step failed — say so and tell the operator what to do.
+    let degraded = |why: String| AttachOutcome {
+        message: format!(
+            "Attached NIC ({}) on {} via libvirt, but {}. Configure IP {} inside the guest.",
+            mac, p.bridge, why, p.ip_cidr),
+        restarted: false,
+    };
+
+    // 2. Record this NIC as a per-NIC cloud-init block, then assemble
+    //    the VM's full netcfg from EVERY block — so a VM attached to
+    //    several vSwitches keeps every IP, not just the latest. Build
+    //    the NoCloud seed from the assembled netcfg.
+    if let Err(e) = write_vm_block(domain, &mac, p.ip_cidr, p.mtu, p.routes) {
+        return Ok(degraded(format!("the cloud-init block could not be written: {}", e)));
+    }
+    let netcfg = match assemble_vm_netcfg(domain) {
+        Some(n) => n,
+        None => return Ok(degraded("the cloud-init netcfg could not be assembled".into())),
+    };
+    let seed = match build_vm_seed_iso(domain, &netcfg) {
+        Ok(s) => s,
+        Err(e) => return Ok(degraded(format!("the cloud-init seed could not be built: {}", e))),
+    };
+
+    // 3. Attach the seed as a CD-ROM if it isn't already attached. On
+    //    a re-attach the seed ISO was just rebuilt in place, so the
+    //    existing CD-ROM already serves the refreshed config.
+    //    Config-only (`--config`): cloud-init reads it at boot.
+    if !seed_already_attached(domain, &seed) {
+        let target = match free_cdrom_target(domain) {
+            Some(t) => t,
+            None => return Ok(degraded(
+                "no free CD-ROM slot was available for the cloud-init seed".into())),
+        };
+        let cd = Command::new("virsh").args([
+            "attach-disk", domain, &seed, &target,
+            "--type", "cdrom", "--mode", "readonly", "--config",
+        ]).output().map_err(|e| format!("spawn virsh attach-disk: {}", e))?;
+        if !cd.status.success() {
+            return Ok(degraded(format!(
+                "attaching the cloud-init seed CD-ROM failed: {}",
+                String::from_utf8_lossy(&cd.stderr).trim())));
+        }
+    }
+
+    // 4. Reboot only if asked.
+    if p.reboot {
+        let rb = Command::new("virsh").args(["reboot", domain]).output()
+            .map_err(|e| format!("spawn virsh reboot: {}", e))?;
+        if !rb.status.success() {
+            return Ok(AttachOutcome {
+                message: format!(
+                    "Attached NIC ({}) on {} and staged IP {} via cloud-init, but the reboot \
+                     failed: {}. Reboot the VM manually to apply the IP.",
+                    mac, p.bridge, p.ip_cidr, String::from_utf8_lossy(&rb.stderr).trim()),
+                restarted: false,
+            });
+        }
+        return Ok(AttachOutcome {
+            message: format!(
+                "Attached NIC ({}) on {}, staged IP {} via cloud-init, and rebooted the VM. \
+                 The IP applies once the guest's cloud-init runs (requires cloud-init + the \
+                 NoCloud datasource in the guest).",
+                mac, p.bridge, p.ip_cidr),
+            restarted: true,
+        });
+    }
     Ok(AttachOutcome {
         message: format!(
-            "Attached interface on {} via libvirt. The VM still needs IP {} configured INSIDE the guest OS.",
-            p.bridge, p.ip_cidr,
-        ),
+            "Attached NIC ({}) on {} and staged IP {} via a cloud-init seed. Reboot the VM to \
+             apply it (requires cloud-init + the NoCloud datasource in the guest).",
+            mac, p.bridge, p.ip_cidr),
         restarted: false,
     })
+}
+
+/// Per-VM directory holding one `<mac>.block` file per WolfStack
+/// vSwitch NIC. `assemble_vm_netcfg` concatenates them into the seed.
+fn vm_blocks_dir(domain: &str) -> String {
+    format!("/var/lib/wolfstack/vlan-seeds/{}.d", safe_seed_name(domain))
+}
+
+/// Path of the per-NIC cloud-init block file for one MAC.
+fn mac_block_file(domain: &str, mac: &str) -> String {
+    format!("{}/{}.block", vm_blocks_dir(domain), mac.replace(':', ""))
+}
+
+/// Build one cloud-init network-config (v2 / netplan) `ethernets`
+/// entry for a VLAN NIC, matched by MAC so it binds to exactly that
+/// interface. Operator-configured VLAN routes are emitted as specific
+/// routes — never a default route, since a vSwitch NIC is a secondary
+/// interface. This is one block; `assemble_vm_netcfg` wraps all of a
+/// VM's blocks under a single `version: 2` / `ethernets:` header.
+fn vm_ethernet_block(mac: &str, ip_cidr: &str, mtu: u32, routes: &[RouteEntry]) -> String {
+    let mut s = String::new();
+    // Key the entry by MAC so several vSwitch NICs on one VM never
+    // collide when their blocks are concatenated.
+    s.push_str(&format!("  wsvlan{}:\n", mac.replace(':', "")));
+    s.push_str("    match:\n");
+    s.push_str(&format!("      macaddress: \"{}\"\n", mac));
+    s.push_str("    dhcp4: false\n");
+    s.push_str("    dhcp6: false\n");
+    s.push_str(&format!("    mtu: {}\n", mtu));
+    s.push_str("    addresses:\n");
+    s.push_str(&format!("      - \"{}\"\n", ip_cidr));
+    // Only emit routes whose destination + via look like IP/CIDR —
+    // operator free-text must not be able to inject YAML.
+    let safe: Vec<&RouteEntry> = routes.iter()
+        .filter(|r| is_ip_like(&r.destination) && is_ip_like(&r.via))
+        .collect();
+    if !safe.is_empty() {
+        s.push_str("    routes:\n");
+        for r in safe {
+            s.push_str(&format!("      - to: \"{}\"\n", r.destination));
+            s.push_str(&format!("        via: \"{}\"\n", r.via));
+        }
+    }
+    s
+}
+
+/// Write (overwrite) the per-NIC cloud-init block for one MAC.
+fn write_vm_block(domain: &str, mac: &str, ip_cidr: &str, mtu: u32, routes: &[RouteEntry])
+    -> Result<(), String>
+{
+    let dir = vm_blocks_dir(domain);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {}", dir, e))?;
+    std::fs::write(mac_block_file(domain, mac), vm_ethernet_block(mac, ip_cidr, mtu, routes))
+        .map_err(|e| format!("write block: {}", e))
+}
+
+/// Concatenate every per-NIC block in the VM's blocks dir into one
+/// netplan-v2 network-config. None = the VM has no WolfStack vSwitch
+/// NIC blocks (dir missing or empty).
+fn assemble_vm_netcfg(domain: &str) -> Option<String> {
+    let mut blocks: Vec<(String, String)> = Vec::new();
+    for entry in std::fs::read_dir(vm_blocks_dir(domain)).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("block") { continue; }
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+            blocks.push((name, content));
+        }
+    }
+    if blocks.is_empty() { return None; }
+    blocks.sort_by(|a, b| a.0.cmp(&b.0));   // deterministic order
+    let mut s = String::from("version: 2\nethernets:\n");
+    for (_, content) in blocks { s.push_str(&content); }
+    Some(s)
+}
+
+/// True if the VM already has the given seed ISO attached as a disk.
+fn seed_already_attached(domain: &str, seed_iso: &str) -> bool {
+    Command::new("virsh").args(["domblklist", domain]).output().ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .any(|l| l.split_whitespace().nth(1) == Some(seed_iso)))
+        .unwrap_or(false)
+}
+
+/// True if `s` contains only characters legal in an IPv4 address or
+/// CIDR (`default` is also allowed, for a default route). Keeps
+/// operator free-text out of the generated YAML.
+fn is_ip_like(s: &str) -> bool {
+    s == "default"
+        || (!s.is_empty()
+            && s.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '/'))
+}
+
+/// Build a NoCloud seed ISO carrying just the network-config. Returns
+/// the ISO path. Uses `cloud-localds` — the canonical NoCloud tool,
+/// already a WolfStack pool prerequisite.
+///
+/// A fresh `instance-id` each call makes the guest's cloud-init treat
+/// the seed as a new instance and re-apply the network stage on the
+/// next boot. user-data is minimal and pins `preserve_hostname` +
+/// `ssh_deletekeys: false` so the re-init can't rename the host or
+/// regenerate the SSH host keys.
+fn build_vm_seed_iso(domain: &str, network_config: &str) -> Result<String, String> {
+    if !command_exists("cloud-localds") {
+        return Err("cloud-localds not installed (apt: cloud-image-utils / \
+            cloud-utils, dnf: cloud-utils)".into());
+    }
+    let dir = "/var/lib/wolfstack/vlan-seeds";
+    std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {}", dir, e))?;
+    let safe = safe_seed_name(domain);
+    let user_data = format!("{}/{}-userdata.yaml", dir, safe);
+    let meta_data = format!("{}/{}-metadata.yaml", dir, safe);
+    let net_cfg = format!("{}/{}-netcfg.yaml", dir, safe);
+    let seed_iso = format!("{}/{}-vlan-seed.iso", dir, safe);
+
+    let iid = format!("wolfstack-vlan-{}", unix_now());
+    std::fs::write(&user_data,
+        "#cloud-config\npreserve_hostname: true\nssh_deletekeys: false\n")
+        .map_err(|e| format!("write user-data: {}", e))?;
+    std::fs::write(&meta_data, format!("instance-id: {}\n", iid))
+        .map_err(|e| format!("write meta-data: {}", e))?;
+    std::fs::write(&net_cfg, network_config)
+        .map_err(|e| format!("write network-config: {}", e))?;
+
+    // cloud-localds [--network-config F] OUTPUT USER-DATA [META-DATA]
+    let out = Command::new("cloud-localds")
+        .arg("--network-config").arg(&net_cfg)
+        .arg(&seed_iso).arg(&user_data).arg(&meta_data)
+        .output().map_err(|e| format!("cloud-localds spawn: {}", e))?;
+    if !out.status.success() {
+        return Err(format!("cloud-localds failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    Ok(seed_iso)
+}
+
+/// Filesystem-safe per-domain stem for seed artefacts.
+fn safe_seed_name(domain: &str) -> String {
+    domain.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(64).collect()
+}
+
+/// Seconds since the Unix epoch — a unique cloud-init instance-id per
+/// attach.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// PATH lookup for an executable. True iff `name` is on $PATH and is
+/// an executable file.
+fn command_exists(name: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    for dir in std::env::split_paths(&path) {
+        if let Ok(meta) = std::fs::metadata(dir.join(name))
+            && meta.is_file()
+            && meta.permissions().mode() & 0o111 != 0
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Pick a free disk target for the cloud-init CD-ROM by inspecting
+/// `virsh domblklist`. None = every candidate slot is taken.
+fn free_cdrom_target(domain: &str) -> Option<String> {
+    let out = Command::new("virsh").args(["domblklist", domain]).output().ok()?;
+    if !out.status.success() { return None; }
+    let listing = String::from_utf8_lossy(&out.stdout);
+    // domblklist columns: Target | Source. First column = target dev.
+    let used: std::collections::HashSet<String> = listing.lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('-'))
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|t| !t.eq_ignore_ascii_case("target"))
+        .map(|t| t.to_string())
+        .collect();
+    ["sdb", "sdc", "sdd", "sde", "hdc", "hdd", "hdb", "sda"]
+        .into_iter()
+        .find(|c| !used.contains(*c))
+        .map(|c| c.to_string())
 }
 
 pub fn detach_vm_libvirt(target_id: &str, bridge: &str) -> Result<AttachOutcome, String> {
@@ -666,13 +1115,57 @@ pub fn detach_vm_libvirt(target_id: &str, bridge: &str) -> Result<AttachOutcome,
     } else {
         format!(" ({} failed: {})", errors.len(), errors.join("; "))
     };
+    let seed_note = cleanup_libvirt_seed(target_id, &macs);
     Ok(AttachOutcome {
         message: format!(
-            "Detached {} interface(s) from VM {} on bridge {}{}.",
-            detached, target_id, bridge, warning,
+            "Detached {} interface(s) from VM {} on bridge {}{}.{}",
+            detached, target_id, bridge, warning, seed_note,
         ),
         restarted: false,
     })
+}
+
+/// After NIC detach: drop the per-NIC cloud-init blocks for the
+/// removed MACs. If the VM still has other WolfStack vSwitch NICs,
+/// rebuild the seed in place so their IPs survive; otherwise detach
+/// the seed CD-ROM and wipe every artefact. Returns a note for the
+/// detach message.
+fn cleanup_libvirt_seed(domain: &str, removed_macs: &[String]) -> String {
+    for mac in removed_macs {
+        let _ = std::fs::remove_file(mac_block_file(domain, mac));
+    }
+    if let Some(netcfg) = assemble_vm_netcfg(domain) {
+        // VM still has WolfStack vSwitch NICs — refresh the seed in
+        // place (the CD-ROM keeps pointing at the same path).
+        return match build_vm_seed_iso(domain, &netcfg) {
+            Ok(_) => " Rebuilt the cloud-init seed for the VM's remaining vSwitch NICs.".into(),
+            Err(_) => String::new(),
+        };
+    }
+    // No WolfStack NICs left — detach the seed CD-ROM and wipe it.
+    let dir = "/var/lib/wolfstack/vlan-seeds";
+    let safe = safe_seed_name(domain);
+    let seed_iso = format!("{}/{}-vlan-seed.iso", dir, safe);
+    let mut note = String::new();
+    if let Ok(out) = Command::new("virsh").args(["domblklist", domain]).output()
+        && out.status.success()
+    {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            if cols.len() >= 2 && cols[1] == seed_iso {
+                let _ = Command::new("virsh")
+                    .args(["detach-disk", domain, cols[0], "--config"])
+                    .output();
+                note = " Removed the cloud-init seed CD-ROM.".into();
+            }
+        }
+    }
+    // Delete the seed artefacts. remove_file ignores missing files.
+    for suffix in ["-vlan-seed.iso", "-userdata.yaml", "-metadata.yaml", "-netcfg.yaml"] {
+        let _ = std::fs::remove_file(format!("{}/{}{}", dir, safe, suffix));
+    }
+    let _ = std::fs::remove_dir_all(vm_blocks_dir(domain));
+    note
 }
 
 /// Parse `virsh domiflist` output to find every MAC whose source matches
@@ -738,13 +1231,6 @@ lxc.net.2.link = vmbr4000
     fn ip_only_strips_prefix() {
         assert_eq!(ip_only("10.0.1.10/24"), "10.0.1.10");
         assert_eq!(ip_only("10.0.1.10"), "10.0.1.10");
-    }
-
-    #[test]
-    fn prefix_only_parses_or_none() {
-        assert_eq!(prefix_only("10.0.1.10/24"), Some(24));
-        assert_eq!(prefix_only("10.0.1.10"), None);
-        assert_eq!(prefix_only("10.0.1.10/garbage"), None);
     }
 
     #[test]
@@ -819,5 +1305,96 @@ lxc.net.2.link = vmbr4000
  vnet0       bridge   vmbr4000   virtio   not-a-real-mac-address
 ";
         assert!(parse_libvirt_macs_for_bridge(out, "vmbr4000").is_empty());
+    }
+
+    #[test]
+    fn max_cfg_index_finds_highest() {
+        let cfg = "net0: virtio=AA,bridge=vmbr0\n\
+                   net2: virtio=BB,bridge=vmbr4000\n\
+                   scsi0: local:vm-1-disk-0\n";
+        assert_eq!(max_cfg_index(cfg, "net"), 2);
+        assert_eq!(max_cfg_index("", "net"), -1);
+        assert_eq!(max_cfg_index("memory: 2048\n", "net"), -1);
+    }
+
+    #[test]
+    fn is_disk_bus_key_excludes_controller() {
+        assert!(is_disk_bus_key("scsi0: local:vm-1-disk-0,size=32G"));
+        assert!(is_disk_bus_key("ide2: local:vm-1-cloudinit,media=cdrom"));
+        assert!(is_disk_bus_key("virtio0: local:vm-1-disk-0"));
+        // scsihw is the SCSI controller model, not a disk slot.
+        assert!(!is_disk_bus_key("scsihw: virtio-scsi-pci"));
+        assert!(!is_disk_bus_key("net0: virtio=AA,bridge=vmbr0"));
+        assert!(!is_disk_bus_key("memory: 2048"));
+    }
+
+    #[test]
+    fn cfg_has_cloudinit_drive_detects_drive() {
+        let with = "scsi0: local:vm-1-disk-0\n\
+                    ide2: local-lvm:vm-1-cloudinit,media=cdrom\n";
+        let without = "scsi0: local:vm-1-disk-0\nide2: none,media=cdrom\n";
+        assert!(cfg_has_cloudinit_drive(with));
+        assert!(!cfg_has_cloudinit_drive(without));
+    }
+
+    #[test]
+    fn free_ide_slot_prefers_two_then_three() {
+        assert_eq!(free_ide_slot(""), Some(2));
+        assert_eq!(free_ide_slot("ide2: local:vm-1-cd,media=cdrom\n"), Some(3));
+        assert_eq!(free_ide_slot("ide0: local:vm-1-disk-0\n"), Some(2));
+        assert_eq!(free_ide_slot("ide0: a\nide1: b\nide2: c\nide3: d\n"), None);
+    }
+
+    #[test]
+    fn os_disk_storage_skips_cdrom_and_cloudinit() {
+        let cfg = "ide2: local-lvm:vm-1-cloudinit,media=cdrom\n\
+                   ide0: none,media=cdrom\n\
+                   scsi0: fastpool:vm-1-disk-0,size=32G\n";
+        assert_eq!(os_disk_storage(cfg).as_deref(), Some("fastpool"));
+        assert_eq!(os_disk_storage("memory: 2048\n"), None);
+    }
+
+    #[test]
+    fn is_ip_like_accepts_only_ip_chars() {
+        assert!(is_ip_like("10.0.0.0/16"));
+        assert!(is_ip_like("10.0.1.1"));
+        assert!(is_ip_like("default"));
+        assert!(!is_ip_like("10.0.0.0/16\"; rm -rf"));
+        assert!(!is_ip_like(""));
+        assert!(!is_ip_like("evil\nkey: value"));
+    }
+
+    #[test]
+    fn vm_ethernet_block_matches_by_mac() {
+        let routes = vec![
+            RouteEntry { destination: "10.0.0.0/16".into(), via: "10.0.1.1".into() },
+        ];
+        let block = vm_ethernet_block(
+            "02:ab:cd:ef:01:02", "10.0.1.10/24", 1400, &routes);
+        // Entry keyed by MAC so multiple NICs never collide on assembly.
+        assert!(block.contains("wsvlan02abcdef0102:"));
+        assert!(block.contains("macaddress: \"02:ab:cd:ef:01:02\""));
+        assert!(block.contains("- \"10.0.1.10/24\""));
+        assert!(block.contains("mtu: 1400"));
+        assert!(block.contains("to: \"10.0.0.0/16\""));
+        assert!(block.contains("via: \"10.0.1.1\""));
+    }
+
+    #[test]
+    fn vm_ethernet_block_drops_unsafe_routes() {
+        let routes = vec![
+            RouteEntry { destination: "evil\"\ninject: x".into(), via: "10.0.1.1".into() },
+        ];
+        let block = vm_ethernet_block(
+            "02:ab:cd:ef:01:02", "10.0.1.10/24", 1400, &routes);
+        // The unsafe route is filtered out — no routes block emitted.
+        assert!(!block.contains("routes:"));
+        assert!(!block.contains("inject"));
+    }
+
+    #[test]
+    fn mac_block_file_strips_colons() {
+        let path = mac_block_file("web01", "02:ab:cd:ef:01:02");
+        assert!(path.ends_with("/web01.d/02abcdef0102.block"));
     }
 }

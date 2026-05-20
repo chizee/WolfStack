@@ -8136,7 +8136,7 @@ dns_cloudflare_api_token = your_token_here"
                 <div class="card-header"
                     style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
                     <h3>Network Interfaces</h3>
-                    <button class="btn btn-sm btn-primary" onclick="showCreateVlanModal()">+ Add VLAN</button>
+                    <button class="btn btn-sm btn-primary" onclick="vlanShowAddDialog()">+ Add VLAN</button>
                 </div>
                 <div class="card-body">
                     <table class="data-table">
@@ -8573,35 +8573,6 @@ pveum aclmod / -token 'root@pam!wolfstack' -role WolfStackMonitor</code></pre>
                             </div>
                         </a>
                     </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- Create VLAN Modal -->
-        <div class="modal-overlay" id="create-vlan-modal">
-            <div class="modal" style="max-width: 480px; width: 95%;">
-                <div class="modal-header">
-                    <h3>🏷️ Create VLAN</h3>
-                    <button class="modal-close" onclick="closeCreateVlanModal()">&times;</button>
-                </div>
-                <div class="modal-body">
-                    <div class="form-group">
-                        <label>Parent Interface</label>
-                        <select id="vlan-parent" class="form-control"></select>
-                    </div>
-                    <div class="form-group">
-                        <label>VLAN ID</label>
-                        <input type="number" id="vlan-id" class="form-control" min="1" max="4094"
-                            placeholder="e.g. 100">
-                    </div>
-                    <div class="form-group">
-                        <label>Name (optional — defaults to parent.vlanid)</label>
-                        <input type="text" id="vlan-name" class="form-control" placeholder="e.g. mgmt-vlan">
-                    </div>
-                </div>
-                <div class="modal-footer">
-                    <button class="btn" onclick="closeCreateVlanModal()">Cancel</button>
-                    <button class="btn btn-primary" onclick="createVlan()">Create VLAN</button>
                 </div>
             </div>
         </div>
