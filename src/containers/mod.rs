@@ -5281,7 +5281,10 @@ pub fn lxc_parse_config(container: &str) -> Option<LxcParsedConfig> {
                         "ipv6.gateway" => nic.ipv6_gw = val.to_string(),
                         "flags" => nic.flags = val.to_string(),
                         "mtu" => nic.mtu = val.to_string(),
-                        "vlan.id" => nic.vlan = val.to_string(),
+                        // type=vlan writes `vlan.id`; a veth on a bridge
+                        // writes `veth.vlan.id` — accept both so the
+                        // editor round-trips whichever form is on disk.
+                        "vlan.id" | "veth.vlan.id" => nic.vlan = val.to_string(),
                         "firewall" => nic.firewall = val == "1",
                         _ => {}
                     }
@@ -5697,6 +5700,24 @@ mod mem_parse_tests {
         assert_eq!(parse_mem_to_mb(" 2048 "), 2048);
         assert_eq!(parse_mem_to_mb("2 G"), 2048);
     }
+
+    #[test]
+    fn lxc_vlan_key_is_type_aware() {
+        // type=vlan interfaces take the tag via `vlan.id`; a veth on a
+        // bridge takes it via `veth.vlan.id`. lxc.container.conf(5).
+        assert_eq!(lxc_vlan_key_suffix("vlan"), "vlan.id");
+        assert_eq!(lxc_vlan_key_suffix("veth"), "veth.vlan.id");
+        assert_eq!(lxc_vlan_key_suffix(""), "veth.vlan.id");
+    }
+}
+
+/// The `lxc.net.N.<suffix>` key that carries a VLAN tag — it differs by
+/// interface type. Source: lxc.container.conf(5) — a `type=vlan`
+/// interface takes the tag via `vlan.id`, while a `veth` in bridge mode
+/// takes its untagged/access VLAN via `veth.vlan.id`. Writing `vlan.id`
+/// on a veth (the editor's default type) is silently ignored by LXC.
+fn lxc_vlan_key_suffix(net_type: &str) -> &'static str {
+    if net_type == "vlan" { "vlan.id" } else { "veth.vlan.id" }
 }
 
 pub fn lxc_update_settings(container: &str, settings: &LxcSettingsUpdate) -> Result<String, String> {
@@ -5846,7 +5867,8 @@ pub fn lxc_update_settings(container: &str, settings: &LxcSettingsUpdate) -> Res
             preserved.push(format!("lxc.net.{}.mtu = {}", i, nic.mtu));
         }
         if !nic.vlan.is_empty() {
-            preserved.push(format!("lxc.net.{}.vlan.id = {}", i, nic.vlan));
+            preserved.push(format!("lxc.net.{}.{} = {}",
+                i, lxc_vlan_key_suffix(net_type), nic.vlan));
         }
         if nic.firewall {
             preserved.push(format!("lxc.net.{}.firewall = 1", i));

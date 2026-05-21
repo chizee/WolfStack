@@ -20973,7 +20973,7 @@ function closeNicEditor() {
     }
 }
 
-function addLxcNic() {
+function addLxcNic(name) {
     var list = document.getElementById('lxc-nic-list');
     if (!list) return;
     // Find the next available index
@@ -21044,6 +21044,9 @@ function addLxcNic() {
                         <label style="font-size:11px;">VLAN Tag</label>
                         <input type="text" class="form-control lxc-nic-field" data-nic="${newIdx}" data-field="vlan" value="" placeholder="None">
                     </div>
+                </div>
+                <div style="display:flex;justify-content:flex-end;margin-top:10px;">
+                    <button class="btn btn-sm btn-primary" onclick="saveLxcSettings('${name}')">Save Settings</button>
                 </div>
             </div>
         </div>`;
@@ -21285,7 +21288,7 @@ async function openLxcSettings(name) {
                 `).join('')}
                 </div>
 
-                <button class="btn btn-sm" onclick="addLxcNic()" style="margin-top:4px;font-size:11px;padding:6px 12px;">+ Add Interface</button>
+                <button class="btn btn-sm" onclick="addLxcNic('${name}')" style="margin-top:4px;font-size:11px;padding:6px 12px;">+ Add Interface</button>
 
                 <div style="margin-top:12px;padding:12px;background:var(--bg-tertiary);border-radius:8px;border:1px solid var(--border);">
                     <h4 style="margin:0 0 8px 0;font-size:13px;">WolfNet</h4>
@@ -21429,6 +21432,12 @@ async function openLxcSettings(name) {
 }
 
 async function saveLxcSettings(name) {
+    // A NIC editor open as a popup has its fields detached into the
+    // backdrop overlay, not inside its .lxc-nic-item — so collecting
+    // NICs below would read that interface as empty and silently drop
+    // the operator's input. Fold any open editor back into its item
+    // first so every field is collected.
+    closeNicEditor();
     // Check if raw config editor was used (tab 4, details open)
     var rawEditor = document.getElementById('lxc-config-editor');
     var rawDetails = rawEditor ? rawEditor.closest('details') : null;
