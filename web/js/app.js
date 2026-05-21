@@ -1982,6 +1982,7 @@ function selectServerView(nodeId, view) {
         'ceph': 'Ceph',
         'wolfkube': 'WolfKube',
         'wolfram': 'Wolfram',
+        'wolfrouter': 'WolfRouter',
     };
     document.getElementById('page-title').textContent = `${hostname} — ${viewTitles[view] || view}`;
     document.getElementById('hostname-display').textContent = `${hostname} (${node?.address}:${node?.port})`;
@@ -2002,7 +2003,7 @@ function selectServerView(nodeId, view) {
 
     // Load data for the view
     // Show a modern loading overlay for views that fetch data asynchronously
-    const asyncViews = ['components', 'services', 'containers', 'compose', 'secrets', 'lxc', 'vms', 'storage', 'shares', 'networking', 'backups', 'wolfnet', 'certificates', 'cron', 'pve-resources', 'mysql-editor', 'security', 'ceph', 'wolfkube', 'wolfram'];
+    const asyncViews = ['components', 'services', 'containers', 'compose', 'secrets', 'lxc', 'vms', 'storage', 'shares', 'networking', 'backups', 'wolfnet', 'certificates', 'cron', 'pve-resources', 'mysql-editor', 'security', 'ceph', 'wolfkube', 'wolfram', 'wolfrouter'];
     if (asyncViews.includes(view) && el) {
         // Clear table bodies to prevent stale data showing
         el.querySelectorAll('tbody').forEach(tb => { tb.innerHTML = ''; });
@@ -2066,6 +2067,7 @@ function selectServerView(nodeId, view) {
     if (view === 'networking') loadNetworking().finally(() => hidePageLoadingOverlay(el));
     if (view === 'backups') loadBackups().finally(() => hidePageLoadingOverlay(el));
     if (view === 'wolfnet') loadWolfNet().finally(() => hidePageLoadingOverlay(el));
+    if (view === 'wolfrouter') showWolfRouterForNode(nodeId, hostname, node?.cluster_name).finally(() => hidePageLoadingOverlay(el));
     if (view === 'certificates') loadCertificates().finally(() => hidePageLoadingOverlay(el));
     if (view === 'cron') loadCronJobs().finally(() => hidePageLoadingOverlay(el));
     if (view === 'pve-resources') { renderPveResourcesView(nodeId); hidePageLoadingOverlay(el); }
@@ -3393,6 +3395,9 @@ function buildServerTree(nodes) {
                         </a>
                         <a class="nav-item server-child-item" data-node="${node.id}" data-view="networking" onclick="selectServerView('${node.id}', 'networking')">
                             <span class="icon ws-icon-clean-wrap" data-icon="globe"></span> Networking
+                        </a>
+                        <a class="nav-item server-child-item" data-node="${node.id}" data-view="wolfrouter" onclick="selectServerView('${node.id}', 'wolfrouter')">
+                            <span class="icon ws-icon-clean-wrap" data-icon="compass"></span> WolfRouter
                         </a>
                         <a class="nav-item server-child-item" data-node="${node.id}" data-view="security" onclick="selectServerView('${node.id}', 'security')">
                             <span class="icon ws-icon-clean-wrap" data-icon="shield"></span> Security
@@ -15072,7 +15077,20 @@ function vlanProviderDefaults(provider) {
     return { hetzner: 1400, ovh: 1500, equinix: 1500, custom: 1500 }[provider] || 1500;
 }
 
-function vlanShowAddDialog(existing) {
+async function vlanShowAddDialog(existing) {
+    // The NIC dropdown is built from cachedInterfaces, which is only
+    // populated once the Networking page has finished loading. Operators
+    // hit "no physical NICs detected" when opening this dialog before
+    // that — so fetch interfaces directly if the cache is still empty.
+    if (!cachedInterfaces || cachedInterfaces.length === 0) {
+        try {
+            const r = await fetch(apiUrl('/api/networking/interfaces'));
+            if (r.ok) {
+                const ifs = await r.json();
+                if (Array.isArray(ifs)) cachedInterfaces = ifs;
+            }
+        } catch (_) { /* dialog still opens; NIC list falls back to empty */ }
+    }
     const ex = existing || {
         id: '', name: '', provider: 'hetzner',
         parent_iface: '', vlan_id: 4000, mtu: 1400,

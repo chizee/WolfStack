@@ -70,7 +70,10 @@
     let wrState = {
         view: 'rack',          // 'rack' | 'table'
         activeTab: 'firewall', // firewall | lans | leases | zones | connections | logs
-        cluster: null,         // active cluster name — scopes every fetch
+        cluster: null,         // active cluster name — scopes every fetch (cluster view)
+        nodeCluster: null,     // per-host view: that node's own cluster name, sent
+                               // through the proxy so the node answers exactly as
+                               // its own WolfRouter UI would
         topology: null,
         rules: [],
         lans: [],
@@ -81,12 +84,34 @@
         pollInterval: null,
     };
 
-    // Builds an /api/router/* URL with the active cluster as a query
-    // parameter. Backend uses it to filter nodes by cluster_name.
-    function wrUrl(path) {
-        if (!wrState.cluster) return path;
-        const sep = path.includes('?') ? '&' : '?';
-        return path + sep + 'cluster=' + encodeURIComponent(wrState.cluster);
+    // Builds an /api/router/* URL for the active scope. Scope is read
+    // from wrState only — never from the global currentNodeId, which
+    // is a lexical `let` in app.js (not window.currentNodeId) and can
+    // be stale here. Pass {local:true} for node-local endpoints that
+    // carry no cluster context (recovery, http-proxy ops).
+    function wrUrl(path, opts) {
+        const local = !!(opts && opts.local);
+        // Cluster view — filter by the active cluster name. Unchanged.
+        if (wrState.cluster) {
+            if (local) return path;
+            const sep = path.includes('?') ? '&' : '?';
+            return path + sep + 'cluster=' + encodeURIComponent(wrState.cluster);
+        }
+        // Per-host view — showWolfRouterForNode set nodeCluster, and
+        // selectServerView set currentNodeId. Proxy the call to that
+        // node via apiUrl(); for non-local endpoints carry the node's
+        // own cluster name so it answers exactly as its own WolfRouter
+        // UI would. node_proxy forwards the query string, so ?cluster=
+        // survives the hop.
+        if (wrState.nodeCluster) {
+            let p = path;
+            if (!local) {
+                const sep = path.includes('?') ? '&' : '?';
+                p = path + sep + 'cluster=' + encodeURIComponent(wrState.nodeCluster);
+            }
+            return (typeof apiUrl === 'function') ? apiUrl(p) : p;
+        }
+        return path;
     }
 
     // ─── Recovery banner ───
@@ -101,7 +126,7 @@
 
     async function wrFetchRecoveryState() {
         try {
-            const r = await fetch('/api/router/recovery');
+            const r = await fetch(wrUrl('/api/router/recovery', {local:true}));
             if (!r.ok) return null;
             return await r.json();
         } catch (_) { return null; }
@@ -247,7 +272,7 @@
             return;
         }
         try {
-            const r = await fetch('/api/router/recovery/restore', {
+            const r = await fetch(wrUrl('/api/router/recovery/restore', {local:true}), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ path }),
@@ -273,7 +298,7 @@
 
     async function wrPreviewReconstruction() {
         try {
-            const r = await fetch('/api/router/recovery/reconstruct');
+            const r = await fetch(wrUrl('/api/router/recovery/reconstruct', {local:true}));
             if (!r.ok) {
                 alert('Could not load reconstruction preview.');
                 return;
@@ -290,7 +315,7 @@
                 `The currently-live file (if any) is rotated to a .bak.<ts> first.`
             );
             if (!proceed) return;
-            const c = await fetch('/api/router/recovery/reconstruct', { method: 'POST' });
+            const c = await fetch(wrUrl('/api/router/recovery/reconstruct', {local:true}), { method: 'POST' });
             if (c.ok) {
                 alert('Reconstruction committed. Reloading WolfRouter…');
                 if (wrState && wrState.cluster) {
@@ -318,6 +343,7 @@
     window.wrLoadAll = wrLoadAll;
     window.wrStartPolling = wrStartPolling;
     window.showWolfRouterForCluster = showWolfRouterForCluster;
+    window.showWolfRouterForNode = showWolfRouterForNode;
     window.wrClearDiagnosticsPanel = () => wrClearDiagnosticsPanel();
     window.wrSwitchView = wrSwitchView;
     window.wrSelectTab = wrSelectTab;
@@ -416,6 +442,38 @@
         } finally {
             wrHideClusterLoading();
         }
+        wrStartPolling();
+    }
+
+    // Per-host WolfRouter — opened from a host node via
+    // selectServerView('<node>', 'wolfrouter'), which has already set
+    // currentNodeId, shown #page-wolfrouter, highlighted the tree item
+    // and set the page title. wrUrl() keys off currentNodeId, so every
+    // /api/router/* call is proxied to this node with its own cluster
+    // name — the node answers exactly as its own WolfRouter UI would.
+    async function showWolfRouterForNode(nodeId, hostname, clusterName) {
+        if (typeof closeSidebarMobile === 'function') closeSidebarMobile();
+        wrState.cluster = null;
+        wrState.nodeCluster = clusterName || 'WolfStack';
+        // Drop stale topology so the rack doesn't flash the wrong
+        // nodes before this host's data lands.
+        wrState.topology = null;
+        wrState.lans = [];
+        wrState.rules = [];
+        wrState.proxies = [];
+        wrState.zones = { assignments: {} };
+        wrState.wan = [];
+        wrState.lastRackHash = '';
+        const label = hostname || nodeId;
+        try {
+            const rec = await wrFetchRecoveryState();
+            if (rec && rec.load_failed) wrRenderRecoveryBanner(rec);
+            wrClearDiagnosticsPanel();
+            const pf = await wrRunPreflight();
+            await wrLoadAll();
+            if (pf && pf.status === 'error') wrRenderPreflight(pf, label);
+            else if (pf && pf.status === 'warning') wrRenderPreflightBanner(pf);
+        } catch (e) { /* wrLoadAll renders its own fetch-failure UI */ }
         wrStartPolling();
     }
 
@@ -8760,7 +8818,7 @@
                 fetch(wrUrl('/api/router/http-proxies')),
                 fetch(wrUrl('/api/router/topology')),
                 fetch('/api/configurator/nginx/available-certs'),
-                fetch('/api/router/http-proxies/runtime'),
+                fetch(wrUrl('/api/router/http-proxies/runtime', {local:true})),
                 fetch('/api/edge/cloud-providers'),
                 fetch('/api/dns-providers'),
             ]);
@@ -9431,7 +9489,7 @@
             out.innerHTML = '<div style="background:var(--bg-input);border:1px solid var(--border);border-radius:6px;padding:10px 12px;font-size:12px;color:var(--text-muted);">Running install for <code>' + escHtml(which) + '</code>…</div>';
         }
         try {
-            const resp = await fetch('/api/router/http-proxies/install/' + encodeURIComponent(which), { method: 'POST' });
+            const resp = await fetch(wrUrl('/api/router/http-proxies/install/' + encodeURIComponent(which), {local:true}), { method: 'POST' });
             const data = await resp.json().catch(() => ({}));
             if (resp.ok && data.ok) {
                 if (out) out.innerHTML =
