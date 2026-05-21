@@ -20902,6 +20902,7 @@ async function toggleContainerCronJob(index, currentlyEnabled, schedule, command
 
 var _lxcSettingsTab = 1;
 var _lxcParsedCfg = null;
+var _lxcPhysicalNics = [];  // physical NICs for the vSwitch-uplink picker; loaded by openLxcSettings
 
 function switchLxcTab(tab) {
     _lxcSettingsTab = tab;
@@ -20991,6 +20992,29 @@ function closeNicEditor() {
     }
 }
 
+// Build the <option> list for a NIC editor's "vSwitch uplink NIC"
+// picker from the physical NICs openLxcSettings detected.
+function lxcUplinkOptions() {
+    var opts = '<option value="">— none —</option>';
+    (_lxcPhysicalNics || []).forEach(function (n) {
+        opts += `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`;
+    });
+    return opts;
+}
+
+// Remove a network interface from the LXC settings editor. It's gone
+// once the operator clicks Save — saveLxcSettings rebuilds the
+// container's network config from whatever .lxc-nic-item rows remain.
+async function removeLxcNic(idx) {
+    if (typeof wolfConfirm === 'function' &&
+        !await wolfConfirm('Remove this network interface? It is deleted when you click Save Settings.', 'Remove interface')) {
+        return;
+    }
+    closeNicEditor();  // fold any open editor back so none is left orphaned
+    var item = document.querySelector('.lxc-nic-item[data-nic-index="' + idx + '"]');
+    if (item) item.remove();
+}
+
 function addLxcNic(name) {
     var list = document.getElementById('lxc-nic-list');
     if (!list) return;
@@ -21011,6 +21035,7 @@ function addLxcNic(name) {
                     <div style="font-weight:600;font-size:13px;">net${newIdx} — eth${newIdx}</div>
                     <div style="font-size:11px;color:var(--text-muted);font-family:monospace;">New interface</div>
                 </div>
+                <button class="btn btn-sm" onclick="event.stopPropagation(); removeLxcNic(${newIdx})" title="Remove interface" style="padding:2px 8px;line-height:1;color:#ef4444;"><span class="ws-icon-clean-wrap" data-icon="trash"></span></button>
                 <span class="lxc-nic-arrow" id="lxc-nic-arrow-${newIdx}" style="font-size:12px;color:var(--text-muted);transition:transform .2s;">▶</span>
             </div>
             <div class="lxc-nic-editor" id="lxc-nic-editor-${newIdx}" style="display:none;padding:14px;border-top:1px solid var(--border);background:var(--bg-primary);">
@@ -21060,18 +21085,19 @@ function addLxcNic(name) {
                     </div>
                     <div class="form-group" style="margin:0;">
                         <label style="font-size:11px;">VLAN Tag</label>
-                        <input type="text" class="form-control lxc-nic-field" data-nic="${newIdx}" data-field="vlan" value="" placeholder="None">
+                        <input type="text" class="form-control lxc-nic-field" data-nic="${newIdx}" data-field="vlan" value="" placeholder="e.g. 4000">
                     </div>
                     <div class="form-group" style="margin:0;">
                         <label style="font-size:11px;">vSwitch uplink NIC</label>
-                        <input type="text" class="form-control lxc-nic-field" data-nic="${newIdx}" data-field="vsw_uplink" value="" placeholder="e.g. enp6s0">
+                        <select class="form-control lxc-nic-field" data-nic="${newIdx}" data-field="vsw_uplink">${lxcUplinkOptions()}</select>
                     </div>
                 </div>
                 <div style="font-size:11px;color:var(--text-muted);margin-top:8px;line-height:1.5;">
-                    <strong>vSwitch VLAN:</strong> set <em>VLAN Tag</em> + <em>vSwitch uplink NIC</em> and leave
-                    <em>Bridge / Link</em> blank — on Save, WolfStack auto-creates the tagged sub-interface and
-                    bridge (<code>vmbr&lt;vlan&gt;</code>) and attaches this NIC. Leave the uplink blank for a
-                    plain bridge.
+                    <strong>vSwitch VLAN:</strong> pick a <em>vSwitch uplink NIC</em> and set the <em>VLAN Tag</em> —
+                    the VLAN ID your provider assigned (Hetzner: Robot → vSwitches, 4000–4091; OVH: your vRack VLAN
+                    number). Leave <em>Bridge / Link</em> blank — on Save, WolfStack auto-creates the tagged
+                    sub-interface and bridge (<code>vmbr&lt;vlan&gt;</code>) and attaches this NIC. Leave the uplink
+                    on <em>— none —</em> for a plain bridge.
                 </div>
                 <div style="display:flex;justify-content:flex-end;margin-top:10px;">
                     <button class="btn btn-sm btn-primary" onclick="saveLxcSettings('${name}')">Save Settings</button>
@@ -21126,6 +21152,24 @@ async function openLxcSettings(name) {
         if (!resp.ok) throw new Error('Failed to load config');
         const cfg = await resp.json();
         _lxcParsedCfg = cfg;
+
+        // Physical NICs for the vSwitch-uplink picker in the NIC editor.
+        _lxcPhysicalNics = [];
+        try {
+            const ifr = await fetch(apiUrl('/api/networking/interfaces'));
+            if (ifr.ok) {
+                const ifs = await ifr.json();
+                if (Array.isArray(ifs)) {
+                    _lxcPhysicalNics = ifs
+                        .filter(i => !i.is_vlan
+                            && !i.name.startsWith('docker') && !i.name.startsWith('br-')
+                            && !i.name.startsWith('veth') && !i.name.startsWith('wn')
+                            && !i.name.startsWith('wolfnet') && !i.name.startsWith('lo')
+                            && !i.name.startsWith('vmbr'))
+                        .map(i => i.name);
+                }
+            }
+        } catch (_) { /* picker falls back to "— none —" only */ }
 
         // Auto-generate MAC if missing or invalid
         var macRegex = /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/;
@@ -21256,6 +21300,7 @@ async function openLxcSettings(name) {
                                     ${nic.ipv6_gw ? `<span>IPv6 GW: ${escapeHtml(nic.ipv6_gw)}</span>` : ''}
                                 </div>
                             </div>
+                            <button class="btn btn-sm" onclick="event.stopPropagation(); removeLxcNic(${nic.index})" title="Remove interface" style="padding:2px 8px;line-height:1;color:#ef4444;"><span class="ws-icon-clean-wrap" data-icon="trash"></span></button>
                             <span class="lxc-nic-arrow" id="lxc-nic-arrow-${nic.index}" style="font-size:12px;color:var(--text-muted);transition:transform .2s;">▶</span>
                         </div>
                         <div class="lxc-nic-editor" id="lxc-nic-editor-${nic.index}" style="display:none;padding:14px;border-top:1px solid var(--border);background:var(--bg-primary);">
@@ -21305,17 +21350,19 @@ async function openLxcSettings(name) {
                                 </div>
                                 <div class="form-group" style="margin:0;">
                                     <label style="font-size:11px;">VLAN Tag</label>
-                                    <input type="text" class="form-control lxc-nic-field" data-nic="${nic.index}" data-field="vlan" value="${escapeHtml(nic.vlan)}" placeholder="None">
+                                    <input type="text" class="form-control lxc-nic-field" data-nic="${nic.index}" data-field="vlan" value="${escapeHtml(nic.vlan)}" placeholder="e.g. 4000">
                                 </div>
                                 <div class="form-group" style="margin:0;">
                                     <label style="font-size:11px;">vSwitch uplink NIC</label>
-                                    <input type="text" class="form-control lxc-nic-field" data-nic="${nic.index}" data-field="vsw_uplink" value="" placeholder="e.g. enp6s0">
+                                    <select class="form-control lxc-nic-field" data-nic="${nic.index}" data-field="vsw_uplink">${lxcUplinkOptions()}</select>
                                 </div>
                             </div>
                             <div style="font-size:11px;color:var(--text-muted);margin-top:8px;line-height:1.5;">
-                                <strong>vSwitch VLAN:</strong> set <em>VLAN Tag</em> + <em>vSwitch uplink NIC</em> and
-                                leave <em>Bridge / Link</em> blank — on Save, WolfStack auto-creates the tagged
-                                sub-interface and bridge (<code>vmbr&lt;vlan&gt;</code>) and attaches this NIC.
+                                <strong>vSwitch VLAN:</strong> pick a <em>vSwitch uplink NIC</em> and set the
+                                <em>VLAN Tag</em> — the VLAN ID your provider assigned (Hetzner: Robot → vSwitches,
+                                4000–4091; OVH: your vRack VLAN number). Leave <em>Bridge / Link</em> blank — on Save,
+                                WolfStack auto-creates the tagged sub-interface and bridge
+                                (<code>vmbr&lt;vlan&gt;</code>) and attaches this NIC.
                             </div>
                             <div style="display:flex;justify-content:flex-end;margin-top:10px;">
                                 <button class="btn btn-sm btn-primary" onclick="saveLxcSettings('${name}')">Save Settings</button>
