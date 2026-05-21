@@ -1797,8 +1797,21 @@ fn store_pbs_with_notes_and_log(local_path: &Path, storage: &BackupStorage, file
                         let si = s.get("backup-id").and_then(|v| v.as_str()).unwrap_or("");
                         let stime = s.get("backup-time").and_then(|v| v.as_i64()).unwrap_or(0);
                         if st == backup_type && si == backup_id && stime > best_time {
-                            best_time = stime;
-                            best_snap = format!("{}/{}/{}", st, si, stime);
+                            // The snapshot's time component must be an RFC3339
+                            // string (e.g. "ct/131/2026-05-21T09:35:01Z"): the
+                            // PBS CLI parses the <snapshot> argument as a
+                            // BackupDir and rejects a raw unix epoch.
+                            // `snapshot list --output-format json` reports
+                            // `backup-time` as an epoch, so convert it here —
+                            // without this, `snapshot notes update` fails and
+                            // the snapshot lands on PBS with an empty comment.
+                            // Source: pbs.proxmox.com/docs/backup-client.html
+                            //   — snapshot paths shown as host/elsa/2019-12-03T09:35:01Z
+                            if let Some(ts) = chrono::DateTime::from_timestamp(stime, 0) {
+                                best_time = stime;
+                                best_snap = format!("{}/{}/{}", st, si,
+                                    ts.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+                            }
                         }
                     }
                     if !best_snap.is_empty() {
@@ -1830,12 +1843,40 @@ fn store_pbs_with_notes_and_log(local_path: &Path, storage: &BackupStorage, file
                         if !pbs_pw.is_empty() {
                             notes_cmd.env("PBS_PASSWORD", pbs_pw);
                         }
-                        let notes_result = notes_cmd.output();
-                        if let Ok(out) = &notes_result {
-                            if !out.status.success() {
-                                warn!("Failed to set PBS snapshot notes: {}",
-                                    String::from_utf8_lossy(&out.stderr));
+                        match notes_cmd.output() {
+                            Ok(out) if out.status.success() => {
+                                if let Some(log_tx) = log {
+                                    let _ = log_tx.send(
+                                        "  PBS: snapshot notes set".to_string());
+                                }
                             }
+                            Ok(out) => {
+                                let err = String::from_utf8_lossy(&out.stderr);
+                                warn!("Failed to set PBS snapshot notes for {}: {}",
+                                    best_snap, err.trim());
+                                if let Some(log_tx) = log {
+                                    let _ = log_tx.send(format!(
+                                        "  PBS: warning — could not set snapshot \
+                                         notes: {}", err.trim()));
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to run `proxmox-backup-client \
+                                       snapshot notes update`: {}", e);
+                                if let Some(log_tx) = log {
+                                    let _ = log_tx.send(format!(
+                                        "  PBS: warning — could not run snapshot \
+                                         notes update: {}", e));
+                                }
+                            }
+                        }
+                    } else {
+                        warn!("PBS snapshot notes: no snapshot matching {}/{} \
+                               found — comment not set", backup_type, backup_id);
+                        if let Some(log_tx) = log {
+                            let _ = log_tx.send(format!(
+                                "  PBS: warning — uploaded snapshot {}/{} not \
+                                 found, comment not set", backup_type, backup_id));
                         }
                     }
                 }
