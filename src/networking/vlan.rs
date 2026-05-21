@@ -1061,6 +1061,24 @@ fn validate_vlan_attachment(v: &VlanAttachment) -> Result<(), String> {
             v.bridge_name, v.bridge_name.len()
         ));
     }
+    // L2-only attachment: empty subnet AND empty self_ip = a pure
+    // bridge with no host address (e.g. a vSwitch whose IPs live only
+    // on the guests attached to it — the container-driven auto-wire
+    // path uses this). Skip the L3 checks for that case; routes need a
+    // subnet, so they're disallowed without one.
+    let subnet_empty = v.subnet.is_empty();
+    let self_ip_empty = v.self_ip.is_empty();
+    if subnet_empty != self_ip_empty {
+        return Err("subnet and self_ip must both be set or both be empty \
+            (both empty = an L2-only bridge with no host IP)".into());
+    }
+    if subnet_empty {
+        if !v.routes.is_empty() {
+            return Err("an L2-only VLAN attachment (no subnet/self_ip) cannot \
+                carry routes — routes require a subnet".into());
+        }
+        return Ok(());
+    }
     parse_cidr(&v.subnet).map_err(|e| format!("subnet: {}", e))?;
     parse_ip(&v.self_ip).map_err(|e| format!("self_ip: {}", e))?;
     if !ip_in_cidr(&v.self_ip, &v.subnet)? {
@@ -1341,9 +1359,15 @@ pub fn render_ifupdown(store: &VlanStore) -> String {
         out.push('\n');
         // Bridge on top — containers/VMs attach here.
         out.push_str(&format!("auto {}\n", v.bridge_name));
-        out.push_str(&format!("iface {} inet static\n", v.bridge_name));
-        out.push_str(&format!("    address {}\n", v.self_ip));
-        out.push_str(&format!("    netmask {}\n", netmask));
+        if v.self_ip.is_empty() {
+            // L2-only bridge — no host address (a vSwitch whose IPs
+            // live only on the guests attached to it).
+            out.push_str(&format!("iface {} inet manual\n", v.bridge_name));
+        } else {
+            out.push_str(&format!("iface {} inet static\n", v.bridge_name));
+            out.push_str(&format!("    address {}\n", v.self_ip));
+            out.push_str(&format!("    netmask {}\n", netmask));
+        }
         out.push_str(&format!("    bridge-ports {}\n", vlan_iface));
         out.push_str("    bridge-stp off\n");
         out.push_str("    bridge-fd 0\n");
@@ -1986,19 +2010,22 @@ fn apply_kernel_state(store: &VlanStore, report: &mut ApplyReport) {
         // a bridge that's down still allows the operator to debug.
         run_ip_capture(&["link", "set", &v.bridge_name, "up"], report, "bring bridge up");
 
-        // Address + routes — soft-failable. The operator can fix these
-        // later without re-creating the bridge.
-        let prefix = cidr_prefix(&v.subnet).unwrap_or(24);
-        let cidr_self = format!("{}/{}", v.self_ip, prefix);
-        run_ip_idempotent(
-            &["addr", "add", &cidr_self, "dev", &v.bridge_name],
-            report, "add address",
-        );
-        for r in &v.routes {
+        // Address + routes — soft-failable, and skipped entirely for an
+        // L2-only attachment (empty self_ip = pure bridge, no host
+        // address; the bridge still works as a vSwitch for its guests).
+        if !v.self_ip.is_empty() {
+            let prefix = cidr_prefix(&v.subnet).unwrap_or(24);
+            let cidr_self = format!("{}/{}", v.self_ip, prefix);
             run_ip_idempotent(
-                &["route", "add", &r.destination, "via", &r.via, "dev", &v.bridge_name],
-                report, "add route",
+                &["addr", "add", &cidr_self, "dev", &v.bridge_name],
+                report, "add address",
             );
+            for r in &v.routes {
+                run_ip_idempotent(
+                    &["route", "add", &r.destination, "via", &r.via, "dev", &v.bridge_name],
+                    report, "add route",
+                );
+            }
         }
     }
 }
@@ -2194,7 +2221,9 @@ pub fn render_netplan(store: &VlanStore) -> String {
         out.push_str(&format!("    {}:\n", v.bridge_name));
         out.push_str(&format!("      interfaces: [{}]\n", vlan_iface));
         out.push_str(&format!("      mtu: {}\n", v.mtu));
-        out.push_str(&format!("      addresses: [\"{}/{}\"]\n", v.self_ip, prefix));
+        if !v.self_ip.is_empty() {
+            out.push_str(&format!("      addresses: [\"{}/{}\"]\n", v.self_ip, prefix));
+        }
         // dhcp/v6 hygiene matching the VLAN above. Bridges without
         // these are a common source of "I added a static address but
         // there's also a DHCP one" confusion.
@@ -2292,11 +2321,15 @@ pub fn render_nm_script(store: &VlanStore) -> String {
         // bridge.forward-delay 0 — same kernel-default-1500 footgun as
         // every other renderer. Without this, NM creates the bridge with
         // fd=15s and guests wait that long for traffic.
+        let ipv4_cfg = if v.self_ip.is_empty() {
+            "ipv4.method disabled".to_string()  // L2-only — no host IPv4
+        } else {
+            format!("ipv4.method manual ipv4.addresses '{}/{}'", v.self_ip, prefix)
+        };
         out.push_str(&format!(
             "nmcli connection add type bridge con-name '{}' ifname '{}' \
-             ipv4.method manual ipv4.addresses '{}/{}' \
-             ipv6.method ignore stp no bridge.forward-delay 0 802-3-ethernet.mtu {}\n",
-            bridge_con, v.bridge_name, v.self_ip, prefix, v.mtu,
+             {} ipv6.method ignore stp no bridge.forward-delay 0 802-3-ethernet.mtu {}\n",
+            bridge_con, v.bridge_name, ipv4_cfg, v.mtu,
         ));
         out.push_str(&format!(
             "nmcli connection add type vlan con-name '{}' ifname '{}.{}' \
@@ -2412,18 +2445,26 @@ fn persist_network_manager(store: &VlanStore, report: &mut ApplyReport) {
         if bridge_already {
             report.actions.push(format!("nmcli {} already present", bridge_con));
         } else {
-        let bridge_args = vec![
+        let mut bridge_args: Vec<&str> = vec![
             "connection", "add",
             "type", "bridge",
             "con-name", bridge_con.as_str(),
             "ifname", v.bridge_name.as_str(),
-            "ipv4.method", "manual",
-            "ipv4.addresses", addr.as_str(),
+        ];
+        if v.self_ip.is_empty() {
+            // L2-only bridge — no IPv4 on the host side.
+            bridge_args.extend_from_slice(&["ipv4.method", "disabled"]);
+        } else {
+            bridge_args.extend_from_slice(&[
+                "ipv4.method", "manual", "ipv4.addresses", addr.as_str(),
+            ]);
+        }
+        bridge_args.extend_from_slice(&[
             "ipv6.method", "ignore",
             "stp", "no",
             "bridge.forward-delay", "0",
             "802-3-ethernet.mtu", mtu.as_str(),
-        ];
+        ]);
         run_nmcli_capture(&bridge_args, report, &format!("create bridge {}", bridge_con));
         }
 
@@ -2586,7 +2627,9 @@ pub fn render_systemd_networkd_files(store: &VlanStore) -> Vec<(String, String)>
         br_net.push_str("[Match]\n");
         br_net.push_str(&format!("Name={}\n", v.bridge_name));
         br_net.push_str("\n[Network]\n");
-        br_net.push_str(&format!("Address={}/{}\n", v.self_ip, prefix));
+        if !v.self_ip.is_empty() {
+            br_net.push_str(&format!("Address={}/{}\n", v.self_ip, prefix));
+        }
         // Explicit IPv6 hygiene: don't accept RA on the bridge (could
         // pull in an unwanted default route from a router on the VLAN);
         // don't auto-assign link-local v6 addresses on the bridge.
@@ -2858,6 +2901,32 @@ mod tests {
             notes: String::new(),
         };
         validate_vlan_attachment(&v).expect("valid attachment must pass");
+    }
+
+    #[test]
+    fn validate_vlan_attachment_l2_only() {
+        // Empty subnet AND self_ip = L2-only bridge — valid (no host IP).
+        let mut v = VlanAttachment {
+            id: String::new(),
+            name: "l2only".into(),
+            provider: VlanProvider::Hetzner,
+            parent_iface: "eno1".into(),
+            vlan_id: 4000,
+            mtu: 1400,
+            bridge_name: "vmbr4000".into(),
+            subnet: String::new(),
+            self_ip: String::new(),
+            routes: vec![], allocations: vec![], external_reservations: vec![],
+            notes: String::new(),
+        };
+        validate_vlan_attachment(&v).expect("L2-only attachment must pass");
+        // Exactly one of subnet/self_ip empty = inconsistent → rejected.
+        v.subnet = "10.0.1.0/24".into();
+        assert!(validate_vlan_attachment(&v).is_err(), "subnet without self_ip must fail");
+        // L2-only cannot carry routes (routes need a subnet).
+        v.subnet = String::new();
+        v.routes = vec![RouteEntry { destination: "10.0.0.0/16".into(), via: "10.0.1.1".into() }];
+        assert!(validate_vlan_attachment(&v).is_err(), "L2-only with routes must fail");
     }
 
     #[test]

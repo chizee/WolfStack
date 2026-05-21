@@ -21062,6 +21062,16 @@ function addLxcNic(name) {
                         <label style="font-size:11px;">VLAN Tag</label>
                         <input type="text" class="form-control lxc-nic-field" data-nic="${newIdx}" data-field="vlan" value="" placeholder="None">
                     </div>
+                    <div class="form-group" style="margin:0;">
+                        <label style="font-size:11px;">vSwitch uplink NIC</label>
+                        <input type="text" class="form-control lxc-nic-field" data-nic="${newIdx}" data-field="vsw_uplink" value="" placeholder="e.g. enp6s0">
+                    </div>
+                </div>
+                <div style="font-size:11px;color:var(--text-muted);margin-top:8px;line-height:1.5;">
+                    <strong>vSwitch VLAN:</strong> set <em>VLAN Tag</em> + <em>vSwitch uplink NIC</em> and leave
+                    <em>Bridge / Link</em> blank — on Save, WolfStack auto-creates the tagged sub-interface and
+                    bridge (<code>vmbr&lt;vlan&gt;</code>) and attaches this NIC. Leave the uplink blank for a
+                    plain bridge.
                 </div>
                 <div style="display:flex;justify-content:flex-end;margin-top:10px;">
                     <button class="btn btn-sm btn-primary" onclick="saveLxcSettings('${name}')">Save Settings</button>
@@ -21297,6 +21307,15 @@ async function openLxcSettings(name) {
                                     <label style="font-size:11px;">VLAN Tag</label>
                                     <input type="text" class="form-control lxc-nic-field" data-nic="${nic.index}" data-field="vlan" value="${escapeHtml(nic.vlan)}" placeholder="None">
                                 </div>
+                                <div class="form-group" style="margin:0;">
+                                    <label style="font-size:11px;">vSwitch uplink NIC</label>
+                                    <input type="text" class="form-control lxc-nic-field" data-nic="${nic.index}" data-field="vsw_uplink" value="" placeholder="e.g. enp6s0">
+                                </div>
+                            </div>
+                            <div style="font-size:11px;color:var(--text-muted);margin-top:8px;line-height:1.5;">
+                                <strong>vSwitch VLAN:</strong> set <em>VLAN Tag</em> + <em>vSwitch uplink NIC</em> and
+                                leave <em>Bridge / Link</em> blank — on Save, WolfStack auto-creates the tagged
+                                sub-interface and bridge (<code>vmbr&lt;vlan&gt;</code>) and attaches this NIC.
                             </div>
                             <div style="display:flex;justify-content:flex-end;margin-top:10px;">
                                 <button class="btn btn-sm btn-primary" onclick="saveLxcSettings('${name}')">Save Settings</button>
@@ -21449,6 +21468,44 @@ async function openLxcSettings(name) {
     }
 }
 
+// Ensure a vSwitch VLAN's L2 plumbing exists; returns { name, mtu } for
+// its bridge. Reuses an existing VLAN attachment for (uplink, vlanId)
+// if there is one; otherwise creates an L2-only attachment — empty
+// subnet/self_ip, so the bridge is pure L2 and the guests carry the
+// addresses. Idempotent: a second call for the same VLAN reuses it.
+async function ensureVswitchBridge(uplink, vlanId, mtuStr) {
+    const mtu = parseInt(mtuStr, 10) || 1400;  // Hetzner vSwitch default
+    // Reuse an existing attachment for this (uplink, VLAN) pair.
+    try {
+        const listResp = await fetch(apiUrl('/api/networking/vlan'));
+        if (listResp.ok) {
+            const data = await listResp.json();
+            const existing = (data.vlans || []).find(v =>
+                v.parent_iface === uplink && v.vlan_id === vlanId);
+            if (existing) return { name: existing.bridge_name, mtu: existing.mtu };
+        }
+    } catch (_) { /* fall through and create */ }
+    // None — create an L2-only attachment. provider 'custom' accepts any
+    // VLAN ID; empty subnet/self_ip means no host IP on the bridge.
+    const bridge = 'vmbr' + vlanId;
+    const body = {
+        id: '', name: 'vswitch-vlan-' + vlanId, provider: 'custom',
+        parent_iface: uplink, vlan_id: vlanId, mtu: mtu,
+        bridge_name: bridge, subnet: '', self_ip: '', routes: [],
+        notes: 'Auto-created for a container vSwitch attachment.',
+    };
+    const resp = await fetch(apiUrl('/api/networking/vlan/attachments?ack_critical=true'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+    });
+    const out = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+        throw new Error(out.error || ('VLAN attachment create failed (HTTP ' + resp.status + ')'));
+    }
+    return { name: bridge, mtu: mtu };
+}
+
 async function saveLxcSettings(name) {
     // A NIC editor open as a popup has its fields detached into the
     // backdrop overlay, not inside its .lxc-nic-item — so collecting
@@ -21499,10 +21556,36 @@ async function saveLxcSettings(name) {
             ipv6_gw: getField('ipv6_gw'),
             mtu: getField('mtu'),
             vlan: getField('vlan'),
+            vsw_uplink: getField('vsw_uplink'),
             firewall: false,
             flags: 'up'
         });
     });
+
+    // vSwitch VLAN auto-wire — a NIC with a VLAN Tag + a vSwitch uplink
+    // NIC gets its L2 plumbing (tagged sub-interface + bridge) created
+    // on demand, then is attached to that bridge with no tag of its own
+    // (the tag rides on the sub-interface). vsw_uplink is a frontend-
+    // only helper field and must never reach the backend.
+    for (const nic of networkInterfaces) {
+        const uplink = (nic.vsw_uplink || '').trim();
+        delete nic.vsw_uplink;
+        if (!uplink || !nic.vlan) continue;
+        const vlanId = parseInt(nic.vlan, 10);
+        if (!Number.isInteger(vlanId) || vlanId < 1 || vlanId > 4094) {
+            showToast(`vSwitch: VLAN tag "${nic.vlan}" is invalid (must be 1-4094)`, 'error');
+            return;
+        }
+        try {
+            const bridge = await ensureVswitchBridge(uplink, vlanId, nic.mtu);
+            nic.link = bridge.name;
+            if (!nic.mtu) nic.mtu = String(bridge.mtu);
+            nic.vlan = '';  // bridge-per-VLAN: the bridge IS the VLAN — no tag on the NIC
+        } catch (e) {
+            showToast('vSwitch setup failed: ' + (e.message || e), 'error');
+            return;
+        }
+    }
 
     var settings = {
         hostname: (document.getElementById('lxc-hostname') || {}).value || '',
