@@ -9779,6 +9779,7 @@ async function syncWolfNetCluster() {
             let msg = `${data.nodes_reached} nodes reached`;
             if (data.synced > 0) msg += `, ${data.synced} new peer(s) added`;
             if (data.skipped > 0) msg += `, ${data.skipped} already connected`;
+            if (data.pruned > 0) msg += `, ${data.pruned} cross-cluster peer(s) removed`;
             showToast(msg, 'success');
             if (status) status.textContent = msg;
             if (data.errors && data.errors.length > 0) {
@@ -9862,7 +9863,6 @@ function showDiagnosticsPopup(results) {
         const api = r.wolfstack_api || {};
         const wn = r.wolfnet || {};
         const apiOk = api.reachable;
-        const wnOk = wn.reachable;
         const isSelf = r.is_self;
 
         // API status
@@ -9876,16 +9876,16 @@ function showDiagnosticsPopup(results) {
             apiCell = `<span style="color:#ef4444;">Fail${statusBadge}</span>`;
         }
 
-        // WolfNet status
+        // WolfNet status — the node's own overlay health
         let wnCell;
         if (isSelf) {
             wnCell = '<span style="color:#10b981;">Self</span>';
-        } else if (wn.ip === null) {
-            wnCell = '<span style="color:#f59e0b;" title="No WolfNet peer configured for this node">No peer</span>';
-        } else if (wnOk) {
-            wnCell = `<span style="color:#10b981;">${wn.ip}</span>`;
+        } else if (wn.ip == null) {
+            wnCell = '<span style="color:#f59e0b;" title="WolfNet not running, or node unreachable">WolfNet down</span>';
         } else {
-            wnCell = `<span style="color:#ef4444;">${wn.ip}</span>`;
+            const n = wn.peer_count;
+            const peers = (n != null) ? ` <span style="opacity:0.6;font-size:11px;">(${n} peer${n === 1 ? '' : 's'})</span>` : '';
+            wnCell = `<span style="color:#10b981;">${wn.ip}</span>${peers}`;
         }
 
         // Latency
@@ -20994,11 +20994,21 @@ function closeNicEditor() {
 }
 
 // Build the <option> list for a NIC editor's "vSwitch uplink NIC"
-// picker from the physical NICs openLxcSettings detected.
-function lxcUplinkOptions() {
-    var opts = '<option value="">— none —</option>';
-    (_lxcPhysicalNics || []).forEach(function (n) {
-        opts += `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`;
+// picker from the physical NICs openLxcSettings detected. `selected`
+// is the NIC's currently-saved uplink (recovered by the backend from
+// the VLAN attachment store) — it must be marked so the editor shows
+// the real value instead of always falling back to "— none —".
+function lxcUplinkOptions(selected) {
+    var sel = (selected || '').trim();
+    var opts = '<option value=""' + (sel ? '' : ' selected') + '>— none —</option>';
+    var nics = (_lxcPhysicalNics || []).slice();
+    // The saved uplink may not be in the detected list (NIC renamed, or
+    // the node failed to enumerate interfaces). Keep it as an option so
+    // the value still displays and round-trips on Save.
+    if (sel && nics.indexOf(sel) === -1) nics.push(sel);
+    nics.forEach(function (n) {
+        var s = (n === sel) ? ' selected' : '';
+        opts += `<option value="${escapeHtml(n)}"${s}>${escapeHtml(n)}</option>`;
     });
     return opts;
 }
@@ -21372,7 +21382,7 @@ async function openLxcSettings(name) {
                                 </div>
                                 <div class="form-group" style="margin:0;">
                                     <label style="font-size:11px;">vSwitch uplink NIC</label>
-                                    <select class="form-control lxc-nic-field" data-nic="${nic.index}" data-field="vsw_uplink" onchange="vswUplinkChanged(${nic.index})">${lxcUplinkOptions()}</select>
+                                    <select class="form-control lxc-nic-field" data-nic="${nic.index}" data-field="vsw_uplink" onchange="vswUplinkChanged(${nic.index})">${lxcUplinkOptions(nic.vsw_uplink)}</select>
                                 </div>
                             </div>
                             <div style="font-size:11px;color:var(--text-muted);margin-top:8px;line-height:1.5;">
@@ -21528,6 +21538,14 @@ async function openLxcSettings(name) {
                 <button class="btn btn-sm btn-primary" onclick="saveLxcSettings('${name}')">Save Settings</button>
             </div>
         `;
+
+        // A vSwitch NIC comes back with a recovered uplink. vswUplinkChanged
+        // only fires on user input, so run it once per such NIC to grey out
+        // the auto-managed Bridge/Link field — matching how the NIC looks
+        // right after the vSwitch is first configured.
+        (cfg.network_interfaces || []).forEach(function (nic) {
+            if (nic.vsw_uplink) vswUplinkChanged(nic.index);
+        });
     } catch (e) {
         body.innerHTML = `<p style="color:#ef4444;">Failed to load config: ${e.message}</p>`;
     }

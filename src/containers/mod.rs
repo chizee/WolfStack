@@ -5101,6 +5101,14 @@ pub struct LxcNetInterface {
     pub mtu: String,
     pub vlan: String,
     pub flags: String,         // e.g. "up"
+    /// Physical uplink NIC this interface's VLAN bridge rides on. NOT a
+    /// real LXC config key — it is recovered from the VLAN attachment
+    /// store so the settings editor's "vSwitch uplink NIC" picker can
+    /// round-trip. The frontend strips it before POSTing settings, and
+    /// the config writer never emits it. `#[serde(default)]` is required:
+    /// settings POSTs (and older configs) won't carry this field.
+    #[serde(default)]
+    pub vsw_uplink: String,
 }
 
 /// Structured representation of an LXC config
@@ -5288,8 +5296,12 @@ fn parse_proxmox_config(mut cfg: LxcParsedConfig, content: &str, container: &str
         }
     }
 
-    // Populate flat fields from NIC 0 for backward compat
-    if let Some(nic0) = net_map.get(&0) {
+    cfg.network_interfaces = net_map.into_values().collect();
+    recover_vswitch_uplinks(&mut cfg.network_interfaces);
+
+    // Populate flat fields from NIC 0 for backward compat — read from the
+    // enriched interface list so flat net_vlan matches network_interfaces[0].
+    if let Some(nic0) = cfg.network_interfaces.iter().find(|n| n.index == 0) {
         cfg.net_type = nic0.net_type.clone();
         cfg.net_link = nic0.link.clone();
         cfg.net_name = nic0.name.clone();
@@ -5303,8 +5315,6 @@ fn parse_proxmox_config(mut cfg: LxcParsedConfig, content: &str, container: &str
         cfg.net_vlan = nic0.vlan.clone();
     }
 
-    cfg.network_interfaces = net_map.into_values().collect();
-
     // Read WolfNet IP
     let wolfnet_ip_file = format!("{}/{}/.wolfnet/ip", lxc_base_dir(container), container);
     if let Ok(ip) = std::fs::read_to_string(&wolfnet_ip_file) {
@@ -5312,6 +5322,114 @@ fn parse_proxmox_config(mut cfg: LxcParsedConfig, content: &str, container: &str
     }
 
     cfg
+}
+
+/// Recover the vSwitch uplink — and, for tagless vSwitch NICs, the VLAN
+/// ID — for each parsed interface.
+///
+/// A container attached to a WolfStack VLAN bridge carries only the
+/// bridge name (`vmbr<vlan>`) in its LXC config: the originating
+/// physical uplink and the VLAN tag live in the VLAN attachment store
+/// (`vlan-attachments.json`), not the container config. `saveLxcSettings`
+/// even clears the NIC's own `vlan` because the tag rides on the
+/// bridge's sub-interface. Without this recovery the settings editor's
+/// "vSwitch uplink NIC" picker and VLAN Tag field both come back blank.
+fn recover_vswitch_uplinks(nics: &mut [LxcNetInterface]) {
+    if nics.iter().all(|n| n.link.is_empty()) {
+        return;
+    }
+    let store = crate::networking::vlan::VlanStore::load();
+    apply_vswitch_uplinks(nics, &store.vlans);
+}
+
+/// Pure form of [`recover_vswitch_uplinks`] — given the VLAN attachment
+/// list, match each NIC's bridge against it. Split out from the store
+/// load so it can be unit-tested without touching the filesystem.
+fn apply_vswitch_uplinks(
+    nics: &mut [LxcNetInterface],
+    vlans: &[crate::networking::vlan::VlanAttachment],
+) {
+    for nic in nics.iter_mut() {
+        if nic.link.is_empty() {
+            continue;
+        }
+        if let Some(att) = vlans.iter().find(|v| v.bridge_name == nic.link) {
+            nic.vsw_uplink = att.parent_iface.clone();
+            // A vSwitch NIC keeps its tag on the bridge sub-interface, so
+            // its own `vlan` is blank on disk — recover it. Never clobber
+            // a tag the config genuinely carries.
+            if nic.vlan.is_empty() {
+                nic.vlan = att.vlan_id.to_string();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod vswitch_recovery_tests {
+    use super::*;
+
+    fn vlans(json: &str) -> Vec<crate::networking::vlan::VlanAttachment> {
+        serde_json::from_str(json).expect("vlan fixture parses")
+    }
+
+    #[test]
+    fn recovers_uplink_and_tag_for_a_vswitch_bridge_nic() {
+        let store = vlans(
+            r#"[{"id":"v1","name":"vsw","provider":"custom","parent_iface":"eno1",
+                 "vlan_id":4000,"mtu":1400,"bridge_name":"vmbr4000",
+                 "subnet":"","self_ip":""}]"#,
+        );
+        let mut nics = vec![
+            // On the vSwitch bridge — tag was cleared on save, blank on disk.
+            LxcNetInterface { index: 0, link: "vmbr4000".into(), ..Default::default() },
+            // On a plain bridge with a real tag — must be left alone.
+            LxcNetInterface {
+                index: 1,
+                link: "lxcbr0".into(),
+                vlan: "7".into(),
+                ..Default::default()
+            },
+        ];
+        apply_vswitch_uplinks(&mut nics, &store);
+
+        assert_eq!(nics[0].vsw_uplink, "eno1");
+        assert_eq!(nics[0].vlan, "4000", "tag recovered from the attachment");
+        assert_eq!(nics[1].vsw_uplink, "", "plain-bridge NIC gets no uplink");
+        assert_eq!(nics[1].vlan, "7", "a real on-disk tag is preserved");
+    }
+
+    #[test]
+    fn does_not_clobber_a_tag_the_config_already_carries() {
+        let store = vlans(
+            r#"[{"id":"v1","name":"vsw","provider":"custom","parent_iface":"bond0",
+                 "vlan_id":4000,"mtu":1400,"bridge_name":"vmbr4000",
+                 "subnet":"","self_ip":""}]"#,
+        );
+        let mut nics = vec![LxcNetInterface {
+            index: 0,
+            link: "vmbr4000".into(),
+            vlan: "99".into(),
+            ..Default::default()
+        }];
+        apply_vswitch_uplinks(&mut nics, &store);
+
+        assert_eq!(nics[0].vsw_uplink, "bond0");
+        assert_eq!(nics[0].vlan, "99", "on-disk tag wins over the attachment");
+    }
+
+    #[test]
+    fn no_attachments_leaves_nics_untouched() {
+        let mut nics = vec![LxcNetInterface {
+            index: 0,
+            link: "vmbr4000".into(),
+            ..Default::default()
+        }];
+        apply_vswitch_uplinks(&mut nics, &[]);
+
+        assert_eq!(nics[0].vsw_uplink, "");
+        assert_eq!(nics[0].vlan, "");
+    }
 }
 
 /// Parse an LXC container config into structured form
@@ -5456,8 +5574,13 @@ pub fn lxc_parse_config(container: &str) -> Option<LxcParsedConfig> {
         }
     }
 
-    // Populate flat fields from NIC 0 for backward compatibility
-    if let Some(nic0) = net_map.get(&0) {
+    // Store all NICs
+    cfg.network_interfaces = net_map.into_values().collect();
+    recover_vswitch_uplinks(&mut cfg.network_interfaces);
+
+    // Populate flat fields from NIC 0 for backward compatibility — read
+    // from the enriched list so flat net_vlan matches network_interfaces[0].
+    if let Some(nic0) = cfg.network_interfaces.iter().find(|n| n.index == 0) {
         cfg.net_type = nic0.net_type.clone();
         cfg.net_link = nic0.link.clone();
         cfg.net_name = nic0.name.clone();
@@ -5470,9 +5593,6 @@ pub fn lxc_parse_config(container: &str) -> Option<LxcParsedConfig> {
         cfg.net_mtu = nic0.mtu.clone();
         cfg.net_vlan = nic0.vlan.clone();
     }
-
-    // Store all NICs
-    cfg.network_interfaces = net_map.into_values().collect();
 
     // Read WolfNet IP from file
     let wolfnet_ip_file = format!("{}/{}/.wolfnet/ip", lxc_base_dir(container), container);
