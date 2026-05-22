@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v24.3.5: scope WolfNet peering to each cluster** _(2026-05-22 — [`07bc3c5`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/07bc3c5a2477268247de792acf7c1c5b1a525074))_
 - **v24.3.4: fix empty PBS backup comments — convert snapshot time to RFC3339** _(2026-05-21 — [`b01e281`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/b01e2813e205bc06b8d5f7420b0e434d5dd102b2))_
 - **v24.3.3: stop WolfNet hijacking the default route on vSwitch containers** _(2026-05-21 — [`3f43dcd`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/3f43dcd2b5cfd18720f8137fd0b2e6a934791a64))_
 - **v24.3.2: fix LXC settings double-save + clearer vSwitch NIC feedback** _(2026-05-21 — [`dcc4088`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/dcc4088311b647dda9b4681b5514315ee00ad7f6))_
