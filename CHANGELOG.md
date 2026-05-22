@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v24.3.11: harden LXC CPU-cores input validation** _(2026-05-22 — [`36eaa06`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/36eaa0622ed8c7f98b4e51ef3c5ea497e81025df))_
 - **v24.3.10: fix LXC CPU cores — a count is a count, not a core ID** _(2026-05-22 — [`bdc5187`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/bdc5187eb016853cdd880963d8d540a9daff506e))_
 - **v24.3.9: restore dialog with Proxmox storage selection** _(2026-05-22 — [`37aded6`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/37aded6c492f7496e42841b50c27ef69aad5986c))_
 - **v24.3.8: recover vSwitch uplink + VLAN tag in LXC NIC editor** _(2026-05-22 — [`4657e17`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/4657e1727a87ec06fe8ed94f6f45e43d77313574))_
