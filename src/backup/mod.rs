@@ -2347,47 +2347,101 @@ pub fn restore_lxc(entry: &BackupEntry) -> Result<String, String> {
         return restore_lxc_proxmox(entry, &local_path);
     }
 
-    // Native LXC restore: extract tar to /var/lib/lxc/
+    // Native LXC restore. `backup_lxc` archives the container directory with
+    // its ORIGINAL name at the archive's top level (`<orig>/config`,
+    // `<orig>/rootfs/...`). Extract into a temp dir UNDER /var/lib/lxc — same
+    // filesystem, so the final install is an atomic rename — then verify the
+    // contents before declaring success.
+    let extract_root = PathBuf::from(format!("/var/lib/lxc/.wolfstack-restore-{}", entry.id));
+    let _ = fs::remove_dir_all(&extract_root);
+    fs::create_dir_all(&extract_root)
+        .map_err(|e| format!("Failed to create restore staging dir: {}", e))?;
+
     let output = Command::new("tar")
-        .args(["xzf", &local_path.to_string_lossy(), "-C", "/var/lib/lxc/"])
+        .args(["xzf", &local_path.to_string_lossy(), "-C", &extract_root.to_string_lossy()])
         .output()
         .map_err(|e| format!("Failed to extract LXC backup: {}", e))?;
-
     let _ = fs::remove_file(&local_path);
-
     if !output.status.success() {
+        let _ = fs::remove_dir_all(&extract_root);
         return Err(format!("LXC extract failed: {}", String::from_utf8_lossy(&output.stderr)));
     }
 
+    // The archive should yield exactly one top-level container directory.
+    let extracted = fs::read_dir(&extract_root).ok()
+        .and_then(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).find(|p| p.is_dir()));
+    let extracted = match extracted {
+        Some(d) => d,
+        None => {
+            let _ = fs::remove_dir_all(&extract_root);
+            return Err("Backup archive did not contain an LXC container directory".to_string());
+        }
+    };
+
+    // Verify the backup actually carries a root filesystem AND a config.
+    // Without this the container starts and instantly dies with
+    // "Failed to exec /sbin/init" — better to fail the restore loudly here.
+    let src_rootfs = extracted.join("rootfs");
+    let rootfs_ok = ["sbin", "etc", "bin", "usr"].iter().any(|d| src_rootfs.join(d).exists());
+    if !rootfs_ok {
+        let _ = fs::remove_dir_all(&extract_root);
+        return Err(format!(
+            "Backup is incomplete — no root filesystem inside it (rootfs/ has no sbin, etc or bin). \
+             Nothing was restored for '{}'.", container_name));
+    }
+    if !extracted.join("config").exists() {
+        let _ = fs::remove_dir_all(&extract_root);
+        return Err(format!(
+            "Backup is incomplete — no LXC config inside it. Nothing was restored for '{}'.", container_name));
+    }
+
+    // Install under the requested name. Refuse to clobber an existing
+    // container — silently merging two rootfs trees is worse than failing.
     let container_dir = format!("/var/lib/lxc/{}", container_name);
+    if Path::new(&container_dir).exists() {
+        let _ = fs::remove_dir_all(&extract_root);
+        return Err(format!(
+            "A container directory already exists at {} — remove it first, then restore.", container_dir));
+    }
+    if let Err(e) = fs::rename(&extracted, &container_dir) {
+        let _ = fs::remove_dir_all(&extract_root);
+        return Err(format!("Failed to install restored container at {}: {}", container_dir, e));
+    }
+    let _ = fs::remove_dir_all(&extract_root);
+
     let config_path = format!("{}/config", container_dir);
     let rootfs_path = format!("{}/rootfs", container_dir);
 
-    // Ensure rootfs directory exists
-    if !std::path::Path::new(&rootfs_path).exists() {
-        warn!("Restored LXC container '{}' has no rootfs directory", container_name);
+    // Rewrite the config for THIS node: correct rootfs path, the restored
+    // name, and a permissive apparmor profile (the backed-up profile name
+    // may not exist on the new host).
+    let config = std::fs::read_to_string(&config_path)
+        .map_err(|e| format!("Restored container config could not be read: {}", e))?;
+    let mut lines: Vec<String> = config.lines()
+        .filter(|l| {
+            let t = l.trim();
+            !t.starts_with("lxc.rootfs.path") && !t.starts_with("lxc.uts.name")
+        })
+        .map(|l| l.to_string())
+        .collect();
+    lines.insert(0, format!("lxc.rootfs.path = dir:{}", rootfs_path));
+    lines.insert(1, format!("lxc.uts.name = {}", container_name));
+    if !lines.iter().any(|l| l.contains("lxc.apparmor.profile")) {
+        lines.push("lxc.apparmor.profile = unconfined".to_string());
     }
+    std::fs::write(&config_path, lines.join("\n") + "\n")
+        .map_err(|e| format!("Failed to write restored config: {}", e))?;
 
-    // Fix config: ensure lxc.rootfs.path is set correctly
-    if let Ok(config) = std::fs::read_to_string(&config_path) {
-        let mut lines: Vec<String> = config.lines()
-            .filter(|l| !l.trim().starts_with("lxc.rootfs.path"))
-            .map(|l| l.to_string())
-            .collect();
-        lines.insert(0, format!("lxc.rootfs.path = dir:{}", rootfs_path));
-
-        if !lines.iter().any(|l| l.contains("lxc.apparmor.profile")) {
-            lines.push("lxc.apparmor.profile = unconfined".to_string());
-        }
-
-        let new_config = lines.join("\n") + "\n";
-        let _ = std::fs::write(&config_path, &new_config);
-    }
-
-    let _ = Command::new("chown").args(["-R", "root:root", &container_dir]).output();
+    // Own the container directory and its config file as root — but DO NOT
+    // recurse. The rootfs files keep the ownership `tar` restored from the
+    // archive; a `chown -R root:root` here would flatten every non-root file
+    // inside the rootfs and break the container (fatally so for an
+    // unprivileged container, whose files are owned by shifted UIDs).
+    let _ = Command::new("chown").args(["root:root", &container_dir]).output();
+    let _ = Command::new("chown").args(["root:root", &config_path]).output();
     let _ = Command::new("chmod").args(["755", &container_dir]).output();
 
-    Ok(format!("LXC container '{}' restored — you can now start it from the Containers page", container_name))
+    Ok(format!("LXC container '{}' restored and verified — start it from the Containers page", container_name))
 }
 
 /// Restore a Proxmox LXC container from a vzdump archive using pct restore
