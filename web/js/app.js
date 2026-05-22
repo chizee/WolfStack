@@ -26918,26 +26918,118 @@ async function loadPbsSnapshots() {
     }
 }
 
-async function restorePbsSnapshot(snapshot, backupType, overwrite) {
-    // Choose sensible restore target based on backup type
-    var targetDir = '/var/lib/wolfstack/restored';
-    if (backupType === 'ct') targetDir = '/var/lib/lxc';
-    else if (backupType === 'vm') targetDir = '/var/lib/wolfstack/vms';
+// Restore a PBS snapshot — proper dialog (restore-as name + overwrite +
+// live progress) instead of the old bare confirm. The snapshot id is
+// "type/id/timestamp"; for a container the operator can restore it
+// under a different name.
+async function restorePbsSnapshot(snapshot, backupType) {
+    const parts = String(snapshot).split('/');
+    const snapType = parts[0] || backupType || '';
+    const snapId = parts[1] || '';
+    const isCt = snapType === 'ct';
 
-    if (!overwrite && !(await showConfirm('Restore PBS snapshot:\n' + snapshot + '\n\nRestore to: ' + targetDir + '\n\nThis will download and restore the data to this node.'))) return;
-
-    // Find the clicked button and show progress
-    var btn = event && event.target;
-    var origText = btn ? btn.innerHTML : '';
-    if (btn) {
-        btn.disabled = true;
-        btn.innerHTML = '<span style="display:inline-block; width:12px; height:12px; border:2px solid rgba(255,255,255,0.3); border-top-color:#fff; border-radius:50%; animation:spin 0.8s linear infinite; vertical-align:middle;"></span> Starting...';
+    const stale = document.getElementById('pbs-restore-backdrop');
+    if (stale) {
+        if (stale._onKey) document.removeEventListener('keydown', stale._onKey);
+        stale.remove();
     }
-    showToast('Starting PBS restore... Progress will update live.', 'info');
-    var taskId = taskLogStart('PBS restore: ' + snapshot);
 
+    const nameRow = isCt ? `
+        <div style="margin-bottom:14px;">
+            <label for="pbs-restore-name" style="display:block;font-size:12px;color:var(--text-muted);margin-bottom:4px;">Restore as container name</label>
+            <input type="text" id="pbs-restore-name" class="form-control" value="${escapeHtml(String(snapId))}" placeholder="e.g. web-01">
+            <div style="font-size:11px;color:var(--text-muted);margin-top:4px;">Defaults to the snapshot's original name. Change it to restore as a separate copy.</div>
+        </div>` : '';
+
+    const backdrop = document.createElement('div');
+    backdrop.id = 'pbs-restore-backdrop';
+    backdrop.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:10001;display:flex;align-items:center;justify-content:center;';
+    backdrop.innerHTML = `
+        <div role="dialog" aria-modal="true" aria-labelledby="pbs-restore-title"
+             style="background:var(--bg-primary);border:1px solid var(--border);border-radius:12px;padding:20px;width:480px;max-width:92vw;max-height:85vh;overflow-y:auto;box-shadow:0 20px 60px rgba(0,0,0,0.4);">
+            <h3 id="pbs-restore-title" style="margin:0 0 4px;font-size:16px;">Restore PBS snapshot</h3>
+            <div style="font-size:12px;color:var(--text-muted);margin-bottom:14px;font-family:monospace;">${escapeHtml(String(snapshot))}</div>
+            ${nameRow}
+            <label style="display:flex;align-items:flex-start;gap:8px;font-size:13px;margin-bottom:14px;cursor:pointer;">
+                <input type="checkbox" id="pbs-restore-overwrite" style="margin-top:2px;">
+                <span>Replace the target if it already exists<br><span style="color:var(--text-muted);font-size:11px;">Any existing copy is stopped and replaced.</span></span>
+            </label>
+            <pre id="pbs-restore-progress" role="status" aria-live="polite"
+                 style="display:none;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;padding:10px;font-size:11px;line-height:1.5;max-height:200px;overflow:auto;white-space:pre-wrap;margin:0 0 12px;"></pre>
+            <div id="pbs-restore-result" role="alert" style="display:none;font-size:12px;font-weight:600;margin-bottom:12px;"></div>
+            <div style="display:flex;justify-content:flex-end;gap:8px;">
+                <button class="btn btn-sm" id="pbs-restore-cancel">Cancel</button>
+                <button class="btn btn-sm btn-primary" id="pbs-restore-go">Restore</button>
+            </div>
+        </div>`;
+    document.body.appendChild(backdrop);
+
+    const cancelBtn = backdrop.querySelector('#pbs-restore-cancel');
+    const goBtn = backdrop.querySelector('#pbs-restore-go');
+    let running = false;
+
+    function closeDialog() {
+        if (running) return;  // a restore in flight can't be aborted client-side
+        document.removeEventListener('keydown', onKey);
+        backdrop.remove();
+    }
+    function onKey(e) { if (e.key === 'Escape') closeDialog(); }
+    backdrop._onKey = onKey;
+    cancelBtn.onclick = closeDialog;
+    backdrop.onclick = (e) => { if (e.target === backdrop) closeDialog(); };
+    document.addEventListener('keydown', onKey);
+
+    goBtn.onclick = async () => {
+        if (running) return;
+        running = true;
+        goBtn.disabled = true;
+        cancelBtn.disabled = true;
+        goBtn.textContent = 'Restoring…';
+        const progressEl = backdrop.querySelector('#pbs-restore-progress');
+        const resultEl = backdrop.querySelector('#pbs-restore-result');
+        progressEl.textContent = '';
+        progressEl.style.display = 'none';
+        resultEl.style.display = 'none';
+        const overwrite = backdrop.querySelector('#pbs-restore-overwrite').checked;
+        const nameEl = backdrop.querySelector('#pbs-restore-name');
+        const ok = await _runPbsRestore(snapshot, snapType, overwrite,
+                                        nameEl ? nameEl.value.trim() : '', progressEl, resultEl);
+        running = false;
+        cancelBtn.disabled = false;
+        if (ok) {
+            cancelBtn.textContent = 'Close';
+            goBtn.style.display = 'none';
+            if (typeof loadContainers === 'function') loadContainers();
+            if (typeof loadVMs === 'function') loadVMs();
+        } else {
+            goBtn.disabled = false;
+            goBtn.textContent = 'Restore';
+        }
+    };
+
+    (backdrop.querySelector('#pbs-restore-name') || goBtn).focus();
+}
+
+// POST a PBS restore and poll its progress into the modal. Resolves
+// true on success, false on failure.
+async function _runPbsRestore(snapshot, snapType, overwrite, newName, progressEl, resultEl) {
+    let targetDir = '/var/lib/wolfstack/restored';
+    if (snapType === 'ct') targetDir = '/var/lib/lxc';
+    else if (snapType === 'vm') targetDir = '/var/lib/wolfstack/vms';
+
+    const show = (line) => {
+        progressEl.style.display = 'block';
+        progressEl.textContent = line;   // PBS progress is one live status line
+    };
+    const finish = (failed, msg) => {
+        resultEl.style.display = 'block';
+        resultEl.style.color = failed ? 'var(--danger)' : '#22c55e';
+        resultEl.textContent = (failed ? 'Restore failed: ' : '✅ ') + msg;
+        showToast(failed ? ('PBS restore failed: ' + msg) : ('PBS restore complete: ' + msg),
+                  failed ? 'error' : 'success');
+    };
     try {
-        var res = await fetch(apiUrl('/api/backups/pbs/restore'), {
+        const res = await fetch(apiUrl('/api/backups/pbs/restore'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -26945,78 +27037,51 @@ async function restorePbsSnapshot(snapshot, backupType, overwrite) {
                 archive: '',
                 target_dir: targetDir,
                 overwrite: !!overwrite,
+                new_name: newName || '',
             }),
         });
-        var data = await res.json();
+        const data = await res.json().catch(() => ({}));
         if (data.error) {
-            console.error('PBS restore error:', data.error);
-            showToast('PBS restore failed: ' + data.error, 'error');
-            updateTaskLogEntry(taskId, { status: 'failed', description: 'PBS restore failed: ' + data.error });
-            if (btn) { btn.disabled = false; btn.innerHTML = origText; }
-            return;
+            finish(true, data.error);
+            return false;
         }
-
-        updateTaskLogEntry(taskId, { description: 'Starting restore...' });
-
-        // Start polling for progress
-        var pollInterval = setInterval(async function () {
-            try {
-                var pres = await fetch(apiUrl('/api/backups/pbs/restore/progress'));
-                if (!pres.ok) return;
-                var progress = await pres.json();
-
-                // Update task log with live progress
-                if (progress.active) {
-                    var label = progress.progress_text || 'Working...';
-                    if (progress.percentage != null) {
-                        label = progress.percentage.toFixed(0) + '% — ' + label;
-                    }
-                    updateTaskLogEntry(taskId, { description: label });
+        show('Starting restore…');
+        return await new Promise((resolve) => {
+            let polls = 0;
+            const poll = setInterval(async () => {
+                if (++polls > 900) {   // ~30 min at 2s — the server caps a restore there too
+                    clearInterval(poll);
+                    finish(true, 'restore timed out — check the server task log');
+                    resolve(false);
+                    return;
                 }
-
-                // Update button with progress
-                if (btn && progress.active) {
-                    var btnLabel = progress.progress_text || 'Working...';
-                    if (progress.percentage != null) {
-                        btnLabel = progress.percentage.toFixed(1) + '% — ' + btnLabel;
+                try {
+                    const pres = await fetch(apiUrl('/api/backups/pbs/restore/progress'));
+                    if (!pres.ok) return;
+                    const p = await pres.json();
+                    if (p.active) {
+                        let label = p.progress_text || 'Working…';
+                        if (p.percentage != null) label = p.percentage.toFixed(0) + '% — ' + label;
+                        show(label);
                     }
-                    btn.innerHTML =
-                        '<div style="position:relative; min-width:120px; padding:3px 8px; text-align:center;">' +
-                        '<span style="position:relative; font-size:11px;">' +
-                        '<span style="display:inline-block; width:12px; height:12px; border:2px solid rgba(255,255,255,0.3); border-top-color:#fff; border-radius:50%; animation:spin 0.8s linear infinite; vertical-align:middle; margin-right:6px;"></span>' +
-                        btnLabel + '</span></div>';
-                }
-
-                if (progress.finished) {
-                    clearInterval(pollInterval);
-                    if (progress.message === 'TARGET_EXISTS') {
-                        updateTaskLogEntry(taskId, { status: 'failed', description: 'Target files already exist' });
-                        if (btn) { btn.disabled = false; btn.innerHTML = origText; }
-                        if (await showConfirm('This snapshot was previously restored and files already exist. Overwrite them?')) {
-                            return restorePbsSnapshot(snapshot, backupType, true);
+                    if (p.finished) {
+                        clearInterval(poll);
+                        if (p.success) {
+                            finish(false, p.message || 'Restore complete');
+                            resolve(true);
+                        } else {
+                            finish(true, p.message || 'unknown error');
+                            resolve(false);
                         }
-                    } else if (progress.success) {
-                        showToast('PBS restore complete: ' + progress.message, 'success');
-                        updateTaskLogEntry(taskId, { status: 'completed', description: progress.message });
-                        if (typeof loadContainers === 'function') loadContainers();
-                        if (typeof loadVMs === 'function') loadVMs();
-                        if (btn) { btn.disabled = false; btn.innerHTML = origText; }
-                    } else {
-                        showToast('PBS restore failed: ' + progress.message, 'error');
-                        updateTaskLogEntry(taskId, { status: 'failed', description: progress.message });
-                        if (btn) { btn.disabled = false; btn.innerHTML = origText; }
                     }
+                } catch (_) {
+                    // transient poll error — keep trying
                 }
-            } catch (e) {
-                // Polling error — keep trying
-                console.warn('Progress poll error:', e);
-            }
-        }, 2000);
-
+            }, 2000);
+        });
     } catch (e) {
-        showToast('PBS restore error: ' + e.message, 'error');
-        taskLog('PBS restore: ' + snapshot, 'failed');
-        if (btn) { btn.disabled = false; btn.innerHTML = origText; }
+        finish(true, e.message);
+        return false;
     }
 }
 

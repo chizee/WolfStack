@@ -2333,36 +2333,49 @@ pub fn restore_docker(entry: &BackupEntry, overwrite: bool) -> Result<String, St
 
 /// Restore an LXC container from backup
 pub fn restore_lxc(entry: &BackupEntry, storage: &str, overwrite: bool, new_name: &str) -> Result<String, String> {
+    // Fast-fail an obviously bad restore-as name before the (possibly
+    // large, remote) archive download. restore_lxc_local re-validates,
+    // so callers that bypass this wrapper (PBS restore) are still covered.
+    let trimmed = new_name.trim();
+    if !trimmed.is_empty() && !crate::auth::is_safe_name(trimmed) {
+        return Err(format!(
+            "'{}' is not a valid container name — use letters, digits, '-', '_' and '.' only, with no '..'.",
+            trimmed));
+    }
+    if !trimmed.is_empty()
+        && entry.filename.contains("vzdump")
+        && crate::containers::is_proxmox()
+        && trimmed.parse::<u32>().map(|n| n < 100).unwrap_or(true)
+    {
+        return Err(format!(
+            "'{}' is not a valid Proxmox container ID — it must be a whole number, 100 or higher.",
+            trimmed));
+    }
 
-    // `new_name` lets the operator restore under a different container
-    // name / VMID. Validate it BEFORE downloading anything — it ends up
-    // in a filesystem path (`/var/lib/lxc/<name>`), so an unsafe value
-    // must never get that far.
+    let local_path = retrieve_backup(entry)?;
+    restore_lxc_local(&local_path, &entry.target.name, storage, overwrite, new_name)
+}
+
+/// Restore an LXC container from an archive that is ALREADY on local disk.
+/// Shared core: `restore_lxc` calls it after downloading from backup
+/// storage; the PBS snapshot restore calls it after un-wrapping the
+/// snapshot's `backup.pxar`. `local_path` is consumed (removed on both
+/// success and failure). `new_name` empty = keep `original_name`.
+pub fn restore_lxc_local(
+    local_path: &Path,
+    original_name: &str,
+    storage: &str,
+    overwrite: bool,
+    new_name: &str,
+) -> Result<String, String> {
     let new_name = new_name.trim();
     if !new_name.is_empty() && !crate::auth::is_safe_name(new_name) {
+        let _ = fs::remove_file(local_path);
         return Err(format!(
             "'{}' is not a valid container name — use letters, digits, '-', '_' and '.' only, with no '..'.",
             new_name));
     }
-    // A Proxmox vzdump restore targets a numeric VMID — catch a typo'd
-    // name here, before the (possibly remote, large) archive download,
-    // rather than only in restore_lxc_proxmox after it.
-    if !new_name.is_empty()
-        && entry.filename.contains("vzdump")
-        && crate::containers::is_proxmox()
-        && new_name.parse::<u32>().map(|n| n < 100).unwrap_or(true)
-    {
-        return Err(format!(
-            "'{}' is not a valid Proxmox container ID — it must be a whole number, 100 or higher.",
-            new_name));
-    }
-
-    let local_path = retrieve_backup(entry)?;
-    let container_name: &str = if new_name.is_empty() {
-        entry.target.name.as_str()
-    } else {
-        new_name
-    };
+    let container_name: &str = if new_name.is_empty() { original_name } else { new_name };
 
     // Detect if this is a vzdump archive (Proxmox backup)
     let filename = local_path.file_name()
@@ -2371,7 +2384,7 @@ pub fn restore_lxc(entry: &BackupEntry, storage: &str, overwrite: bool, new_name
     let is_vzdump = filename.contains("vzdump");
 
     if is_vzdump && crate::containers::is_proxmox() {
-        return restore_lxc_proxmox(&local_path, storage, overwrite, container_name);
+        return restore_lxc_proxmox(local_path, storage, overwrite, container_name);
     }
 
     // Native LXC restore. `backup_lxc` archives the container directory with
@@ -2379,7 +2392,7 @@ pub fn restore_lxc(entry: &BackupEntry, storage: &str, overwrite: bool, new_name
     // `<orig>/rootfs/...`). Extract into a temp dir UNDER /var/lib/lxc — same
     // filesystem, so the final install is an atomic rename — then verify the
     // contents before declaring success.
-    let extract_root = PathBuf::from(format!("/var/lib/lxc/.wolfstack-restore-{}", entry.id));
+    let extract_root = PathBuf::from(format!("/var/lib/lxc/.wolfstack-restore-{}", Uuid::new_v4().simple()));
     let _ = fs::remove_dir_all(&extract_root);
     fs::create_dir_all(&extract_root)
         .map_err(|e| format!("Failed to create restore staging dir: {}", e))?;
@@ -2559,9 +2572,15 @@ fn restore_lxc_proxmox(archive_path: &Path, storage: &str, overwrite: bool, vmid
 
 /// Restore a VM from backup
 pub fn restore_vm(entry: &BackupEntry) -> Result<String, String> {
-
     let local_path = retrieve_backup(entry)?;
+    restore_vm_local(&local_path, &entry.target.name)
+}
 
+/// Restore a VM from an archive already on local disk. Shared by
+/// `restore_vm` (after download from backup storage) and the PBS
+/// snapshot restore (after it un-wraps the snapshot's `backup.pxar`).
+/// `local_path` is consumed.
+pub fn restore_vm_local(local_path: &Path, vm_name: &str) -> Result<String, String> {
     let vm_base = "/var/lib/wolfstack/vms";
     fs::create_dir_all(vm_base).map_err(|e| format!("Failed to create VM dir: {}", e))?;
 
@@ -2572,28 +2591,26 @@ pub fn restore_vm(entry: &BackupEntry) -> Result<String, String> {
         .output()
         .map_err(|e| format!("Failed to extract VM backup: {}", e))?;
 
-    let _ = fs::remove_file(&local_path);
+    let _ = fs::remove_file(local_path);
 
     if !output.status.success() {
         return Err(format!("VM extract failed: {}", String::from_utf8_lossy(&output.stderr)));
     }
 
     // Verify the config JSON was restored
-    let config_path = format!("{}/{}.json", vm_base, entry.target.name);
+    let config_path = format!("{}/{}.json", vm_base, vm_name);
     if !Path::new(&config_path).exists() {
         // Legacy backup format: config might be inside a subdirectory
-        let legacy_config = format!("{}/{}/config.json", vm_base, entry.target.name);
+        let legacy_config = format!("{}/{}/config.json", vm_base, vm_name);
         if Path::new(&legacy_config).exists() {
             // Move it to the expected flat location
             let _ = fs::copy(&legacy_config, &config_path);
-
         } else {
             warn!("VM config not found after restore: {} — VM may not appear in list until config is recreated", config_path);
         }
     }
 
-
-    Ok(format!("VM '{}' restored", entry.target.name))
+    Ok(format!("VM '{}' restored", vm_name))
 }
 
 /// Restore WolfStack configuration from backup
@@ -2961,81 +2978,23 @@ pub fn restore_by_id_with_log(id: &str, overwrite: bool, storage: &str, new_name
         if exists && !overwrite {
             return Err(format!("CONTAINER_EXISTS:{}", entry.target.name));
         }
-        if exists && overwrite {
-            let _ = log.send(format!("Stopping existing container '{}'...", entry.target.name));
-            let _ = Command::new("docker").args(["stop", &entry.target.name]).output();
-            let _ = Command::new("docker").args(["rm", "-f", &entry.target.name]).output();
-            let _ = log.send("Existing container removed".to_string());
-        }
+        // When overwrite is set, restore_docker stops and removes the
+        // existing container itself — no need to duplicate that here.
     }
-
-    // Use saved docker inspect config from the backup entry
-    let inspect_json = if entry.target.target_type == BackupTargetType::Docker && !entry.docker_config.is_empty() {
-        let json = serde_json::from_str::<serde_json::Value>(&entry.docker_config).ok();
-        if json.is_some() { let _ = log.send("Found saved container config".to_string()); }
-        json
-    } else {
-        if entry.target.target_type == BackupTargetType::Docker {
-            let _ = log.send("No saved config — will use defaults".to_string());
-        }
-        None
-    };
-
-    let _ = log.send("Downloading backup...".to_string());
-    let local_path = retrieve_backup(entry)?;
-    let _ = log.send("Download complete".to_string());
 
     match entry.target.target_type {
         BackupTargetType::Docker => {
-            let _ = log.send("Loading Docker image...".to_string());
-            let output = Command::new("sh")
-                .args(["-c", &format!("gunzip -c '{}' | docker load", local_path.display())])
-                .output()
-                .map_err(|e| format!("Failed to load Docker image: {}", e))?;
-
-            let _ = fs::remove_file(&local_path);
-
-            if !output.status.success() {
-                let err = format!("Docker load failed: {}", String::from_utf8_lossy(&output.stderr));
-                let _ = log.send(err.clone());
-                return Err(err);
+            // The streaming path used to run `docker load` on the
+            // v20.11+ wrapper tarball (image + volumes + binds), which
+            // `docker load` rejects. Delegate to restore_docker, which
+            // unpacks the wrapper and restores the mounts correctly.
+            let _ = log.send("Restoring Docker container...".to_string());
+            let result = restore_docker(entry, overwrite);
+            match &result {
+                Ok(msg) => { let _ = log.send(format!("✅ {}", msg)); }
+                Err(e) => { let _ = log.send(format!("❌ {}", e)); }
             }
-
-            let load_result = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let image_name = load_result
-                .lines()
-                .find_map(|line| line.strip_prefix("Loaded image: "))
-                .unwrap_or(&format!("wolfstack-backup/{}", entry.target.name))
-                .to_string();
-
-            let _ = log.send(format!("Image loaded: {}", image_name));
-
-            let extra_args = inspect_json.as_ref()
-                .map(|j| docker_run_args_from_inspect(j))
-                .unwrap_or_else(|| vec!["--restart".to_string(), "unless-stopped".to_string()]);
-
-            let _ = log.send(format!("Creating container '{}'...", entry.target.name));
-
-            let mut run_args = vec!["run".to_string(), "-d".to_string(), "--name".to_string(), entry.target.name.clone()];
-            run_args.extend(extra_args);
-            run_args.push(image_name.clone());
-
-            let create = Command::new("docker")
-                .args(&run_args)
-                .output()
-                .map_err(|e| format!("Failed to create container: {}", e))?;
-
-            if !create.status.success() {
-                let err = String::from_utf8_lossy(&create.stderr);
-                let msg = format!("Image restored but container creation failed: {}", err.trim());
-                let _ = log.send(msg.clone());
-                return Ok(msg);
-            }
-
-            let config_note = if inspect_json.is_some() { " (with original config)" } else { " (default config)" };
-            let msg = format!("✅ Docker container '{}' restored and started{}", entry.target.name, config_note);
-            let _ = log.send(msg.clone());
-            Ok(msg)
+            result
         }
         BackupTargetType::Lxc => {
             let _ = log.send("Restoring LXC container...".to_string());
@@ -3690,9 +3649,10 @@ pub fn restore_from_pbs_with_progress<F>(
     storage: &BackupStorage,
     snapshot: &str,
     archive: &str,
-    target_dir: &str,
+    _target_dir: &str,
     on_progress: F,
     overwrite: bool,
+    new_name: &str,
 ) -> Result<String, String>
 where
     F: Fn(String, Option<f64>),
@@ -3704,47 +3664,30 @@ where
     let snap_type = parts.first().copied().unwrap_or("");
     let snap_id = parts.get(1).copied().unwrap_or("");
 
-    // Compute the effective target directory based on backup type:
-    // - ct: /var/lib/lxc/pbs-{id}/rootfs/  (LXC container structure)
-    // - vm: /var/lib/wolfstack/vms/pbs-{id}/  (VM disk image)
-    // - host/other: use target_dir as-is
-    let (effective_target, container_name) = if snap_type == "ct" && !snap_id.is_empty() {
-        let name = format!("pbs-{}", snap_id);
-        let rootfs = format!("/var/lib/lxc/{}/rootfs", name);
-        on_progress(format!("Setting up container {}...", name), Some(0.5));
-        (rootfs, Some(name))
-    } else if snap_type == "vm" && !snap_id.is_empty() {
-        let name = format!("pbs-{}", snap_id);
-        let vm_dir = format!("/var/lib/wolfstack/vms/{}", name);
-        on_progress(format!("Setting up VM directory {}...", name), Some(0.5));
-        (vm_dir, None)
-    } else {
-        (target_dir.to_string(), None)
-    };
-
-    // Check if target already has files from a previous restore
-    if Path::new(&effective_target).exists() {
-        let has_files = fs::read_dir(&effective_target)
-            .map(|mut d| d.next().is_some())
-            .unwrap_or(false);
-        if has_files && !overwrite {
-            return Err("TARGET_EXISTS".to_string());
-        }
-        if has_files && overwrite {
-            on_progress("Cleaning previous restore files...".to_string(), Some(0.2));
-            let _ = fs::remove_dir_all(&effective_target);
-        }
+    if snap_id.is_empty() {
+        return Err(format!("Malformed PBS snapshot id: '{}'", snapshot));
     }
 
-    fs::create_dir_all(&effective_target)
-        .map_err(|e| format!("Failed to create target dir: {}", e))?;
+    // A WolfStack PBS snapshot is a `backup.pxar` that wraps exactly ONE
+    // WolfStack archive file. Extract the pxar into a private staging
+    // dir, then hand that archive to the SAME restore code the Backups
+    // list uses. The old code reimplemented restore here and got it
+    // wrong — it left the archive un-extracted and wrote a stub config.
+    // Stage under the backup staging dir (operator-controlled, sized for
+    // backup archives) rather than /tmp, which may be a small tmpfs.
+    let stage = ensure_staging_dir()?
+        .join(format!("pbs-restore-{}", Uuid::new_v4().simple()));
+    let _ = fs::remove_dir_all(&stage);
+    fs::create_dir_all(&stage)
+        .map_err(|e| format!("Failed to create PBS restore staging dir: {}", e))?;
 
     let snapshot_fixed = fix_pbs_snapshot_timestamp(snapshot);
 
     on_progress("Detecting archive...".to_string(), Some(1.0));
 
     let actual_archive = if archive.is_empty() || archive == "root.pxar" {
-        detect_pbs_archive(storage, &snapshot_fixed).unwrap_or_else(|| "root.pxar".to_string())
+        // WolfStack always uploads its backup wrapped as `backup.pxar`.
+        detect_pbs_archive(storage, &snapshot_fixed).unwrap_or_else(|| "backup.pxar".to_string())
     } else {
         archive.to_string()
     };
@@ -3758,7 +3701,7 @@ where
     cmd.arg("restore")
        .arg(&snapshot_fixed)
        .arg(&actual_archive)
-       .arg(&effective_target)
+       .arg(&stage)
        .arg("--repository").arg(&repo)
        .arg("--ignore-ownership").arg("true");
 
@@ -3777,11 +3720,16 @@ where
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::piped());
 
-    let mut child = cmd.spawn()
-        .map_err(|e| format!("Failed to start proxmox-backup-client: {}", e))?;
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&stage);
+            return Err(format!("Failed to start proxmox-backup-client: {}", e));
+        }
+    };
 
-    // Monitor target directory size growth while child runs
-    let target_path = effective_target.clone();
+    // Monitor staging-dir size growth while the download runs
+    let target_path = stage.to_string_lossy().to_string();
     let progress_fn = &on_progress;
 
     loop {
@@ -3800,8 +3748,13 @@ where
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
 
-    let status = child.wait()
-        .map_err(|e| format!("PBS restore wait failed: {}", e))?;
+    let status = match child.wait() {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&stage);
+            return Err(format!("PBS restore wait failed: {}", e));
+        }
+    };
 
     if !status.success() {
         // Read stderr for the actual error message
@@ -3819,154 +3772,40 @@ where
         } else {
             stderr_output.trim().to_string()
         };
+        let _ = fs::remove_dir_all(&stage);
         return Err(format!("PBS restore failed for '{}': {}", snapshot_fixed, err_detail));
     }
 
-    // Post-restore: create LXC config for container restores
-    if let Some(ref cname) = container_name {
-        let container_dir = format!("/var/lib/lxc/{}", cname);
-        let config_path = format!("{}/config", container_dir);
-
-        on_progress("Creating LXC configuration...".to_string(), Some(98.0));
-
-        // Try to extract pct.conf.blob from PBS for reference
-        let pct_path = format!("{}/pct.conf.blob", container_dir);
-        let mut pct_cmd = Command::new("proxmox-backup-client");
-        pct_cmd.arg("restore").arg(&snapshot_fixed).arg("pct.conf.blob").arg(&pct_path)
-            .arg("--repository").arg(&repo);
-        if !pbs_pw.is_empty() { pct_cmd.env("PBS_PASSWORD", pbs_pw); }
-        if !storage.pbs_fingerprint.is_empty() { pct_cmd.env("PBS_FINGERPRINT", &storage.pbs_fingerprint); }
-        let _ = pct_cmd.output(); // Best-effort
-
-        // Create a basic LXC config so `lxc-ls` discovers the container
-        if !Path::new(&config_path).exists() {
-            let lxc_config = format!(
-                "# LXC container restored from PBS\n\
-                 # Original Proxmox VMID: {}\n\
-                 # Snapshot: {}\n\
-                 lxc.uts.name = {}\n\
-                 lxc.rootfs.path = dir:{}/rootfs\n\
-                 lxc.include = /usr/share/lxc/config/common.conf\n\
-                 lxc.arch = amd64\n\
-                 \n\
-                 # Network — configure as needed\n\
-                 lxc.net.0.type = veth\n\
-                 lxc.net.0.link = lxcbr0\n\
-                 lxc.net.0.flags = up\n\
-                 lxc.net.0.hwaddr = 00:16:3e:xx:xx:xx\n",
-                snap_id, snapshot, cname, container_dir,
-            );
-            let _ = fs::write(&config_path, lxc_config);
-
+    // The pxar yielded the WolfStack archive — the single regular file
+    // now sitting in the staging dir.
+    on_progress("Unpacking restored backup...".to_string(), Some(90.0));
+    let archive_file = fs::read_dir(&stage).ok()
+        .and_then(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).find(|p| p.is_file()));
+    let archive_file = match archive_file {
+        Some(f) => f,
+        None => {
+            let _ = fs::remove_dir_all(&stage);
+            return Err(format!(
+                "Snapshot '{}' contains no WolfStack backup archive — it may be a \
+                 native Proxmox backup; restore those from a Proxmox host.", snapshot));
         }
+    };
 
-
-        return Ok(format!("Container {} restored to {}", cname, container_dir));
-    }
-
-
-    // Post-restore: if the extracted files contain a Docker backup tar.gz, load and create the container
-    if snap_type == "host" {
-        // Look for docker-*.tar.gz files in the restore directory
-        if let Ok(entries) = fs::read_dir(&effective_target) {
-            for entry in entries.flatten() {
-                let fname = entry.file_name().to_string_lossy().to_string();
-                if fname.starts_with("docker-") && fname.ends_with(".tar.gz") {
-                    on_progress(format!("Loading Docker image from {}...", fname), Some(90.0));
-                    let tar_path = entry.path();
-
-                    let output = Command::new("sh")
-                        .args(["-c", &format!("gunzip -c '{}' | docker load", tar_path.display())])
-                        .output();
-
-                    match output {
-                        Ok(o) if o.status.success() => {
-                            let load_result = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                            let image_name = load_result
-                                .lines()
-                                .find_map(|line| line.strip_prefix("Loaded image: "))
-                                .unwrap_or("unknown")
-                                .to_string();
-                            on_progress(format!("Image loaded: {}", image_name), Some(95.0));
-
-                            // Extract container name from filename: docker-{name}-{timestamp}.tar.gz
-                            // Strip "docker-" prefix and ".tar.gz" suffix, then remove the timestamp suffix
-                            let parts: Vec<&str> = fname.strip_prefix("docker-").unwrap_or(&fname)
-                                .strip_suffix(".tar.gz").unwrap_or(&fname)
-                                .rsplitn(3, '-').collect();
-                            let container_name = if parts.len() == 3 { parts[2].to_string() }
-                                else { snap_id.to_string() };
-
-                            if !container_name.is_empty() {
-                                // Look for inspect config alongside the tar
-                                let inspect_name = fname.replace(".tar.gz", ".inspect.json");
-                                let inspect_path = Path::new(&effective_target).join(&inspect_name);
-                                let inspect_json = fs::read_to_string(&inspect_path).ok()
-                                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-                                if inspect_json.is_some() {
-                                    on_progress("Found original container config".to_string(), Some(95.5));
-                                }
-                                let _ = fs::remove_file(&inspect_path);
-
-                                // Check if container already exists
-                                let check = Command::new("docker")
-                                    .args(["container", "inspect", &container_name])
-                                    .output();
-                                let exists = check.map(|o| o.status.success()).unwrap_or(false);
-
-                                if exists && !overwrite {
-                                    on_progress(format!("Container '{}' already exists — image loaded but not replaced", container_name), Some(98.0));
-                                } else {
-                                    if exists {
-                                        on_progress(format!("Replacing existing container '{}'...", container_name), Some(96.0));
-                                        let _ = Command::new("docker").args(["stop", &container_name]).output();
-                                        let _ = Command::new("docker").args(["rm", "-f", &container_name]).output();
-                                    }
-
-                                    let extra_args = inspect_json.as_ref()
-                                        .map(|j| docker_run_args_from_inspect(j))
-                                        .unwrap_or_else(|| vec!["--restart".to_string(), "unless-stopped".to_string()]);
-
-                                    on_progress(format!("Creating container '{}'...", container_name), Some(97.0));
-                                    let mut run_args = vec!["run".to_string(), "-d".to_string(), "--name".to_string(), container_name.clone()];
-                                    run_args.extend(extra_args);
-                                    run_args.push(image_name.clone());
-                                    let create = Command::new("docker")
-                                        .args(&run_args)
-                                        .output();
-                                    match create {
-                                        Ok(c) if c.status.success() => {
-                                            on_progress(format!("Docker container '{}' restored and started", container_name), Some(99.0));
-                                        }
-                                        Ok(c) => {
-                                            let err = String::from_utf8_lossy(&c.stderr);
-                                            on_progress(format!("Image loaded but container creation failed: {}", err.trim()), Some(99.0));
-                                        }
-                                        Err(e) => {
-                                            on_progress(format!("Image loaded but failed to create container: {}", e), Some(99.0));
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Clean up the tar.gz
-                            let _ = fs::remove_file(&tar_path);
-                            return Ok(format!("Docker container '{}' restored from PBS", container_name));
-                        }
-                        Ok(o) => {
-                            let err = String::from_utf8_lossy(&o.stderr);
-                            on_progress(format!("Docker load failed: {}", err.trim()), Some(99.0));
-                        }
-                        Err(e) => {
-                            on_progress(format!("Failed to run docker load: {}", e), Some(99.0));
-                        }
-                    }
-                }
-            }
+    // Hand the archive to the SAME restore path the Backups list uses —
+    // it un-archives the rootfs properly and restores the real config,
+    // instead of leaving a compressed file behind under a stub config.
+    let result = match snap_type {
+        "ct" => restore_lxc_local(&archive_file, snap_id, "", overwrite, new_name),
+        "vm" => restore_vm_local(&archive_file, snap_id),
+        other => {
+            let _ = fs::remove_file(&archive_file);
+            Err(format!(
+                "Restoring a '{}' snapshot from the PBS list isn't supported here — \
+                 restore it from the Backups list instead.", other))
         }
-    }
-
-    Ok(format!("Restored {} to {}", actual_archive, effective_target))
+    };
+    let _ = fs::remove_dir_all(&stage);
+    result
 }
 
 /// Recursively calculate directory size in bytes

@@ -13887,6 +13887,10 @@ pub struct PbsRestoreRequest {
     pub target_dir: String,
     #[serde(default)]
     pub overwrite: bool,
+    /// Restore the container under this name instead of the snapshot's
+    /// original. Empty = keep the original. LXC only.
+    #[serde(default)]
+    pub new_name: String,
 }
 fn default_pbs_target_dir() -> String { "/var/lib/wolfstack/restored".to_string() }
 
@@ -13920,6 +13924,7 @@ pub async fn pbs_restore(
     let archive = body.archive.clone();
     let target_dir = body.target_dir.clone();
     let overwrite = body.overwrite;
+    let new_name = body.new_name.clone();
 
     // Reset progress state
     {
@@ -13944,7 +13949,7 @@ pub async fn pbs_restore(
                 progress.progress_text = text;
                 progress.percentage = pct;
             }
-        }, overwrite) {
+        }, overwrite, &new_name) {
             Ok(msg) => {
                 if let Ok(mut progress) = state_clone.pbs_restore_progress.lock() {
                     progress.active = false;
