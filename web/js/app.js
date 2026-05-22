@@ -21436,10 +21436,12 @@ async function openLxcSettings(name) {
                         <small style="color:var(--text-muted);margin-top:4px;display:block;">Enter value in MB. 0 to disable, blank for unlimited.</small>
                     </div>
                     <div class="form-group">
-                        <label>CPU Cores (cpuset)</label>
+                        <label>CPU Cores</label>
                         <input type="text" id="lxc-cpus" class="form-control" value="${escapeHtml(cfg.cpus)}"
-                            placeholder="e.g. 0-3 for 4 cores, or 0,2 for specific">
-                        <small style="color:var(--text-muted);margin-top:4px;display:block;">Leave blank for unlimited</small>
+                            placeholder="${cfg.proxmox ? 'e.g. 4' : 'e.g. 4   —  or 0-3 / 0,2 to pin'}">
+                        <small style="color:var(--text-muted);margin-top:4px;display:block;">${cfg.proxmox
+                            ? 'Number of cores. Leave blank for unlimited.'
+                            : 'A plain number is that many cores (4 → cores 0-3). A cpuset like 0-3 or 0,2 pins specific cores. Blank = unlimited. Restart the container to apply.'}</small>
                     </div>
                 </div>
 

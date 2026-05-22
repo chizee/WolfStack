@@ -6107,9 +6107,13 @@ pub fn lxc_update_settings(container: &str, settings: &LxcSettingsUpdate) -> Res
         }
     }
 
+    // A bare integer N here means "N cpus" and expands to the cpuset
+    // 0-(N-1); an explicit cpuset spec ("0-3", "0,2") is kept as-is.
+    // Writing the value verbatim turned a "28" core count into
+    // `cpuset.cpus = 28` — pinning the container to host CPU #28 alone.
     let cpus = settings.cpus.as_deref().unwrap_or(&current.cpus);
-    if !cpus.is_empty() {
-        preserved.push(format!("lxc.cgroup2.cpuset.cpus = {}", cpus));
+    if let Some(cpuset) = lxc_cpuset_spec(cpus) {
+        preserved.push(format!("lxc.cgroup2.cpuset.cpus = {}", cpuset));
     }
 
     // Features
@@ -8230,6 +8234,54 @@ fn lxc_replace_or_append(config: &mut String, key: &str, value: &str) -> bool {
     changed
 }
 
+/// Normalise a CPU spec for `lxc.cgroup2.cpuset.cpus`. A bare integer N
+/// means "N cpus" and expands to `0-(N-1)`; an explicit cpuset spec
+/// ("0-3", "0,2,4") passes through unchanged. Empty — or 0 — yields
+/// None: no pinning, so the container may use every host CPU.
+///
+/// Both CPU write paths (`lxc_set_resource_limits` and the Settings UI
+/// writer `lxc_update_settings`) MUST funnel through this — otherwise a
+/// core *count* like "28" gets written verbatim as `cpuset.cpus = 28`,
+/// pinning the container to host CPU #28 alone.
+fn lxc_cpuset_spec(cpu: &str) -> Option<String> {
+    let cpu = cpu.trim();
+    if cpu.is_empty() {
+        return None;
+    }
+    match cpu.parse::<u32>() {
+        Ok(0) => None,
+        Ok(1) => Some("0".to_string()),
+        Ok(n) => Some(format!("0-{}", n - 1)),
+        Err(_) => Some(cpu.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod cpuset_spec_tests {
+    use super::lxc_cpuset_spec;
+
+    #[test]
+    fn bare_integer_expands_to_a_zero_based_range() {
+        assert_eq!(lxc_cpuset_spec("28").as_deref(), Some("0-27"));
+        assert_eq!(lxc_cpuset_spec("4").as_deref(), Some("0-3"));
+        assert_eq!(lxc_cpuset_spec("1").as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn empty_or_zero_means_no_pinning() {
+        assert_eq!(lxc_cpuset_spec(""), None);
+        assert_eq!(lxc_cpuset_spec("   "), None);
+        assert_eq!(lxc_cpuset_spec("0"), None);
+    }
+
+    #[test]
+    fn explicit_cpuset_specs_pass_through_unchanged() {
+        assert_eq!(lxc_cpuset_spec("0-3").as_deref(), Some("0-3"));
+        assert_eq!(lxc_cpuset_spec("0,2,4").as_deref(), Some("0,2,4"));
+        assert_eq!(lxc_cpuset_spec("8-15").as_deref(), Some("8-15"));
+    }
+}
+
 /// Persist memory + CPU limits in the container's lxc.config. CPU is
 /// expressed as `lxc.cgroup2.cpuset.cpus = 0-(N-1)` so an integer "4"
 /// pins the container to 4 host CPUs — same convention the Settings →
@@ -8260,24 +8312,11 @@ pub fn lxc_set_resource_limits(container: &str, memory: Option<&str>, cpus: Opti
         }
     }
 
-    if let Some(cpu) = cpus {
-        let cpu = cpu.trim();
-        if !cpu.is_empty() {
-            // Accept either an integer ("4") or a cpuset spec ("0-3", "0,2,4").
-            // Integer N is expanded to "0-(N-1)".
-            let cpuset = if let Ok(n) = cpu.parse::<u32>() {
-                if n == 0 { String::new() }
-                else if n == 1 { "0".to_string() }
-                else { format!("0-{}", n - 1) }
-            } else {
-                cpu.to_string()
-            };
-            if !cpuset.is_empty() {
-                if lxc_replace_or_append(&mut config, "lxc.cgroup2.cpuset.cpus", &cpuset) {
-                    modified = true;
-                    messages.push(format!("CPU pinning set to {}", cpuset));
-                }
-            }
+    if let Some(cpuset) = cpus.and_then(lxc_cpuset_spec) {
+        let applied = lxc_replace_or_append(&mut config, "lxc.cgroup2.cpuset.cpus", &cpuset);
+        if applied {
+            modified = true;
+            messages.push(format!("CPU pinning set to {}", cpuset));
         }
     }
 
