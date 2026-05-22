@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v24.3.13: fix PBS snapshot restore — actually un-archive the guest** _(2026-05-22 — [`0da0b1e`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/0da0b1e8091e1ead77495eeae87cac9b36227a31))_
 - **v24.3.12: restore a backup under a different name / VMID** _(2026-05-22 — [`7522a76`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/7522a76c423fb4f0999f20022adcf68fd1c92d86))_
 - **v24.3.11: harden LXC CPU-cores input validation** _(2026-05-22 — [`36eaa06`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/36eaa0622ed8c7f98b4e51ef3c5ea497e81025df))_
 - **v24.3.10: fix LXC CPU cores — a count is a count, not a core ID** _(2026-05-22 — [`bdc5187`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/bdc5187eb016853cdd880963d8d540a9daff506e))_
