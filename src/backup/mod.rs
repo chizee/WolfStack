@@ -2332,7 +2332,7 @@ pub fn restore_docker(entry: &BackupEntry, overwrite: bool) -> Result<String, St
 }
 
 /// Restore an LXC container from backup
-pub fn restore_lxc(entry: &BackupEntry) -> Result<String, String> {
+pub fn restore_lxc(entry: &BackupEntry, storage: &str, overwrite: bool) -> Result<String, String> {
 
     let local_path = retrieve_backup(entry)?;
     let container_name = &entry.target.name;
@@ -2344,7 +2344,7 @@ pub fn restore_lxc(entry: &BackupEntry) -> Result<String, String> {
     let is_vzdump = filename.contains("vzdump");
 
     if is_vzdump && crate::containers::is_proxmox() {
-        return restore_lxc_proxmox(entry, &local_path);
+        return restore_lxc_proxmox(entry, &local_path, storage, overwrite);
     }
 
     // Native LXC restore. `backup_lxc` archives the container directory with
@@ -2395,13 +2395,24 @@ pub fn restore_lxc(entry: &BackupEntry) -> Result<String, String> {
             "Backup is incomplete — no LXC config inside it. Nothing was restored for '{}'.", container_name));
     }
 
-    // Install under the requested name. Refuse to clobber an existing
-    // container — silently merging two rootfs trees is worse than failing.
+    // Install under the requested name. An existing container is only
+    // replaced when the operator ticked "replace" — otherwise refuse,
+    // because silently merging two rootfs trees is worse than failing.
     let container_dir = format!("/var/lib/lxc/{}", container_name);
     if Path::new(&container_dir).exists() {
-        let _ = fs::remove_dir_all(&extract_root);
-        return Err(format!(
-            "A container directory already exists at {} — remove it first, then restore.", container_dir));
+        if !overwrite {
+            let _ = fs::remove_dir_all(&extract_root);
+            return Err(format!(
+                "A container already exists at {} — re-run the restore with \"replace\" enabled to overwrite it.",
+                container_dir));
+        }
+        // Operator consented to replace it: stop it if still running, then
+        // drop the old directory so the rename below lands cleanly.
+        let _ = Command::new("lxc-stop").args(["-n", container_name, "-k"]).output();
+        if let Err(e) = fs::remove_dir_all(&container_dir) {
+            let _ = fs::remove_dir_all(&extract_root);
+            return Err(format!("Failed to remove the existing container at {}: {}", container_dir, e));
+        }
     }
     if let Err(e) = fs::rename(&extracted, &container_dir) {
         let _ = fs::remove_dir_all(&extract_root);
@@ -2445,7 +2456,7 @@ pub fn restore_lxc(entry: &BackupEntry) -> Result<String, String> {
 }
 
 /// Restore a Proxmox LXC container from a vzdump archive using pct restore
-fn restore_lxc_proxmox(entry: &BackupEntry, archive_path: &Path) -> Result<String, String> {
+fn restore_lxc_proxmox(entry: &BackupEntry, archive_path: &Path, storage: &str, overwrite: bool) -> Result<String, String> {
     let vmid = &entry.target.name;
 
     // Check if the VMID already exists — pct restore will fail if it does
@@ -2453,22 +2464,54 @@ fn restore_lxc_proxmox(entry: &BackupEntry, archive_path: &Path) -> Result<Strin
         .map(|o| o.status.success()).unwrap_or(false);
 
     if exists {
+        // `pct destroy` purges the container's disks — never do that
+        // without the operator explicitly asking to replace it.
+        if !overwrite {
+            let _ = fs::remove_file(archive_path);
+            return Err(format!(
+                "Container {} already exists — re-run the restore with \"replace\" enabled to overwrite it.", vmid));
+        }
         // Container exists — stop it first if running, then destroy and recreate
         let _ = Command::new("pct").args(["stop", vmid]).output();
         std::thread::sleep(std::time::Duration::from_secs(2));
-        let destroy = Command::new("pct").args(["destroy", vmid, "--force", "1"]).output()
-            .map_err(|e| format!("Failed to destroy existing container {}: {}", vmid, e))?;
+        let destroy = match Command::new("pct").args(["destroy", vmid, "--force", "1"]).output() {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = fs::remove_file(archive_path);
+                return Err(format!("Failed to destroy existing container {}: {}", vmid, e));
+            }
+        };
         if !destroy.status.success() {
+            let _ = fs::remove_file(archive_path);
             return Err(format!("Failed to destroy existing container {}: {}",
                 vmid, String::from_utf8_lossy(&destroy.stderr)));
         }
     }
 
-    // Restore using pct restore — handles all storage backends
-    let output = Command::new("pct")
-        .args(["restore", vmid, &archive_path.to_string_lossy()])
-        .output()
-        .map_err(|e| format!("pct restore failed to start: {}", e))?;
+    // Restore using pct restore — handles all storage backends. When the
+    // operator picked a target storage, pass it through; pct args go
+    // straight to execve (no shell), but reject anything that is not a
+    // plausible PVE storage id as defence in depth.
+    let mut args: Vec<String> = vec![
+        "restore".to_string(), vmid.to_string(),
+        archive_path.to_string_lossy().to_string(),
+    ];
+    let storage = storage.trim();
+    if !storage.is_empty() {
+        if !storage.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')) {
+            let _ = fs::remove_file(archive_path);
+            return Err(format!("Invalid Proxmox storage id: '{}'", storage));
+        }
+        args.push("--storage".to_string());
+        args.push(storage.to_string());
+    }
+    let output = match Command::new("pct").args(&args).output() {
+        Ok(o) => o,
+        Err(e) => {
+            let _ = fs::remove_file(archive_path);
+            return Err(format!("pct restore failed to start: {}", e));
+        }
+    };
 
     let _ = fs::remove_file(archive_path);
 
@@ -2540,11 +2583,14 @@ pub fn restore_config_backup(entry: &BackupEntry) -> Result<String, String> {
     Ok("WolfStack configuration restored. Restart services to apply changes.".to_string())
 }
 
-/// Restore from a backup entry (auto-detects type)
+/// Restore from a backup entry (auto-detects type). Non-streaming path:
+/// an LXC restore here uses the node's default storage — the streaming
+/// restore (`restore_by_id_with_log`) is the one that honours a storage
+/// the operator picked in the restore dialog.
 pub fn restore_backup(entry: &BackupEntry, overwrite: bool) -> Result<String, String> {
     match entry.target.target_type {
         BackupTargetType::Docker => restore_docker(entry, overwrite),
-        BackupTargetType::Lxc => restore_lxc(entry),
+        BackupTargetType::Lxc => restore_lxc(entry, "", overwrite),
         BackupTargetType::Vm => restore_vm(entry),
         BackupTargetType::Config => restore_config_backup(entry),
     }
@@ -2860,7 +2906,7 @@ pub fn restore_by_id(id: &str, overwrite: bool) -> Result<String, String> {
 }
 
 /// Restore from a backup by ID with streaming log output
-pub fn restore_by_id_with_log(id: &str, overwrite: bool, log: std::sync::mpsc::Sender<String>) -> Result<String, String> {
+pub fn restore_by_id_with_log(id: &str, overwrite: bool, storage: &str, log: std::sync::mpsc::Sender<String>) -> Result<String, String> {
     let config = load_config();
     let entry = config.entries.iter().find(|e| e.id == id)
         .ok_or_else(|| format!("Backup not found: {}", id))?;
@@ -2959,7 +3005,7 @@ pub fn restore_by_id_with_log(id: &str, overwrite: bool, log: std::sync::mpsc::S
         }
         BackupTargetType::Lxc => {
             let _ = log.send("Restoring LXC container...".to_string());
-            let result = restore_lxc(entry);
+            let result = restore_lxc(entry, storage, overwrite);
             match &result {
                 Ok(msg) => { let _ = log.send(format!("✅ {}", msg)); }
                 Err(e) => { let _ = log.send(format!("❌ {}", e)); }

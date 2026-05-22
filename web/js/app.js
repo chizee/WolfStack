@@ -26041,7 +26041,7 @@ function renderBackupHistory(backups) {
             <td>${date}</td>
             <td>${statusBadge}</td>
             <td style="text-align:right; white-space:nowrap;">
-                ${b.status === 'completed' ? `<button class="btn btn-sm btn-primary" onclick="restoreBackup('${b.id}')" style="margin-right:4px;">Restore</button>` : ''}
+                ${b.status === 'completed' ? `<button class="btn btn-sm btn-primary" onclick="openRestoreDialog('${b.id}', '${b.target?.type || ''}', '${(b.target?.name || '').replace(/[^\w.\- ]/g, '')}')" style="margin-right:4px;">Restore</button>` : ''}
                 <button class="btn btn-sm" onclick="deleteBackup('${b.id}')" style="background:var(--bg-tertiary); color:var(--text-primary); border:1px solid var(--border);"><span class="ws-icon-clean-wrap" data-icon="trash"></span></button>
             </td>
         </tr>`;
@@ -26252,33 +26252,163 @@ async function deleteBackup(id) {
     loadBackups();
 }
 
-async function restoreBackup(id, overwrite) {
-    if (!overwrite && !(await showConfirm('Restore from this backup? This will overwrite existing data for the target.'))) return;
-    const btn = event && event.target;
-    const origText = btn ? btn.textContent : '';
-    if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner" style="display:inline-block; width:12px; height:12px; border:2px solid var(--border); border-top-color:#fff; border-radius:50%; animation:spin 0.8s linear infinite; vertical-align:middle;"></span> Restoring...'; }
-    showToast('Restore in progress...', 'info');
-    const taskId = taskLogStart('Restoring backup...');
-    let failed = false;
-    let resultMsg = '';
+// Tracks the live restore dialog: its Escape-key handler (so a re-open
+// can detach the previous one instead of leaking listeners) and whether
+// a restore is mid-flight (so a second dialog can't open over a
+// streaming one and write progress into a detached node).
+var _restoreKeyHandler = null;
+var _restoreInFlight = false;
+
+// Restore dialog — replaces the old bare confirm(). Lets the operator
+// pick a target Proxmox storage for an LXC restore (`pct restore` needs
+// one), choose whether to replace an existing target, and watch live
+// progress in the modal instead of hunting for a transient toast.
+async function openRestoreDialog(id, type, name) {
+    if (_restoreInFlight) {
+        showToast('A restore is already running — wait for it to finish.', 'error');
+        return;
+    }
+    // Storage selection only applies to a Proxmox LXC restore — that is
+    // the path that shells out to `pct restore --storage`.
+    let proxmox = false, storages = [];
     try {
-        const url = overwrite ? `/api/backups/${id}/restore/stream?overwrite=true` : `/api/backups/${id}/restore/stream`;
-        const res = await fetch(apiUrl(url), { method: 'POST' });
-
-        if (res.status === 409) {
-            const data = await res.json();
-            updateTaskLogEntry(taskId, { status: 'failed' });
-            if (btn) { btn.disabled = false; btn.textContent = origText; }
-            if (await showConfirm(`Container '${data.container}' already exists. Stop and replace it with the backup?`)) {
-                return restoreBackup(id, true);
-            }
-            return;
+        const r = await fetch(apiUrl('/api/storage/list'));
+        if (r.ok) {
+            const d = await r.json();
+            proxmox = !!d.proxmox;
+            storages = Array.isArray(d.storages) ? d.storages : [];
         }
+    } catch (_) { /* no picker — restore still works with the default storage */ }
 
+    const wantsStorage = proxmox && type === 'lxc';
+    let stores = storages.filter(s => Array.isArray(s.content) && s.content.includes('rootdir'));
+    if (wantsStorage && stores.length === 0) stores = storages;  // content unknown — offer all
+
+    const storageRow = (wantsStorage && stores.length > 0) ? `
+        <div style="margin-bottom:14px;">
+            <label for="restore-storage" style="display:block;font-size:12px;color:var(--text-muted);margin-bottom:4px;">Target Proxmox storage</label>
+            <select id="restore-storage" class="form-control">
+                ${stores.map(s => {
+                    const free = s.available_bytes ? ` — ${formatBytes(s.available_bytes)} free` : '';
+                    const st = s.type ? ` (${escapeHtml(String(s.type))})` : '';
+                    return `<option value="${escapeHtml(String(s.id))}">${escapeHtml(String(s.id))}${st}${free}</option>`;
+                }).join('')}
+            </select>
+            <div style="font-size:11px;color:var(--text-muted);margin-top:4px;">Where the restored container's root filesystem is placed — passed to <code>pct restore</code>.</div>
+        </div>` : '';
+
+    const stale = document.getElementById('restore-dialog-backdrop');
+    if (stale) {
+        if (_restoreKeyHandler) document.removeEventListener('keydown', _restoreKeyHandler);
+        stale.remove();
+    }
+
+    const backdrop = document.createElement('div');
+    backdrop.id = 'restore-dialog-backdrop';
+    backdrop.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:10001;display:flex;align-items:center;justify-content:center;';
+    backdrop.innerHTML = `
+        <div role="dialog" aria-modal="true" aria-labelledby="restore-dialog-title"
+             style="background:var(--bg-primary);border:1px solid var(--border);border-radius:12px;padding:20px;width:480px;max-width:92vw;max-height:85vh;overflow-y:auto;box-shadow:0 20px 60px rgba(0,0,0,0.4);">
+            <h3 id="restore-dialog-title" style="margin:0 0 4px;font-size:16px;">Restore backup</h3>
+            <div style="font-size:12px;color:var(--text-muted);margin-bottom:14px;">${escapeHtml(String(name || id))} — ${escapeHtml(String(type || 'backup').toUpperCase())}</div>
+            ${storageRow}
+            <label style="display:flex;align-items:flex-start;gap:8px;font-size:13px;margin-bottom:14px;cursor:pointer;">
+                <input type="checkbox" id="restore-overwrite" style="margin-top:2px;">
+                <span>Replace the target if it already exists<br><span style="color:var(--text-muted);font-size:11px;">Any existing copy is stopped and replaced.</span></span>
+            </label>
+            <pre id="restore-progress" role="status" aria-live="polite"
+                 style="display:none;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;padding:10px;font-size:11px;line-height:1.5;max-height:220px;overflow:auto;white-space:pre-wrap;margin:0 0 12px;"></pre>
+            <div id="restore-result" role="alert" style="display:none;font-size:12px;font-weight:600;margin-bottom:12px;"></div>
+            <div style="display:flex;justify-content:flex-end;gap:8px;">
+                <button class="btn btn-sm" id="restore-cancel-btn">Cancel</button>
+                <button class="btn btn-sm btn-primary" id="restore-go-btn">Restore</button>
+            </div>
+        </div>`;
+    document.body.appendChild(backdrop);
+
+    const cancelBtn = backdrop.querySelector('#restore-cancel-btn');
+    const goBtn = backdrop.querySelector('#restore-go-btn');
+    let running = false;
+
+    function closeDialog() {
+        if (running) return;  // a restore in flight can't be aborted client-side
+        document.removeEventListener('keydown', onKey);
+        if (_restoreKeyHandler === onKey) _restoreKeyHandler = null;
+        backdrop.remove();
+    }
+    function onKey(e) { if (e.key === 'Escape') closeDialog(); }
+    cancelBtn.onclick = closeDialog;
+    backdrop.onclick = (e) => { if (e.target === backdrop) closeDialog(); };
+    document.addEventListener('keydown', onKey);
+    _restoreKeyHandler = onKey;
+
+    goBtn.onclick = async () => {
+        if (running) return;
+        running = true;
+        _restoreInFlight = true;
+        goBtn.disabled = true;
+        cancelBtn.disabled = true;
+        goBtn.textContent = 'Restoring…';
+        const progressEl = backdrop.querySelector('#restore-progress');
+        const resultEl = backdrop.querySelector('#restore-result');
+        progressEl.textContent = '';
+        progressEl.style.display = 'none';
+        resultEl.style.display = 'none';
+        const overwrite = backdrop.querySelector('#restore-overwrite').checked;
+        const storageSel = backdrop.querySelector('#restore-storage');
+        const ok = await _runRestoreStream(id, overwrite, storageSel ? storageSel.value : '', progressEl, resultEl);
+        running = false;
+        _restoreInFlight = false;
+        cancelBtn.disabled = false;
+        if (ok) {
+            cancelBtn.textContent = 'Close';
+            goBtn.style.display = 'none';
+            loadBackups();
+        } else {
+            // Let the operator adjust (e.g. tick Replace) and try again.
+            goBtn.disabled = false;
+            goBtn.textContent = 'Restore';
+        }
+    };
+
+    // Focus the most useful control for keyboard users.
+    (backdrop.querySelector('#restore-storage') || goBtn).focus();
+}
+
+// Stream a restore over SSE, appending progress lines into `progressEl`
+// and the final outcome into `resultEl`. Resolves true on success.
+async function _runRestoreStream(id, overwrite, storage, progressEl, resultEl) {
+    const params = new URLSearchParams();
+    if (overwrite) params.set('overwrite', 'true');
+    if (storage) params.set('storage', storage);
+    const qs = params.toString();
+    const append = (line) => {
+        progressEl.style.display = 'block';
+        progressEl.textContent += (progressEl.textContent ? '\n' : '') + line;
+        progressEl.scrollTop = progressEl.scrollHeight;
+    };
+    const finish = (failed, msg) => {
+        resultEl.style.display = 'block';
+        resultEl.style.color = failed ? 'var(--danger)' : '#22c55e';
+        resultEl.textContent = (failed ? 'Restore failed: ' : '✅ ') + msg;
+        showToast(failed ? `Restore failed: ${msg}` : (msg || 'Restore complete'),
+                  failed ? 'error' : 'success');
+    };
+    try {
+        const res = await fetch(apiUrl(`/api/backups/${id}/restore/stream${qs ? '?' + qs : ''}`),
+                                { method: 'POST' });
+        if (res.status === 409) {
+            const data = await res.json().catch(() => ({}));
+            finish(true, (data.message || 'The target already exists.') + ' Tick "Replace …" and restore again.');
+            return false;
+        }
+        if (!res.ok || !res.body) {
+            finish(true, `server returned HTTP ${res.status}`);
+            return false;
+        }
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
-        let buffer = '';
-
+        let buffer = '', resultMsg = '', failed = false;
         while (true) {
             const { done, value } = await reader.read();
             if (done) break;
@@ -26286,38 +26416,24 @@ async function restoreBackup(id, overwrite) {
             const lines = buffer.split('\n');
             buffer = lines.pop() || '';
             for (const line of lines) {
-                if (line.startsWith('data: ')) {
-                    const msg = line.substring(6);
-                    if (msg.startsWith('RESULT:OK:')) {
-                        resultMsg = msg.substring(10);
-                    } else if (msg.startsWith('RESULT:ERR:')) {
-                        resultMsg = msg.substring(11);
-                        failed = true;
-                    } else {
-                        updateTaskLogEntry(taskId, { description: msg, logLine: msg });
-                    }
-                }
+                if (!line.startsWith('data: ')) continue;
+                const msg = line.substring(6);
+                if (msg.startsWith('RESULT:OK:')) resultMsg = msg.substring(10);
+                else if (msg.startsWith('RESULT:ERR:')) { resultMsg = msg.substring(11); failed = true; }
+                else append(msg);
             }
         }
         if (buffer.startsWith('data: ')) {
             const msg = buffer.substring(6);
-            if (msg.startsWith('RESULT:OK:')) { resultMsg = msg.substring(10); }
+            if (msg.startsWith('RESULT:OK:')) resultMsg = msg.substring(10);
             else if (msg.startsWith('RESULT:ERR:')) { resultMsg = msg.substring(11); failed = true; }
         }
-
-        if (failed) {
-            showToast(`Restore failed: ${resultMsg}`, 'error');
-            updateTaskLogEntry(taskId, { status: 'failed', description: resultMsg });
-        } else {
-            showToast(resultMsg || 'Restore completed!', 'success');
-            updateTaskLogEntry(taskId, { status: 'completed', description: resultMsg || 'Restore completed' });
-        }
+        finish(failed, resultMsg || (failed ? 'unknown error' : 'Restore complete'));
+        return !failed;
     } catch (e) {
-        showToast(`Restore error: ${e.message}`, 'error');
-        updateTaskLogEntry(taskId, { status: 'failed', description: e.message });
+        finish(true, e.message);
+        return false;
     }
-    if (btn) { btn.disabled = false; btn.textContent = origText; }
-    loadBackups();
 }
 
 // ─── Schedule Modal ───
