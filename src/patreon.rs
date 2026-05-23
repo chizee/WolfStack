@@ -77,7 +77,9 @@ impl PatreonTier {
     }
 }
 
-/// Persisted Patreon config — stored at /etc/wolfstack/patreon.json
+/// Persisted Patreon / sponsor config — stored at /etc/wolfstack/patreon.json
+/// (file name is historical — also holds the GitHub Sponsors self-attest
+/// flag now that the org accepts donations via both channels).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PatreonConfig {
     #[serde(default)]
@@ -98,6 +100,21 @@ pub struct PatreonConfig {
     pub last_checked: Option<String>,
     #[serde(default)]
     pub linked: bool,
+    /// Operator self-attests they support development via GitHub
+    /// Sponsors at <https://github.com/sponsors/wolfsoftwaresystemsltd>.
+    /// Honour-system — no OAuth verification (GitHub's Sponsors API
+    /// requires the org's auth to enumerate sponsors, and the public
+    /// sponsor listing is opt-in per sponsor). Beta access is granted
+    /// to anyone who flips this; the gate is intentionally minimal
+    /// because the cost of misuse is "stranger gets beta builds" and
+    /// the cost of friction is "real sponsor can't unlock beta".
+    #[serde(default)]
+    pub github_sponsor: bool,
+    /// Optional GitHub login for display purposes only. Not used as
+    /// part of the access check. Lets the operator see (and prove to
+    /// support) which account they linked.
+    #[serde(default)]
+    pub github_sponsor_login: Option<String>,
 }
 
 impl Default for PatreonConfig {
@@ -112,6 +129,8 @@ impl Default for PatreonConfig {
             pledge_amount_cents: 0,
             last_checked: None,
             linked: false,
+            github_sponsor: false,
+            github_sponsor_login: None,
         }
     }
 }
@@ -144,6 +163,21 @@ impl PatreonState {
         Self {
             config: RwLock::new(config),
         }
+    }
+
+    /// Set the GitHub Sponsor self-attest flag and optional GitHub
+    /// login. Persists immediately so the next process restart and
+    /// any subsequent `/api/patreon/status` call see the new state.
+    /// `login` is for display only — not part of the access check.
+    pub fn set_github_sponsor(&self, enabled: bool, login: Option<String>) -> Result<(), String> {
+        let mut cfg = self.config.write().unwrap();
+        cfg.github_sponsor = enabled;
+        cfg.github_sponsor_login = login
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        // Save while holding the write lock so concurrent reads
+        // never see a half-persisted state.
+        cfg.save()
     }
 
     /// Build the OAuth authorization URL. The state parameter encodes the

@@ -30626,13 +30626,12 @@ function escapeHtml(str) {
 var issuesScanResults = []; // cached for upgrade-all
 var issuesLatestVersion = '0.0.0'; // GitHub-resolved latest, cached after each scan
 
-// Gate the beta channel dropdown based on EITHER a paid WolfStack
-// licence OR Patreon Advanced+ sponsorship. Pre-fix this only checked
-// the sponsor tier — Enterprise-licenced operators were locked out
-// of beta despite having paid for the highest WolfStack tier. The
-// backend now ORs the two grants and reports `beta_access_reason`
-// ("licence" / "sponsor" / "none") so we can show a less misleading
-// label when access is denied.
+// Gate the beta channel dropdown based on ANY of three grants:
+// (1) Patreon Advanced+ sponsorship, (2) paid WolfStack licence, or
+// (3) operator self-attested GitHub Sponsor. Backend reports
+// `beta_access_reason` so we can show how access was granted; when
+// denied we surface a one-click "I'm a GitHub Sponsor" toggle right
+// next to the dropdown so real sponsors aren't stuck.
 async function checkBetaAccess() {
     var sel = document.getElementById('issues-channel-select');
     if (!sel) return;
@@ -30643,24 +30642,120 @@ async function checkBetaAccess() {
         if (betaOpt) {
             if (data.has_beta_access) {
                 betaOpt.disabled = false;
-                // Show how access was granted so the operator knows
-                // why it works for them (and that it's not dependent
-                // on their Patreon link staying current).
                 betaOpt.textContent = data.beta_access_reason === 'licence'
                     ? 'Beta (via paid licence)'
                     : data.beta_access_reason === 'sponsor'
                         ? 'Beta (via Patreon sponsorship)'
-                        : 'Beta';
+                        : data.beta_access_reason === 'github_sponsor'
+                            ? 'Beta (via GitHub Sponsor)'
+                            : 'Beta';
             } else {
                 betaOpt.disabled = true;
-                betaOpt.textContent = 'Beta (paid licence OR Patreon Advanced+ required)';
+                betaOpt.textContent = 'Beta (paid licence, GitHub Sponsor, or Patreon Advanced+ required)';
                 if (sel.value === 'beta') sel.value = 'master';
             }
         }
+        // Inline "I'm a GitHub Sponsor" toggle next to the channel
+        // selector. Created lazily so we don't pollute the markup of
+        // installs that don't need it (i.e. anyone already with beta
+        // access). Sits to the right of the channel dropdown.
+        renderGithubSponsorToggle(data);
     } catch (e) {
         // If we can't check, leave it as-is
     }
 }
+
+function renderGithubSponsorToggle(statusData) {
+    var sel = document.getElementById('issues-channel-select');
+    if (!sel) return;
+    var parent = sel.parentElement;
+    if (!parent) return;
+    var toggleId = 'issues-github-sponsor-toggle';
+    var existing = document.getElementById(toggleId);
+    var isSponsor = !!statusData.github_sponsor;
+    var hasAccess = !!statusData.has_beta_access;
+    // Hide the toggle entirely if access is granted by some OTHER path
+    // (licence or Patreon) — no value in advertising GitHub Sponsors
+    // to operators who don't need it. Show it if access is denied OR
+    // if access is already granted via github_sponsor (so they can
+    // see the current state and turn it off if needed).
+    var shouldShow = !hasAccess || statusData.beta_access_reason === 'github_sponsor';
+    if (!shouldShow) {
+        if (existing) existing.remove();
+        return;
+    }
+    if (!existing) {
+        existing = document.createElement('button');
+        existing.id = toggleId;
+        existing.type = 'button';
+        existing.className = 'btn';
+        existing.style.cssText = 'background:transparent; border:1px solid var(--border); color:var(--text-secondary); font-size:11px; padding:4px 8px; margin-left:6px;';
+        existing.onclick = toggleGithubSponsor;
+        parent.parentElement.insertBefore(existing, parent.nextSibling);
+    }
+    existing.textContent = isSponsor
+        ? '✓ GitHub Sponsor (' + (statusData.github_sponsor_login || 'unlinked') + ')'
+        : 'I support via GitHub Sponsors';
+    existing.title = isSponsor
+        ? 'You are marked as a GitHub Sponsor. Click to unmark.'
+        : 'Click if you support WolfStack development via GitHub Sponsors at github.com/sponsors/wolfsoftwaresystemsltd.';
+}
+
+async function toggleGithubSponsor() {
+    // Fetch the current state first so we know which direction we're toggling.
+    var current;
+    try {
+        var statusResp = await fetch('/api/patreon/status');
+        current = await statusResp.json();
+    } catch (e) {
+        showToast('Could not read current sponsor state: ' + (e.message || e), 'error');
+        return;
+    }
+    var enabling = !current.github_sponsor;
+    var loginPrompt;
+    if (enabling) {
+        if (!await wolfConfirm(
+            'Mark this install as supported by GitHub Sponsors?\n\n' +
+            'This unlocks beta channel access. WolfStack has no way to verify ' +
+            'sponsorships against GitHub\'s API (the org\'s side requires our auth, ' +
+            'which we don\'t embed), so this is an honour-system toggle. ' +
+            'If you DO support development at github.com/sponsors/wolfsoftwaresystemsltd, ' +
+            'click OK — thank you!',
+            'GitHub Sponsor', { okText: 'Yes, I sponsor' }
+        )) return;
+        loginPrompt = window.prompt('Your GitHub username (optional, for display):', '');
+    } else {
+        if (!await wolfConfirm(
+            'Unmark this install as a GitHub Sponsor?\n\nBeta channel will return to checking licence + Patreon only.',
+            'Unmark GitHub Sponsor', { okText: 'Unmark' }
+        )) return;
+    }
+    try {
+        var resp = await fetch('/api/sponsor/github', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({
+                enabled: enabling,
+                login: (loginPrompt && loginPrompt.trim()) || null,
+            }),
+        });
+        var data = await resp.json();
+        if (!resp.ok) {
+            showToast('GitHub Sponsor toggle failed: ' + (data.error || ('HTTP ' + resp.status)), 'error');
+            return;
+        }
+        showToast(enabling
+            ? 'Marked as GitHub Sponsor. Beta channel is now available.'
+            : 'GitHub Sponsor unmarked.', 'success');
+        // Refresh the channel selector with the new state.
+        await checkBetaAccess();
+    } catch (e) {
+        showToast('GitHub Sponsor toggle failed: ' + (e.message || e), 'error');
+    }
+}
+
+window.toggleGithubSponsor = toggleGithubSponsor;
 
 async function checkIssuesAiBadge() {
     try {

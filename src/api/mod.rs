@@ -25941,7 +25941,7 @@ async fn patreon_status(req: HttpRequest, state: web::Data<AppState>) -> HttpRes
         return resp;
     }
     let config = state.patreon.config.read().unwrap();
-    let (beta_ok, beta_reason) = beta_access_granted(&config.tier);
+    let (beta_ok, beta_reason) = beta_access_granted_full(&config.tier, config.github_sponsor);
     HttpResponse::Ok().json(serde_json::json!({
         "linked": config.linked,
         "user_name": config.patreon_user_name,
@@ -25950,7 +25950,52 @@ async fn patreon_status(req: HttpRequest, state: web::Data<AppState>) -> HttpRes
         "pledge_amount_cents": config.pledge_amount_cents,
         "has_beta_access": beta_ok,
         "beta_access_reason": beta_reason,
+        "github_sponsor": config.github_sponsor,
+        "github_sponsor_login": config.github_sponsor_login,
         "last_checked": config.last_checked,
+    }))
+}
+
+/// POST /api/sponsor/github — toggle the GitHub Sponsor self-attest
+/// flag (operator-session auth). Body: `{ "enabled": bool,
+/// "login": Option<String> }`. The `login` is for display purposes
+/// only — never part of the access check. See `beta_access_granted_full`
+/// for the reasoning behind the honour-system design.
+#[derive(serde::Deserialize)]
+struct SetGithubSponsorRequest {
+    enabled: bool,
+    #[serde(default)]
+    login: Option<String>,
+}
+async fn set_github_sponsor(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<SetGithubSponsorRequest>,
+) -> HttpResponse {
+    // Operator-session ONLY (not cluster-secret) — flipping the beta
+    // gate is an operator decision, not a peer-driven one.
+    let _user = match req.cookie("wolfstack_session")
+        .and_then(|c| state.sessions.validate(c.value()))
+    {
+        Some(u) => u,
+        None => return HttpResponse::Unauthorized().json(serde_json::json!({
+            "error": "operator session required to change GitHub Sponsor state"
+        })),
+    };
+    let body = body.into_inner();
+    if let Err(e) = state.patreon.set_github_sponsor(body.enabled, body.login) {
+        return HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("could not persist sponsor flag: {}", e)
+        }));
+    }
+    let cfg = state.patreon.config.read().unwrap();
+    let (beta_ok, beta_reason) = beta_access_granted_full(&cfg.tier, cfg.github_sponsor);
+    HttpResponse::Ok().json(serde_json::json!({
+        "ok": true,
+        "github_sponsor": cfg.github_sponsor,
+        "github_sponsor_login": cfg.github_sponsor_login,
+        "has_beta_access": beta_ok,
+        "beta_access_reason": beta_reason,
     }))
 }
 
@@ -25976,26 +26021,34 @@ async fn patreon_sync(req: HttpRequest, state: web::Data<AppState>) -> HttpRespo
     }
 }
 
-/// Beta-channel access combines TWO independent grants:
+/// Beta-channel access combines THREE independent grants:
 ///
 ///   1. **Patreon sponsorship** — Advanced / Platinum / Enterprise tier
-///      (anyone supporting development at $25+/mo).
+///      (anyone supporting development at $25+/mo through Patreon).
 ///   2. **WolfStack paid licence** — Homelab, Team, MSP/Pro, Enterprise.
 ///      Anyone who paid for the product earns the right to test
 ///      pre-release builds against their environment.
-///
-/// Pre-fix the gate ONLY checked Patreon. Enterprise-licenced operators
-/// who weren't ALSO Patreon sponsors saw the "Beta (Sponsor Advanced+
-/// required)" message even though they'd paid for the highest WolfStack
-/// tier — confusing, and a real customer complaint.
+///   3. **GitHub Sponsor self-attest** — operator flag at
+///      `/etc/wolfstack/patreon.json:github_sponsor=true`, settable
+///      via `POST /api/sponsor/github`. Honour-system: GitHub's
+///      Sponsors API requires the receiving org's auth to enumerate
+///      sponsors, so we can't programmatically verify. The cost of a
+///      false claim is "stranger gets beta builds"; the cost of
+///      requiring verification is "real sponsors locked out by an
+///      OAuth flow". We optimise for the real-sponsor path.
 ///
 /// Returns (granted, reason) so the frontend can show "via licence"
-/// vs "via sponsor" if it wants to.
-fn beta_access_granted(patreon_tier: &crate::patreon::PatreonTier)
-    -> (bool, &'static str)
+/// vs "via sponsor" vs "via GitHub Sponsor" if it wants to.
+fn beta_access_granted_full(
+    patreon_tier: &crate::patreon::PatreonTier,
+    github_sponsor: bool,
+) -> (bool, &'static str)
 {
     if patreon_tier.has_beta_access() {
         return (true, "sponsor");
+    }
+    if github_sponsor {
+        return (true, "github_sponsor");
     }
     // Any valid (non-expired) WolfStack licence is sufficient. We don't
     // gate on a specific paid tier — Homelab users are exactly the
@@ -26004,6 +26057,16 @@ fn beta_access_granted(patreon_tier: &crate::patreon::PatreonTier)
         return (true, "licence");
     }
     (false, "none")
+}
+
+/// Convenience wrapper that defaults github_sponsor=false. Retained
+/// for the `/api/patreon/sync` path that only knows the freshly-fetched
+/// Patreon tier — that response reflects the live sponsorship state,
+/// while the github_sponsor flag is sticky and reported separately.
+fn beta_access_granted(patreon_tier: &crate::patreon::PatreonTier)
+    -> (bool, &'static str)
+{
+    beta_access_granted_full(patreon_tier, false)
 }
 
 /// POST /api/patreon/disconnect — unlink Patreon account
@@ -31657,6 +31720,12 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/patreon/callback", web::get().to(patreon_callback))
         .route("/api/patreon/status", web::get().to(patreon_status))
         .route("/api/patreon/sync", web::post().to(patreon_sync))
+        // GitHub Sponsor self-attest — see `beta_access_granted_full`.
+        // Lives under /api/sponsor/ rather than /api/patreon/ so the
+        // URL space reflects the design (Patreon and GitHub Sponsors
+        // are independent grants); the persisted state happens to
+        // share patreon.json for historical reasons.
+        .route("/api/sponsor/github", web::post().to(set_github_sponsor))
         .route("/api/patreon/disconnect", web::post().to(patreon_disconnect))
         // Icon Packs
         .route("/api/icon-packs", web::get().to(icon_packs_list))
