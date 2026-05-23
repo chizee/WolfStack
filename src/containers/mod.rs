@@ -5678,8 +5678,13 @@ fn pct_update_settings(container: &str, settings: &LxcSettingsUpdate) -> Result<
 
     // Cores / CPUs — Proxmox `cores` is a whole-number count. Reject a
     // cpuset spec ("0-3") with a clear message instead of letting
-    // `pct set --cores 0-3` fail with a cryptic Proxmox error.
-    let cpus = settings.cpus.as_deref().unwrap_or(&current.cpus);
+    // `pct set --cores 0-3` fail with a cryptic Proxmox error. When the
+    // operator clears a previously-set value, issue `--delete cores`
+    // so the limit actually drops — otherwise `pct set` with no
+    // `--cores` leaves the old value in place and "clear = unlimited"
+    // silently doesn't take.
+    let new_cpus = settings.cpus.as_deref();
+    let cpus = new_cpus.unwrap_or(&current.cpus);
     if !cpus.is_empty() {
         match cpus.trim().parse::<u32>() {
             Ok(n) if n >= 1 => {
@@ -5692,6 +5697,11 @@ fn pct_update_settings(container: &str, settings: &LxcSettingsUpdate) -> Result<
                      A cpuset range like 0-3 applies only to native LXC.", cpus.trim()));
             }
         }
+    } else if new_cpus.is_some() && !current.cpus.is_empty() {
+        // Operator explicitly cleared a previously-set cores value —
+        // tell pct to drop the limit entirely.
+        args.push("--delete".to_string());
+        args.push("cores".to_string());
     }
 
     // Autostart
