@@ -30626,7 +30626,13 @@ function escapeHtml(str) {
 var issuesScanResults = []; // cached for upgrade-all
 var issuesLatestVersion = '0.0.0'; // GitHub-resolved latest, cached after each scan
 
-// Gate the beta channel dropdown based on sponsor tier
+// Gate the beta channel dropdown based on EITHER a paid WolfStack
+// licence OR Patreon Advanced+ sponsorship. Pre-fix this only checked
+// the sponsor tier — Enterprise-licenced operators were locked out
+// of beta despite having paid for the highest WolfStack tier. The
+// backend now ORs the two grants and reports `beta_access_reason`
+// ("licence" / "sponsor" / "none") so we can show a less misleading
+// label when access is denied.
 async function checkBetaAccess() {
     var sel = document.getElementById('issues-channel-select');
     if (!sel) return;
@@ -30637,10 +30643,17 @@ async function checkBetaAccess() {
         if (betaOpt) {
             if (data.has_beta_access) {
                 betaOpt.disabled = false;
-                betaOpt.textContent = 'Beta';
+                // Show how access was granted so the operator knows
+                // why it works for them (and that it's not dependent
+                // on their Patreon link staying current).
+                betaOpt.textContent = data.beta_access_reason === 'licence'
+                    ? 'Beta (via paid licence)'
+                    : data.beta_access_reason === 'sponsor'
+                        ? 'Beta (via Patreon sponsorship)'
+                        : 'Beta';
             } else {
                 betaOpt.disabled = true;
-                betaOpt.textContent = 'Beta (Sponsor Advanced+ required)';
+                betaOpt.textContent = 'Beta (paid licence OR Patreon Advanced+ required)';
                 if (sel.value === 'beta') sel.value = 'master';
             }
         }

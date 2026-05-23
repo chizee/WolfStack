@@ -25941,13 +25941,15 @@ async fn patreon_status(req: HttpRequest, state: web::Data<AppState>) -> HttpRes
         return resp;
     }
     let config = state.patreon.config.read().unwrap();
+    let (beta_ok, beta_reason) = beta_access_granted(&config.tier);
     HttpResponse::Ok().json(serde_json::json!({
         "linked": config.linked,
         "user_name": config.patreon_user_name,
         "email": config.patreon_email,
         "tier": config.tier,
         "pledge_amount_cents": config.pledge_amount_cents,
-        "has_beta_access": config.tier.has_beta_access(),
+        "has_beta_access": beta_ok,
+        "beta_access_reason": beta_reason,
         "last_checked": config.last_checked,
     }))
 }
@@ -25960,16 +25962,48 @@ async fn patreon_sync(req: HttpRequest, state: web::Data<AppState>) -> HttpRespo
     match state.patreon.sync_membership().await {
         Ok(tier) => {
             let config = state.patreon.config.read().unwrap();
+            let (beta_ok, beta_reason) = beta_access_granted(&tier);
             HttpResponse::Ok().json(serde_json::json!({
                 "ok": true,
                 "tier": tier,
-                "has_beta_access": tier.has_beta_access(),
+                "has_beta_access": beta_ok,
+                "beta_access_reason": beta_reason,
                 "user_name": config.patreon_user_name,
                 "last_checked": config.last_checked,
             }))
         }
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
     }
+}
+
+/// Beta-channel access combines TWO independent grants:
+///
+///   1. **Patreon sponsorship** — Advanced / Platinum / Enterprise tier
+///      (anyone supporting development at $25+/mo).
+///   2. **WolfStack paid licence** — Homelab, Team, MSP/Pro, Enterprise.
+///      Anyone who paid for the product earns the right to test
+///      pre-release builds against their environment.
+///
+/// Pre-fix the gate ONLY checked Patreon. Enterprise-licenced operators
+/// who weren't ALSO Patreon sponsors saw the "Beta (Sponsor Advanced+
+/// required)" message even though they'd paid for the highest WolfStack
+/// tier — confusing, and a real customer complaint.
+///
+/// Returns (granted, reason) so the frontend can show "via licence"
+/// vs "via sponsor" if it wants to.
+fn beta_access_granted(patreon_tier: &crate::patreon::PatreonTier)
+    -> (bool, &'static str)
+{
+    if patreon_tier.has_beta_access() {
+        return (true, "sponsor");
+    }
+    // Any valid (non-expired) WolfStack licence is sufficient. We don't
+    // gate on a specific paid tier — Homelab users are exactly the
+    // power-user audience most interested in testing pre-release.
+    if crate::compat::platform_ready() {
+        return (true, "licence");
+    }
+    (false, "none")
 }
 
 /// POST /api/patreon/disconnect — unlink Patreon account
