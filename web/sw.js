@@ -1,5 +1,7 @@
-// WolfStack Service Worker — enables PWA install and offline shell
-const CACHE_NAME = 'wolfstack-v15.10.7a';
+// WolfStack Service Worker — enables PWA install and offline shell.
+// Bump CACHE_NAME on any change to SHELL_ASSETS or the fetch handler so
+// every client's activate event evicts the stale cache and rebuilds.
+const CACHE_NAME = 'wolfstack-v24.5.0';
 const SHELL_ASSETS = [
     '/',
     '/index.html',
@@ -43,10 +45,28 @@ self.addEventListener('fetch', (event) => {
     event.respondWith(
         fetch(event.request)
             .then((response) => {
-                // Cache successful responses for shell assets
-                if (response.ok && SHELL_ASSETS.includes(url.pathname)) {
+                // Cache successful responses for shell assets, but ONLY when:
+                //   • status is 2xx (response.ok)
+                //   • the response wasn't followed from a redirect — Cache.put
+                //     rejects redirected responses with the "Failed to execute
+                //     'put' on 'Cache': Cache.put() encountered a network
+                //     error" we were seeing whenever an unauthenticated user
+                //     hit `/` and the server 302'd them to `/login.html`
+                //   • the response type is "basic" (same-origin, full body
+                //     readable) — opaque cross-origin responses can't be put
+                //     either. Belt and braces.
+                // Defensive catch on the put itself so any other browser-
+                // specific rejection doesn't bubble up as an uncaught
+                // promise rejection in the console.
+                if (response.ok
+                    && !response.redirected
+                    && response.type === 'basic'
+                    && SHELL_ASSETS.includes(url.pathname))
+                {
                     const clone = response.clone();
-                    caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
+                    caches.open(CACHE_NAME)
+                        .then((cache) => cache.put(event.request, clone))
+                        .catch(() => { /* cache full / quota / browser quirk — non-fatal */ });
                 }
                 return response;
             })
