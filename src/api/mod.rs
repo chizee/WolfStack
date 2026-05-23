@@ -3468,6 +3468,59 @@ pub async fn add_node(req: HttpRequest, state: web::Data<AppState>, body: web::J
         });
     }
 
+    // C1-Fix-2: Push the cluster_name to the new node so it KNOWS which
+    // cluster it's in. Pre-fix, the new node had no way to learn its
+    // cluster name except via gossip (which was broken — see agent/mod.rs
+    // gossip ID-namespace mismatch fix). Operator-visible symptom of the
+    // bug was the per-node WolfRouter showing "this node is in cluster
+    // `WolfStack`" (the hardcoded fallback) regardless of actual cluster.
+    if let Some(ref name) = cluster_name {
+        let addr = body.address.clone();
+        let our_secret = state.cluster_secret.clone();
+        let cluster_name_val = name.clone();
+        tokio::spawn(async move {
+            // The concurrent secret push may trigger a bootstrap-restart
+            // on the new node (cluster_secret_receive auto-restarts if
+            // `bootstrap: true` + secret_actually_changed + no peers).
+            // The restart takes 3-8 seconds. Retry the cluster-name
+            // push a few times with backoff so we don't lose the push
+            // to the restart window. Without retry the new node would
+            // come back up with no cluster name and default to
+            // "(not yet configured)" until the operator manually re-pushed.
+            let client = &*API_HTTP_CLIENT;
+            let urls = build_node_urls(&addr, port, "/api/agent/cluster-name");
+            let payload = serde_json::json!({ "cluster_name": cluster_name_val });
+            for attempt in 0..5u32 {
+                if attempt > 0 {
+                    // 2s, 4s, 6s, 8s — covers a ~20s restart window.
+                    tokio::time::sleep(std::time::Duration::from_secs(2 * attempt as u64)).await;
+                }
+                // Same two-credential bootstrap pattern as the secret push.
+                for auth_value in [our_secret.as_str(), crate::auth::default_cluster_secret()] {
+                    let mut pushed = false;
+                    for url in &urls {
+                        if let Ok(resp) = client.post(url)
+                            .timeout(std::time::Duration::from_secs(10))
+                            .header("X-WolfStack-Secret", auth_value)
+                            .json(&payload)
+                            .send()
+                            .await
+                        {
+                            let success = resp.status().is_success();
+                            let _ = resp.bytes().await;
+                            if success { pushed = true; break; }
+                        }
+                    }
+                    if pushed { return; }
+                }
+            }
+            tracing::warn!(target: "add_node",
+                "cluster-name push to {} did not succeed after 5 attempts; \
+                 operator may need to re-set cluster name manually",
+                addr);
+        });
+    }
+
     let mut response = serde_json::json!({
         "id": id,
         "address": body.address,

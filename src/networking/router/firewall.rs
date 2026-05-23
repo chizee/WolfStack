@@ -180,10 +180,23 @@ fn emit_rule(
         Action::Allow => "-j ACCEPT",
         Action::Deny => "-j DROP",
         Action::Reject => "-j REJECT",
+        // `Action::Log` is paired with `-j NFLOG` below — by itself
+        // `-j RETURN` would silently exit the WOLFROUTER chain with
+        // no record of the match (the bug fixed by H4). Treating the
+        // Log action as implicitly setting log_match=true ensures the
+        // NFLOG line is always emitted alongside the RETURN.
         Action::Log => "-j RETURN",
     };
 
-    if rule.log_match {
+    // H4 fix: Action::Log MUST emit the NFLOG line. Pre-fix, it compiled
+    // to just `-j RETURN` which exits the chain without logging — a
+    // silent no-op that turned a "Log this match" rule into a no-record
+    // accept-bypass. Now Log is treated as if log_match=true regardless
+    // of the operator's separate log_match toggle (it's nonsensical to
+    // pick the Log action and disable logging on the same rule).
+    let want_log_emit = rule.log_match || matches!(rule.action, Action::Log);
+
+    if want_log_emit {
         // Emit the NFLOG copy first (doesn't terminate), then the action.
         let prefix = format!("wolfrouter-{} ", &rule.id[..rule.id.len().min(8)]);
         let mut log_parts = parts.clone();

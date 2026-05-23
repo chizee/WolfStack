@@ -772,8 +772,30 @@ pub async fn get_topology(
     };
 
     let mut nodes = Vec::new();
+    let mut local_error: Option<String> = None;
     if include_self {
-        nodes.push(topology::compute_local(&self_id, &self_name, &cfg, &state.router));
+        // C2 fix: compute_local fans out to `docker ps`, `docker inspect`
+        // per container, `lxc-ls`, `lxc-info` per container, and
+        // gateway-probe `curl`/`ping`/`dig` on cache misses. Up to
+        // several seconds of blocking subprocess work. Offload to a
+        // blocking pool thread so the actix worker stays free for
+        // other requests (terminals, polls, etc).
+        let self_id_clone = self_id.clone();
+        let self_name_clone = self_name.clone();
+        let cfg_clone = cfg.clone();
+        let router_clone = state.router.clone();
+        let local = web::block(move || {
+            topology::compute_local(&self_id_clone, &self_name_clone, &cfg_clone, &router_clone)
+        }).await;
+        match local {
+            Ok(t) => nodes.push(t),
+            // Surface the failure rather than silently omitting self
+            // from the topology — pre-fix-of-fix this dropped the
+            // local node with no signal to the caller, making a
+            // pool-exhaustion bug indistinguishable from "no nodes
+            // exist".
+            Err(e) => local_error = Some(format!("local topology task failed: {}", e)),
+        }
     }
 
     // Fan out to every other online cluster node's topology-local
@@ -954,6 +976,9 @@ pub async fn get_topology(
         "generated_at": generated_at,
         "peer_diagnostics": peer_diagnostics,
         "cluster_filter": cluster_filter,
+        // Surface the C2 web::block failure if it happened — caller
+        // sees a structured signal instead of silently missing local.
+        "local_error": local_error,
     }))
 }
 
@@ -972,8 +997,15 @@ pub async fn get_topology_local(
     let cfg = state.router.config.read().unwrap().clone();
     let self_id = crate::agent::self_node_id();
     let self_name = self_node_name();
-    let t = topology::compute_local(&self_id, &self_name, &cfg, &state.router);
-    HttpResponse::Ok().json(t)
+    // C2 fix: blocking subprocess work — offload to blocking pool.
+    let router_clone = state.router.clone();
+    let t = web::block(move || {
+        topology::compute_local(&self_id, &self_name, &cfg, &router_clone)
+    }).await;
+    match t {
+        Ok(t) => HttpResponse::Ok().json(t),
+        Err(e) => HttpResponse::InternalServerError().body(format!("topology task: {}", e)),
+    }
 }
 
 // ─── Preflight ───
@@ -1027,6 +1059,19 @@ pub async fn preflight(
     query: web::Query<TopologyQuery>,
 ) -> HttpResponse {
     auth_or_return!(req, state);
+
+    // C3 fix: the preflight body runs dozens of blocking subprocesses
+    // (hostname, ip, iptables-save, ip link, ss, ip route, dig, ...)
+    // — moving it to the blocking pool keeps the actix worker free.
+    // The body is wrapped wholesale rather than per-check because the
+    // checks share many of the same parsed values (e.g. `ip -j addr`
+    // output) and splitting them per-call would multiply the context
+    // switches without performance benefit.
+    let state_for_block = state.clone();
+    let query_inner = query.into_inner();
+    let body_result = web::block(move || -> serde_json::Value {
+        let state = state_for_block;
+        let query = query_inner;
 
     let mut checks: Vec<PreflightCheck> = Vec::new();
     let mut actions: std::collections::HashMap<&'static str, PreflightAction>
@@ -1215,6 +1260,22 @@ pub async fn preflight(
     let self_cluster_norm = normalize(
         if self_cluster.is_empty() { None } else { Some(&self_cluster) }
     );
+    // M6: When `get_self_cluster_name()` returns the hardcoded fallback,
+    // we can't tell from the return value alone whether the operator
+    // genuinely configured "WolfStack" or whether the fallback fired.
+    // The disambiguation: presence of /etc/wolfstack/self_cluster.json
+    // means the cluster name has been set (via agent_set_cluster_name
+    // or gossip). Absence means this node has never been told its
+    // cluster — the diagnostic should surface that explicitly instead
+    // of misleadingly displaying "WolfStack".
+    let self_cluster_configured = std::path::Path::new(
+        &crate::paths::get().self_cluster_config
+    ).exists();
+    let self_cluster_display = if self_cluster_configured {
+        self_cluster_norm.clone()
+    } else {
+        "(not yet configured — admin must set the cluster name when adding this node)".to_string()
+    };
     let requested = query.cluster.clone();
 
     let all_nodes = state.cluster.get_all_nodes();
@@ -1262,11 +1323,11 @@ pub async fn preflight(
             severity: "error",
             message: format!(
                 "Cluster `{}` has 0 WolfStack nodes (this node is in cluster `{}`). WolfRouter can only render topology from WolfStack peers.",
-                label, self_cluster_norm
+                label, self_cluster_display
             ),
             fix: Some(format!(
                 "Either open WolfRouter for cluster `{}` from the sidebar, or join/install a WolfStack node into cluster `{}`.\nProxmox peers ({}) and other-type peers ({}) are intentionally skipped from topology — they're managed through the Proxmox cluster view.",
-                self_cluster_norm, label, proxmox_in_cluster, other_in_cluster
+                self_cluster_display, label, proxmox_in_cluster, other_in_cluster
             )),
         });
     } else if online_wolfstack == 0 {
@@ -1307,7 +1368,7 @@ pub async fn preflight(
                 severity: "info",
                 message: format!(
                     "This node is in `{}`; you're viewing WolfRouter for `{}`. The local chassis will be omitted.",
-                    self_cluster_norm, w
+                    self_cluster_display, w
                 ),
                 fix: None,
             });
@@ -1855,12 +1916,17 @@ pub async fn preflight(
     let has_warning = checks.iter().any(|c| !c.ok && c.severity == "warning");
     let status = if has_error { "error" } else if has_warning { "warning" } else { "ok" };
 
-    HttpResponse::Ok().json(serde_json::json!({
+    serde_json::json!({
         "ok": !has_error,
         "status": status,
         "checks": checks,
         "actions": actions,
-    }))
+    })
+    }).await;
+    match body_result {
+        Ok(json) => HttpResponse::Ok().json(json),
+        Err(e) => HttpResponse::InternalServerError().body(format!("preflight task: {}", e)),
+    }
 }
 
 // ─── Zones ───
@@ -2424,6 +2490,13 @@ pub async fn apply_rules_now(req: HttpRequest, state: S) -> HttpResponse {
                         .map(|_| "Firewall reverted to previous ruleset.".to_string())
                 }),
             );
+            // H5 fix: store the danger_id so confirm_rules can
+            // cancel the timer via crate::danger::confirm. Without
+            // this, the operator clicked Confirm, the legacy
+            // rollback_deadline was cleared, but the danger
+            // framework timer kept running and reverted the rules
+            // ~30s later anyway.
+            *state.router.firewall_apply_danger_id.write().unwrap() = Some(danger_id.clone());
             // Keep the legacy safe_mode deadline in step — when the
             // danger framework rolls back, the legacy path sees a
             // re-applied ruleset and no-ops. If the operator confirms
@@ -2448,19 +2521,50 @@ pub async fn apply_rules_now(req: HttpRequest, state: S) -> HttpResponse {
 
 pub async fn confirm_rules(req: HttpRequest, state: S) -> HttpResponse {
     auth_or_return!(req, state);
+    // H5 fix: cancel the danger-framework rollback timer in addition
+    // to clearing the legacy deadline. Pre-fix the timer kept ticking
+    // and reverted the rules ~30 seconds after the operator clicked
+    // Confirm. Take the ID under lock, drop the lock, then call
+    // danger::confirm — the danger API takes an exclusive lock of
+    // its own and we don't want to nest.
+    let danger_id = state.router.firewall_apply_danger_id.write().unwrap().take();
+    let raced_with_tick = if let Some(id) = danger_id {
+        // H5-TTL-RACE: danger::confirm() returns Err if the op was
+        // already rolled back by the background tick (the op status
+        // transitioned to "rolled_back" between our take() above and
+        // confirm(&id) here). Pre-fix that Err was silently discarded
+        // and the operator saw "confirmed" while the firewall was
+        // actually back to the old rules. Surface this as a 409 so
+        // the operator knows the rules they were trying to keep have
+        // already been reverted.
+        crate::danger::confirm(&id).is_err()
+    } else {
+        false
+    };
     *state.router.rollback_deadline.write().unwrap() = None;
-    HttpResponse::Ok().body("confirmed")
+    if raced_with_tick {
+        HttpResponse::Conflict().json(serde_json::json!({
+            "error": "rules were already reverted by the rollback timer before \
+                      you confirmed. The cluster is back on the previous ruleset.",
+            "status": "reverted-before-confirm",
+        }))
+    } else {
+        HttpResponse::Ok().body("confirmed")
+    }
 }
 
 // ─── Connections & Logs ───
 
 pub async fn list_connections(req: HttpRequest, state: S) -> HttpResponse {
     auth_or_return!(req, state);
-    // Try `conntrack -L` (default format works fine — extended adds an
-    // L3 prefix that's harder to parse). Surface the actual error if
-    // it fails so the user knows whether conntrack isn't installed,
-    // requires root, or some other problem.
-    let result = std::process::Command::new("conntrack").args(["-L"]).output();
+    // C4 fix: `conntrack -L` on a busy firewall blocks 100-500ms.
+    // Offload to a blocking pool thread so the actix worker can
+    // service other requests in the meantime.
+    let result = web::block(|| {
+        std::process::Command::new("conntrack").args(["-L"]).output()
+    }).await.unwrap_or_else(|e|
+        Err(std::io::Error::new(std::io::ErrorKind::Other, format!("blocking task: {}", e)))
+    );
     let out = match result {
         Ok(o) if o.status.success() => o,
         Ok(o) => {
@@ -2515,9 +2619,15 @@ pub async fn list_connections(req: HttpRequest, state: S) -> HttpResponse {
 /// via journalctl (dmesg is not reliably available on all distros).
 pub async fn list_firewall_logs(req: HttpRequest, state: S) -> HttpResponse {
     auth_or_return!(req, state);
-    let out = std::process::Command::new("journalctl")
-        .args(["-k", "--no-pager", "-n", "300", "-g", "wolfrouter"])
-        .output();
+    // C4 fix: journalctl with -n 300 can take meaningful time on
+    // busy hosts. Offload.
+    let out = web::block(|| {
+        std::process::Command::new("journalctl")
+            .args(["-k", "--no-pager", "-n", "300", "-g", "wolfrouter"])
+            .output()
+    }).await.unwrap_or_else(|e|
+        Err(std::io::Error::new(std::io::ErrorKind::Other, format!("blocking task: {}", e)))
+    );
     let lines: Vec<String> = match out {
         Ok(o) if o.status.success() => {
             String::from_utf8_lossy(&o.stdout).lines().map(|s| s.to_string()).collect()
@@ -2564,26 +2674,32 @@ pub async fn get_managed_overview(req: HttpRequest, state: S) -> HttpResponse {
 pub async fn get_host_snapshot(req: HttpRequest, state: S) -> HttpResponse {
     auth_or_return!(req, state);
 
-    let firewall_filter = run_capture(&["iptables-save", "-t", "filter"]);
-    let firewall_nat    = run_capture(&["iptables-save", "-t", "nat"]);
-    let parsed_filter   = parse_iptables(&firewall_filter, "filter");
-    let parsed_nat      = parse_iptables(&firewall_nat, "nat");
-
-    let dnsmasq_processes = list_dnsmasq_processes();
-    let lease_files = list_lease_files();
-
-    HttpResponse::Ok().json(serde_json::json!({
-        "firewall": {
-            "filter": parsed_filter,
-            "nat": parsed_nat,
-            "raw_filter_lines": firewall_filter.lines().count(),
-            "raw_nat_lines": firewall_nat.lines().count(),
-        },
-        "dhcp": {
-            "dnsmasq_processes": dnsmasq_processes,
-            "lease_files": lease_files,
-        },
-    }))
+    // C6 fix: iptables-save (twice), ps (via list_dnsmasq_processes),
+    // and a filesystem walk (via list_lease_files) all block. Bundle
+    // into one blocking task so the actix worker is free during.
+    let snapshot = web::block(|| {
+        let firewall_filter = run_capture(&["iptables-save", "-t", "filter"]);
+        let firewall_nat    = run_capture(&["iptables-save", "-t", "nat"]);
+        let parsed_filter   = parse_iptables(&firewall_filter, "filter");
+        let parsed_nat      = parse_iptables(&firewall_nat, "nat");
+        let dnsmasq_processes = list_dnsmasq_processes();
+        let lease_files = list_lease_files();
+        serde_json::json!({
+            "firewall": {
+                "filter": parsed_filter,
+                "nat": parsed_nat,
+                "raw_filter_lines": firewall_filter.lines().count(),
+                "raw_nat_lines": firewall_nat.lines().count(),
+            },
+            "dhcp": {
+                "dnsmasq_processes": dnsmasq_processes,
+                "lease_files": lease_files,
+            },
+        })
+    }).await.unwrap_or_else(|e| serde_json::json!({
+        "error": format!("host snapshot task: {}", e),
+    }));
+    HttpResponse::Ok().json(snapshot)
 }
 
 fn run_capture(args: &[&str]) -> String {
@@ -3128,8 +3244,19 @@ pub async fn create_wan(req: HttpRequest, state: S, body: web::Json<wan::WanConn
         if matches!(conn.mode, wan::WanMode::Pppoe(_)) {
             ensure_pppoe_installed_async();
         }
-        if let Err(e) = wan::apply(&conn) {
-            tracing::warn!("WAN apply failed for {}: {}", conn.name, e);
+        // C5 fix: wan::apply → pppoe_apply → pppoe_stop calls
+        // std::thread::sleep up to 56 × 250ms = 14 seconds. Offload
+        // to the blocking pool so the actix worker isn't pinned.
+        let conn_clone = conn.clone();
+        let res = web::block(move || wan::apply(&conn_clone)).await;
+        match res {
+            Ok(Err(e)) => tracing::warn!("WAN apply failed for {}: {}", conn.name, e),
+            // C5-SILENT-PANIC fix: surface pool failure too. Pre-fix
+            // a panicking blocking task would return Err here and
+            // get silently dropped; operator saw HTTP 200 and a
+            // normal-looking response while traffic didn't route.
+            Err(e) => tracing::warn!("WAN apply blocking task failed for {}: {}", conn.name, e),
+            Ok(Ok(())) => {}
         }
     }
     replicate_config_to_cluster(state);
@@ -3180,7 +3307,17 @@ pub async fn update_wan(
         }
     }
     if updated.node_id == crate::agent::self_node_id() || updated.node_id.is_empty() {
-        let _ = wan::apply(&updated);
+        // C5 fix: same as create_wan — offload the wan::apply call.
+        // Log inner errors AND pool failures (the latter would otherwise
+        // be silently dropped — operator sees HTTP 200 while traffic
+        // never routes).
+        let updated_clone = updated.clone();
+        let res = web::block(move || wan::apply(&updated_clone)).await;
+        match res {
+            Ok(Err(e)) => tracing::warn!("WAN update apply failed for {}: {}", updated.name, e),
+            Err(e) => tracing::warn!("WAN update apply blocking task failed for {}: {}", updated.name, e),
+            Ok(Ok(())) => {}
+        }
     }
     replicate_config_to_cluster(state);
     // Mask password before returning — never echo plaintext back to UI.
@@ -3435,14 +3572,21 @@ pub async fn test_dns(
 
     let port = if r.port == 0 { 53 } else { r.port };
     let start = std::time::Instant::now();
-    let out = std::process::Command::new("dig")
-        .args([
-            &format!("@{}", r.router_ip),
-            "-p", &port.to_string(),
-            hostname,
-            "+short", "+time=3", "+tries=1",
-        ])
-        .output();
+    // C4 fix: `dig` blocks for up to 3 seconds (+time=3). Offload.
+    let router_ip = r.router_ip.clone();
+    let hostname_owned = hostname.to_string();
+    let out = web::block(move || {
+        std::process::Command::new("dig")
+            .args([
+                &format!("@{}", router_ip),
+                "-p", &port.to_string(),
+                &hostname_owned,
+                "+short", "+time=3", "+tries=1",
+            ])
+            .output()
+    }).await.unwrap_or_else(|e|
+        Err(std::io::Error::new(std::io::ErrorKind::Other, format!("blocking task: {}", e)))
+    );
     let duration_ms = start.elapsed().as_millis() as u64;
 
     match out {
@@ -3641,17 +3785,26 @@ pub async fn tool_status(
     req: HttpRequest, state: S,
 ) -> HttpResponse {
     auth_or_return!(req, state);
-    let check = |name: &str| -> bool {
-        std::process::Command::new("which").arg(name).output()
-            .map(|o| o.status.success()).unwrap_or(false)
-    };
-    HttpResponse::Ok().json(serde_json::json!({
-        "ping": check("ping"),
-        "traceroute": check("traceroute"),
-        "nslookup": check("nslookup"),
-        "dig": check("dig"),
-        "whois": check("whois"),
-    }))
+    // C4 fix: five `which` subprocess calls per request. Cheap individually
+    // but executor-blocking under load. Offload them as a batch.
+    let json = web::block(|| {
+        let check = |name: &str| -> bool {
+            std::process::Command::new("which").arg(name).output()
+                .map(|o| o.status.success()).unwrap_or(false)
+        };
+        serde_json::json!({
+            "ping": check("ping"),
+            "traceroute": check("traceroute"),
+            "nslookup": check("nslookup"),
+            "dig": check("dig"),
+            "whois": check("whois"),
+        })
+    }).await.unwrap_or_else(|_| serde_json::json!({
+        "ping": false, "traceroute": false, "nslookup": false,
+        "dig": false, "whois": false,
+        "error": "tool-status blocking task failed",
+    }));
+    HttpResponse::Ok().json(json)
 }
 
 /// POST /api/router/tools/install — install any of the diag tools that
@@ -3809,7 +3962,16 @@ pub async fn export_config(
         Err(e) => return HttpResponse::InternalServerError().body(format!("serialize: {}", e)),
     };
     let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
-    let cluster_tag = query.cluster.as_deref().unwrap_or("all");
+    // H3 fix: sanitise the operator-controlled cluster tag before
+    // interpolating into Content-Disposition. Cluster names allow
+    // hyphens and underscores; anything else is replaced with `_`
+    // so an attacker-controlled name like `foo"; filename="evil`
+    // can't break out of the quoted-string header value.
+    let cluster_tag_raw = query.cluster.as_deref().unwrap_or("all");
+    let cluster_tag: String = cluster_tag_raw.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let cluster_tag = if cluster_tag.is_empty() { "all".to_string() } else { cluster_tag };
     let filename = format!("wolfrouter-config-{}-{}.json", cluster_tag, ts);
     HttpResponse::Ok()
         .insert_header(("Content-Type", "application/json"))
@@ -3881,6 +4043,17 @@ pub async fn import_config(
             }));
         }
     }
+
+    // M3 fix: firewall rule validation. Pre-fix imports could carry
+    // rules referencing zone IDs / LAN IDs / interface names that
+    // didn't exist in the imported config; compile_rule emitted a
+    // skip-comment at apply time and the rule silently no-op'd. Run
+    // the same validator the live config uses; surface findings as a
+    // non-blocking warning (operator may be importing a partial
+    // config they intend to fix manually) but record them in the
+    // response so they aren't silent.
+    let self_id_for_validate = crate::agent::self_node_id();
+    let firewall_issues = crate::networking::router::firewall::validate(&new_cfg, &self_id_for_validate);
 
     // Preserve PPPoE passwords where the import carries the masked "***".
     // This lets users round-trip their own exports without losing creds.
@@ -3972,6 +4145,13 @@ pub async fn import_config(
         },
         "summary": summary,
         "applied": applied,
+        // M3 fix: surface firewall validation issues so an operator
+        // importing a config with bad rule references sees them
+        // immediately rather than discovering days later that the
+        // rules silently no-op'd in the compiled iptables ruleset.
+        "firewall_issues": firewall_issues.iter().map(|(id, msg)| serde_json::json!({
+            "rule_id": id, "message": msg,
+        })).collect::<Vec<_>>(),
     }))
 }
 
@@ -4911,7 +5091,14 @@ pub async fn delete_subnet_route(req: HttpRequest, state: S, path: web::Path<Str
     // kernel mutation.
     if let Some(route) = deleted_route {
         let self_id = crate::agent::self_node_id();
-        if super::route_targets_self(&route, &self_id) {
+        // H2 fix: use the SAME predicate the apply path uses
+        // (`node_handles_route`, which is target OR gateway).
+        // Pre-fix this used `route_targets_self` (target only), so
+        // routes where this node is the gateway-but-not-target had
+        // their kernel entries installed at apply time but never
+        // cleaned up on delete — stale `ip route` entries persisted
+        // until reboot, and traffic kept getting forwarded.
+        if super::node_handles_route(&route, &self_id) {
             if let Err(e) = super::remove_subnet_route(&route) {
                 tracing::warn!("delete_subnet_route: remove failed: {}", e);
             }
@@ -5381,20 +5568,13 @@ pub async fn wolfnet_routes_resync(req: HttpRequest, state: S) -> HttpResponse {
     }
 
     // Remote nodes — pick up their advertised wolfnet_ips by re-polling
-    // the agent endpoint. Single client built outside the loop so all
-    // peers share a connection pool (matches the POLL_CLIENT pattern in
-    // agent::poll_remote_nodes).
-    let client = match crate::api::ipv4_only_client_builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .danger_accept_invalid_certs(true)
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({
-            "ok": false,
-            "error": format!("failed to build HTTP client: {}", e),
-        })),
-    };
+    // the agent endpoint.
+    //
+    // M1 fix: reuse the process-wide ROUTER_RPC_CLIENT instead of
+    // building a fresh reqwest::Client per request. The process-wide
+    // pool keeps connections to peers warm across calls; the per-request
+    // builder discarded them every time.
+    let client = &*ROUTER_RPC_CLIENT;
     let nodes = state.cluster.get_all_nodes();
     let mut polled_peers: usize = 0;
     for node in &nodes {
@@ -5723,8 +5903,16 @@ pub async fn set_lan_interface(
 /// Persist `net.ipv4.ip_forward=1` to /etc/sysctl.d/99-wolfrouter.conf
 /// and reload sysctl. Idempotent — overwriting the drop-in is the
 /// behaviour we want when a previous run wrote a stale value.
-pub async fn fix_enable_ip_forward(req: HttpRequest, state: S) -> HttpResponse {
+pub async fn fix_enable_ip_forward(
+    req: HttpRequest, state: S, query: web::Query<TopologyQuery>,
+) -> HttpResponse {
     auth_or_return!(req, state);
+    // H1 fix: this fix mutates THIS node's sysctl. If the operator is
+    // viewing a different cluster's WolfRouter, refuse — cross-cluster
+    // "fix" buttons firing on the wrong node was a real risk.
+    if let Some(resp) = cluster_guard_node_id(&state, &query, Some(&crate::agent::self_node_id())) {
+        return resp;
+    }
     let res = tokio::task::spawn_blocking(|| {
         let dropin = "/etc/sysctl.d/99-wolfrouter.conf";
         let body = "# Written by WolfRouter — required for any LAN/firewall forwarding to work.\n\
@@ -5770,8 +5958,14 @@ pub async fn fix_enable_ip_forward(req: HttpRequest, state: S) -> HttpResponse {
 /// the startup hook uses (`purge_self_loop_defaults`) — deletes ONLY
 /// routes whose next-hop is one of THIS host's own IPs. Such routes
 /// can never deliver a packet, so this can never make egress worse.
-pub async fn fix_purge_self_loop_routes(req: HttpRequest, state: S) -> HttpResponse {
+pub async fn fix_purge_self_loop_routes(
+    req: HttpRequest, state: S, query: web::Query<TopologyQuery>,
+) -> HttpResponse {
     auth_or_return!(req, state);
+    // H1 fix: this fix mutates THIS node's kernel routes. Cluster-scope.
+    if let Some(resp) = cluster_guard_node_id(&state, &query, Some(&crate::agent::self_node_id())) {
+        return resp;
+    }
     let removed = tokio::task::spawn_blocking(|| {
         super::purge_self_loop_defaults()
     }).await.unwrap_or_default();
@@ -5807,9 +6001,14 @@ pub struct DhclientIfaceRequest { pub iface: String }
 /// the host's own DHCP client never grabbed a lease (Starlink trap,
 /// boot-order race against the dishy bring-up).
 pub async fn fix_dhclient_iface(
-    req: HttpRequest, state: S, body: web::Json<DhclientIfaceRequest>
+    req: HttpRequest, state: S, query: web::Query<TopologyQuery>,
+    body: web::Json<DhclientIfaceRequest>,
 ) -> HttpResponse {
     auth_or_return!(req, state);
+    // H1 fix: dhclient runs against THIS node's iface. Cluster-scope.
+    if let Some(resp) = cluster_guard_node_id(&state, &query, Some(&crate::agent::self_node_id())) {
+        return resp;
+    }
     let iface = body.iface.trim().to_string();
     if iface.is_empty() || !iface.chars().all(|c|
         c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_'
@@ -5845,9 +6044,18 @@ pub async fn fix_dhclient_iface(
 /// POST /api/router/fix/wan/{id}/reapply
 /// Re-apply a WAN connection — installs MASQUERADE, redials PPPoE if
 /// needed, etc. Same logic the WAN editor's Save button runs.
-pub async fn fix_reapply_wan(req: HttpRequest, state: S, path: web::Path<String>) -> HttpResponse {
+pub async fn fix_reapply_wan(
+    req: HttpRequest, state: S, path: web::Path<String>,
+    query: web::Query<TopologyQuery>,
+) -> HttpResponse {
     auth_or_return!(req, state);
     let id = path.into_inner();
+    // H1 fix: WAN belongs to a specific node; check that node is in
+    // the caller's cluster scope before touching it. Pre-fix, an
+    // operator on cluster A could re-apply cluster B's PPPoE WAN by
+    // knowing its UUID — the proxy-to-owning-node code path would
+    // happily forward the fix to cluster B's node.
+    if let Some(resp) = cluster_guard_existing_wan(&state, &query, &id) { return resp; }
     let conn = {
         let cfg = state.router.config.read().unwrap();
         cfg.wan_connections.iter().find(|w| w.id == id).cloned()
@@ -5882,9 +6090,14 @@ pub async fn fix_reapply_wan(req: HttpRequest, state: S, path: web::Path<String>
 /// preflight row that asks for this exists because pppd writes
 /// `nodefaultroute` to the peer file when the flag is off — clearing
 /// it requires a redial.
-pub async fn fix_tick_pppoe_default_route(req: HttpRequest, state: S, path: web::Path<String>) -> HttpResponse {
+pub async fn fix_tick_pppoe_default_route(
+    req: HttpRequest, state: S, path: web::Path<String>,
+    query: web::Query<TopologyQuery>,
+) -> HttpResponse {
     auth_or_return!(req, state);
     let id = path.into_inner();
+    // H1 fix: same cluster-scope guard as fix_reapply_wan above.
+    if let Some(resp) = cluster_guard_existing_wan(&state, &query, &id) { return resp; }
     let updated = {
         let mut cfg = state.router.config.write().unwrap();
         let Some(conn) = cfg.wan_connections.iter_mut().find(|w| w.id == id) else {
@@ -6260,6 +6473,22 @@ fn cluster_node_id_set(
 /// 1's wolfrouter must not display or affect anything on cluster 2".
 /// The "affect" half lives here — every create/update/delete on
 /// router config calls this before mutating.
+/// Verify the operator's WolfRouter view (the `?cluster=NAME` query
+/// param the browser sends) matches the cluster that owns `node_id`.
+///
+/// **Permissive when no `?cluster=` is supplied.** `cluster_node_id_set`
+/// returns `None` for "no cluster context", and we `?`-propagate that
+/// into a top-level `None` (allow). This is intentional: many handlers
+/// share this helper, and not all browser views supply the query (e.g.
+/// global Settings → System Check, scripted callers). Cluster isolation
+/// is enforced ONLY for requests that carry a `?cluster=` — those are
+/// the ones the operator clicked from a specific cluster's UI surface.
+/// Direct API callers (curl, automation) without the parameter inherit
+/// the same trust they had before this guard existed (operator-session
+/// or cluster-secret auth, no per-cluster check).
+///
+/// If you want a handler to REQUIRE a cluster context, check
+/// `query.cluster.is_some()` explicitly before calling this helper.
 fn cluster_guard_node_id(state: &S, query: &TopologyQuery, node_id: Option<&str>) -> Option<HttpResponse> {
     let set = cluster_node_id_set(state, query)?;
     match node_id {

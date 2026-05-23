@@ -842,6 +842,14 @@ pub struct RouterState {
     /// on, this is set to the epoch second at which we auto-revert if they
     /// haven't confirmed.
     pub rollback_deadline: RwLock<Option<u64>>,
+    /// H5 fix: danger-framework ID for the in-flight firewall-apply
+    /// rollback timer. Set by `apply_rules` at the same time as
+    /// `rollback_deadline`; cleared (and `crate::danger::cancel`-ed)
+    /// by `confirm_rules`. Without this, confirm_rules cleared the
+    /// legacy deadline but the danger framework timer kept firing —
+    /// the operator would see "Confirm" then watch the rules revert
+    /// 30 seconds later anyway.
+    pub firewall_apply_danger_id: RwLock<Option<String>>,
     /// Per-node topology snapshots populated by the agent tick. Keyed by
     /// node_id. The local node is computed on demand, not cached here.
     pub remote_topologies: RwLock<HashMap<String, topology::NodeTopology>>,
@@ -935,6 +943,7 @@ impl RouterState {
             config: RwLock::new(cfg),
             last_applied_rules: RwLock::new(None),
             rollback_deadline: RwLock::new(None),
+            firewall_apply_danger_id: RwLock::new(None),
             remote_topologies: RwLock::new(HashMap::new()),
             last_validation: RwLock::new(None),
             loaded_clean: AtomicBool::new(clean),

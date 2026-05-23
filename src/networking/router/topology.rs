@@ -799,36 +799,65 @@ fn walk_containers(_node_id: &str) -> Vec<DeviceAttachment> {
     // Best-effort: list docker + lxc containers WITH their IPs so the
     // rack-view device badges show something useful.
     let mut out = Vec::new();
-    // Docker — `docker ps --format` can include the network IP via
-    // {{.Networks}} but that gives the network NAME, not the IP. To get
-    // the IP we use Go template syntax to pull NetworkSettings.IPAddress
-    // (or any per-network IP). One docker call covers all running
-    // containers.
+    // Docker — M4 fix: collapse the per-container `docker inspect`
+    // fan-out into a SINGLE multi-id inspect call. `docker inspect`
+    // accepts any number of container IDs as positional args, so one
+    // subprocess produces output for every running container instead
+    // of (1 + N). On a node with 20 containers that's 2 subprocess
+    // calls per topology poll instead of 21.
+    //
+    // Pass 1: collect (name, networks) from `docker ps --format` (no
+    // IP available here — `.Networks` is the network-name CSV).
+    // Pass 2: feed every name into a single `docker inspect ...` and
+    // parse one line of "<name>\t<first-ip>" per container.
     if let Ok(o) = Command::new("docker")
         .args(["ps", "--format", "{{.Names}}\t{{.Networks}}"])
         .output()
     {
         if o.status.success() {
+            let mut entries: Vec<(String, String)> = Vec::new();
             for line in String::from_utf8_lossy(&o.stdout).lines() {
                 let parts: Vec<&str> = line.splitn(2, '\t').collect();
                 if parts.is_empty() { continue; }
                 let name = parts[0].to_string();
                 let nets = parts.get(1).map(|s| s.to_string()).unwrap_or_default();
-                // Best-effort IP fetch per container (skip on error).
-                let ip = Command::new("docker")
-                    .args(["inspect", "--format",
-                           "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}",
-                           &name])
-                    .output()
-                    .ok()
-                    .filter(|o| o.status.success())
-                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    // First non-empty IP token (a container can be on
-                    // multiple networks).
-                    .and_then(|s| s.split_whitespace().next()
-                        .filter(|t| !t.is_empty())
-                        .map(|t| t.to_string()));
+                entries.push((name, nets));
+            }
+            // Single multi-id inspect.
+            let mut ip_by_name: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            if !entries.is_empty() {
+                let mut args: Vec<&str> = vec![
+                    "inspect", "--format",
+                    "{{.Name}}\t{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}",
+                ];
+                let name_refs: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+                args.extend(name_refs.iter().copied());
+                if let Ok(o2) = Command::new("docker").args(&args).output() {
+                    // M4-FAIL-ALL fix: parse stdout regardless of exit
+                    // status. `docker inspect` exits non-zero if ANY
+                    // container ID is missing (the brief race between
+                    // `docker ps` above and this call — short-lived
+                    // containers can disappear), but it still emits
+                    // output for every container it DID find before
+                    // hitting the missing one. Gating on success was
+                    // turning that race into "all IPs vanish" on busy
+                    // hosts; without the gate we get IPs for whatever
+                    // is still alive, which is what we want.
+                    for line in String::from_utf8_lossy(&o2.stdout).lines() {
+                        let parts: Vec<&str> = line.splitn(2, '\t').collect();
+                        if parts.len() != 2 { continue; }
+                        // docker prepends `/` to .Name; strip it.
+                        let name = parts[0].trim_start_matches('/').to_string();
+                        let ip = parts[1].split_whitespace().next()
+                            .filter(|t| !t.is_empty())
+                            .map(|t| t.to_string());
+                        if let Some(ip) = ip { ip_by_name.insert(name, ip); }
+                    }
+                }
+            }
+            for (name, nets) in entries {
+                let ip = ip_by_name.get(&name).cloned();
                 out.push(DeviceAttachment {
                     name,
                     kind: "docker".into(),
@@ -1004,20 +1033,21 @@ pub fn derive_links(nodes: &[NodeTopology]) -> Vec<TopologyLink> {
         }
     }
 
-    // Cross-node WolfNet mesh link (one logical edge between each pair
-    // for the UI to render the overlay). The rack view treats these as
-    // a shaded "WolfNet cloud" rather than individual wires.
-    for i in 0..nodes.len() {
-        for j in (i + 1)..nodes.len() {
-            links.push(TopologyLink {
-                from: EndpointRef::Wolfnet,
-                to: EndpointRef::Wolfnet,
-                kind: LinkKind::Wolfnet,
-                bps_live: None,
-            });
-            // Break early; one logical node-to-node link is enough.
-            let _ = (i, j);
-        }
+    // Cross-node WolfNet mesh edge — L2 fix: emit ONE logical edge
+    // representing the WolfNet cloud (the rack view renders it as a
+    // shaded cloud, not per-pair wires). Pre-fix the nested loop
+    // emitted N*(N-1)/2 IDENTICAL `Wolfnet→Wolfnet` links (both
+    // endpoints had no node identifier) — the inner `let _ = (i, j)`
+    // discarded the loop indices and the misleading "Break early"
+    // comment suggested it stopped after one iteration; it didn't.
+    // The frontend deduplicated visually but the payload was N²-bloated.
+    if nodes.len() > 1 {
+        links.push(TopologyLink {
+            from: EndpointRef::Wolfnet,
+            to: EndpointRef::Wolfnet,
+            kind: LinkKind::Wolfnet,
+            bps_live: None,
+        });
     }
 
     links

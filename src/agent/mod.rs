@@ -305,13 +305,13 @@ impl ClusterState {
                 for mut node in saved {
                     node.online = false; // Will be updated by polling
                     node.is_self = false;
-                    // Default to WolfStack if no cluster name
-                    if node.cluster_name.is_none() {
-                         node.cluster_name = Some("WolfStack".to_string());
-                    }
+                    // H7 fix: do NOT silently overwrite `None` cluster_name
+                    // with the hardcoded "WolfStack" — that masks the
+                    // genuine "this peer was never assigned to a cluster"
+                    // state. The sidebar grouping handles None at display
+                    // time via its own normalise() helper.
                     nodes.insert(node.id.clone(), node);
                 }
-
             }
         }
     }
@@ -1057,7 +1057,20 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
                                 .map(|h| h.to_string_lossy().to_string())
                                 .unwrap_or_default();
                             for known in known_nodes {
-                                if known.id == cluster.self_id {
+                                // Self-identification in a gossip entry: match EITHER
+                                // by the entry's id (only fires when a node gossips its
+                                // OWN view, which is rare) OR by the entry's `self_id`
+                                // field (populated from the remote's StatusReport.node_id,
+                                // which is the canonical `ws-{uuid}` from /etc/wolfstack/
+                                // node_id). Pre-fix this only checked `known.id` against
+                                // `self_id`, but those live in disjoint ID namespaces —
+                                // `id` is the LOCALLY-ASSIGNED `node-{uuid}` of the
+                                // sending peer, while `self_id` is the global ws-{uuid}.
+                                // The pre-fix condition never matched cross-node, so
+                                // gossip-driven cluster-name adoption was dead code.
+                                let is_self = known.id == cluster.self_id
+                                    || known.self_id.as_deref() == Some(cluster.self_id.as_str());
+                                if is_self {
                                     // Accept cluster_name updates from gossip (admin may have changed it on another node)
                                     if let Some(ref gossiped_cluster) = known.cluster_name {
                                         let current_cluster = {
