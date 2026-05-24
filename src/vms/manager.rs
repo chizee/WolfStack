@@ -199,6 +199,45 @@ pub struct VmConfig {
     /// passthrough) that don't want a dangling unused NAT interface.
     #[serde(default)]
     pub skip_default_nic: bool,
+
+    /// Primary NIC mode. Mirrors the LXC network_mode model:
+    ///   • "wolfnet" — net0 attached to per-VM WolfNet bridge `wnbr-<id>`
+    ///     (Proxmox keeps an extra net0 on vmbr0 for LAN egress; net1 is
+    ///     the WolfNet NIC). Auto when `wolfnet_ip` is set on older configs.
+    ///   • "bridge"  — net0 attached to operator-chosen bridge in `bridge`.
+    ///     Also used for the vSwitch UI sugar — the frontend auto-creates
+    ///     `vmbr<vlan>` via the VLAN-attachment store before saving, then
+    ///     just stores the bridge name here.
+    ///   • "nat"     — user-mode SLIRP (native QEMU) / vmbr0 (Proxmox) /
+    ///     `default` libvirt network. Default when nothing else is set.
+    /// Absent / empty deserializes via [`Self::effective_network_mode`]
+    /// for backwards compatibility with configs written before this field.
+    #[serde(default)]
+    pub network_mode: Option<String>,
+
+    /// Bridge name used when `network_mode == "bridge"`. For the vSwitch
+    /// preset the frontend writes `vmbr<vlan>` here after creating the
+    /// VLAN attachment; for plain bridge it's whatever the operator picked
+    /// (vmbr0, lxcbr0, br-pt-*, etc.).
+    #[serde(default)]
+    pub bridge: Option<String>,
+
+    /// IP-assignment hint for bridge mode: "dhcp" or "static". The guest
+    /// configures its own IP; this is persisted so the editor shows the
+    /// operator's choice back and so the cloud-init / staged-config path
+    /// added in v24.1.0 can pre-seed the guest when wanted.
+    #[serde(default)]
+    pub bridge_ip_mode: Option<String>,
+
+    /// Static IP+CIDR (e.g. "192.168.10.50/24") for bridge mode when
+    /// `bridge_ip_mode == "static"`. Surfaced via cloud-init.
+    #[serde(default)]
+    pub bridge_ip: Option<String>,
+
+    /// Static gateway (e.g. "192.168.10.1") for bridge mode when
+    /// `bridge_ip_mode == "static"`. Paired with `bridge_ip`.
+    #[serde(default)]
+    pub bridge_gateway: Option<String>,
 }
 
 fn default_net_model() -> String { "virtio".to_string() }
@@ -231,6 +270,22 @@ impl VmConfig {
             bios_type: "seabios".to_string(),
             host_id: None,
             skip_default_nic: false,
+            network_mode: None,
+            bridge: None,
+            bridge_ip_mode: None,
+            bridge_ip: None,
+            bridge_gateway: None,
+        }
+    }
+
+    /// Effective network mode with backwards-compatible inference. Configs
+    /// written before `network_mode` existed get "wolfnet" when a
+    /// `wolfnet_ip` is set and "nat" otherwise, matching pre-existing
+    /// runtime behaviour exactly.
+    pub fn effective_network_mode(&self) -> &str {
+        match self.network_mode.as_deref() {
+            Some(s) if !s.is_empty() => s,
+            _ => if self.wolfnet_ip.is_some() { "wolfnet" } else { "nat" },
         }
     }
 }
@@ -580,6 +635,7 @@ impl VmManager {
                 let mut mac_address: Option<String> = None;
                 let mut iso_path: Option<String> = None;
                 let mut storage_path: Option<String> = None;
+                let mut net0_bridge: Option<String> = None;
 
                 // Capture the raw qm config text so we can parse passthrough lines too
                 let qm_config_text = Command::new("qm").args(["config", &vmid.to_string()]).output()
@@ -596,12 +652,15 @@ impl VmManager {
                         } else if cline.starts_with("onboot:") {
                             auto_start = cline.split(':').nth(1).unwrap_or("0").trim() == "1";
                         } else if cline.starts_with("net0:") {
-                            // Extract MAC from net0: virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0
+                            // Extract MAC + bridge from net0: virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0
                             if let Some(val) = cline.splitn(2, ':').nth(1) {
                                 for part in val.split(',') {
                                     let part = part.trim();
                                     if part.starts_with("virtio=") || part.starts_with("e1000=") || part.starts_with("rtl8139=") {
                                         mac_address = part.split('=').nth(1).map(|s| s.to_string());
+                                    } else if let Some(br) = part.strip_prefix("bridge=") {
+                                        let br = br.trim();
+                                        if !br.is_empty() { net0_bridge = Some(br.to_string()); }
                                     }
                                 }
                             }
@@ -638,6 +697,17 @@ impl VmManager {
                 // Parse usbN= and hostpciN= lines so device state round-trips through edits
                 let (usb_devices, pci_devices) = parse_proxmox_passthrough(&qm_config_text);
 
+                // Derive network_mode from the parsed bridge so the editor
+                // shows the right preset. vmbr0 (PVE's default management
+                // bridge) is the "nat" preset on Proxmox; anything else is
+                // a bridge / vSwitch attachment. Mode is recomputed at
+                // display time — `effective_network_mode` keeps the fallback
+                // for configs that pre-date this field.
+                let (derived_mode, derived_bridge) = match net0_bridge.as_deref() {
+                    Some("vmbr0") | None => (Some("nat".to_string()), None),
+                    Some(other) => (Some("bridge".to_string()), Some(other.to_string())),
+                };
+
                 Some(VmConfig {
                     name,
                     cpus,
@@ -663,6 +733,11 @@ impl VmManager {
                     bios_type: "seabios".to_string(),
                     host_id: Some(crate::agent::self_node_id()),
                     skip_default_nic: false,
+                    network_mode: derived_mode,
+                    bridge: derived_bridge,
+                    bridge_ip_mode: None,
+                    bridge_ip: None,
+                    bridge_gateway: None,
                 })
             })
             .collect()
@@ -920,6 +995,22 @@ impl VmManager {
 
 
 
+        // net0 wiring depends on the chosen network_mode. Mirrors the LXC
+        // network_mode model: "wolfnet" keeps the original dual-NIC layout
+        // (vmbr0 LAN + per-VM WolfNet bridge), "bridge" attaches net0 to an
+        // operator-chosen bridge (vmbr*, lxcbr*, br-pt-*, or a vSwitch
+        // VLAN bridge `vmbr<vlan>` the frontend auto-creates), "nat" stays
+        // on vmbr0 (PVE's default management bridge — the closest equivalent
+        // to user-mode NAT on a Proxmox host).
+        let mode = config.effective_network_mode();
+        let net0_bridge: String = match mode {
+            "bridge" => config.bridge.clone()
+                .filter(|b| !b.is_empty())
+                .unwrap_or_else(|| "vmbr0".to_string()),
+            _ => "vmbr0".to_string(),
+        };
+        let net0_model = if config.net_model.is_empty() { "virtio".to_string() } else { config.net_model.clone() };
+
         let mut args = vec![
             "create".to_string(),
             vmid.to_string(),
@@ -928,16 +1019,15 @@ impl VmManager {
             "--memory".to_string(), config.memory_mb.to_string(),
             "--scsi0".to_string(), format!("{}:{}", storage, config.disk_size_gb),
             "--scsihw".to_string(), "virtio-scsi-single".to_string(),
-            "--net0".to_string(), format!("virtio,bridge=vmbr0"),
+            "--net0".to_string(), format!("{},bridge={}", net0_model, net0_bridge),
             "--ostype".to_string(), "l26".to_string(), // Linux 2.6+ kernel
             "--serial0".to_string(), "socket".to_string(), // Serial console for qm terminal
         ];
 
-        // When a WolfNet IP is configured, set up a per-VM bridge with a
-        // pinned-IP dnsmasq, then add `--net1 virtio,bridge=wnbr-{vmid}`.
-        // PVE attaches its own tap to the bridge when the VM starts; the
-        // VM gets its WolfNet IP via DHCP automatically. Same UX as the
-        // standalone QEMU path.
+        // WolfNet mode (or legacy configs with wolfnet_ip set but no
+        // network_mode field) gets a SECOND NIC on a per-VM bridge with a
+        // pinned-IP dnsmasq. PVE attaches its own tap to the bridge when
+        // the VM starts; the VM gets its WolfNet IP via DHCP automatically.
         //
         // Note on VLANs: on Proxmox, a VLAN tag on the same NIC as WolfNet
         // mangles the routing model (we hit this with LXC — see
@@ -945,14 +1035,16 @@ impl VmManager {
         // net0 stays on vmbr0 (with whatever VLAN tag the user wants),
         // net1 lives on its own dedicated bridge with no VLAN. The two
         // NICs never share a broadcast domain, so VLAN + WolfNet coexist.
-        if let Some(ref wip) = config.wolfnet_ip {
-            self.ensure_dnsmasq_installed();
-            let bridge = Self::wn_bridge_name(&vmid.to_string());
-            if let Err(e) = self.setup_wolfnet_bridge(&bridge, wip) {
-                warn!("WolfNet bridge setup for VMID {} failed (VM will still be created): {}", vmid, e);
+        if mode == "wolfnet" {
+            if let Some(ref wip) = config.wolfnet_ip {
+                self.ensure_dnsmasq_installed();
+                let bridge = Self::wn_bridge_name(&vmid.to_string());
+                if let Err(e) = self.setup_wolfnet_bridge(&bridge, wip) {
+                    warn!("WolfNet bridge setup for VMID {} failed (VM will still be created): {}", vmid, e);
+                }
+                args.push("--net1".to_string());
+                args.push(format!("virtio,bridge={}", bridge));
             }
-            args.push("--net1".to_string());
-            args.push(format!("virtio,bridge={}", bridge));
         }
 
         // Boot media (ISO as CD-ROM, .img not supported as USB on Proxmox)
@@ -1267,7 +1359,12 @@ impl VmManager {
                      bios_type: Option<String>,
                      extra_nics: Option<Vec<NicConfig>>,
                      usb_devices: Option<Vec<UsbDevice>>,
-                     pci_devices: Option<Vec<PciDevice>>) -> Result<(), String> {
+                     pci_devices: Option<Vec<PciDevice>>,
+                     network_mode: Option<String>,
+                     bridge: Option<String>,
+                     bridge_ip_mode: Option<String>,
+                     bridge_ip: Option<String>,
+                     bridge_gateway: Option<String>) -> Result<(), String> {
         // On Proxmox, delegate to qm set
         if containers::is_proxmox() {
             let vmid = self.qm_vmid_by_name(name)
@@ -1286,6 +1383,91 @@ impl VmManager {
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     return Err(format!("qm set failed: {}", stderr.trim()));
+                }
+            }
+            // net0 bridge change: when network_mode flips wolfnet/nat ↔ bridge,
+            // or the operator picks a different bridge (incl. switching to a
+            // vSwitch VLAN bridge `vmbr<vlan>` the frontend auto-created),
+            // we have to re-emit net0 via `qm set`. Default mode for both
+            // "wolfnet" and "nat" on Proxmox is vmbr0 — the WolfNet TAP rides
+            // on net1, not net0, because mixing VLAN tags with the WolfNet
+            // bridge breaks PVE's routing model (same gotcha LXC hit, see
+            // validate_wolfnet_vlan_conflict).
+            //
+            // CRITICAL: `qm set --net0 virtio,bridge=X` without the existing
+            // MAC makes PVE generate a fresh MAC, which breaks DHCP leases
+            // and stale ARP entries inside the guest. Read the current MAC +
+            // model from `qm config` first and round-trip them; only fire
+            // `qm set` when the bridge OR model would actually change.
+            if network_mode.is_some() || bridge.is_some() {
+                let mode = network_mode.as_deref().unwrap_or("");
+                let target_bridge: String = match mode {
+                    "bridge" => bridge.clone().filter(|b| !b.is_empty())
+                        .unwrap_or_else(|| "vmbr0".to_string()),
+                    "" => bridge.clone().filter(|b| !b.is_empty()).unwrap_or_default(),
+                    _ => "vmbr0".to_string(),
+                };
+                if !target_bridge.is_empty() {
+                    // Parse current net0 to recover model + MAC + bridge.
+                    let cfg_out = Command::new("qm").args(["config", &vmid_str]).output();
+                    let (cur_model, cur_mac, cur_bridge) = match cfg_out {
+                        Ok(o) if o.status.success() => {
+                            let cfg = String::from_utf8_lossy(&o.stdout).to_string();
+                            let mut model = "virtio".to_string();
+                            let mut mac: Option<String> = None;
+                            let mut br: Option<String> = None;
+                            for line in cfg.lines() {
+                                let line = line.trim();
+                                if let Some(val) = line.strip_prefix("net0:") {
+                                    for part in val.split(',') {
+                                        let part = part.trim();
+                                        if let Some((k, v)) = part.split_once('=') {
+                                            if matches!(k, "virtio"|"e1000"|"e1000e"|"rtl8139"|"vmxnet3") {
+                                                model = k.to_string();
+                                                mac = Some(v.to_string());
+                                            } else if k == "bridge" {
+                                                let v = v.trim();
+                                                if !v.is_empty() { br = Some(v.to_string()); }
+                                            }
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+                            (model, mac, br)
+                        }
+                        _ => ("virtio".to_string(), None, None),
+                    };
+
+                    // Honour an explicit model override from the request;
+                    // otherwise preserve what PVE currently has.
+                    let model = net_model.as_deref()
+                        .filter(|m| !m.is_empty())
+                        .map(|s| s.to_string())
+                        .unwrap_or(cur_model);
+
+                    // Skip the qm set entirely when nothing would change —
+                    // avoids spurious config-file rewrites and keeps PVE's
+                    // last-modified timestamp meaningful.
+                    let model_unchanged = net_model.as_deref().filter(|m| !m.is_empty()).is_none()
+                        || net_model.as_deref() == Some(&model);
+                    let bridge_unchanged = cur_bridge.as_deref() == Some(target_bridge.as_str());
+                    if !(bridge_unchanged && model_unchanged) {
+                        let val = if let Some(ref m) = cur_mac {
+                            format!("{}={},bridge={}", model, m, target_bridge)
+                        } else {
+                            // No existing MAC parsed — let PVE pick one
+                            // (only happens on adopted VMs with malformed
+                            // net0 lines, which is rare).
+                            format!("{},bridge={}", model, target_bridge)
+                        };
+                        let out = Command::new("qm").args(["set", &vmid_str, "--net0", &val]).output()
+                            .map_err(|e| format!("qm set --net0 failed: {}", e))?;
+                        if !out.status.success() {
+                            let stderr = String::from_utf8_lossy(&out.stderr);
+                            warn!("qm set --net0 for VMID {} failed: {}", vmid, stderr.trim());
+                        }
+                    }
                 }
             }
             // Disk resize on Proxmox
@@ -1329,6 +1511,35 @@ impl VmManager {
                 tmp.pci_devices = pci_devices.clone().unwrap_or_default();
                 super::passthrough::apply_proxmox_passthrough(vmid, &tmp)?;
             }
+            // WolfNet net1 reconcile. On Proxmox the per-VM WolfNet bridge
+            // rides on net1 (not net0) — see qm_create for the reasoning.
+            // Flipping into / out of WolfNet mode means add or delete net1.
+            // Idempotent: re-emitting the same net1 is a no-op for PVE.
+            if let Some(ref mode) = network_mode {
+                if mode == "wolfnet" {
+                    if let Some(ref wip) = wolfnet_ip {
+                        if !wip.is_empty() {
+                            self.ensure_dnsmasq_installed();
+                            let bridge = Self::wn_bridge_name(&vmid_str);
+                            if let Err(e) = self.setup_wolfnet_bridge(&bridge, wip) {
+                                warn!("WolfNet bridge reconcile (qm) for VMID {} failed: {}", vmid, e);
+                            } else {
+                                let _ = Command::new("qm").args([
+                                    "set", &vmid_str, "--net1",
+                                    &format!("virtio,bridge={}", bridge)
+                                ]).output();
+                            }
+                        }
+                    }
+                } else {
+                    // Mode is explicitly non-wolfnet — drop net1 if present.
+                    // qm errors when net1 doesn't exist; the result is
+                    // ignored on purpose (the desired state IS "no net1").
+                    let _ = Command::new("qm").args(["set", &vmid_str, "--delete", "net1"]).output();
+                    let bridge = Self::wn_bridge_name(&vmid_str);
+                    self.cleanup_wolfnet_bridge(&bridge, wolfnet_ip.as_deref());
+                }
+            }
             return Ok(());
         }
         // On libvirt, delegate to virsh (VM must be stopped for CPU/memory
@@ -1370,6 +1581,67 @@ impl VmManager {
                 tmp.pci_devices = pci_devices.clone().unwrap_or_default();
                 super::passthrough::apply_libvirt_passthrough(name, &tmp)?;
             }
+            // WolfNet reconcile on libvirt — same pattern as Proxmox but
+            // via the existing `reconcile_wolfnet_for_vm` path (which uses
+            // virsh attach-interface / detach-interface under the hood).
+            // We build a synthetic VmConfig with just the wolfnet_ip set
+            // because that's all the reconcile path looks at.
+            if network_mode.is_some() || wolfnet_ip.is_some() {
+                let want_wolfnet = network_mode.as_deref() == Some("wolfnet")
+                    || (network_mode.is_none()
+                        && wolfnet_ip.as_deref().map(|s| !s.is_empty()).unwrap_or(false));
+                let mut synth = VmConfig::new(name.to_string(), 1, 512, 1);
+                synth.wolfnet_ip = if want_wolfnet {
+                    wolfnet_ip.clone().filter(|s| !s.is_empty())
+                } else { None };
+                // We don't have the previous wolfnet_ip handy on the
+                // libvirt edit branch (it's not loaded from a sidecar
+                // here). Passing None means "don't try to GC an old
+                // /32 route" — safe; setup_wolfnet_bridge is idempotent.
+                self.reconcile_wolfnet_for_vm(name, &synth, None);
+            }
+            // Also persist the network_mode + bridge fields into the
+            // WolfStack JSON sidecar so the editor remembers the choice
+            // across reloads. Libvirt's XML doesn't carry these as
+            // first-class fields, so the sidecar is authoritative for
+            // them.
+            if network_mode.is_some() || bridge.is_some()
+                || bridge_ip_mode.is_some() || bridge_ip.is_some() || bridge_gateway.is_some() {
+                let sidecar_path = self.vm_config_path(name);
+                // Load existing sidecar or build a minimal one. We only
+                // touch the network fields; everything else falls back to
+                // whatever was there (or VmConfig::new defaults).
+                let mut sidecar = fs::read_to_string(&sidecar_path).ok()
+                    .and_then(|t| serde_json::from_str::<VmConfig>(&t).ok())
+                    .unwrap_or_else(|| VmConfig::new(name.to_string(), 1, 512, 1));
+                if let Some(ref nm) = network_mode {
+                    sidecar.network_mode = if nm.is_empty() { None } else { Some(nm.clone()) };
+                    if nm != "bridge" {
+                        sidecar.bridge = None;
+                        sidecar.bridge_ip_mode = None;
+                        sidecar.bridge_ip = None;
+                        sidecar.bridge_gateway = None;
+                    }
+                }
+                if let Some(ref br) = bridge {
+                    sidecar.bridge = if br.is_empty() { None } else { Some(br.clone()) };
+                }
+                if let Some(ref ipm) = bridge_ip_mode {
+                    sidecar.bridge_ip_mode = if ipm.is_empty() { None } else { Some(ipm.clone()) };
+                }
+                if let Some(ref bi) = bridge_ip {
+                    sidecar.bridge_ip = if bi.is_empty() { None } else { Some(bi.clone()) };
+                }
+                if let Some(ref bg) = bridge_gateway {
+                    sidecar.bridge_gateway = if bg.is_empty() { None } else { Some(bg.clone()) };
+                }
+                if let Some(ref wip) = wolfnet_ip {
+                    sidecar.wolfnet_ip = if wip.is_empty() { None } else { Some(wip.clone()) };
+                }
+                let _ = serde_json::to_string_pretty(&sidecar)
+                    .map_err(|_| ())
+                    .and_then(|json| fs::write(&sidecar_path, json).map_err(|_| ()));
+            }
             return Ok(());
         }
 
@@ -1387,6 +1659,8 @@ impl VmManager {
         let old_wolfnet_ip = config.wolfnet_ip.clone();
         let old_net_model = config.net_model.clone();
         let old_nics_count = config.extra_nics.len();
+        let old_network_mode = config.network_mode.clone();
+        let old_bridge = config.bridge.clone();
 
         if let Some(c) = cpus { if c > 0 { config.cpus = c; } }
         if let Some(m) = memory_mb { if m >= 256 { config.memory_mb = m; } }
@@ -1431,6 +1705,38 @@ impl VmManager {
         if let Some(ref bt) = bios_type {
             if !bt.is_empty() { config.bios_type = bt.clone(); }
         }
+
+        // Primary-NIC network mode + bridge details. Each field is independently
+        // patchable so the API caller can update just one without nulling
+        // sibling fields. Empty string clears optional Strings; mode "" is
+        // ignored (the editor never sends an empty mode).
+        if let Some(ref nm) = network_mode {
+            if !nm.is_empty() {
+                config.network_mode = Some(nm.clone());
+                // Switching off bridge mode wipes the bridge fields so a
+                // stale bridge name from a previous mode doesn't ride along
+                // and confuse the start path.
+                if nm != "bridge" {
+                    config.bridge = None;
+                    config.bridge_ip_mode = None;
+                    config.bridge_ip = None;
+                    config.bridge_gateway = None;
+                }
+            }
+        }
+        if let Some(ref br) = bridge {
+            config.bridge = if br.is_empty() { None } else { Some(br.clone()) };
+        }
+        if let Some(ref ipm) = bridge_ip_mode {
+            config.bridge_ip_mode = if ipm.is_empty() { None } else { Some(ipm.clone()) };
+        }
+        if let Some(ref bi) = bridge_ip {
+            config.bridge_ip = if bi.is_empty() { None } else { Some(bi.clone()) };
+        }
+        if let Some(ref bg) = bridge_gateway {
+            config.bridge_gateway = if bg.is_empty() { None } else { Some(bg.clone()) };
+        }
+
         if let Some(nics) = extra_nics {
             // Auto-generate MACs for any NICs that don't have one
             config.extra_nics = nics.into_iter().map(|mut n| {
@@ -1462,7 +1768,9 @@ impl VmManager {
             let net_changed = config.wolfnet_ip != old_wolfnet_ip;
             let nics_changed = config.extra_nics.len() != old_nics_count;
             let model_changed = config.net_model != old_net_model;
-            if net_changed || nics_changed || model_changed {
+            let mode_changed = config.network_mode != old_network_mode;
+            let bridge_changed = config.bridge != old_bridge;
+            if net_changed || nics_changed || model_changed || mode_changed || bridge_changed {
                 let vars_path = self.vm_efivars_path(&config);
                 if vars_path.exists() {
                     let vars_sources = [
@@ -2031,45 +2339,85 @@ impl VmManager {
         write_log(&format!("NIC model: {} (mac: {})", nic_device, config.mac_address.as_deref().unwrap_or("auto")));
 
         // Networking: VMs configure their own IP inside the guest OS.
-        // If WolfNet IP is set, try TAP networking for direct L2 access.
-        // Otherwise (or if TAP fails), use user-mode networking which always works.
+        // network_mode picks the net0 topology:
+        //   • "wolfnet" → TAP into per-VM WolfNet bridge (DHCP'd by pinned dnsmasq)
+        //   • "bridge"  → TAP attached to operator-chosen bridge (vmbr0, vmbr<vlan>
+        //                 from a vSwitch attachment, lxcbr0, br-pt-*, etc.)
+        //   • "nat"     → user-mode SLIRP (works without any host bridge config)
+        // Backwards-compat: configs without `network_mode` derive it from
+        // wolfnet_ip via `effective_network_mode`, matching prior behaviour.
         // Exception: `skip_default_nic` skips net0 entirely — extra_nics[0]
         // becomes net0 (vtnet0) instead. Used by firewall appliances that
         // want the first guest interface to be a physical passthrough.
-        let mut using_tap = false;
+        let mut net0_attached = false;
         let mut default_nic_used = false;
         if !config.skip_default_nic {
-            if let Some(ref wolfnet_ip) = config.wolfnet_ip {
-                let tap = Self::tap_name(name);
-                write_log(&format!("Attempting TAP networking for WolfNet IP {} (configure this IP inside the guest OS)", wolfnet_ip));
-
-                match self.setup_tap(&tap) {
-                    Ok(_) => {
-                        write_log(&format!("TAP '{}' created successfully", tap));
-                        cmd.arg("-netdev").arg(format!("tap,id=net0,ifname={},script=no,downscript=no", tap))
-                           .arg("-device").arg(&nic_arg);
-
-                        if let Err(e) = self.setup_wolfnet_routing(&tap, wolfnet_ip) {
-                            write_log(&format!("WolfNet routing warning: {} (VM will still start)", e));
-                        } else {
-                            write_log(&format!("WolfNet routing configured for {} via {}", wolfnet_ip, tap));
+            let mode = config.effective_network_mode();
+            match mode {
+                "wolfnet" => {
+                    if let Some(ref wolfnet_ip) = config.wolfnet_ip {
+                        let tap = Self::tap_name(name);
+                        write_log(&format!("Net0 mode=wolfnet: TAP networking for WolfNet IP {} (configure this IP inside the guest OS)", wolfnet_ip));
+                        match self.setup_tap(&tap) {
+                            Ok(_) => {
+                                write_log(&format!("TAP '{}' created successfully", tap));
+                                cmd.arg("-netdev").arg(format!("tap,id=net0,ifname={},script=no,downscript=no", tap))
+                                   .arg("-device").arg(&nic_arg);
+                                if let Err(e) = self.setup_wolfnet_routing(&tap, wolfnet_ip) {
+                                    write_log(&format!("WolfNet routing warning: {} (VM will still start)", e));
+                                } else {
+                                    write_log(&format!("WolfNet routing configured for {} via {}", wolfnet_ip, tap));
+                                }
+                                net0_attached = true;
+                            }
+                            Err(e) => {
+                                write_log(&format!("TAP setup failed: {} — falling back to user-mode networking", e));
+                            }
                         }
-                        using_tap = true;
-                        default_nic_used = true;
-                    }
-                    Err(e) => {
-                        write_log(&format!("TAP setup failed: {} — falling back to user-mode networking", e));
-                        write_log("Note: You can still configure the WolfNet IP inside the guest OS manually");
+                    } else {
+                        write_log("Net0 mode=wolfnet but wolfnet_ip is empty — falling back to user-mode");
                     }
                 }
+                "bridge" => {
+                    let bridge = config.bridge.clone().filter(|b| !b.is_empty());
+                    if let Some(bridge) = bridge {
+                        // Same TAP-on-bridge pattern the extra_nics path already uses.
+                        let tap = format!("tap-{}-0", &name[..name.len().min(8)]);
+                        let _ = Command::new("ip").args(["link", "set", &tap, "down"]).output();
+                        let _ = Command::new("ip").args(["tuntap", "del", "dev", &tap, "mode", "tap"]).output();
+                        let mut ok = false;
+                        if let Ok(o) = Command::new("ip").args(["tuntap", "add", "dev", &tap, "mode", "tap"]).output() {
+                            if o.status.success() {
+                                let master_out = Command::new("ip").args(["link", "set", &tap, "master", &bridge]).output();
+                                if let Ok(ref mo) = master_out {
+                                    if !mo.status.success() {
+                                        write_log(&format!("WARNING: bridge '{}' not found or cannot attach TAP — net0 may have no connectivity", bridge));
+                                    }
+                                }
+                                let _ = Command::new("ip").args(["link", "set", &tap, "up"]).output();
+                                cmd.arg("-netdev").arg(format!("tap,id=net0,ifname={},script=no,downscript=no", tap))
+                                   .arg("-device").arg(&nic_arg);
+                                write_log(&format!("Net0 mode=bridge: attached to {} (tap: {})", bridge, tap));
+                                ok = true;
+                                net0_attached = true;
+                            }
+                        }
+                        if !ok {
+                            write_log(&format!("Net0 mode=bridge for '{}' failed — falling back to user-mode networking", bridge));
+                        }
+                    } else {
+                        write_log("Net0 mode=bridge but no bridge name set — falling back to user-mode");
+                    }
+                }
+                _ => { /* nat (or unknown) — fall through to user-mode below */ }
             }
 
-            if !using_tap {
-                write_log("Networking: user-mode (NAT, VM can access host network)");
+            if !net0_attached {
+                write_log("Net0: user-mode (NAT, VM can access host network)");
                 cmd.arg("-netdev").arg("user,id=net0")
                    .arg("-device").arg(&nic_arg);
-                default_nic_used = true;
             }
+            default_nic_used = true;
         } else {
             write_log("Networking: skip_default_nic set — net0 will come from extra_nics[0]");
         }
@@ -3553,6 +3901,11 @@ impl VmManager {
             bios_type,
             host_id: Some(crate::agent::self_node_id()),
             skip_default_nic: false,
+            network_mode: None,
+            bridge: None,
+            bridge_ip_mode: None,
+            bridge_ip: None,
+            bridge_gateway: None,
         };
 
         // Overlay adoption sidecar for WolfStack-specific fields that
@@ -3572,6 +3925,14 @@ impl VmManager {
                     config.os_disk_bus = sidecar.os_disk_bus;
                 }
                 config.skip_default_nic = sidecar.skip_default_nic;
+                // Network-mode + bridge details: libvirt's domain XML
+                // doesn't carry these as first-class fields the way our
+                // VmConfig does, so the sidecar is authoritative.
+                if config.network_mode.is_none() { config.network_mode = sidecar.network_mode; }
+                if config.bridge.is_none() { config.bridge = sidecar.bridge; }
+                if config.bridge_ip_mode.is_none() { config.bridge_ip_mode = sidecar.bridge_ip_mode; }
+                if config.bridge_ip.is_none() { config.bridge_ip = sidecar.bridge_ip; }
+                if config.bridge_gateway.is_none() { config.bridge_gateway = sidecar.bridge_gateway; }
             }
         }
 
@@ -3701,6 +4062,11 @@ impl VmManager {
             bios_type,
             host_id: Some(crate::agent::self_node_id()),
             skip_default_nic: false,
+            network_mode: None,
+            bridge: None,
+            bridge_ip_mode: None,
+            bridge_ip: None,
+            bridge_gateway: None,
         };
 
         // Same WolfStack sidecar overlay as the subprocess path.
@@ -3716,6 +4082,11 @@ impl VmManager {
                     config.os_disk_bus = sidecar.os_disk_bus;
                 }
                 config.skip_default_nic = sidecar.skip_default_nic;
+                if config.network_mode.is_none() { config.network_mode = sidecar.network_mode; }
+                if config.bridge.is_none() { config.bridge = sidecar.bridge; }
+                if config.bridge_ip_mode.is_none() { config.bridge_ip_mode = sidecar.bridge_ip_mode; }
+                if config.bridge_ip.is_none() { config.bridge_ip = sidecar.bridge_ip; }
+                if config.bridge_gateway.is_none() { config.bridge_gateway = sidecar.bridge_gateway; }
             }
         }
 
@@ -3744,28 +4115,41 @@ impl VmManager {
             "--noautoconsole".to_string(),
         ];
 
-        // Network: use libvirt's default NAT network for primary connectivity
-        // (gives the VM internet access via 192.168.122.x).
-        args.extend(["--network".to_string(), "default".to_string()]);
-
-        // When a WolfNet IP is configured, attach a SECOND NIC to a per-VM
-        // bridge. WolfStack runs a one-IP dnsmasq on that bridge so the VM
-        // gets its WolfNet IP automatically via DHCP — same UX as the
-        // standalone QEMU path. dnsmasq is started here (idempotent) and
-        // again at start_vm() time in case the host rebooted or dnsmasq
-        // was killed.
-        let wn_bridge = if let Some(ref wip) = config.wolfnet_ip {
-            self.ensure_dnsmasq_installed();
-            let bridge = Self::wn_bridge_name(&config.name);
-            if let Err(e) = self.setup_wolfnet_bridge(&bridge, wip) {
-                warn!("WolfNet bridge setup for VM '{}' failed (VM will still be created): {}", config.name, e);
+        // Net0 wiring driven by network_mode (mirrors the LXC model):
+        //   • "bridge"  — `--network bridge=<config.bridge>,model=virtio`
+        //   • "wolfnet" — `--network default` (NAT for internet egress)
+        //                 PLUS a SECOND NIC on the per-VM WolfNet bridge.
+        //   • "nat"     — `--network default` only (NAT, no WolfNet).
+        // virt-install's "default" is libvirt's NAT network (192.168.122.x).
+        let mode = config.effective_network_mode();
+        match mode {
+            "bridge" => {
+                let bridge = config.bridge.clone()
+                    .filter(|b| !b.is_empty())
+                    .unwrap_or_else(|| "virbr0".to_string());
+                args.extend(["--network".to_string(), format!("bridge={},model=virtio", bridge)]);
             }
-            args.extend(["--network".to_string(), format!("bridge={},model=virtio", bridge)]);
-            Some(bridge)
-        } else {
-            None
-        };
-        let _ = wn_bridge; // silence unused warning when no WolfNet IP set
+            _ => {
+                args.extend(["--network".to_string(), "default".to_string()]);
+            }
+        }
+
+        // For WolfNet mode (or legacy configs with wolfnet_ip set), attach a
+        // SECOND NIC to the per-VM WolfNet bridge. WolfStack runs a one-IP
+        // dnsmasq on that bridge so the VM gets its WolfNet IP automatically
+        // via DHCP — same UX as the standalone QEMU path. dnsmasq is started
+        // here (idempotent) and again at start_vm() time in case the host
+        // rebooted or dnsmasq was killed.
+        if mode == "wolfnet" {
+            if let Some(ref wip) = config.wolfnet_ip {
+                self.ensure_dnsmasq_installed();
+                let bridge = Self::wn_bridge_name(&config.name);
+                if let Err(e) = self.setup_wolfnet_bridge(&bridge, wip) {
+                    warn!("WolfNet bridge setup for VM '{}' failed (VM will still be created): {}", config.name, e);
+                }
+                args.extend(["--network".to_string(), format!("bridge={},model=virtio", bridge)]);
+            }
+        }
 
         // Import image or ISO — one of these is required for virt-install
         if let Some(ref import) = config.import_image {
@@ -4084,6 +4468,14 @@ impl VmManager {
             bios_type: discovered.bios_type,
             host_id: Some(crate::agent::self_node_id()),
             skip_default_nic: false,
+            // Adopted VMs default to "nat" — the libvirt sidecar overlay
+            // will populate the real mode if a sidecar exists; otherwise
+            // the operator picks a mode from the editor on first edit.
+            network_mode: None,
+            bridge: None,
+            bridge_ip_mode: None,
+            bridge_ip: None,
+            bridge_gateway: None,
         };
 
         // Save config
@@ -5840,6 +6232,8 @@ fn parse_pve_qemu_conf(vmid: u32, text: &str) -> Option<VmConfig> {
     let mut iso_path: Option<String> = None;
     let mut storage_path: Option<String> = None;
     let mut bios_type = "seabios".to_string();
+    let mut net0_bridge: Option<String> = None;
+    let mut net_model = "virtio".to_string();
 
     for line in main_section.lines() {
         let line = line.trim();
@@ -5857,9 +6251,13 @@ fn parse_pve_qemu_conf(vmid: u32, text: &str) -> Option<VmConfig> {
                 for part in val.split(',') {
                     let part = part.trim();
                     if let Some((kind, mac)) = part.split_once('=') {
-                        if matches!(kind, "virtio" | "e1000" | "rtl8139" | "vmxnet3") {
+                        if matches!(kind, "virtio" | "e1000" | "e1000e" | "rtl8139" | "vmxnet3") {
                             mac_address = Some(mac.to_string());
+                            net_model = kind.to_string();
                         }
+                    } else if let Some(br) = part.strip_prefix("bridge=") {
+                        let br = br.trim();
+                        if !br.is_empty() { net0_bridge = Some(br.to_string()); }
                     }
                 }
             }
@@ -5902,6 +6300,15 @@ fn parse_pve_qemu_conf(vmid: u32, text: &str) -> Option<VmConfig> {
 
     let running = is_pve_vmid_running(vmid);
 
+    // Derive network_mode from net0's bridge so the editor shows the right
+    // preset. vmbr0 (PVE's default management bridge) maps to "nat"; any
+    // other bridge means the operator (or WolfStack's vSwitch sugar) wired
+    // net0 to something explicit, so the editor shows the "bridge" preset.
+    let (derived_mode, derived_bridge) = match net0_bridge.as_deref() {
+        Some("vmbr0") | None => (Some("nat".to_string()), None),
+        Some(other) => (Some("bridge".to_string()), Some(other.to_string())),
+    };
+
     Some(VmConfig {
         name,
         cpus,
@@ -5916,7 +6323,7 @@ fn parse_pve_qemu_conf(vmid: u32, text: &str) -> Option<VmConfig> {
         wolfnet_ip: None,
         storage_path,
         os_disk_bus: "virtio".to_string(),
-        net_model: "virtio".to_string(),
+        net_model,
         drivers_iso: None,
         import_image: None,
         extra_disks: Vec::new(),
@@ -5927,6 +6334,11 @@ fn parse_pve_qemu_conf(vmid: u32, text: &str) -> Option<VmConfig> {
         bios_type,
         host_id: Some(crate::agent::self_node_id()),
         skip_default_nic: false,
+        network_mode: derived_mode,
+        bridge: derived_bridge,
+        bridge_ip_mode: None,
+        bridge_ip: None,
+        bridge_gateway: None,
     })
 }
 

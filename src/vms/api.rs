@@ -258,6 +258,26 @@ struct CreateVmRequest {
     /// BIOS type: "seabios" (legacy) or "ovmf" (UEFI/EFI)
     #[serde(default = "default_bios_type")]
     bios_type: String,
+    /// Primary-NIC network mode: "wolfnet" | "bridge" | "nat". Backwards-
+    /// compatible: omit and the manager derives mode from `wolfnet_ip`.
+    #[serde(default)]
+    network_mode: Option<String>,
+    /// Bridge name for `network_mode == "bridge"` (operator-picked vmbr0,
+    /// vmbr<vlan>, lxcbr0, br-pt-*, …). The frontend writes `vmbr<vlan>`
+    /// here after auto-creating a vSwitch VLAN attachment.
+    #[serde(default)]
+    bridge: Option<String>,
+    /// IP-assignment hint for bridge mode: "dhcp" | "static" (UI only — the
+    /// guest configures its own IP; persisted so the editor shows the
+    /// operator's choice back).
+    #[serde(default)]
+    bridge_ip_mode: Option<String>,
+    /// Static IP+CIDR for bridge mode when `bridge_ip_mode == "static"`.
+    #[serde(default)]
+    bridge_ip: Option<String>,
+    /// Static gateway for bridge mode when `bridge_ip_mode == "static"`.
+    #[serde(default)]
+    bridge_gateway: Option<String>,
 }
 
 fn default_bios_type() -> String { "seabios".to_string() }
@@ -286,6 +306,24 @@ async fn create_vm(req: HttpRequest, state: web::Data<AppState>, body: web::Json
     config.net_model = body.net_model.clone();
     config.drivers_iso = body.drivers_iso.clone();
     config.bios_type = body.bios_type.clone();
+
+    // Network mode + bridge fields. Validate mode at the boundary so a
+    // typo in the request can't silently fall through to the default
+    // path; everything else is a free-form string that the manager
+    // stores and read paths echo back.
+    if let Some(ref nm) = body.network_mode {
+        let allowed = matches!(nm.as_str(), "" | "wolfnet" | "bridge" | "nat");
+        if !allowed {
+            return HttpResponse::BadRequest().json(serde_json::json!({
+                "error": format!("invalid network_mode '{}': expected wolfnet | bridge | nat", nm)
+            }));
+        }
+        config.network_mode = if nm.is_empty() { None } else { Some(nm.clone()) };
+    }
+    config.bridge = body.bridge.clone().filter(|s| !s.is_empty());
+    config.bridge_ip_mode = body.bridge_ip_mode.clone().filter(|s| !s.is_empty());
+    config.bridge_ip = body.bridge_ip.clone().filter(|s| !s.is_empty());
+    config.bridge_gateway = body.bridge_gateway.clone().filter(|s| !s.is_empty());
 
     // If importing a disk image, set it on the config
     if let Some(ref img) = body.import_image {
@@ -345,13 +383,29 @@ struct UpdateVmRequest {
     extra_nics: Option<Vec<super::manager::NicConfig>>,
     usb_devices: Option<Vec<UsbDevice>>,
     pci_devices: Option<Vec<PciDevice>>,
+    /// Primary-NIC network mode: "wolfnet" | "bridge" | "nat".
+    network_mode: Option<String>,
+    /// Bridge name for `network_mode == "bridge"`.
+    bridge: Option<String>,
+    bridge_ip_mode: Option<String>,
+    bridge_ip: Option<String>,
+    bridge_gateway: Option<String>,
 }
 
 async fn update_vm(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>, body: web::Json<UpdateVmRequest>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let name = path.into_inner();
-    let manager = state.vms.lock().unwrap();
 
+    // Validate network_mode at the boundary (same as CreateVmRequest).
+    if let Some(ref nm) = body.network_mode {
+        if !matches!(nm.as_str(), "" | "wolfnet" | "bridge" | "nat") {
+            return HttpResponse::BadRequest().json(serde_json::json!({
+                "error": format!("invalid network_mode '{}': expected wolfnet | bridge | nat", nm)
+            }));
+        }
+    }
+
+    let manager = state.vms.lock().unwrap();
     match manager.update_vm(&name, body.cpus, body.memory_mb, body.iso_path.clone(),
                             body.wolfnet_ip.clone(), body.disk_size_gb,
                             body.os_disk_bus.clone(), body.net_model.clone(),
@@ -359,7 +413,12 @@ async fn update_vm(req: HttpRequest, state: web::Data<AppState>, path: web::Path
                             body.bios_type.clone(),
                             body.extra_nics.clone(),
                             body.usb_devices.clone(),
-                            body.pci_devices.clone()) {
+                            body.pci_devices.clone(),
+                            body.network_mode.clone(),
+                            body.bridge.clone(),
+                            body.bridge_ip_mode.clone(),
+                            body.bridge_ip.clone(),
+                            body.bridge_gateway.clone()) {
         Ok(_) => HttpResponse::Ok().json(serde_json::json!({ "success": true })),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
     }

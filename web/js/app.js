@@ -8308,6 +8308,375 @@ function removeVmDiskRow(id) {
     if (row) row.remove();
 }
 
+// ─── VM primary-NIC network section ──────────────────────────────────
+// Mirrors the LXC create / settings network UX so the operator picks a
+// preset card (WolfNet / Bridged LAN / vSwitch VLAN / NAT) instead of
+// guessing what blank-vs-filled-IP-textbox means. Used by both the create
+// modal (prefix "new-vm") and the edit modal (prefix "edit-vm"); the
+// `prefix` argument namespaces every element ID so both modals can coexist
+// in the DOM without clashing.
+
+// Cached lookups so we don't refetch on every modal open within the
+// same page lifetime. Mirrors `_lxcPhysicalNics` etc.
+var _vmBridgesCache = null;
+var _vmPhysicalNicsCache = null;
+var _vmWolfnetStatusCache = null;
+
+/// Build the HTML for a VM primary-NIC section. Returns a string the
+/// caller drops into a placeholder div (create modal) or into the edit
+/// modal markup. `prefix` is "new-vm" or "edit-vm" — every element ID
+/// is namespaced with it.
+function buildVmNetSection(prefix) {
+    return `
+    <div class="form-group" style="margin-top:12px;">
+        <label style="display:flex;align-items:center;gap:8px;">
+            <span style="font-weight:600;">Network</span>
+            <span id="${prefix}-net-status" style="font-size:12px;color:var(--text-muted);font-weight:400;">Checking WolfNet…</span>
+        </label>
+        <div style="padding:12px;background:var(--bg-tertiary);border-radius:8px;border:1px solid var(--border);">
+            <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;">
+                <button type="button" class="btn btn-sm ${prefix}-net-preset" data-net="wolfnet" onclick="vmSelectNetPreset('${prefix}','wolfnet')" style="flex:1;min-width:140px;padding:10px 12px;text-align:left;border:2px solid var(--primary,#06b6d4);background:rgba(6,182,212,0.1);">
+                    <strong style="display:block;font-size:12px;">WolfNet</strong>
+                    <span style="font-size:10px;color:var(--text-muted);">Recommended — reachable from every cluster node, auto-assigned IP, zero config.</span>
+                </button>
+                <button type="button" class="btn btn-sm ${prefix}-net-preset" data-net="bridge" onclick="vmSelectNetPreset('${prefix}','bridge')" style="flex:1;min-width:140px;padding:10px 12px;text-align:left;border:2px solid transparent;">
+                    <strong style="display:block;font-size:12px;">Bridged LAN</strong>
+                    <span style="font-size:10px;color:var(--text-muted);">Attach to a physical LAN bridge (vmbr0, lxcbr0). LAN IP via DHCP or static.</span>
+                </button>
+                <button type="button" class="btn btn-sm ${prefix}-net-preset" data-net="vswitch" onclick="vmSelectNetPreset('${prefix}','vswitch')" style="flex:1;min-width:140px;padding:10px 12px;text-align:left;border:2px solid transparent;">
+                    <strong style="display:block;font-size:12px;">vSwitch VLAN</strong>
+                    <span style="font-size:10px;color:var(--text-muted);">Hetzner vSwitch / OVH vRack — pick uplink + VLAN, bridge auto-created.</span>
+                </button>
+                <button type="button" class="btn btn-sm ${prefix}-net-preset" data-net="nat" onclick="vmSelectNetPreset('${prefix}','nat')" style="flex:1;min-width:140px;padding:10px 12px;text-align:left;border:2px solid transparent;">
+                    <strong style="display:block;font-size:12px;">NAT</strong>
+                    <span style="font-size:10px;color:var(--text-muted);">User-mode networking — VM has internet but nothing on your LAN can reach it.</span>
+                </button>
+            </div>
+            <input type="hidden" id="${prefix}-net-mode" value="wolfnet"/>
+            <div id="${prefix}-net-wolfnet">
+                <div style="display:flex;align-items:center;gap:8px;">
+                    <label style="font-size:13px;white-space:nowrap;">WolfNet IP:</label>
+                    <input id="${prefix}-wolfnet-ip" type="text" placeholder="auto (next free)"
+                        style="flex:1;padding:6px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg-primary);color:var(--text-primary);font-size:13px;">
+                </div>
+                <div style="font-size:11px;color:var(--text-muted);margin-top:4px;">Auto-assigned from the WolfNet subnet. Override with a specific IP or leave blank to skip WolfNet.</div>
+            </div>
+            <div id="${prefix}-net-bridge" style="display:none;">
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+                    <div>
+                        <label style="font-size:12px;">Bridge</label>
+                        <select id="${prefix}-bridge-name" style="width:100%;padding:6px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg-primary);color:var(--text-primary);font-size:12px;margin-top:3px;">
+                            <option value="vmbr0">vmbr0 (default)</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label style="font-size:12px;">IP assignment</label>
+                        <select id="${prefix}-bridge-ip-mode" onchange="document.getElementById('${prefix}-bridge-static').style.display = this.value === 'static' ? 'grid' : 'none';" style="width:100%;padding:6px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg-primary);color:var(--text-primary);font-size:12px;margin-top:3px;">
+                            <option value="dhcp">DHCP (from your router)</option>
+                            <option value="static">Static IP</option>
+                        </select>
+                    </div>
+                </div>
+                <div id="${prefix}-bridge-static" style="display:none;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px;">
+                    <div><label style="font-size:12px;">IP + CIDR</label><input id="${prefix}-bridge-ip" placeholder="192.168.10.50/24" style="width:100%;padding:6px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg-primary);color:var(--text-primary);font-size:12px;margin-top:3px;"/></div>
+                    <div><label style="font-size:12px;">Gateway</label><input id="${prefix}-bridge-gw" placeholder="192.168.10.1" style="width:100%;padding:6px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg-primary);color:var(--text-primary);font-size:12px;margin-top:3px;"/></div>
+                </div>
+                <div style="font-size:11px;color:var(--text-muted);margin-top:4px;">VM is attached to this bridge and gets a LAN IP. Use this when the VM should be reachable from your physical network.</div>
+            </div>
+            <div id="${prefix}-net-vswitch" style="display:none;">
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+                    <div>
+                        <label style="font-size:12px;">vSwitch uplink NIC</label>
+                        <select id="${prefix}-vsw-uplink" style="width:100%;padding:6px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg-primary);color:var(--text-primary);font-size:12px;margin-top:3px;">
+                            <option value="">Select interface…</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label style="font-size:12px;">VLAN Tag</label>
+                        <input id="${prefix}-vsw-vlan" type="text" placeholder="e.g. 4001" style="width:100%;padding:6px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg-primary);color:var(--text-primary);font-size:12px;margin-top:3px;"/>
+                    </div>
+                </div>
+                <div style="font-size:11px;color:var(--text-muted);margin-top:6px;line-height:1.5;">
+                    Pick a vSwitch uplink NIC and set the VLAN Tag (Hetzner: Robot → vSwitches, 4000–4091; OVH: your vRack VLAN). On Save, WolfStack auto-creates the tagged sub-interface + bridge <code>vmbr&lt;vlan&gt;</code> and attaches this VM. Uses the same VLAN-attachment store as LXC, so a vSwitch shared with containers is auto-detected.
+                </div>
+            </div>
+            <div id="${prefix}-net-nat" style="display:none;">
+                <div style="font-size:11px;color:var(--text-muted);">User-mode SLIRP — VM has internet via the host, but nothing on your LAN can reach it. Pick a bridge mode if you need inbound reachability.</div>
+            </div>
+            <div id="${prefix}-net-preview" style="margin-top:10px;font-size:11px;padding:6px 8px;background:var(--bg-secondary);border-radius:4px;color:var(--text-muted);">…</div>
+        </div>
+    </div>`;
+}
+
+/// Highlight the chosen preset card, hide every other detail section,
+/// and refresh the preview line. Mirrors `lxcSelectNetPreset()`.
+function vmSelectNetPreset(prefix, mode) {
+    const modeInput = document.getElementById(`${prefix}-net-mode`);
+    if (modeInput) {
+        modeInput.value = mode;
+        // .value= doesn't fire change/input on its own — dispatch one so
+        // the "equivalent curl" panel (which listens at modal scope) and
+        // any other live observers refresh.
+        modeInput.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    document.querySelectorAll(`.${prefix}-net-preset`).forEach(btn => {
+        const sel = btn.dataset.net === mode;
+        btn.style.borderColor = sel ? 'var(--primary,#06b6d4)' : 'transparent';
+        btn.style.background  = sel ? 'rgba(6,182,212,0.1)' : 'transparent';
+    });
+    const sections = ['wolfnet', 'bridge', 'vswitch', 'nat'];
+    sections.forEach(s => {
+        const el = document.getElementById(`${prefix}-net-${s}`);
+        if (el) el.style.display = (s === mode) ? '' : 'none';
+    });
+    updateVmNetPreview(prefix);
+}
+
+/// Live "this VM will be reachable at X" preview line. Updates on every
+/// keystroke when the user is in an interactive field.
+function updateVmNetPreview(prefix) {
+    const mode = (document.getElementById(`${prefix}-net-mode`) || {}).value || 'wolfnet';
+    const preview = document.getElementById(`${prefix}-net-preview`);
+    if (!preview) return;
+    if (mode === 'wolfnet') {
+        const ipField = document.getElementById(`${prefix}-wolfnet-ip`);
+        const ip = (ipField && (ipField.value || ipField.placeholder)) || '(auto)';
+        preview.innerHTML = `This VM will be reachable at <code>${ip}</code> via WolfNet from every cluster node.`;
+    } else if (mode === 'bridge') {
+        const br = (document.getElementById(`${prefix}-bridge-name`) || {}).value || 'vmbr0';
+        const ipMode = (document.getElementById(`${prefix}-bridge-ip-mode`) || {}).value || 'dhcp';
+        if (ipMode === 'static') {
+            const ip = (document.getElementById(`${prefix}-bridge-ip`) || {}).value || '<unset>';
+            preview.innerHTML = `VM attached to bridge <code>${br}</code> with static IP <code>${ip}</code>.`;
+        } else {
+            preview.innerHTML = `VM attached to bridge <code>${br}</code> — guest will request a DHCP lease from your LAN router.`;
+        }
+    } else if (mode === 'vswitch') {
+        const up = (document.getElementById(`${prefix}-vsw-uplink`) || {}).value || '<uplink>';
+        const vlan = (document.getElementById(`${prefix}-vsw-vlan`) || {}).value || '<vlan>';
+        preview.innerHTML = `On Save: bridge <code>vmbr${vlan}</code> will be created on uplink <code>${up}</code> (VLAN ${vlan}), VM attached to it.`;
+    } else {
+        preview.innerHTML = `VM gets internet via user-mode NAT. Nothing on your LAN can reach the VM.`;
+    }
+}
+
+/// Populate the bridge picker from /api/networking/interfaces. Filters to
+/// bridges only (`is_bridge`) and skips the per-VM WolfNet bridges
+/// (`wnbr-*`) since those are internal. Falls back to a vmbr0 default if
+/// the API isn't reachable.
+async function populateVmBridges(prefix, selected) {
+    const sel = document.getElementById(`${prefix}-bridge-name`);
+    if (!sel) return;
+    let bridges = _vmBridgesCache;
+    if (!bridges) {
+        try {
+            const r = await fetch(apiUrl('/api/networking/interfaces'));
+            if (r.ok) {
+                const arr = await r.json();
+                bridges = (Array.isArray(arr) ? arr : [])
+                    .filter(i => i && (i.is_bridge || (i.name || '').match(/^(vmbr|br-|lxcbr|virbr|wolfnet0)/)))
+                    .filter(i => !(i.name || '').startsWith('wnbr-'))
+                    .map(i => i.name);
+            }
+        } catch (_) { bridges = null; }
+        _vmBridgesCache = bridges;
+    }
+    const opts = (bridges && bridges.length) ? bridges : ['vmbr0'];
+    // Keep the saved selection visible even if it's no longer in the
+    // detected list (bridge renamed, host changed) so the editor
+    // round-trips the value on Save.
+    if (selected && !opts.includes(selected)) opts.unshift(selected);
+    sel.innerHTML = opts.map(b => {
+        const s = b === selected ? ' selected' : '';
+        return `<option value="${escapeHtml(b)}"${s}>${escapeHtml(b)}${b === 'vmbr0' ? ' (default)' : ''}</option>`;
+    }).join('');
+}
+
+/// Populate the vSwitch uplink picker from /api/networking/interfaces,
+/// same filter LXC uses (physical NICs only — no veth/bridges/wolfnet).
+async function populateVmVswitchUplinks(prefix, selected) {
+    const sel = document.getElementById(`${prefix}-vsw-uplink`);
+    if (!sel) return;
+    let nics = _vmPhysicalNicsCache;
+    if (!nics) {
+        try {
+            const r = await fetch(apiUrl('/api/networking/interfaces'));
+            if (r.ok) {
+                const arr = await r.json();
+                nics = (Array.isArray(arr) ? arr : [])
+                    .filter(i => !i.is_vlan
+                        && !(i.name || '').startsWith('docker')
+                        && !(i.name || '').startsWith('br-')
+                        && !(i.name || '').startsWith('veth')
+                        && !(i.name || '').startsWith('wn')
+                        && !(i.name || '').startsWith('wolfnet')
+                        && !(i.name || '').startsWith('lo')
+                        && !(i.name || '').startsWith('vmbr'))
+                    .map(i => i.name);
+            }
+        } catch (_) { nics = []; }
+        _vmPhysicalNicsCache = nics;
+    }
+    const list = (nics || []).slice();
+    if (selected && !list.includes(selected)) list.push(selected);
+    let html = '<option value="">Select interface…</option>';
+    list.forEach(n => {
+        const s = n === selected ? ' selected' : '';
+        html += `<option value="${escapeHtml(n)}"${s}>${escapeHtml(n)}</option>`;
+    });
+    sel.innerHTML = html;
+}
+
+/// Fetch WolfNet status and seed the auto-IP placeholder. If WolfNet
+/// isn't available, switch the form to Bridge mode (or NAT if no bridges)
+/// so the operator isn't on a broken default.
+async function loadVmWolfnetStatus(prefix, currentIp) {
+    const statusEl = document.getElementById(`${prefix}-net-status`);
+    const ipInput = document.getElementById(`${prefix}-wolfnet-ip`);
+    let status = _vmWolfnetStatusCache;
+    try {
+        if (!status) {
+            const r = await fetch(apiUrl('/api/wolfnet/status'));
+            if (r.ok) status = await r.json();
+            _vmWolfnetStatusCache = status;
+        }
+    } catch (_) { status = null; }
+    if (status && status.available) {
+        if (statusEl) statusEl.innerHTML = '<span style="color:var(--success);">● Active</span> — subnet ' + escapeHtml(String(status.subnet || ''));
+        if (ipInput) {
+            ipInput.placeholder = status.next_available_ip || 'auto';
+            if (!ipInput.value && currentIp) ipInput.value = currentIp;
+            else if (!ipInput.value) ipInput.value = status.next_available_ip || '';
+        }
+        updateVmNetPreview(prefix);
+    } else {
+        if (statusEl) statusEl.innerHTML = '<span style="color:var(--text-muted);">● Not available</span> — set up WolfNet first';
+        if (ipInput) { ipInput.placeholder = 'WolfNet not running'; ipInput.disabled = true; }
+        // Only auto-flip on the create modal; on edit we don't want to
+        // force a mode change on a VM that was already configured.
+        if (prefix === 'new-vm') vmSelectNetPreset(prefix, 'bridge');
+    }
+}
+
+/// Set up the network section in the modal identified by `prefix`. Wires
+/// click/input listeners, populates dropdowns from API data, and shows
+/// the right preset card for `existing` (a VmConfig fragment, or {} for
+/// the create modal default). Call this once per modal open.
+async function wireVmNetSection(prefix, existing) {
+    existing = existing || {};
+    const mode = existing.network_mode
+        || ((existing.wolfnet_ip ? 'wolfnet' : null))
+        || 'wolfnet';
+    // Pre-fill scalar fields BEFORE flipping the preset so the preview
+    // line and visibility match the persisted state.
+    const ipInput = document.getElementById(`${prefix}-wolfnet-ip`);
+    if (ipInput && existing.wolfnet_ip) ipInput.value = existing.wolfnet_ip;
+    const bIpMode = document.getElementById(`${prefix}-bridge-ip-mode`);
+    if (bIpMode && existing.bridge_ip_mode) bIpMode.value = existing.bridge_ip_mode;
+    const bIp = document.getElementById(`${prefix}-bridge-ip`);
+    if (bIp && existing.bridge_ip) bIp.value = existing.bridge_ip;
+    const bGw = document.getElementById(`${prefix}-bridge-gw`);
+    if (bGw && existing.bridge_gateway) bGw.value = existing.bridge_gateway;
+
+    // Populate the bridge and uplink pickers BEFORE picking the mode so
+    // the saved selection sticks (the option must exist before the
+    // `.value =` setter takes effect).
+    let initialMode = mode;
+    let initialBridge = existing.bridge || '';
+    let initialVswUplink = '';
+    let initialVlanTag = '';
+    // If the persisted bridge is a vSwitch attachment (vmbr<vlan>),
+    // recover the uplink + VLAN from /api/networking/vlan so the
+    // editor shows the vSwitch card instead of bare Bridge mode.
+    if (mode === 'bridge' && initialBridge) {
+        try {
+            const r = await fetch(apiUrl('/api/networking/vlan'));
+            if (r.ok) {
+                const data = await r.json();
+                const att = (data.vlans || []).find(v => v.bridge_name === initialBridge);
+                if (att && att.parent_iface && att.vlan_id) {
+                    initialMode = 'vswitch';
+                    initialVswUplink = att.parent_iface;
+                    initialVlanTag = String(att.vlan_id);
+                }
+            }
+        } catch (_) { /* keep plain bridge mode */ }
+    }
+    await populateVmBridges(prefix, initialBridge);
+    await populateVmVswitchUplinks(prefix, initialVswUplink);
+    if (initialVlanTag) {
+        const vlanEl = document.getElementById(`${prefix}-vsw-vlan`);
+        if (vlanEl) vlanEl.value = initialVlanTag;
+    }
+
+    vmSelectNetPreset(prefix, initialMode);
+
+    // Re-style the bridge-static row when ip-mode is static at load.
+    if (bIpMode && bIpMode.value === 'static') {
+        const stat = document.getElementById(`${prefix}-bridge-static`);
+        if (stat) stat.style.display = 'grid';
+    }
+
+    // Live preview wiring.
+    ['wolfnet-ip', 'bridge-name', 'bridge-ip-mode', 'bridge-ip', 'bridge-gw', 'vsw-uplink', 'vsw-vlan']
+        .forEach(suffix => {
+            const el = document.getElementById(`${prefix}-${suffix}`);
+            if (el) el.addEventListener('input', () => updateVmNetPreview(prefix));
+            if (el && el.tagName === 'SELECT') el.addEventListener('change', () => updateVmNetPreview(prefix));
+        });
+
+    await loadVmWolfnetStatus(prefix, existing.wolfnet_ip || '');
+}
+
+/// Collect VM net section values into the JSON-ready payload. Returns a
+/// Promise that resolves to the field object — for vSwitch mode we await
+/// the bridge auto-create (same `ensureVswitchBridge` LXC uses) before
+/// returning so the saved `bridge` field is the resolved name. On error
+/// the promise rejects with a human-readable message the caller can show.
+async function collectVmNetFields(prefix) {
+    const mode = (document.getElementById(`${prefix}-net-mode`) || {}).value || 'wolfnet';
+    const out = {
+        network_mode: mode,
+        wolfnet_ip: null,
+        bridge: null,
+        bridge_ip_mode: null,
+        bridge_ip: null,
+        bridge_gateway: null,
+    };
+    if (mode === 'wolfnet') {
+        const ip = ((document.getElementById(`${prefix}-wolfnet-ip`) || {}).value || '').trim();
+        out.wolfnet_ip = ip || null;
+    } else if (mode === 'bridge') {
+        const br = ((document.getElementById(`${prefix}-bridge-name`) || {}).value || '').trim();
+        if (!br) throw new Error('Pick a bridge for Bridged LAN mode');
+        out.bridge = br;
+        const ipm = ((document.getElementById(`${prefix}-bridge-ip-mode`) || {}).value || 'dhcp').trim();
+        out.bridge_ip_mode = ipm;
+        if (ipm === 'static') {
+            out.bridge_ip = ((document.getElementById(`${prefix}-bridge-ip`) || {}).value || '').trim() || null;
+            out.bridge_gateway = ((document.getElementById(`${prefix}-bridge-gw`) || {}).value || '').trim() || null;
+        }
+    } else if (mode === 'vswitch') {
+        const up = ((document.getElementById(`${prefix}-vsw-uplink`) || {}).value || '').trim();
+        const vlanStr = ((document.getElementById(`${prefix}-vsw-vlan`) || {}).value || '').trim();
+        if (!up) throw new Error('Pick a vSwitch uplink NIC');
+        const vlan = parseInt(vlanStr, 10);
+        if (!Number.isInteger(vlan) || vlan < 1 || vlan > 4094) {
+            throw new Error(`vSwitch VLAN "${vlanStr}" is invalid (must be 1–4094)`);
+        }
+        // Same auto-bridge helper LXC uses — idempotent, returns
+        // { name: "vmbr<vlan>", mtu }. Persisted state is just the
+        // bridge name (mode flips to "bridge" on the wire).
+        const bridge = await ensureVswitchBridge(up, vlan, '1400');
+        out.network_mode = 'bridge';
+        out.bridge = bridge.name;
+        out.bridge_ip_mode = 'dhcp';
+    } else {
+        out.network_mode = 'nat';
+    }
+    return out;
+}
+
 async function showVmCreate() {
     // Fetch storage locations before showing the modal
     await fetchStorageLocations();
@@ -8315,6 +8684,15 @@ async function showVmCreate() {
     const storageSelect = document.getElementById('new-vm-storage');
     if (storageSelect) {
         storageSelect.innerHTML = buildStorageOptions('');
+    }
+    // Inject the LXC-style primary-NIC section into the create modal's
+    // placeholder div. Mirrors what showLxcCreate() does for containers.
+    const netPlaceholder = document.getElementById('new-vm-net-section-placeholder');
+    if (netPlaceholder) {
+        netPlaceholder.innerHTML = buildVmNetSection('new-vm');
+        // Default to WolfNet — wireVmNetSection will auto-flip to Bridge
+        // if WolfNet isn't available on this node.
+        await wireVmNetSection('new-vm', {});
     }
     // Clear extra disks from previous use
     document.getElementById('vm-extra-disks-container').innerHTML = '';
@@ -8384,17 +8762,24 @@ function _injectNewVmEquivalentCli() {
 function _buildNewVmCurl() {
     const v = (id) => (document.getElementById(id) || {}).value || '';
     const name = v('new-vm-name').trim() || '<vm-name>';
+    const mode = v('new-vm-net-mode') || 'wolfnet';
     const body = {
         name: name,
         cpus: parseInt(v('new-vm-cpus'), 10) || 2,
         memory_mb: parseInt(v('new-vm-memory'), 10) || 2048,
         disk_size_gb: parseInt(v('new-vm-disk'), 10) || 20,
         iso_path: v('new-vm-iso').trim() || null,
-        wolfnet_ip: v('new-vm-wolfnet-ip').trim() || null,
+        wolfnet_ip: mode === 'wolfnet' ? (v('new-vm-wolfnet-ip').trim() || null) : null,
         storage_path: v('new-vm-storage') || null,
         os_disk_bus: v('new-vm-os-bus') || 'virtio',
         net_model: v('new-vm-net-model') || 'virtio',
         bios_type: v('new-vm-bios-type') || 'seabios',
+        // vSwitch resolves to "bridge" on submit (the bridge is auto-
+        // created). The curl preview shows the same wire shape.
+        network_mode: mode === 'vswitch' ? 'bridge' : mode,
+        bridge: (mode === 'bridge') ? (v('new-vm-bridge-name') || null)
+              : (mode === 'vswitch') ? `vmbr${v('new-vm-vsw-vlan') || '<vlan>'}`
+              : null,
     };
     const json = JSON.stringify(body, null, 2)
         .split('\n').map((l, i) => i === 0 ? l : '       ' + l).join('\n');
@@ -8607,7 +8992,6 @@ async function createVm() {
     const memory = parseInt(document.getElementById('new-vm-memory').value);
     const disk = parseInt(document.getElementById('new-vm-disk').value);
     const iso = document.getElementById('new-vm-iso').value.trim() || null;
-    const wolfnetIp = document.getElementById('new-vm-wolfnet-ip').value.trim() || null;
     const storagePath = document.getElementById('new-vm-storage').value || null;
     const osDiskBus = document.getElementById('new-vm-os-bus').value || 'virtio';
     const netModel = document.getElementById('new-vm-net-model').value || 'virtio';
@@ -8631,6 +9015,17 @@ async function createVm() {
         }
     }
 
+    // Collect primary-NIC network mode. vSwitch resolves to a Bridge
+    // mode payload, auto-creating `vmbr<vlan>` first via the same
+    // VLAN-attachment endpoint LXC uses.
+    let netFields;
+    try {
+        netFields = await collectVmNetFields('new-vm');
+    } catch (e) {
+        showToast(e.message || String(e), 'error');
+        return;
+    }
+
     try {
         showToast('Creating VM...', 'info');
         const resp = await fetch(apiUrl('/api/vms/create'), {
@@ -8642,7 +9037,7 @@ async function createVm() {
                 memory_mb: memory,
                 disk_size_gb: disk,
                 iso_path: iso,
-                wolfnet_ip: wolfnetIp,
+                wolfnet_ip: netFields.wolfnet_ip,
                 storage_path: storagePath,
                 os_disk_bus: osDiskBus,
                 net_model: netModel,
@@ -8650,7 +9045,12 @@ async function createVm() {
                 import_image: importImage,
                 bios_type: biosType,
                 extra_disks: extraDisks,
-                extra_nics: collectExtraNics('new-vm-extra-nics')
+                extra_nics: collectExtraNics('new-vm-extra-nics'),
+                network_mode: netFields.network_mode,
+                bridge: netFields.bridge,
+                bridge_ip_mode: netFields.bridge_ip_mode,
+                bridge_ip: netFields.bridge_ip,
+                bridge_gateway: netFields.bridge_gateway
             })
         });
         const data = await resp.json();
@@ -25535,28 +25935,25 @@ async function showVmSettings(name) {
             <!-- ═══ Tab 3: Network & Boot ═══ -->
             <div class="vms-tab-page" id="vms-tab-3" style="display:none;">
                 <div style="padding:12px;background:var(--bg-tertiary);border-radius:8px;border:1px solid var(--border);margin-bottom:12px;">
-                    <h4 style="margin:0 0 8px 0;font-size:13px;">Network Interface</h4>
+                    <h4 style="margin:0 0 8px 0;font-size:13px;">Current state</h4>
                     <div style="font-size:11px;color:var(--text-muted);font-family:monospace;display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:2px 12px;padding:6px 8px;background:var(--bg-primary);border-radius:6px;border:1px solid var(--border);">
                         <span>MAC: ${escapeHtml(vm.mac_address || 'auto')}</span>
                         <span>Model: ${escapeHtml(vm.net_model || 'virtio')}</span>
-                        <span>Bridge: ${escapeHtml(vm.bridge || 'user-mode')}</span>
+                        <span>Bridge: ${escapeHtml(vm.bridge || (vm.wolfnet_ip ? 'wolfnet' : 'user-mode'))}</span>
                         ${vm.wolfnet_ip ? `<span>WolfNet: ${escapeHtml(vm.wolfnet_ip)}</span>` : ''}
                     </div>
                 </div>
-                <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
-                    <div class="form-group">
-                        <label>Network Adapter</label>
-                        <select class="form-control" id="edit-vm-net-model" style="font-size:13px;">
-                            <option value="virtio"${vm.net_model === 'virtio' || !vm.net_model ? ' selected' : ''}>VirtIO (Linux)</option>
-                            <option value="e1000"${vm.net_model === 'e1000' ? ' selected' : ''}>Intel e1000 (Windows)</option>
-                            <option value="rtl8139"${vm.net_model === 'rtl8139' ? ' selected' : ''}>Realtek RTL8139</option>
-                        </select>
-                    </div>
-                    <div class="form-group">
-                        <label>WolfNet IP</label>
-                        <input type="text" class="form-control" id="edit-vm-wolfnet-ip" value="${vm.wolfnet_ip || ''}"
-                            placeholder="Leave empty for user-mode networking">
-                    </div>
+                <!-- LXC-style primary-NIC preset cards. Wired up by
+                     wireVmNetSection('edit-vm', vm) below the modal HTML. -->
+                <div id="edit-vm-net-section-placeholder"></div>
+                <div class="form-group" style="margin-top:12px;">
+                    <label>Network adapter driver</label>
+                    <select class="form-control" id="edit-vm-net-model" style="font-size:13px;">
+                        <option value="virtio"${vm.net_model === 'virtio' || !vm.net_model ? ' selected' : ''}>VirtIO (Linux)</option>
+                        <option value="e1000"${vm.net_model === 'e1000' ? ' selected' : ''}>Intel e1000 (Windows)</option>
+                        <option value="e1000e"${vm.net_model === 'e1000e' ? ' selected' : ''}>Intel e1000e</option>
+                        <option value="rtl8139"${vm.net_model === 'rtl8139' ? ' selected' : ''}>Realtek RTL8139</option>
+                    </select>
                 </div>
                 <!-- Extra NICs -->
                 <div style="margin-top:12px; padding:12px; background:var(--bg-tertiary); border-radius:8px; border:1px solid var(--border);">
@@ -25639,6 +26036,14 @@ async function showVmSettings(name) {
             for (const nic of vm.extra_nics) {
                 addExtraNicRow('edit-vm-extra-nics', nic);
             }
+        }
+        // Build + wire the primary-NIC preset cards from the persisted
+        // mode. wireVmNetSection re-detects vSwitch attachments so editing
+        // a VM created via the vSwitch preset re-opens on that card.
+        const editNetPlaceholder = document.getElementById('edit-vm-net-section-placeholder');
+        if (editNetPlaceholder) {
+            editNetPlaceholder.innerHTML = buildVmNetSection('edit-vm');
+            await wireVmNetSection('edit-vm', vm);
         }
         // Stash the VM's current passthrough selection + load host devices
         window._editVmPassthrough = {
@@ -25914,11 +26319,21 @@ async function saveVmSettings(name) {
     const memory = parseInt(document.getElementById('edit-vm-memory').value);
     const disk = parseInt(document.getElementById('edit-vm-disk').value);
     const iso = document.getElementById('edit-vm-iso').value.trim();
-    const wolfnetIp = document.getElementById('edit-vm-wolfnet-ip').value.trim();
     const osDiskBus = document.getElementById('edit-vm-os-bus')?.value || undefined;
     const netModel = document.getElementById('edit-vm-net-model')?.value || undefined;
     const driversIso = document.getElementById('edit-vm-drivers-iso')?.value.trim() ?? undefined;
     const biosType = document.getElementById('edit-vm-bios-type')?.value || undefined;
+
+    // Primary-NIC network mode. vSwitch resolves to a Bridge payload after
+    // the auto-create. Validation errors come back as exceptions so we
+    // can surface them and stop the save.
+    let netFields;
+    try {
+        netFields = await collectVmNetFields('edit-vm');
+    } catch (e) {
+        showToast(e.message || String(e), 'error');
+        return;
+    }
 
     const passthrough = collectPassthroughDevices();
     try {
@@ -25930,7 +26345,7 @@ async function saveVmSettings(name) {
                 memory_mb: memory,
                 disk_size_gb: disk,
                 iso_path: iso,
-                wolfnet_ip: wolfnetIp,
+                wolfnet_ip: netFields.wolfnet_ip,
                 os_disk_bus: osDiskBus,
                 net_model: netModel,
                 drivers_iso: driversIso,
@@ -25938,6 +26353,11 @@ async function saveVmSettings(name) {
                 extra_nics: collectExtraNics('edit-vm-extra-nics'),
                 usb_devices: passthrough.usb_devices,
                 pci_devices: passthrough.pci_devices,
+                network_mode: netFields.network_mode,
+                bridge: netFields.bridge,
+                bridge_ip_mode: netFields.bridge_ip_mode,
+                bridge_ip: netFields.bridge_ip,
+                bridge_gateway: netFields.bridge_gateway,
             })
         });
         const data = await resp.json();
