@@ -1,7 +1,7 @@
 // WolfStack Service Worker — enables PWA install and offline shell.
 // Bump CACHE_NAME on any change to SHELL_ASSETS or the fetch handler so
 // every client's activate event evicts the stale cache and rebuilds.
-const CACHE_NAME = 'wolfstack-v24.6.0';
+const CACHE_NAME = 'wolfstack-v24.6.1';
 const SHELL_ASSETS = [
     '/',
     '/index.html',

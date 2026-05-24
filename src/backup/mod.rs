@@ -4057,25 +4057,32 @@ pub fn list_available_targets() -> Vec<BackupTarget> {
         }
     }
 
-    // VMs (stored as {name}.json in the vms directory)
-    let vm_dir = Path::new("/var/lib/wolfstack/vms");
-    if vm_dir.exists() {
-        if let Ok(entries) = fs::read_dir(vm_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("json")
-                    && !path.to_string_lossy().contains(".runtime.")
-                {
-                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                        targets.push(BackupTarget {
-                            target_type: BackupTargetType::Vm,
-                            name: stem.to_string(),
-                            hostname: None, state: None, specs: None,
-                        });
-                    }
-                }
+    // VMs — enumerated via VmManager so Proxmox (`qm list`) and libvirt
+    // (`virsh list --all`) hosts surface their VMs in the backup picker
+    // too. Before v24.6.0 this scanned only `/var/lib/wolfstack/vms/*.json`
+    // (the native-KVM layout), so Proxmox/libvirt operators saw zero VMs
+    // in the Backups page even though backup_vm_proxmox / backup_vm_libvirt
+    // are perfectly capable of backing them up.
+    let vm_manager = crate::vms::manager::VmManager::new();
+    for vm in vm_manager.list_vms() {
+        let mut spec_parts: Vec<String> = Vec::new();
+        if vm.cpus > 0 { spec_parts.push(format!("{} vCPU", vm.cpus)); }
+        if vm.memory_mb > 0 {
+            if vm.memory_mb >= 1024 {
+                spec_parts.push(format!("{} GB RAM", vm.memory_mb / 1024));
+            } else {
+                spec_parts.push(format!("{} MB RAM", vm.memory_mb));
             }
         }
+        let specs = if spec_parts.is_empty() { None } else { Some(spec_parts.join(", ")) };
+        let state = Some(if vm.running { "running".to_string() } else { "stopped".to_string() });
+        targets.push(BackupTarget {
+            target_type: BackupTargetType::Vm,
+            name: vm.name,
+            hostname: None,
+            state,
+            specs,
+        });
     }
 
     // Config is always available

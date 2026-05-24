@@ -5446,21 +5446,57 @@ function renderVms(vms) {
                 <td><input type="checkbox" ${autostart} onchange="toggleVmAutostart('${vm.name}', this.checked)"></td>
                 <td><div style="display:flex; flex-wrap:wrap; gap:2px; min-width:0;">
                     <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="showVmLogs('${vm.name}')" title="Logs"><span class="ws-icon-clean-wrap" data-icon="logs"></span></button>
-                    ${vm.running ?
-                `${vm.vmid
-                    ? `<button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="openPveVmConsole('${vm.vmid}', '${vm.name}')" title="VNC Console"><span class="ws-icon-clean-wrap" data-icon="terminal"></span></button>`
-                    : ((vm.vnc_ws_port || vm.vnc_port) ? `<button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="openVmVnc('${vm.name}', ${vm.vnc_ws_port || vm.vnc_port})" title="VNC Console"><span class="ws-icon-clean-wrap" data-icon="terminal"></span></button>` : '')}
-                         <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="openVmConsole('${vm.name}')" title="Serial terminal (guest must have serial console enabled)"><span class="ws-icon-clean-wrap" data-icon="terminal"></span></button>
-                         <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#ef4444;" onclick="vmAction('${vm.name}', 'stop', this)" title="Stop (graceful ACPI shutdown)"><span class="ws-icon-clean-wrap" data-icon="stop"></span></button>
-                         <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#b91c1c;" onclick="vmForceStopConfirm('${vm.name}', this)" title="Force Stop (power off immediately)"><span class="ws-icon-clean-wrap" data-icon="stop"></span></button>` :
-                `<button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="showVmSettings('${vm.name}')" title="Settings"><span class="ws-icon-clean-wrap" data-icon="settings"></span></button>
-                         <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#a855f7;" onclick="backupSingleVm('${vm.name}')" title="Back up this VM now (portable tar.gz to local storage)"><span class="ws-icon-clean-wrap" data-icon="save"></span></button>
-                         <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#eab308;" onclick="cloneVm('${vm.name}')" title="Clone this VM (full copy of disks, fresh MACs)"><span class="ws-icon-clean-wrap" data-icon="copy"></span></button>
-                         <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#3b82f6;" onclick="migrateVm('${vm.name}')" title="Migrate to another node"><span class="ws-icon-clean-wrap" data-icon="migrate"></span></button>
-                         <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#06b6d4;" onclick="migrateVmDiskStorage('${vm.name}')" title="Move disk to different storage (same node)"><span class="ws-icon-clean-wrap" data-icon="migrate"></span></button>
-                         <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#22c55e;" onclick="vmAction('${vm.name}', 'start', this)" title="Start">▶️</button>
-                         <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#ef4444;" onclick="deleteVm('${vm.name}')" title="Delete"><span class="ws-icon-clean-wrap" data-icon="trash"></span></button>`
-            }
+                    ${(() => {
+                        // Shared button styles. `disabledStyle` mirrors the
+                        // card view's `bd`: visible but greyed and unclickable,
+                        // so the operator can SEE the action exists and read
+                        // why it's disabled, rather than the button vanishing.
+                        const baseStyle    = 'margin:2px;font-size:20px;line-height:1;padding:4px 6px;';
+                        const disabledStyle = baseStyle + 'opacity:0.3;cursor:not-allowed;pointer-events:none;';
+                        const stopReason = (verb) =>
+                            `Stop the VM first — ${verb} a running VM produces an inconsistent disk image`;
+                        // Settings + delete are stop-only too (changing CPU/RAM/
+                        // disks of a live guest needs the qmp socket dance we
+                        // don't do; delete refuses if running anyway).
+                        const settingsBtn = vm.running
+                            ? `<button class="btn btn-sm" style="${disabledStyle}" disabled title="Stop the VM to edit its hardware settings"><span class="ws-icon-clean-wrap" data-icon="settings"></span></button>`
+                            : `<button class="btn btn-sm" style="${baseStyle}" onclick="showVmSettings('${vm.name}')" title="Settings"><span class="ws-icon-clean-wrap" data-icon="settings"></span></button>`;
+                        const backupBtn = vm.running
+                            ? `<button class="btn btn-sm" style="${disabledStyle}color:#a855f7;" disabled title="${stopReason('backing up')}"><span class="ws-icon-clean-wrap" data-icon="save"></span></button>`
+                            : `<button class="btn btn-sm" style="${baseStyle}color:#a855f7;" onclick="backupSingleVm('${vm.name}')" title="Back up this VM now (portable tar.gz to local storage)"><span class="ws-icon-clean-wrap" data-icon="save"></span></button>`;
+                        const cloneBtn = vm.running
+                            ? `<button class="btn btn-sm" style="${disabledStyle}color:#eab308;" disabled title="${stopReason('cloning')}"><span class="ws-icon-clean-wrap" data-icon="copy"></span></button>`
+                            : `<button class="btn btn-sm" style="${baseStyle}color:#eab308;" onclick="cloneVm('${vm.name}')" title="Clone this VM (full copy of disks, fresh MACs)"><span class="ws-icon-clean-wrap" data-icon="copy"></span></button>`;
+                        const migrateBtn = vm.running
+                            ? `<button class="btn btn-sm" style="${disabledStyle}color:#3b82f6;" disabled title="${stopReason('migrating')}"><span class="ws-icon-clean-wrap" data-icon="migrate"></span></button>`
+                            : `<button class="btn btn-sm" style="${baseStyle}color:#3b82f6;" onclick="migrateVm('${vm.name}')" title="Migrate to another node"><span class="ws-icon-clean-wrap" data-icon="migrate"></span></button>`;
+                        const diskMigrateBtn = vm.running
+                            ? `<button class="btn btn-sm" style="${disabledStyle}color:#06b6d4;" disabled title="Stop the VM first — moving a live disk would corrupt it"><span class="ws-icon-clean-wrap" data-icon="migrate"></span></button>`
+                            : `<button class="btn btn-sm" style="${baseStyle}color:#06b6d4;" onclick="migrateVmDiskStorage('${vm.name}')" title="Move disk to different storage (same node)"><span class="ws-icon-clean-wrap" data-icon="migrate"></span></button>`;
+                        const deleteBtn = vm.running
+                            ? `<button class="btn btn-sm" style="${disabledStyle}color:#ef4444;" disabled title="Stop the VM before deleting"><span class="ws-icon-clean-wrap" data-icon="trash"></span></button>`
+                            : `<button class="btn btn-sm" style="${baseStyle}color:#ef4444;" onclick="deleteVm('${vm.name}')" title="Delete"><span class="ws-icon-clean-wrap" data-icon="trash"></span></button>`;
+                        // Power controls — only one of start/stop is sensible at a time.
+                        const powerBtn = vm.running
+                            ? `<button class="btn btn-sm" style="${baseStyle}color:#ef4444;" onclick="vmAction('${vm.name}', 'stop', this)" title="Stop (graceful ACPI shutdown)"><span class="ws-icon-clean-wrap" data-icon="stop"></span></button>
+                               <button class="btn btn-sm" style="${baseStyle}color:#b91c1c;" onclick="vmForceStopConfirm('${vm.name}', this)" title="Force Stop (power off immediately)"><span class="ws-icon-clean-wrap" data-icon="stop"></span></button>`
+                            : `<button class="btn btn-sm" style="${baseStyle}color:#22c55e;" onclick="vmAction('${vm.name}', 'start', this)" title="Start">▶️</button>`;
+                        // Console / VNC — only meaningful when running.
+                        const vncBtn = vm.running
+                            ? (vm.vmid
+                                ? `<button class="btn btn-sm" style="${baseStyle}" onclick="openPveVmConsole('${vm.vmid}', '${vm.name}')" title="VNC Console"><span class="ws-icon-clean-wrap" data-icon="terminal"></span></button>`
+                                : ((vm.vnc_ws_port || vm.vnc_port)
+                                    ? `<button class="btn btn-sm" style="${baseStyle}" onclick="openVmVnc('${vm.name}', ${vm.vnc_ws_port || vm.vnc_port})" title="VNC Console"><span class="ws-icon-clean-wrap" data-icon="terminal"></span></button>`
+                                    : ''))
+                            : '';
+                        const serialBtn = vm.running
+                            ? `<button class="btn btn-sm" style="${baseStyle}" onclick="openVmConsole('${vm.name}')" title="Serial terminal (guest must have serial console enabled)"><span class="ws-icon-clean-wrap" data-icon="terminal"></span></button>`
+                            : '';
+                        // Stable order regardless of state so the same icon
+                        // sits in the same column slot whether the VM is up
+                        // or down — operator muscle memory survives a reboot.
+                        return `${vncBtn} ${serialBtn} ${settingsBtn} ${backupBtn} ${cloneBtn} ${migrateBtn} ${diskMigrateBtn} ${powerBtn} ${deleteBtn}`;
+                    })()}
                 </div></td>
             </tr>${storageSubRow}
         `;
