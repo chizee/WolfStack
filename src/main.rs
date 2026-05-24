@@ -1646,11 +1646,22 @@ async fn main() -> std::io::Result<()> {
             }
         });
 
-        // Background: backup schedule checker (every 60s)
+        // Background: backup schedule checker (every 60s).
+        // check_schedules() is synchronous and ultimately runs
+        // qemu-img convert / tar over multi-GB VM disks — call it via
+        // spawn_blocking so a long backup can't starve the Tokio
+        // worker threads (which would also block the actix workers
+        // that share the same runtime).
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
-                backup::check_schedules();
+                if let Err(e) = tokio::task::spawn_blocking(backup::check_schedules).await {
+                    // A panic inside check_schedules would surface here
+                    // as a JoinError. Log it so we don't silently lose
+                    // the scheduler loop (the spawn itself keeps the
+                    // loop alive because each iteration spawns afresh).
+                    tracing::error!("backup::check_schedules panicked: {}", e);
+                }
             }
         });
 

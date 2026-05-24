@@ -250,6 +250,206 @@ pub(crate) fn generate_mac() -> String {
     format!("52:54:00:{:02x}:{:02x}:{:02x}", rng.r#gen::<u8>(), rng.r#gen::<u8>(), rng.r#gen::<u8>())
 }
 
+/// Validate a VM name for use in clone source / destination positions.
+/// Mirrors the backup-restore name validator: rejects path-traversal
+/// characters, control bytes, leading dots, and anything outside the
+/// libvirt-safe allowlist `[A-Za-z0-9_.+:-]`. Both `qm` and `virsh`
+/// pass these names as positional args; the allowlist also ensures
+/// they can't be misinterpreted by either hypervisor's arg parsing.
+pub(crate) fn validate_clone_vm_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("VM name is empty".into());
+    }
+    if name.contains('/') || name.contains('\\') || name.contains('\0')
+        || name.contains("..") || name.starts_with('.') || name.starts_with('-')
+    {
+        // Reject leading `-` so a malicious name (e.g. `--full`) can't
+        // be argv-injected into `qm clone … --name <name>` — Command
+        // does no shell parsing but the positional becomes a flag.
+        return Err(format!(
+            "invalid VM name '{}' — must not contain /, \\, NUL, '..' or start with '.' or '-'", name));
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric()
+        || c == '_' || c == '-' || c == '.' || c == '+' || c == ':')
+    {
+        return Err(format!(
+            "invalid VM name '{}' — only A-Z a-z 0-9 _ . - + : are allowed", name));
+    }
+    Ok(())
+}
+
+/// Snapshot returned by [`VmManager::prepare_clone`]; consumed by
+/// [`execute_clone`] outside the manager lock. The whole point of
+/// the split is so the multi-minute disk I/O does not hold the
+/// `Mutex<VmManager>` and starve every other VM API call.
+pub struct ClonePlan {
+    pub src: VmConfig,
+    pub base_dir: PathBuf,
+    /// Host runs Proxmox VE — dispatch via `qm clone`.
+    pub on_proxmox: bool,
+    /// Host runs libvirt AND the source has a libvirt domain by the
+    /// same name — dispatch via `virt-clone`. Falls through to the
+    /// native code path otherwise, which is correct on libvirt
+    /// hosts that also run WolfStack-native VMs.
+    pub on_libvirt: bool,
+}
+
+/// Perform the clone described by `plan`. Pure free function — does
+/// NOT take the `VmManager` mutex. Call this from inside `web::block`
+/// AFTER snapshotting via [`VmManager::prepare_clone`].
+pub fn execute_clone(plan: ClonePlan, new_name: &str, full: bool) -> Result<(), String> {
+    if plan.on_proxmox {
+        return clone_vm_proxmox_impl(&plan.src, new_name, full);
+    }
+    if plan.on_libvirt {
+        return clone_vm_libvirt_impl(&plan.src.name, new_name);
+    }
+    clone_vm_native_impl(&plan.src, &plan.base_dir, new_name)
+}
+
+fn clone_vm_proxmox_impl(src: &VmConfig, new_name: &str, full: bool) -> Result<(), String> {
+    let src_vmid = src.vmid.ok_or_else(||
+        format!("Proxmox VM '{}' has no vmid — cannot locate Proxmox state", src.name))?;
+    let new_vmid = next_pve_vmid()?;
+    let mut args: Vec<String> = vec![
+        "clone".to_string(),
+        src_vmid.to_string(),
+        new_vmid.to_string(),
+        "--name".to_string(),
+        new_name.to_string(),
+    ];
+    if full {
+        args.push("--full".to_string());
+        args.push("1".to_string());
+    }
+    let out = Command::new("qm").args(&args).output()
+        .map_err(|e| format!("qm clone failed to start: {}", e))?;
+    if !out.status.success() {
+        return Err(format!(
+            "qm clone {} → {}: {}",
+            src_vmid, new_vmid,
+            String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    Ok(())
+}
+
+fn clone_vm_libvirt_impl(src_name: &str, new_name: &str) -> Result<(), String> {
+    // virt-clone --auto-clone picks a fresh MAC + new disk names
+    // automatically, always does a full disk copy. Operator can
+    // edit the result via `virsh edit <new_name>` post-clone.
+    let out = Command::new("virt-clone")
+        .args(["--original", src_name, "--name", new_name, "--auto-clone"])
+        .output()
+        .map_err(|e| format!(
+            "virt-clone failed to start (is virt-install/virt-manager installed?): {}", e))?;
+    if !out.status.success() {
+        return Err(format!(
+            "virt-clone {} → {}: {}",
+            src_name, new_name,
+            String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    Ok(())
+}
+
+fn clone_vm_native_impl(src: &VmConfig, base_dir: &Path, new_name: &str) -> Result<(), String> {
+    // Live qcow2 copy = inconsistent disk. Refuse if source is
+    // running and tell the operator how to proceed.
+    if src.running {
+        return Err(format!(
+            "VM '{}' is running — stop it before cloning. \
+             Cloning a live disk would produce an inconsistent image.",
+            src.name));
+    }
+
+    // Build the new VmConfig: same shape, fresh identity.
+    let mut new_config = src.clone();
+    new_config.name = new_name.to_string();
+    new_config.mac_address = Some(generate_mac());
+    new_config.running = false;
+    new_config.vnc_port = None;
+    new_config.vnc_ws_port = None;
+    new_config.wolfnet_ip = None;
+    new_config.vmid = None;
+    // Refresh extra-NIC MACs too so the cloned VM doesn't collide
+    // with the source on any NIC.
+    for nic in &mut new_config.extra_nics {
+        nic.mac = Some(generate_mac());
+    }
+    // Rename extra-disk records so their on-disk filenames don't
+    // collide with the source's disks. replacen() swaps the first
+    // occurrence of the source VM name with the new name; this
+    // covers the common convention (e.g. "myvm-data" → "clone-
+    // data"). If the operator named the volume arbitrarily (no
+    // VM-name substring) the replacen is a no-op and we'd produce
+    // a colliding path. Detect that upfront with a clear message.
+    for disk in &mut new_config.extra_disks {
+        let renamed = disk.name.replacen(&src.name, new_name, 1);
+        if renamed == disk.name {
+            return Err(format!(
+                "extra disk '{}' does not contain the source VM name '{}' in its filename, \
+                 so the clone would collide with the source. \
+                 Rename or remove the volume before cloning.",
+                disk.name, src.name));
+        }
+        disk.name = renamed;
+    }
+
+    // Copy OS disk.
+    let src_disk = base_dir.join(format!("{}.qcow2", src.name));
+    let dest_disk = base_dir.join(format!("{}.qcow2", new_name));
+    if dest_disk.exists() {
+        return Err(format!(
+            "destination disk {} already exists — refusing to overwrite",
+            dest_disk.display()));
+    }
+    if src_disk.exists() {
+        if let Err(e) = fs::copy(&src_disk, &dest_disk) {
+            // fs::copy on Linux can leave a partial dest file when it
+            // fails mid-write (disk full, I/O error). Remove it so we
+            // don't leak corrupt qcow2 files into the VM directory.
+            let _ = fs::remove_file(&dest_disk);
+            return Err(format!("copy OS disk: {}", e));
+        }
+    }
+
+    // Copy extra disks. Roll back the OS-disk copy AND every extra
+    // we've already placed in this loop if anything fails — both
+    // "destination exists" and "copy failed" must clean up the
+    // earlier successes, otherwise a mid-loop failure leaks files.
+    let mut placed_extras: Vec<PathBuf> = Vec::new();
+    for (old, new) in src.extra_disks.iter().zip(new_config.extra_disks.iter()) {
+        let src_path = old.file_path();
+        let dest_path = new.file_path();
+        if dest_path.exists() {
+            let _ = fs::remove_file(&dest_disk);
+            for prev in &placed_extras { let _ = fs::remove_file(prev); }
+            return Err(format!(
+                "destination extra disk {} already exists — rolled back",
+                dest_path.display()));
+        }
+        if src_path.exists() {
+            if let Err(e) = fs::copy(&src_path, &dest_path) {
+                let _ = fs::remove_file(&dest_disk);
+                for prev in &placed_extras { let _ = fs::remove_file(prev); }
+                return Err(format!("copy extra disk {}: {}", old.name, e));
+            }
+            placed_extras.push(dest_path);
+        }
+    }
+
+    // Write the new config JSON.
+    let config_json = serde_json::to_string_pretty(&new_config)
+        .map_err(|e| format!("serialize new config: {}", e))?;
+    let new_config_path = base_dir.join(format!("{}.json", new_name));
+    if let Err(e) = fs::write(&new_config_path, &config_json) {
+        // Roll back every disk we actually placed.
+        let _ = fs::remove_file(&dest_disk);
+        for prev in &placed_extras { let _ = fs::remove_file(prev); }
+        return Err(format!("write new config: {}", e));
+    }
+    Ok(())
+}
+
 pub struct VmManager {
     pub base_dir: PathBuf,
 }
@@ -530,6 +730,59 @@ impl VmManager {
         // TAP names limited to 15 chars
         let short = if name.len() > 11 { &name[..11] } else { name };
         format!("tap-{}", short)
+    }
+
+    /// Clone an existing VM under a new name. Platform-dispatched:
+    ///
+    ///   • **Proxmox** → `qm clone <vmid> <new-vmid> --name <new-name>`
+    ///     (linked clone by default; `--full 1` for full copy). The
+    ///     new VMID comes from `next_pve_vmid()` — cluster-safe.
+    ///   • **libvirt** → `virt-clone --original <name> --name <new-name>
+    ///     --auto-clone`. virt-clone picks fresh MACs + disk names
+    ///     automatically and always does a full disk copy.
+    ///   • **native** → read VmConfig, regen MAC, clear runtime state,
+    ///     copy OS disk + every extra disk, write new JSON. Refuses
+    ///     if source is running (live qcow2 copy = inconsistent disk).
+    ///
+    /// `full` is honoured only on Proxmox (libvirt is always full,
+    /// native is always full). Caller is responsible for any
+    /// post-clone follow-up (start, console, etc.).
+    /// Fast, lock-friendly snapshot of everything `execute_clone`
+    /// needs to perform the clone WITHOUT holding the `VmManager`
+    /// mutex for the (potentially multi-minute) disk I/O. The API
+    /// handler calls this under the lock, drops the lock, and then
+    /// calls `execute_clone` on the returned plan.
+    ///
+    /// TOCTOU note: between the lock drop and `execute_clone`'s
+    /// final JSON write, a concurrent `create_vm` for the same name
+    /// could slip in and produce a duplicate. The window is
+    /// milliseconds for the platform paths (`qm clone`/`virt-clone`
+    /// themselves serialise on the hypervisor) and bounded by the
+    /// dest-disk `fs::copy` for native clones. We accept the risk
+    /// rather than hold the lock for the whole clone — name
+    /// collisions in the native path additionally fail at
+    /// `dest_disk.exists()` and at `fs::write(new_config_path)`.
+    pub fn prepare_clone(&self, name: &str, new_name: &str)
+        -> Result<ClonePlan, String>
+    {
+        validate_clone_vm_name(name)?;
+        validate_clone_vm_name(new_name)?;
+        if name == new_name {
+            return Err("source and destination names are identical — pick a different new name".into());
+        }
+        let all = self.list_vms();
+        let src = all.iter().find(|v| v.name == name).cloned()
+            .ok_or_else(|| format!("VM '{}' not found on this host", name))?;
+        if all.iter().any(|v| v.name == new_name) {
+            return Err(format!(
+                "VM '{}' already exists — pick a different new name", new_name));
+        }
+        Ok(ClonePlan {
+            src,
+            base_dir: self.base_dir.clone(),
+            on_proxmox: containers::is_proxmox(),
+            on_libvirt: containers::is_libvirt() && self.virsh_has_domain(name),
+        })
     }
 
     pub fn create_vm(&self, mut config: VmConfig) -> Result<(), String> {
@@ -3932,16 +4185,351 @@ pub fn migration_staging_root(explicit: Option<&str>) -> PathBuf {
     PathBuf::from("/tmp")
 }
 
-/// Export a VM as a tar.gz archive containing config JSON + disk images.
-/// Returns the archive path. The VM must be stopped first.
-/// Same as `export_vm_with_staging(name, None)` but lets the operator pick the staging root
-/// instead of the hardcoded `/tmp`. Live migration of large VMs on
-/// hosts with small tmpfs-backed `/tmp` was failing here; this
-/// parameter lets the dialog route the staging to a roomy disk.
+/// Proxmox-host implementation of `export_vm_with_staging`. Reads the
+/// Proxmox `.conf`, enumerates every disk slot (scsi[N] / virtio[N] /
+/// ide[N] / sata[N], skipping CD-ROM and EFI/TPM and cloud-init seeds),
+/// converts each to qcow2 via `pvesm path` + `qemu-img convert`, writes
+/// a portable JSON VmConfig, and tars the lot into a WolfStack-native
+/// archive at `<staging>/wolfstack-vm-exports/vm-<name>-<ts>.tar.gz`.
+///
+/// **Caller responsibility:** stop the VM beforehand if you want a
+/// consistent snapshot. This function does NOT stop/start — it's
+/// shared between backup (which has its own RAII restart guard) and
+/// migration (which has its own stop/start dance around export).
+pub fn export_proxmox_vm_with_staging(name: &str, staging_dir: Option<&str>) -> Result<PathBuf, String> {
+    // Look up the VM (qm_list_all → parse_pve_qemu_conf) to get name→vmid + bus + memory.
+    let manager = VmManager::new();
+    let vm = manager.list_vms().into_iter()
+        .find(|v| v.name == name)
+        .ok_or_else(|| format!("Proxmox VM '{}' not found", name))?;
+    let vmid = vm.vmid.ok_or_else(||
+        format!("Proxmox VM '{}' has no vmid — cannot locate Proxmox config", name))?;
+
+    // Read raw conf so we can enumerate ALL disk slots, not just the
+    // first one parse_pve_qemu_conf captures.
+    let conf_path = format!("/etc/pve/qemu-server/{}.conf", vmid);
+    let conf_text = fs::read_to_string(&conf_path)
+        .map_err(|e| format!("could not read Proxmox conf {}: {}", conf_path, e))?;
+    let main_section: String = conf_text.lines()
+        .take_while(|l| !l.trim_start().starts_with('['))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Stage qcow2 conversions in a per-export work directory.
+    let export_dir = migration_staging_root(staging_dir).join("wolfstack-vm-exports");
+    fs::create_dir_all(&export_dir)
+        .map_err(|e| format!("create export dir: {}", e))?;
+    let staging = export_dir.join(format!("staging-{}-{}", name, uuid::Uuid::new_v4()));
+    fs::create_dir_all(&staging)
+        .map_err(|e| format!("create staging dir: {}", e))?;
+    // Auto-clean staging on early return.
+    struct StagingGuard(PathBuf);
+    impl Drop for StagingGuard {
+        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+    }
+    let _staging_guard = StagingGuard(staging.clone());
+
+    let mut extra_disks: Vec<StorageVolume> = Vec::new();
+    let mut os_disk_converted = false;
+
+    for line in main_section.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        let Some((key, val)) = line.split_once(':') else { continue; };
+        let key = key.trim();
+        let val = val.trim();
+
+        let is_disk_slot = ["scsi", "virtio", "ide", "sata"].iter().any(|prefix| {
+            key.starts_with(prefix)
+                && !key[prefix.len()..].is_empty()
+                && key[prefix.len()..].chars().all(|c| c.is_ascii_digit())
+        });
+        if !is_disk_slot { continue; }
+        // Skip CD-ROM ISOs (not a real backing disk).
+        if val.contains("media=cdrom") { continue; }
+        // Skip EFI / TPM specials.
+        if val.contains("efitype=") || val.contains("vendor=") { continue; }
+        // C4 fix: skip Proxmox cloud-init drives. They appear as
+        // `ide2: local-lvm:vm-101-cloudinit` — usually with media=cdrom
+        // (caught above) but the PVE API can omit it in edge cases.
+        // Without this filter, qemu-img would try to convert a
+        // cloud-init seed ISO as if it were a VM disk → non-bootable archive.
+        // N7: lowercase compare so an odd PVE release with uppercase
+        // "CLOUDINIT" output still gets filtered.
+        let val_lower = val.to_lowercase();
+        if val_lower.contains("-cloudinit") || val_lower.contains("cloudinit,") { continue; }
+
+        let volume_id = match val.split(',').next() {
+            Some(v) if v.contains(':') => v.trim().to_string(),
+            _ => {
+                warn!("Proxmox VM '{}' disk {}: unparseable value '{}', skipped", name, key, val);
+                continue;
+            }
+        };
+
+        let pvesm = Command::new("pvesm").args(["path", &volume_id]).output()
+            .map_err(|e| format!("pvesm path failed to start: {}", e))?;
+        if !pvesm.status.success() {
+            return Err(format!(
+                "pvesm could not resolve disk '{}' for VM '{}': {}",
+                volume_id, name, String::from_utf8_lossy(&pvesm.stderr).trim()));
+        }
+        let disk_source = String::from_utf8_lossy(&pvesm.stdout).trim().to_string();
+        if disk_source.is_empty() {
+            return Err(format!("pvesm returned empty path for disk '{}'", volume_id));
+        }
+
+        // First non-CD disk becomes OS disk at <name>.qcow2; extras at <name>-<slot>.qcow2.
+        let dest_name = if !os_disk_converted {
+            os_disk_converted = true;
+            format!("{}.qcow2", name)
+        } else {
+            format!("{}-{}.qcow2", name, key)
+        };
+        let dest_path = staging.join(&dest_name);
+
+        let convert = Command::new("qemu-img")
+            .args(["convert", "-O", "qcow2", &disk_source, &dest_path.to_string_lossy()])
+            .output()
+            .map_err(|e| format!("qemu-img convert failed to start: {}", e))?;
+        if !convert.status.success() {
+            return Err(format!(
+                "qemu-img convert failed for disk '{}': {}",
+                volume_id, String::from_utf8_lossy(&convert.stderr).trim()));
+        }
+
+        if dest_name != format!("{}.qcow2", name) {
+            // Record extra disk metadata for restore-side re-attachment.
+            let size_gb = qcow2_virtual_size_gb(&dest_path).unwrap_or(vm.disk_size_gb);
+            let bus = ["scsi", "virtio", "ide", "sata"].iter()
+                .find(|p| key.starts_with(*p))
+                .map(|p| (*p).to_string())
+                .unwrap_or_else(|| "virtio".to_string());
+            extra_disks.push(StorageVolume {
+                name: format!("{}-{}", name, key),
+                size_gb,
+                storage_path: VM_BASE.to_string(),
+                format: "qcow2".to_string(),
+                bus,
+            });
+        }
+    }
+    if !os_disk_converted {
+        return Err(format!(
+            "Proxmox VM '{}' has no non-CD disk slot — nothing to export", name));
+    }
+
+    // Portable JSON config — strip host-specific bits, target-native layout.
+    let mut portable = vm.clone();
+    portable.vmid = None;
+    portable.storage_path = None;
+    portable.running = false;
+    portable.vnc_port = None;
+    portable.vnc_ws_port = None;
+    portable.wolfnet_ip = None;
+    portable.usb_devices.clear();
+    portable.pci_devices.clear();
+    portable.extra_disks = extra_disks;
+    let config_json = serde_json::to_string_pretty(&portable)
+        .map_err(|e| format!("serialize VM config: {}", e))?;
+    fs::write(staging.join(format!("{}.json", name)), &config_json)
+        .map_err(|e| format!("write config: {}", e))?;
+
+    // Tar into the final archive (NOT under staging — that gets cleaned).
+    let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let archive_name = format!("vm-{}-{}.tar.gz", name, timestamp);
+    let archive_path = export_dir.join(&archive_name);
+    // Collect filenames from staging for tar's positional args.
+    let mut tar_items: Vec<String> = Vec::new();
+    if let Ok(entries) = fs::read_dir(&staging) {
+        for entry in entries.flatten() {
+            if let Some(fname) = entry.file_name().to_str() {
+                tar_items.push(fname.to_string());
+            }
+        }
+    }
+    let tar = Command::new("tar")
+        .arg("czf").arg(archive_path.to_string_lossy().as_ref())
+        .arg("-C").arg(staging.to_string_lossy().as_ref())
+        .args(&tar_items)
+        .output()
+        .map_err(|e| {
+            // tar may have created an empty/partial archive before failing
+            // to spawn (rare but possible) — clean up so a later listing
+            // doesn't show a corrupt entry.
+            let _ = fs::remove_file(&archive_path);
+            format!("tar failed to start: {}", e)
+        })?;
+    if !tar.status.success() {
+        let _ = fs::remove_file(&archive_path);
+        return Err(format!("tar failed: {}", String::from_utf8_lossy(&tar.stderr).trim()));
+    }
+
+    Ok(archive_path)
+}
+
+/// Read the virtual size of a qcow2 file via `qemu-img info --output=json`.
+/// Returns size in GB (rounded up).
+fn qcow2_virtual_size_gb(path: &Path) -> Option<u32> {
+    let out = Command::new("qemu-img")
+        .args(["info", "--output=json", &path.to_string_lossy()])
+        .output().ok()?;
+    if !out.status.success() { return None; }
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let bytes = json.get("virtual-size")?.as_u64()?;
+    Some(((bytes + (1 << 30) - 1) >> 30) as u32)
+}
+
+/// libvirt-host implementation of `export_vm_with_staging`. Reads the
+/// libvirt domain XML via `virsh dumpxml`, enumerates disks via
+/// `virsh domblklist --details` (skipping CD-ROMs), converts each
+/// backing file to qcow2 via `qemu-img convert`, writes a portable
+/// JSON VmConfig (translated from dominfo), and tars into the same
+/// WolfStack-native archive format the Proxmox / native paths use.
+///
+/// Same caller contract as the Proxmox helper: caller stops/starts.
+pub fn export_libvirt_vm_with_staging(name: &str, staging_dir: Option<&str>) -> Result<PathBuf, String> {
+    let manager = VmManager::new();
+    let vm = manager.list_vms().into_iter()
+        .find(|v| v.name == name)
+        .ok_or_else(|| format!("libvirt VM '{}' not found", name))?;
+
+    // Enumerate disks via virsh domblklist (Target/Source columns).
+    // Skip cdrom devices — they reference an ISO, not a backing disk.
+    let blklist = Command::new("virsh")
+        .args(["domblklist", name, "--details"])
+        .output()
+        .map_err(|e| format!("virsh domblklist failed to start: {}", e))?;
+    if !blklist.status.success() {
+        return Err(format!("virsh domblklist for '{}' failed: {}",
+            name, String::from_utf8_lossy(&blklist.stderr).trim()));
+    }
+    let blklist_text = String::from_utf8_lossy(&blklist.stdout);
+
+    // Parse: header line + dashes line + entries. Each entry:
+    //   <Type> <Device> <Target> <Source>
+    // We want Device=disk rows with a non-"-" Source.
+    let mut disks: Vec<(String, String)> = Vec::new();  // (target, source)
+    for line in blklist_text.lines().skip(2) {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 4 { continue; }
+        let device = parts[1];
+        let target = parts[2];
+        let source = parts[3..].join(" ");
+        if source == "-" || source.is_empty() { continue; }
+        if device == "cdrom" { continue; }
+        disks.push((target.to_string(), source));
+    }
+    if disks.is_empty() {
+        return Err(format!("libvirt VM '{}' has no non-CD backing disks — nothing to export", name));
+    }
+
+    // Stage qcow2 conversions.
+    let export_dir = migration_staging_root(staging_dir).join("wolfstack-vm-exports");
+    fs::create_dir_all(&export_dir).map_err(|e| format!("create export dir: {}", e))?;
+    let staging = export_dir.join(format!("staging-{}-{}", name, uuid::Uuid::new_v4()));
+    fs::create_dir_all(&staging).map_err(|e| format!("create staging dir: {}", e))?;
+    struct StagingGuard(PathBuf);
+    impl Drop for StagingGuard {
+        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+    }
+    let _staging_guard = StagingGuard(staging.clone());
+
+    let mut extra_disks: Vec<StorageVolume> = Vec::new();
+    for (idx, (target, source)) in disks.iter().enumerate() {
+        let dest_name = if idx == 0 {
+            // First disk is the OS disk — flat layout matches native.
+            format!("{}.qcow2", name)
+        } else {
+            // Extra disks keyed by their libvirt target dev name (vda/vdb/sda…).
+            format!("{}-{}.qcow2", name, target)
+        };
+        let dest_path = staging.join(&dest_name);
+        let convert = Command::new("qemu-img")
+            .args(["convert", "-O", "qcow2", source, &dest_path.to_string_lossy()])
+            .output()
+            .map_err(|e| format!("qemu-img convert failed to start: {}", e))?;
+        if !convert.status.success() {
+            return Err(format!(
+                "qemu-img convert failed for libvirt disk '{}' (target {}): {}",
+                source, target, String::from_utf8_lossy(&convert.stderr).trim()));
+        }
+        if idx > 0 {
+            let size_gb = qcow2_virtual_size_gb(&dest_path).unwrap_or(vm.disk_size_gb);
+            // libvirt target prefix tells us the bus: vd*=virtio, sd*=scsi, hd*=ide.
+            let bus = if target.starts_with("vd") { "virtio" }
+                else if target.starts_with("sd") { "scsi" }
+                else if target.starts_with("hd") { "ide" }
+                else { "virtio" }.to_string();
+            extra_disks.push(StorageVolume {
+                name: format!("{}-{}", name, target),
+                size_gb,
+                storage_path: VM_BASE.to_string(),
+                format: "qcow2".to_string(),
+                bus,
+            });
+        }
+    }
+
+    // Portable JSON config.
+    let mut portable = vm.clone();
+    portable.vmid = None;
+    portable.storage_path = None;
+    portable.running = false;
+    portable.vnc_port = None;
+    portable.vnc_ws_port = None;
+    portable.wolfnet_ip = None;
+    portable.usb_devices.clear();
+    portable.pci_devices.clear();
+    portable.extra_disks = extra_disks;
+    let config_json = serde_json::to_string_pretty(&portable)
+        .map_err(|e| format!("serialize VM config: {}", e))?;
+    fs::write(staging.join(format!("{}.json", name)), &config_json)
+        .map_err(|e| format!("write config: {}", e))?;
+
+    // Tar to final archive (outside staging — staging gets cleaned).
+    let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let archive_path = export_dir.join(format!("vm-{}-{}.tar.gz", name, timestamp));
+    let mut tar_items: Vec<String> = Vec::new();
+    if let Ok(entries) = fs::read_dir(&staging) {
+        for entry in entries.flatten() {
+            if let Some(fname) = entry.file_name().to_str() {
+                tar_items.push(fname.to_string());
+            }
+        }
+    }
+    let tar = Command::new("tar")
+        .arg("czf").arg(archive_path.to_string_lossy().as_ref())
+        .arg("-C").arg(staging.to_string_lossy().as_ref())
+        .args(&tar_items)
+        .output()
+        .map_err(|e| {
+            let _ = fs::remove_file(&archive_path);
+            format!("tar failed to start: {}", e)
+        })?;
+    if !tar.status.success() {
+        let _ = fs::remove_file(&archive_path);
+        return Err(format!("tar failed: {}", String::from_utf8_lossy(&tar.stderr).trim()));
+    }
+    Ok(archive_path)
+}
+
 pub fn export_vm_with_staging(name: &str, staging_dir: Option<&str>) -> Result<PathBuf, String> {
     // Validate name to prevent path traversal
     if name.contains('/') || name.contains("..") || name.contains('\0') || name.is_empty() {
         return Err("Invalid VM name".to_string());
+    }
+
+    // Platform dispatch — Proxmox-managed VMs don't have a WolfStack
+    // .json config; instead their state lives in /etc/pve/qemu-server/
+    // and we build the portable archive from the conf + pvesm-resolved
+    // disks. Migration AND backup both reach this code path; the caller
+    // is responsible for stop/start safety around it.
+    if containers::is_proxmox() {
+        return export_proxmox_vm_with_staging(name, staging_dir);
+    }
+    if containers::is_libvirt() {
+        return export_libvirt_vm_with_staging(name, staging_dir);
     }
 
     let base = Path::new(VM_BASE);
@@ -4165,17 +4753,17 @@ pub fn import_vm_with_staging(
 
     // On Proxmox, create via qm and import the disk
     if containers::is_proxmox() {
-        // Get next VMID
-        let nextid = Command::new("pvesh")
-            .args(["get", "/cluster/nextid"])
-            .output()
-            .map_err(|e| format!("Failed to get next VMID: {}", e))?;
-        if !nextid.status.success() {
-            let _ = fs::remove_dir_all(&tmp);
-            return Err("Failed to allocate Proxmox VMID".to_string());
-        }
-        let vmid: u32 = String::from_utf8_lossy(&nextid.stdout).trim().trim_matches('"').parse()
-            .map_err(|_| "Failed to parse VMID".to_string())?;
+        // N3 fix: use the shared `next_pve_vmid` helper instead of
+        // inlining `pvesh get /cluster/nextid` with simpler error
+        // handling. Same cluster-safe primitive, better error text on
+        // failure (preserves pvesh's stderr instead of "Failed to ...").
+        let vmid = match next_pve_vmid() {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = fs::remove_dir_all(&tmp);
+                return Err(format!("Failed to allocate Proxmox VMID: {}", e));
+            }
+        };
 
         // Create a minimal VM shell
         let create = Command::new("qm")
@@ -4487,7 +5075,13 @@ pub fn import_vm_proxmox(
 
 /// Ask PVE for the next free VMID. Uses pvesh because `qm` doesn't
 /// expose this directly on older releases.
-fn next_pve_vmid() -> Result<u32, String> {
+/// Allocate the next available VMID via Proxmox's cluster-safe API.
+/// Wraps `pvesh get /cluster/nextid` — handles whatever format the
+/// cluster's PVE version returns (raw int, JSON int, quoted string).
+///
+/// Public for backup/restore reuse — the alternative (scanning local
+/// .conf files) races other cluster nodes during concurrent restore.
+pub(crate) fn next_pve_vmid() -> Result<u32, String> {
     let out = Command::new("pvesh")
         .args(["get", "/cluster/nextid"])
         .output()
@@ -4510,7 +5104,11 @@ fn next_pve_vmid() -> Result<u32, String> {
 /// two steps. The disk index PVE assigns depends on what's already
 /// attached, so we parse the importdisk output for the disk id it
 /// picked and use that in the set step.
-fn pve_import_and_attach_disk(
+///
+/// Public for backup/restore reuse — DO NOT duplicate this with
+/// `--format qcow2`, that breaks LVM-thin and ZFS (the most common
+/// production PVE storage layouts).
+pub(crate) fn pve_import_and_attach_disk(
     vmid: u32, qcow2_path: &std::path::Path, storage: &str, slot: &str,
 ) -> Result<(), String> {
     // Intentionally no `--format`: PVE picks the right format for the

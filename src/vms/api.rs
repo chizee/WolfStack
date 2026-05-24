@@ -116,6 +116,7 @@ pub fn config(cfg: &mut web::ServiceConfig) {
             .route("/discover-libvirt", web::get().to(discover_libvirt))
             .route("/adopt-libvirt", web::post().to(adopt_libvirt))
             .route("/{name}/action", web::post().to(vm_action))
+            .route("/{name}/clone", web::post().to(vm_clone))
             .route("/{name}/logs", web::get().to(vm_logs))
             .route("/{name}/serial-status", web::get().to(vm_serial_status))
             .route("/{name}/add-serial", web::post().to(vm_add_serial))
@@ -410,6 +411,66 @@ async fn vm_action(req: HttpRequest, state: web::Data<AppState>, path: web::Path
     match result {
         Ok(_) => HttpResponse::Ok().json(serde_json::json!({ "success": true })),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+    }
+}
+
+#[derive(Deserialize)]
+struct VmCloneRequest {
+    new_name: String,
+    /// Full clone copies the disk image(s); linked clone (Proxmox only)
+    /// uses a thin overlay. libvirt's `virt-clone` is always full; native
+    /// clones are always full (file copy of the qcow2). Defaults to full
+    /// so a careless caller doesn't end up with a dangling backing chain.
+    #[serde(default = "default_true")]
+    full: bool,
+}
+
+fn default_true() -> bool { true }
+
+/// POST /api/vms/{name}/clone — duplicate a VM on this host.
+///
+/// Dispatches by platform:
+///   * Proxmox  → `qm clone <vmid> <new-vmid> --name <new-name> [--full 1]`
+///   * libvirt  → `virt-clone --original <name> --name <new-name> --auto-clone`
+///   * native   → file-copies the OS disk + extra disks, regenerates MACs,
+///                writes a fresh JSON config with cleared runtime fields.
+///
+/// The clone runs synchronously (a full disk copy can take minutes on
+/// large VMs), so the handler is wrapped in `web::block` to keep the
+/// actix worker pool free.
+async fn vm_clone(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<VmCloneRequest>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let name = path.into_inner();
+    let new_name = body.new_name.clone();
+    let full = body.full;
+
+    // Plan FIRST under the lock, synchronously. prepare_clone is
+    // fast (validation + a list_vms read) and its failures are all
+    // user-input problems — return them as 400 so the frontend
+    // distinguishes them from runtime errors. The lock is dropped
+    // before we hand the plan off to the blocking executor.
+    let plan = match state.vms.lock().unwrap().prepare_clone(&name, &new_name) {
+        Ok(p) => p,
+        Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    };
+
+    // Execute the actual clone in a blocking task so the multi-minute
+    // disk copy / qm clone / virt-clone subprocess doesn't block the
+    // actix worker. Lock is already released; the executor owns the
+    // plan and doesn't touch shared state.
+    let result = web::block(move || super::manager::execute_clone(plan, &new_name, full)).await;
+
+    match result {
+        Ok(Ok(_))  => HttpResponse::Ok().json(serde_json::json!({ "success": true })),
+        Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+        Err(e)     => HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("clone task failed: {}", e)
+        })),
     }
 }
 
@@ -779,6 +840,97 @@ struct VmMigrateExternalRequest {
     proxmox: bool,
 }
 
+/// Intra-cluster migration preflight. Talks to the target node BEFORE
+/// the source is stopped, so a failing check leaves the source running
+/// and the operator can correct the input. Two checks today:
+///
+///   1. **Name collision** — `GET /api/vms` on the target. If a VM
+///      with `new_name` already exists, refuse: importing on top of
+///      it would either fail at import time or silently clobber the
+///      existing config.
+///   2. **Free space** — `GET /api/storage/list` on the target. If
+///      `storage_id` is set and we can find a matching entry, we
+///      require `available_bytes >= expected_total`. If `storage_id`
+///      is empty (default) we skip the check; the operator has opted
+///      out of picking a storage and the import logic will land it on
+///      whatever default the target uses.
+///
+/// Errors are returned as human-readable strings; the caller writes
+/// them straight into the migration task's `error` field.
+async fn migrate_preflight_intra(
+    client: &reqwest::Client,
+    node: &crate::agent::Node,
+    new_name: &str,
+    storage_id: &str,
+    expected_total: Option<u64>,
+    cluster_secret: &str,
+) -> Result<(), String> {
+    // ── 1. Name collision ───────────────────────────────────────────
+    let vms_urls = build_node_urls(&node.address, node.port, "/api/vms");
+    let mut last_err = String::new();
+    let mut name_clash_checked = false;
+    for url in &vms_urls {
+        match client.get(url)
+            .header("X-WolfStack-Secret", cluster_secret)
+            .timeout(Duration::from_secs(10))
+            .send().await
+        {
+            Ok(r) if r.status().is_success() => {
+                let body: serde_json::Value = r.json().await
+                    .map_err(|e| format!("parse target VM list: {}", e))?;
+                let arr = body.as_array().cloned().unwrap_or_default();
+                if arr.iter().any(|v| v.get("name").and_then(|n| n.as_str()) == Some(new_name)) {
+                    return Err(format!(
+                        "Target node '{}' already has a VM named '{}'. Pick a different new_name or remove the existing VM first.",
+                        node.hostname.as_str(), new_name));
+                }
+                name_clash_checked = true;
+                break;
+            }
+            Ok(r) => { last_err = format!("{}: HTTP {}", url, r.status()); }
+            Err(e) => { last_err = format!("{}: {}", url, e); }
+        }
+    }
+    if !name_clash_checked {
+        return Err(format!("Pre-flight: could not list VMs on target — {}", last_err));
+    }
+
+    // ── 2. Free-space check (only when both storage and size known) ─
+    let expected = match expected_total { Some(b) if b > 0 => b, _ => return Ok(()) };
+    if storage_id.is_empty() { return Ok(()); }
+    let storage_urls = build_node_urls(&node.address, node.port, "/api/storage/list");
+    for url in &storage_urls {
+        match client.get(url)
+            .header("X-WolfStack-Secret", cluster_secret)
+            .timeout(Duration::from_secs(10))
+            .send().await
+        {
+            Ok(r) if r.status().is_success() => {
+                let body: serde_json::Value = r.json().await
+                    .map_err(|e| format!("parse target storage list: {}", e))?;
+                let storages = body.get("storages").and_then(|s| s.as_array()).cloned().unwrap_or_default();
+                let entry = storages.iter().find(|s| s.get("id").and_then(|i| i.as_str()) == Some(storage_id));
+                let Some(entry) = entry else {
+                    // Storage id we don't recognise — let the import
+                    // surface a clear error rather than us guessing.
+                    return Ok(());
+                };
+                let avail = entry.get("available_bytes").and_then(|a| a.as_u64()).unwrap_or(0);
+                if avail < expected {
+                    return Err(format!(
+                        "Pre-flight: target storage '{}' has {} free, but the VM's disks total {}. Pick a larger storage or free space and retry.",
+                        storage_id, format_bytes_human(avail), format_bytes_human(expected)));
+                }
+                return Ok(());
+            }
+            Ok(_) | Err(_) => { /* try next URL */ }
+        }
+    }
+    // We failed to reach storage/list — non-fatal; the upload will
+    // fail loudly later if space is really short.
+    Ok(())
+}
+
 /// POST /api/vms/{name}/migrate — migrate VM to another cluster node.
 /// Spawns a background task so the HTTP call returns immediately with a
 /// `task_id`; the frontend polls `/api/migration/{id}/status` to drive
@@ -862,6 +1014,23 @@ async fn vm_migrate(
     let target_label = body.target_node.clone();
 
     tokio::spawn(async move {
+        // Preflight — refuse BEFORE stopping the source if the target
+        // already has a VM by this name, or has visibly insufficient
+        // space on the chosen storage. Both failures otherwise lead to
+        // a long fruitless upload followed by an import error, with
+        // the source uselessly stopped throughout. See
+        // migrate_preflight_intra above for what's checked.
+        migration_update(&state_clone.migration_tasks, &tid, "preflight",
+            &format!("Pre-flight checks against '{}'…", target_label));
+        let preflight_client = &*VM_MIGRATION_CLIENT;
+        if let Err(e) = migrate_preflight_intra(
+            preflight_client, &node, &new_name, &storage_val,
+            expected_total, &state_clone.cluster_secret,
+        ).await {
+            migration_fail(&state_clone.migration_tasks, &tid, &e);
+            return;
+        }
+
         migration_update(&state_clone.migration_tasks, &tid, "stopping", &format!("Stopping VM '{}' for consistent export…", name));
         {
             let manager = state_clone.vms.lock().unwrap();
@@ -1295,31 +1464,68 @@ async fn vm_migrate_external(
         let preflight_urls = crate::api::build_external_urls(&target_url, "/api/storage/list");
         let preflight_client = &*VM_MIGRATION_CLIENT;
 
-        let mut preflight_ok = false;
+        // Hit /api/storage/list — proves we can reach the target AND
+        // (when the operator picked a storage) lets us check free
+        // space before the upload starts. NOTE: /api/storage/list is
+        // gated by require_auth, which today accepts X-WolfStack-Secret
+        // (and session cookies) but NOT X-Transfer-Token. So this
+        // check only succeeds when the external target shares our
+        // cluster secret. If it doesn't, we abort here with a 403
+        // — better than transferring multi-GB onto a target that
+        // would reject the import anyway. The transfer token is sent
+        // for future-proofing if storage_list ever accepts it.
+        let mut storage_body: Option<serde_json::Value> = None;
         let mut preflight_err = String::new();
         for url in &preflight_urls {
             match preflight_client.get(url)
+                .header("X-Transfer-Token", &target_token)
                 .header("X-WolfStack-Secret", state_clone.cluster_secret.clone())
                 .timeout(Duration::from_secs(10))
                 .send()
                 .await
             {
-                Ok(resp) => {
-                    // Drain the body so the preflight socket returns
-                    // to the pool; we only care that the request
-                    // succeeded at the transport layer.
-                    let _ = resp.bytes().await;
-                    preflight_ok = true;
+                Ok(resp) if resp.status().is_success() => {
+                    storage_body = resp.json::<serde_json::Value>().await.ok();
                     break;
                 }
-                Err(e) => { preflight_err = format!("{}: {}", url, e); }
+                Ok(resp) => { preflight_err = format!("{}: HTTP {}", url, resp.status()); }
+                Err(e)   => { preflight_err = format!("{}: {}", url, e); }
             }
         }
-        if !preflight_ok {
+        if storage_body.is_none() {
             migration_fail(&state_clone.migration_tasks, &tid,
                 &format!("Pre-flight check failed — cannot reach destination: {}", preflight_err));
             return;
         }
+
+        // Free-space check (best-effort — skip silently if we can't
+        // resolve the storage id; the upload will fail loudly if
+        // there really is no room).
+        if let (Some(expected), false) = (expected_total, storage_val.is_empty()) {
+            if let Some(body) = storage_body.as_ref() {
+                let storages = body.get("storages").and_then(|s| s.as_array()).cloned().unwrap_or_default();
+                if let Some(entry) = storages.iter().find(|s| s.get("id").and_then(|i| i.as_str()) == Some(storage_val.as_str())) {
+                    let avail = entry.get("available_bytes").and_then(|a| a.as_u64()).unwrap_or(0);
+                    if avail < expected {
+                        migration_fail(&state_clone.migration_tasks, &tid, &format!(
+                            "Pre-flight: target storage '{}' has {} free, but the VM's disks total {}. Pick a larger storage or free space and retry.",
+                            storage_val, format_bytes_human(avail), format_bytes_human(expected)));
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Name-collision pre-flight is deliberately NOT done for
+        // external migrations. `/api/vms` is guarded by `require_auth`,
+        // which accepts the LOCAL cluster secret only — the external
+        // target's secret will reject ours, and `X-Transfer-Token` is
+        // not honoured by that endpoint. Rather than write a check
+        // that always silently fails-open, we let the import on the
+        // target surface the collision in its own error path. If a
+        // future endpoint exposes a transfer-token-authed VM list,
+        // wire it in here. (Intra-cluster migration DOES check this,
+        // see migrate_preflight_intra.)
 
         migration_update(&state_clone.migration_tasks, &tid, "stopping", &format!("Stopping VM '{}' for consistent export…", name));
         {

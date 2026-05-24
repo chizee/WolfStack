@@ -989,8 +989,171 @@ fn is_lxc_running(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Backup a KVM/QEMU VM — copy disk images + JSON config
+/// Backup a KVM/QEMU VM — copy disk images + JSON config.
+///
+/// Platform dispatch:
+///   • **Proxmox** → `backup_vm_proxmox` (vzdump-style: stop VM, read
+///     `/etc/pve/qemu-server/<vmid>.conf`, convert every disk to qcow2
+///     via `pvesm path` + `qemu-img convert`, write portable JSON
+///     config, tar everything). Output matches the native WolfStack
+///     archive format so `restore_vm_local` works on any host.
+///   • **libvirt** → `backup_vm_libvirt` (stop VM, read disks via
+///     `virsh domblklist --details`, convert each to qcow2 via
+///     `qemu-img convert`, write portable JSON config, tar everything).
+///     Same archive format as the Proxmox + native paths.
+///   • **native** → existing in-place tar.gz with the RAII restart
+///     guard from A.1.
 pub fn backup_vm(name: &str) -> Result<(PathBuf, u64), String> {
+    if crate::containers::is_proxmox() {
+        return backup_vm_proxmox(name);
+    }
+    if crate::containers::is_libvirt() {
+        return backup_vm_libvirt(name);
+    }
+    backup_vm_native(name)
+}
+
+/// Backup a libvirt-managed VM. Same pattern as Proxmox: stop with
+/// RAII restart guard, delegate the export to the shared helper in
+/// vms::manager. Output matches the native WolfStack format so
+/// `restore_vm_local` works on any host.
+fn backup_vm_libvirt(name: &str) -> Result<(PathBuf, u64), String> {
+    let manager = crate::vms::manager::VmManager::new();
+    let vm = manager.list_vms().into_iter()
+        .find(|v| v.name == name)
+        .ok_or_else(|| format!("libvirt VM '{}' not found", name))?;
+
+    // Same C1 fix as Proxmox: graceful stop + poll + force fallback.
+    // virsh shutdown is fire-and-forget too — must wait for the VM
+    // to actually power down before qemu-img convert touches the disk.
+    let was_running = vm.running;
+    if was_running {
+        stop_vm_and_wait_for_stop(&manager, name, 60)?;
+    }
+    let _restart_guard = VmRestartGuard { name: name.to_string(), should_restart: was_running };
+
+    let staging = ensure_staging_dir()?;
+    let staging_str = staging.to_string_lossy().to_string();
+    let archive = crate::vms::manager::export_libvirt_vm_with_staging(name, Some(&staging_str))?;
+    let size = fs::metadata(&archive).map(|m| m.len()).unwrap_or(0);
+    Ok((archive, size))
+}
+
+/// RAII guard that restarts a VM on Drop. Used by every backup_vm_*
+/// path to ensure we restart the VM on EVERY exit (success, error,
+/// panic). Pre-fix this struct was duplicated inline in three
+/// functions; reviewer rightly flagged the maintenance risk.
+struct VmRestartGuard {
+    name: String,
+    should_restart: bool,
+}
+impl Drop for VmRestartGuard {
+    fn drop(&mut self) {
+        if !self.should_restart { return; }
+        let m = crate::vms::manager::VmManager::new();
+        if let Err(e) = m.start_vm(&self.name) {
+            tracing::error!(target: "backup",
+                "VM backup: failed to restart {} after backup: {} \
+                 — operator must start the VM manually", self.name, e);
+        } else {
+            tracing::info!(target: "backup",
+                "VM backup: restarted {} after backup", self.name);
+        }
+    }
+}
+
+/// Graceful stop with poll-until-stopped + force fallback. Pre-fix
+/// the backup paths called `stop_vm(name, false)` and slept 2 s —
+/// but on Proxmox/libvirt that's fire-and-forget (qm shutdown / virsh
+/// shutdown run detached). The 2 s sleep was nowhere near enough for
+/// the VM to actually power down, so `qemu-img convert` ran against a
+/// LIVE disk → corrupt backup. Now we initiate graceful, poll for
+/// `running=false`, force-stop after `grace_secs` if needed.
+///
+/// `max_wait_secs` budgets the graceful phase. After that we send
+/// the force signal (qm stop / virsh destroy) and wait another 5s.
+/// Returns Err only if even the force-stop fails or the VM is not
+/// known. Returns Ok if VM is already stopped at entry.
+fn stop_vm_and_wait_for_stop(
+    manager: &crate::vms::manager::VmManager,
+    name: &str,
+    max_wait_secs: u64,
+) -> Result<(), String> {
+    // N2: no initial `list_vms()` check — callers gate on their own
+    // `was_running` already. Saves a per-backup directory scan on
+    // Proxmox + closes a TOCTOU window between callers and the helper.
+    //
+    // Initiate graceful shutdown.
+    manager.stop_vm(name, false)
+        .map_err(|e| format!("graceful stop of '{}' failed to start: {}", name, e))?;
+
+    // Poll until stopped or until deadline.
+    //
+    // A1 fix: tri-state interpretation of list_vms. The previous
+    // `.unwrap_or(false)` collapsed two very different outcomes into
+    // "stopped":
+    //   • VM not in list (deleted, renamed, OR list_vms failed because
+    //     `qm list` / `virsh list` errored transiently) → None
+    //   • VM in list with running=true → Some(true)
+    //   • VM in list with running=false → Some(false)
+    // Only `Some(false)` is genuine confirmation that the VM is stopped.
+    // A transient subprocess failure used to silently false-positive
+    // here, letting `qemu-img convert` run against a still-live disk.
+    // Now we keep polling on `None` (don't assume stopped); only
+    // `Some(false)` exits the loop early.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(max_wait_secs);
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let state: Option<bool> = manager.list_vms().into_iter()
+            .find(|v| v.name == name)
+            .map(|v| v.running);
+        match state {
+            Some(false) => {
+                // Brief settle so qemu-img doesn't race storage unmount.
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                return Ok(());
+            }
+            Some(true) | None => {
+                // Keep polling. None means VM not listed — could be
+                // a transient list_vms error, or the VM was deleted
+                // out from under us. Either way, don't assume stopped.
+            }
+        }
+    }
+
+    // Force stop — guest didn't ACPI-shutdown in time.
+    tracing::warn!(target: "backup",
+        "VM '{}' did not gracefully stop within {}s — forcing power off \
+         for backup consistency. Filesystem inside the guest may need fsck on next boot.",
+        name, max_wait_secs);
+    manager.stop_vm(name, true)
+        .map_err(|e| format!("force stop of '{}' failed after graceful timeout: {}", name, e))?;
+
+    // A2 fix: actually verify the VM stopped after the force-stop,
+    // don't just sleep and trust it. `qm stop` is documented as
+    // synchronous, but races have been reported, and `virsh destroy`
+    // returns before the QEMU process necessarily exits on some
+    // libvirt versions. Three 1-second polls is enough to catch the
+    // common case without lengthening the worst-case backup time.
+    for _ in 0..3 {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        if let Some(false) = manager.list_vms().into_iter()
+            .find(|v| v.name == name)
+            .map(|v| v.running)
+        {
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "force-stop of '{}' returned Ok but the VM is still listed as running 3 s later \
+         — refusing to back up a live disk", name))
+}
+
+/// Native WolfStack VM backup — the original path. KVM/QEMU process
+/// spawned by `wolfstack-vm-<name>`, config + disk in
+/// `/var/lib/wolfstack/vms/`. Stop the VM, archive its files, restart
+/// via the RAII guard so it never stays stopped silently.
+fn backup_vm_native(name: &str) -> Result<(PathBuf, u64), String> {
 
     let staging = ensure_staging_dir()?;
     let timestamp = Utc::now().format("%Y%m%d-%H%M%S");
@@ -1014,15 +1177,38 @@ pub fn backup_vm(name: &str) -> Result<(PathBuf, u64), String> {
                 "echo 'system_powerdown' | socat - UNIX-CONNECT:/var/run/wolfstack-vm-{}.sock 2>/dev/null || true", name
             )])
             .output();
-        std::thread::sleep(std::time::Duration::from_secs(5));
-        // Force kill if still running
-        if is_vm_running(name) {
+        // N1 fix: poll until stopped instead of a fixed 5s sleep that
+        // could be too short for a slow guest. Cap at 60s, then
+        // pkill -9 if the guest still hasn't powered down. Matches
+        // the budget the Proxmox/libvirt paths use via
+        // stop_vm_and_wait_for_stop.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut stopped_gracefully = false;
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            if !is_vm_running(name) {
+                stopped_gracefully = true;
+                break;
+            }
+        }
+        if !stopped_gracefully {
+            tracing::warn!(target: "backup",
+                "VM '{}' did not gracefully ACPI-shutdown within 60s — forcing pkill \
+                 for backup consistency. Guest filesystem may need fsck on next boot.", name);
             let _ = Command::new("pkill")
                 .args(["-f", &format!("wolfstack-vm-{}", name)])
                 .output();
             std::thread::sleep(std::time::Duration::from_secs(2));
         }
     }
+
+    // RAII guard: restart on EVERY exit path (success, tar-failure
+    // early return, panic). Shared `VmRestartGuard` is defined
+    // module-level so all three backup_vm_* paths use the same logic.
+    let _restart_guard = VmRestartGuard {
+        name: name.to_string(),
+        should_restart: was_running,
+    };
 
     // Collect all files belonging to this VM:
     // - {name}.json (config - required)
@@ -1063,14 +1249,45 @@ pub fn backup_vm(name: &str) -> Result<(PathBuf, u64), String> {
         return Err(format!("VM tar failed: {}", String::from_utf8_lossy(&output.stderr)));
     }
 
-    // Restart if it was running
-    if was_running {
-
-    }
+    // Restart handled by RestartGuard's Drop above — fires on success
+    // here OR on any earlier `?`/`return`. Don't add a manual restart
+    // call below; we'd double-start.
 
     let size = fs::metadata(&tar_path).map(|m| m.len()).unwrap_or(0);
 
     Ok((tar_path, size))
+}
+
+/// Backup a Proxmox-managed VM. Stops the VM (with an RAII restart
+/// guard so it never stays stopped silently), then delegates the
+/// actual export to `vms::manager::export_proxmox_vm_with_staging`
+/// (also called by the migration path — single source of truth for
+/// the per-platform export format). Output is a WolfStack-format
+/// tar.gz that restores cleanly on any host.
+fn backup_vm_proxmox(name: &str) -> Result<(PathBuf, u64), String> {
+    let manager = crate::vms::manager::VmManager::new();
+    let vm = manager.list_vms().into_iter()
+        .find(|v| v.name == name)
+        .ok_or_else(|| format!("Proxmox VM '{}' not found", name))?;
+
+    // Stop VM for consistent export. C1 fix: graceful stop + poll-
+    // until-stopped + force fallback (pre-fix was stop_vm(false) which
+    // is fire-and-forget on Proxmox — qemu-img would have run against
+    // a live disk → corrupt backup). Shared VmRestartGuard ensures we
+    // always restart afterwards.
+    let was_running = vm.running;
+    if was_running {
+        stop_vm_and_wait_for_stop(&manager, name, 60)?;
+    }
+    let _restart_guard = VmRestartGuard { name: name.to_string(), should_restart: was_running };
+
+    // Delegate the export. The shared helper lives in vms::manager so
+    // migration uses the exact same archive format.
+    let staging = ensure_staging_dir()?;
+    let staging_str = staging.to_string_lossy().to_string();
+    let archive = crate::vms::manager::export_proxmox_vm_with_staging(name, Some(&staging_str))?;
+    let size = fs::metadata(&archive).map(|m| m.len()).unwrap_or(0);
+    Ok((archive, size))
 }
 
 /// Check if a VM is running
@@ -1191,15 +1408,52 @@ pub fn backup_all(storage: &BackupStorage) -> Vec<BackupEntry> {
         }
     }
 
-    // Backup all VMs
-    let vm_dir = Path::new("/var/lib/wolfstack/vms");
-    if vm_dir.exists() {
-        if let Ok(dirs) = fs::read_dir(vm_dir) {
-            for entry in dirs.flatten() {
-                if entry.path().is_dir() {
-                    let name = entry.file_name().to_string_lossy().to_string();
+    // Backup all VMs — native WolfStack VMs only at this stage.
+    //
+    // A.2 fix: the pre-fix code filtered `is_dir()` in /var/lib/wolfstack/vms,
+    // which only matched the extra-volumes-subdir layout (rare). The
+    // common case is a flat `name.json + name.qcow2` layout, and those
+    // were silently invisible to "backup all". Now we parse .json
+    // config files — same source of truth as VmManager::list_vms()'s
+    // native scan path. Proxmox + libvirt branches below enumerate
+    // via VmManager which dispatches to the platform-correct path
+    // (qm/virsh).
+    if crate::containers::is_proxmox() || crate::containers::is_libvirt() {
+        // Enumerate Proxmox / libvirt VMs via VmManager (same source
+        // the dashboard uses — /etc/pve/qemu-server/*.conf on Proxmox,
+        // `virsh list --all` on libvirt). backup_vm dispatches by
+        // platform so all three types (native / Proxmox / libvirt) get
+        // the correct backup path.
+        let manager = crate::vms::manager::VmManager::new();
+        for vm in manager.list_vms() {
+            entries.push(create_backup_entry(
+                BackupTarget {
+                    target_type: BackupTargetType::Vm,
+                    name: vm.name.clone(),
+                    hostname: None, state: None, specs: None,
+                },
+                storage,
+            ));
+        }
+    } else {
+        // Native WolfStack VMs — parse .json configs from /var/lib/wolfstack/vms.
+        let vm_dir = Path::new("/var/lib/wolfstack/vms");
+        if vm_dir.exists() {
+            if let Ok(read) = fs::read_dir(vm_dir) {
+                for entry in read.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) != Some("json") { continue; }
+                    let file_name = match path.file_name().and_then(|n| n.to_str()) {
+                        Some(n) => n, None => continue,
+                    };
+                    if file_name.ends_with(".runtime.json") { continue; }
+                    let name = file_name.trim_end_matches(".json").to_string();
+                    if name.is_empty() { continue; }
                     entries.push(create_backup_entry(
-                        BackupTarget { target_type: BackupTargetType::Vm, name, hostname: None, state: None, specs: None },
+                        BackupTarget {
+                            target_type: BackupTargetType::Vm,
+                            name, hostname: None, state: None, specs: None,
+                        },
                         storage,
                     ));
                 }
@@ -2580,22 +2834,440 @@ pub fn restore_vm(entry: &BackupEntry) -> Result<String, String> {
 /// `restore_vm` (after download from backup storage) and the PBS
 /// snapshot restore (after it un-wraps the snapshot's `backup.pxar`).
 /// `local_path` is consumed.
+///
+/// Platform-dispatched:
+///   • Proxmox host → `restore_vm_to_proxmox` (qm create + qm importdisk)
+///   • libvirt host → `restore_vm_to_libvirt` (move disks into
+///     /var/lib/libvirt/images, generate minimal domain XML, `virsh define`)
+///   • native host → existing in-place extraction to /var/lib/wolfstack/vms
+///
+/// The archive format produced by `backup_vm` (Stage B) is the same
+/// across platforms — flat tar.gz with `<name>.json` (portable VmConfig)
+/// + `<name>.qcow2` (OS disk) + optional `<name>-<slot>.qcow2` extra
+/// disks. Restore reads the JSON, then routes to the per-platform
+/// creation primitives.
 pub fn restore_vm_local(local_path: &Path, vm_name: &str) -> Result<String, String> {
+    if crate::containers::is_proxmox() {
+        return restore_vm_to_proxmox(local_path, vm_name, None);
+    }
+    if crate::containers::is_libvirt() {
+        return restore_vm_to_libvirt(local_path, vm_name);
+    }
+    restore_vm_to_native(local_path, vm_name)
+}
+
+/// Extract a tar.gz to `dest` after verifying NO entry contains a path
+/// traversal vector. The portable backup archive comes from operator-
+/// controlled storage (S3 / NFS / SSHFS / PBS); a crafted archive with
+/// entries like `../../../etc/cron.d/evil` could climb out of the
+/// `dest` work-dir on extraction.
+///
+/// Two-step strategy:
+///   1. `tar tzf <archive>` lists entries; we reject any that start
+///      with `/`, contain a `..` path component, or carry a NUL.
+///   2. Only after validation do we extract.
+///
+/// This costs an extra tar invocation but is small overhead for our
+/// portable VM archives (which contain only a JSON config and a
+/// handful of qcow2 files), and it's the correct defence on top of
+/// whatever GNU tar's default behaviour happens to be on the host.
+fn safe_extract_tar(archive: &Path, dest: &Path) -> Result<(), String> {
+    let list = Command::new("tar")
+        .args(["tzf", &archive.to_string_lossy()])
+        .output()
+        .map_err(|e| format!("tar list failed to start: {}", e))?;
+    if !list.status.success() {
+        return Err(format!(
+            "tar listing failed: {}",
+            String::from_utf8_lossy(&list.stderr).trim()
+        ));
+    }
+    let listing = String::from_utf8_lossy(&list.stdout);
+    for raw in listing.lines() {
+        let entry = raw.trim_end_matches('/').trim();
+        if entry.is_empty() { continue; }
+        if entry.starts_with('/') {
+            return Err(format!(
+                "archive contains absolute path entry '{}' — refusing to extract", entry));
+        }
+        if entry.split('/').any(|c| c == "..") {
+            return Err(format!(
+                "archive entry '{}' contains '..' — refusing to extract", entry));
+        }
+        if entry.contains('\0') {
+            return Err("archive entry contains NUL byte — refusing to extract".into());
+        }
+    }
+    // All entries safe — extract.
+    let extract = Command::new("tar")
+        .args(["xzf", &archive.to_string_lossy(),
+               "-C", &dest.to_string_lossy()])
+        .output()
+        .map_err(|e| format!("tar extract failed to start: {}", e))?;
+    if !extract.status.success() {
+        return Err(format!(
+            "tar extract failed: {}",
+            String::from_utf8_lossy(&extract.stderr).trim()));
+    }
+    Ok(())
+}
+
+/// XML-escape the five characters that change meaning inside attribute
+/// values or element text. Used everywhere libvirt XML is constructed
+/// from values that originated in the portable backup archive (which
+/// is operator-supplied content and therefore untrusted at restore
+/// time). A crafted backup containing `bus="virtio'/></disk><foo"` or
+/// a `vm_name` with `<`/`>` would otherwise break out of the
+/// surrounding markup and inject arbitrary XML — `virsh define` would
+/// reject the result, but the failure mode (restore aborts mid-flow)
+/// is worse than catching it here.
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Validate a disk bus name against the allowlist libvirt accepts.
+/// Rejects anything else with a clear error rather than letting it
+/// flow into the XML (defence-in-depth alongside `xml_escape`).
+fn validate_libvirt_bus(bus: &str) -> Result<&str, String> {
+    match bus {
+        "virtio" | "scsi" | "ide" | "sata" => Ok(bus),
+        other => Err(format!(
+            "invalid disk bus '{}' in backup archive — libvirt accepts only \
+             virtio / scsi / ide / sata", other)),
+    }
+}
+
+/// N2: validate fields from the portable VmConfig's `extra_disks`
+/// entries before they're interpolated into filesystem paths. Same
+/// shape as the VM-name check but allowed against the field name in
+/// errors so the operator can locate the bad entry.
+fn validate_archive_path_field(value: &str, what: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("archive field `{}` is empty", what));
+    }
+    if value.contains('/') || value.contains('\\') || value.contains('\0')
+        || value.contains("..") || value.starts_with('.')
+    {
+        return Err(format!(
+            "archive field `{}` value '{}' contains a path-traversal character — refused",
+            what, value));
+    }
+    if !value.chars().all(|c| c.is_ascii_alphanumeric()
+        || c == '_' || c == '-' || c == '.' || c == '+' || c == ':')
+    {
+        return Err(format!(
+            "archive field `{}` value '{}' contains characters outside [A-Za-z0-9_.+:-]",
+            what, value));
+    }
+    Ok(())
+}
+
+/// N3: validate a MAC address against `AA:BB:CC:DD:EE:FF`. Pre-fix
+/// the value flowed from the portable archive straight into a
+/// `qm create --net0 virtio={mac},bridge=vmbr0` arg — and qm parses
+/// --net0 as comma-separated key=value pairs. A crafted MAC value of
+/// `DE:AD:BE:EF:00:01,firewall=1,queues=65535` would inject extra qm
+/// network options from the archive. Strict regex check eliminates
+/// the vector entirely.
+fn validate_mac_address(mac: &str) -> Result<(), String> {
+    if mac.len() != 17 {
+        return Err(format!("MAC '{}' must be 17 chars (AA:BB:CC:DD:EE:FF)", mac));
+    }
+    for (i, c) in mac.chars().enumerate() {
+        let is_separator = i % 3 == 2;
+        if is_separator {
+            if c != ':' {
+                return Err(format!("MAC '{}' separator at position {} must be ':'", mac, i));
+            }
+        } else if !c.is_ascii_hexdigit() {
+            return Err(format!("MAC '{}' has non-hex char '{}' at position {}", mac, c, i));
+        }
+    }
+    Ok(())
+}
+
+/// Reject VM names that would either break out of file paths or break
+/// libvirt's element-name validation. Mirrors the check
+/// `export_vm_with_staging` uses at the export side.
+fn validate_vm_name_for_restore(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("VM name is empty".into());
+    }
+    if name.contains('/') || name.contains('\\') || name.contains('\0')
+        || name.contains("..") || name.starts_with('.') || name.starts_with('-')
+    {
+        // Leading `-` rejected for the same reason as
+        // validate_clone_vm_name: a name like `--full` becomes a flag
+        // when passed as an argv positional to qm/virsh.
+        return Err(format!(
+            "invalid VM name '{}' — must not contain /, \\, NUL, '..' or start with '.' or '-'", name));
+    }
+    // libvirt domain names: letters, digits, _, -, +, ., :.
+    // Be a touch stricter and refuse anything not in [A-Za-z0-9_.+:-].
+    if !name.chars().all(|c| c.is_ascii_alphanumeric()
+        || c == '_' || c == '-' || c == '.' || c == '+' || c == ':')
+    {
+        return Err(format!(
+            "invalid VM name '{}' — only A-Z a-z 0-9 _ . - + : are allowed", name));
+    }
+    Ok(())
+}
+
+/// libvirt restore: extract the archive into the libvirt images dir,
+/// translate the portable VmConfig into a minimal domain XML, then
+/// `virsh define` it. Disk(s) end up at /var/lib/libvirt/images/<name>.qcow2.
+fn restore_vm_to_libvirt(local_path: &Path, vm_name: &str) -> Result<String, String> {
+    // Validate name before any filesystem or XML work — refuses crafted
+    // archives whose VmConfig.name would escape the libvirt images
+    // dir or inject XML. Same check applied to the Proxmox path below.
+    validate_vm_name_for_restore(vm_name)?;
+    use crate::vms::manager::VmConfig;
+
+    let images_dir = Path::new("/var/lib/libvirt/images");
+    fs::create_dir_all(images_dir)
+        .map_err(|e| format!("create libvirt images dir: {}", e))?;
+
+    // Extract into a per-restore work dir; move disks to images_dir at
+    // the end so a half-failed extract doesn't pollute libvirt's
+    // storage pool.
+    let staging = ensure_staging_dir()?;
+    let timestamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
+    let work_dir = staging.join(format!("libvirt-restore-{}-{}", vm_name, timestamp));
+    fs::create_dir_all(&work_dir).map_err(|e| format!("create work dir: {}", e))?;
+    struct WorkDirGuard(PathBuf);
+    impl Drop for WorkDirGuard {
+        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+    }
+    let _work_guard = WorkDirGuard(work_dir.clone());
+
+    // N1: path-traversal hardening — refuse absolute or `..` paths in
+    // the archive before extracting. Operator-controlled backup storage
+    // means the archive content is untrusted at restore time.
+    safe_extract_tar(local_path, &work_dir)?;
+    let _ = fs::remove_file(local_path);
+
+    let config_path = work_dir.join(format!("{}.json", vm_name));
+    if !config_path.exists() {
+        return Err(format!("archive did not contain {}.json — cannot restore", vm_name));
+    }
+    let config_text = fs::read_to_string(&config_path)
+        .map_err(|e| format!("read config: {}", e))?;
+    let config: VmConfig = serde_json::from_str(&config_text)
+        .map_err(|e| format!("parse config: {}", e))?;
+
+    // Move OS disk to libvirt images dir.
+    let os_disk_src = work_dir.join(format!("{}.qcow2", vm_name));
+    if !os_disk_src.exists() {
+        return Err(format!("archive contained no OS disk ({}.qcow2)", vm_name));
+    }
+    let os_disk_dest = images_dir.join(format!("{}.qcow2", vm_name));
+    if os_disk_dest.exists() {
+        return Err(format!(
+            "{} already exists — refuse to overwrite. Delete it manually or restore under a different name.",
+            os_disk_dest.display()));
+    }
+    fs::rename(&os_disk_src, &os_disk_dest)
+        .or_else(|_| {
+            // Cross-filesystem move falls back to copy + remove.
+            fs::copy(&os_disk_src, &os_disk_dest)?;
+            fs::remove_file(&os_disk_src)?;
+            Ok::<(), std::io::Error>(())
+        })
+        .map_err(|e| format!("move OS disk: {}", e))?;
+
+    // Move each extra disk too, tracking final paths for XML generation.
+    //
+    // N4 fix: device letter uses a counter for SUCCESSFULLY placed
+    // disks rather than the source-array index. Pre-fix, if one extra
+    // disk was skipped (missing in archive OR dest already exists),
+    // the next disk got a letter with a gap (e.g. vdd when vdb/vdc
+    // were skipped) — some guests fail to boot on non-sequential
+    // target dev names.
+    let mut extra_disk_paths: Vec<(String, String, String)> = Vec::new();  // (path, target, bus)
+    let mut placed_count: u32 = 0;
+    for extra in config.extra_disks.iter() {
+        // N2: validate every archive-derived field before using it in a
+        // filesystem path. A crafted VmConfig with extra.name like
+        // `../../etc/cron.d/evil` would escape work_dir / images_dir
+        // on the fs::rename / fs::copy below.
+        if let Err(e) = validate_archive_path_field(&extra.name, "extra_disks[].name") {
+            warn!("libvirt restore: skipping extra disk — {}", e);
+            continue;
+        }
+        if let Err(e) = validate_archive_path_field(&extra.format, "extra_disks[].format") {
+            warn!("libvirt restore: skipping extra disk '{}' — {}", extra.name, e);
+            continue;
+        }
+        let src = work_dir.join(format!("{}.{}", extra.name, extra.format));
+        if !src.exists() {
+            warn!("extra disk {} listed in config but not in archive — skipped", extra.name);
+            continue;
+        }
+        let dest = images_dir.join(format!("{}-{}.qcow2", vm_name, extra.name));
+        if dest.exists() {
+            warn!("extra disk dest {} already exists — skipped", dest.display());
+            continue;
+        }
+        if fs::rename(&src, &dest).is_err() {
+            fs::copy(&src, &dest).map_err(|e| format!("copy extra disk {}: {}", extra.name, e))?;
+            let _ = fs::remove_file(&src);
+        }
+        // A4: validate bus against the libvirt allowlist BEFORE it
+        // flows into XML. The portable archive's VmConfig is untrusted
+        // (operator-supplied content); a bus value like
+        // `virtio'/></disk><foo` would break out of the attribute.
+        let safe_bus = match validate_libvirt_bus(&extra.bus) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("libvirt restore: skipping extra disk {} — {}", extra.name, e);
+                continue;
+            }
+        };
+        // libvirt target dev: vdb, vdc… for virtio bus; sdb, sdc… for scsi.
+        let prefix = match safe_bus {
+            "scsi" => "sd",
+            "ide" => "hd",
+            _ => "vd",
+        };
+        // 'a' is OS disk; extras start at 'b'. Cap at 'z' (26 extras) —
+        // beyond that libvirt's single-letter dev naming doesn't apply
+        // anyway, and the operator should be using a custom XML.
+        if placed_count >= 25 {
+            warn!("libvirt restore: more than 25 extra disks ({}); skipping {} — \
+                   operator must edit XML to attach beyond vdz.", extra.name, extra.name);
+            continue;
+        }
+        let letter = (b'b' + placed_count as u8) as char;
+        let target = format!("{}{}", prefix, letter);
+        placed_count += 1;
+        extra_disk_paths.push((dest.to_string_lossy().to_string(), target, safe_bus.to_string()));
+    }
+
+    // Build a minimal libvirt domain XML. Operator can customise after
+    // `virsh edit <name>` if they need machine type / NIC bridge changes.
+    let machine = if config.bios_type == "ovmf" || config.bios_type == "uefi" {
+        "q35"
+    } else {
+        "pc"
+    };
+    // A4: XML-escape every string that originates from operator-supplied
+    // content (the portable archive's VmConfig). vm_name was already
+    // shape-validated above by `validate_vm_name_for_restore`, so the
+    // escape is defence-in-depth — same for the file paths, which
+    // embed vm_name plus chrono timestamps.
+    let safe_name = xml_escape(vm_name);
+    let safe_os_disk = xml_escape(&os_disk_dest.to_string_lossy());
+    let mut xml = format!(
+        "<domain type='kvm'>\n  \
+         <name>{}</name>\n  \
+         <memory unit='MiB'>{}</memory>\n  \
+         <vcpu>{}</vcpu>\n  \
+         <os>\n    <type arch='x86_64' machine='{}'>hvm</type>\n    <boot dev='hd'/>\n  </os>\n  \
+         <features>\n    <acpi/>\n    <apic/>\n  </features>\n  \
+         <clock offset='utc'/>\n  \
+         <devices>\n    \
+         <disk type='file' device='disk'>\n      \
+         <driver name='qemu' type='qcow2'/>\n      \
+         <source file='{}'/>\n      \
+         <target dev='vda' bus='virtio'/>\n    </disk>\n",
+        safe_name, config.memory_mb, config.cpus, machine,
+        safe_os_disk,
+    );
+    // Append extra disks — `bus` has already passed `validate_libvirt_bus`
+    // (allowlist), `target` is constructed from hardcoded prefix + a
+    // single letter, and `path` is escaped here.
+    for (path, target, bus) in &extra_disk_paths {
+        let safe_path = xml_escape(path);
+        // target and bus are from our allowlist/prefix construction so
+        // escape is redundant but cheap; keep for consistency.
+        xml.push_str(&format!(
+            "    <disk type='file' device='disk'>\n      \
+             <driver name='qemu' type='qcow2'/>\n      \
+             <source file='{}'/>\n      \
+             <target dev='{}' bus='{}'/>\n    </disk>\n",
+            safe_path, xml_escape(target), xml_escape(bus),
+        ));
+    }
+    // Network — virbr0 is libvirt's default NAT bridge.
+    // N3: validate MAC shape AND xml_escape — defence in depth.
+    // If validation fails we drop the MAC and let libvirt assign one
+    // rather than aborting restore for a cosmetic mismatch.
+    let mac_line = if let Some(mac) = &config.mac_address {
+        match validate_mac_address(mac) {
+            Ok(()) => format!("      <mac address='{}'/>\n", xml_escape(mac)),
+            Err(e) => {
+                warn!("libvirt restore: ignoring invalid MAC from archive — {}", e);
+                String::new()
+            }
+        }
+    } else { String::new() };
+    xml.push_str(&format!(
+        "    <interface type='network'>\n      \
+         <source network='default'/>\n{}\
+         <model type='virtio'/>\n    </interface>\n    \
+         <graphics type='vnc' port='-1' autoport='yes' listen='127.0.0.1'/>\n    \
+         <console type='pty'/>\n  </devices>\n</domain>\n",
+        mac_line,
+    ));
+
+    // Write the XML to a temp file and virsh define.
+    let xml_path = work_dir.join(format!("{}.xml", vm_name));
+    fs::write(&xml_path, &xml).map_err(|e| format!("write XML: {}", e))?;
+    let define = Command::new("virsh")
+        .args(["define", &xml_path.to_string_lossy()])
+        .output()
+        .map_err(|e| format!("virsh define failed to start: {}", e))?;
+    if !define.status.success() {
+        // Roll back: remove the disks we just placed.
+        let _ = fs::remove_file(&os_disk_dest);
+        for (path, _, _) in &extra_disk_paths {
+            let _ = fs::remove_file(path);
+        }
+        return Err(format!(
+            "virsh define failed: {} — disks rolled back",
+            String::from_utf8_lossy(&define.stderr).trim()));
+    }
+
+    Ok(format!(
+        "VM '{}' restored to libvirt (disk: {}, {} extra disk(s)). \
+         Start it with `virsh start {}` or via the WolfStack VM list. \
+         W5: NIC is attached to libvirt's 'default' network. If your \
+         libvirt setup uses a custom bridge (virbr1, br0, etc.) or has \
+         'default' disabled, edit with `virsh edit {}` before starting \
+         or the VM will have no network connectivity.",
+        vm_name, os_disk_dest.display(), extra_disk_paths.len(), vm_name, vm_name))
+}
+
+/// Native restore — extract the tar.gz to /var/lib/wolfstack/vms/ and
+/// verify the config landed at the expected flat path. Handles legacy
+/// archives that wrap the config inside a subdirectory.
+fn restore_vm_to_native(local_path: &Path, vm_name: &str) -> Result<String, String> {
+    // Same name-shape validation as the libvirt/Proxmox paths — refuse
+    // crafted archives whose VmConfig.name would let extracted files
+    // land outside /var/lib/wolfstack/vms.
+    validate_vm_name_for_restore(vm_name)?;
+
     let vm_base = "/var/lib/wolfstack/vms";
     fs::create_dir_all(vm_base).map_err(|e| format!("Failed to create VM dir: {}", e))?;
 
-    // Extract to /var/lib/wolfstack/vms/
-    // The tar contains: {name}.json, {name}.qcow2, and optionally {name}/ directory
-    let output = Command::new("tar")
-        .args(["xzf", &local_path.to_string_lossy(), "-C", vm_base])
-        .output()
-        .map_err(|e| format!("Failed to extract VM backup: {}", e))?;
-
+    // Extract to /var/lib/wolfstack/vms/. Uses the same path-traversal-
+    // safe helper as the libvirt and Proxmox restore paths: lists
+    // archive entries first and refuses absolute / `..` / NUL paths
+    // before extracting. Pre-fix this used raw `tar xzf` which would
+    // have allowed a crafted archive to write `../../../etc/cron.d/evil`.
+    safe_extract_tar(local_path, Path::new(vm_base))?;
     let _ = fs::remove_file(local_path);
-
-    if !output.status.success() {
-        return Err(format!("VM extract failed: {}", String::from_utf8_lossy(&output.stderr)));
-    }
 
     // Verify the config JSON was restored
     let config_path = format!("{}/{}.json", vm_base, vm_name);
@@ -2610,8 +3282,202 @@ pub fn restore_vm_local(local_path: &Path, vm_name: &str) -> Result<String, Stri
         }
     }
 
-    Ok(format!("VM '{}' restored", vm_name))
+    Ok(format!("VM '{}' restored to /var/lib/wolfstack/vms/ as a native KVM VM", vm_name))
 }
+
+/// Proxmox restore — extract the portable archive to a work dir,
+/// read the JSON config, allocate a free VMID, create the VM via
+/// `qm create`, and import each disk via `qm importdisk`. The OS
+/// disk lands at scsi0; extras at scsi1, scsi2, … (or their original
+/// bus name when StorageVolume.bus is set).
+///
+/// `target_storage = None` defaults to `local-lvm` (the standard
+/// Proxmox install layout). Callers with custom storage can pass it
+/// explicitly.
+fn restore_vm_to_proxmox(
+    local_path: &Path,
+    vm_name: &str,
+    target_storage: Option<&str>,
+) -> Result<String, String> {
+    use crate::vms::manager::VmConfig;
+
+    // Same validation as the libvirt restore — refuse names that
+    // would escape paths or break `qm create` arg passing.
+    validate_vm_name_for_restore(vm_name)?;
+
+    let storage = target_storage.unwrap_or("local-lvm");
+
+    // 1) Extract the portable archive into a per-restore work dir so
+    //    we don't pollute staging if the qm step fails halfway.
+    let staging = ensure_staging_dir()?;
+    let timestamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
+    let work_dir = staging.join(format!("pmx-restore-{}-{}", vm_name, timestamp));
+    fs::create_dir_all(&work_dir)
+        .map_err(|e| format!("create work dir: {}", e))?;
+    struct WorkDirGuard(PathBuf);
+    impl Drop for WorkDirGuard {
+        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+    }
+    let _work_guard = WorkDirGuard(work_dir.clone());
+
+    // N1: same path-traversal hardening as the libvirt restore path.
+    safe_extract_tar(local_path, &work_dir)?;
+    let _ = fs::remove_file(local_path);
+
+    // 2) Read the portable VmConfig.
+    let config_path = work_dir.join(format!("{}.json", vm_name));
+    if !config_path.exists() {
+        return Err(format!(
+            "archive did not contain {}.json — operator may have an old-format \
+             backup that needs manual conversion. Nothing was created.", vm_name));
+    }
+    let config_text = fs::read_to_string(&config_path)
+        .map_err(|e| format!("read config: {}", e))?;
+    let config: VmConfig = serde_json::from_str(&config_text)
+        .map_err(|e| format!("parse config: {}", e))?;
+
+    // 3) Allocate a free VMID via the cluster-safe Proxmox API. C2 fix:
+    //    pre-fix this used a local-filesystem scan which races other
+    //    cluster nodes during concurrent restore (or against the PVE
+    //    HA manager). `pvesh get /cluster/nextid` is the cluster-wide
+    //    primitive.
+    let vmid = crate::vms::manager::next_pve_vmid()?;
+
+    // 4) Create the VM with `qm create`. Use BIOS / cores / memory from
+    //    the config; default to virtio NIC on vmbr0 if a MAC is present.
+    let bios_arg = match config.bios_type.as_str() {
+        "ovmf" | "uefi" => "ovmf",
+        _ => "seabios",
+    };
+    let mut qm_args: Vec<String> = vec![
+        "create".to_string(),
+        vmid.to_string(),
+        "--name".to_string(), vm_name.to_string(),
+        "--cores".to_string(), config.cpus.to_string(),
+        "--memory".to_string(), config.memory_mb.to_string(),
+        "--bios".to_string(), bios_arg.to_string(),
+        // No disks yet — qm importdisk attaches them below. Without
+        // any disk, `--ostype l26` is a safe default for Linux guests;
+        // Windows users will edit it post-restore.
+        "--ostype".to_string(), "l26".to_string(),
+    ];
+    // N3: validate MAC before it flows into qm's comma-separated arg.
+    // A crafted archive MAC like `DE:AD:BE:EF:00:01,firewall=1` would
+    // inject extra --net0 options. On validation failure we drop the
+    // MAC and fall back to qm picking one, rather than aborting the
+    // restore — the operator can fix the MAC post-restore.
+    let safe_mac = config.mac_address.as_ref().and_then(|m| {
+        match validate_mac_address(m) {
+            Ok(()) => Some(m.clone()),
+            Err(e) => {
+                warn!("Proxmox restore: ignoring invalid MAC from archive — {}", e);
+                None
+            }
+        }
+    });
+    if let Some(mac) = safe_mac {
+        qm_args.push("--net0".to_string());
+        qm_args.push(format!("virtio={},bridge=vmbr0", mac));
+    } else {
+        qm_args.push("--net0".to_string());
+        qm_args.push("virtio,bridge=vmbr0".to_string());
+    }
+
+    let create = Command::new("qm").args(&qm_args).output()
+        .map_err(|e| format!("qm create failed to start: {}", e))?;
+    if !create.status.success() {
+        return Err(format!(
+            "qm create {} failed: {}",
+            vmid, String::from_utf8_lossy(&create.stderr).trim()));
+    }
+
+    // 5) Import the OS disk first (lands at unused0 after import, then
+    //    we move it to scsi0).
+    let os_disk = work_dir.join(format!("{}.qcow2", vm_name));
+    if !os_disk.exists() {
+        // Roll back the half-created VM so the operator isn't left
+        // with a husk to clean up by hand.
+        let _ = Command::new("qm").args(["destroy", &vmid.to_string()]).output();
+        return Err(format!(
+            "archive contained no OS disk ({}.qcow2). VM {} created+destroyed; \
+             nothing to attach.", vm_name, vmid));
+    }
+    // C3 fix: use the shared `pve_import_and_attach_disk` helper from
+    // vms::manager — it CORRECTLY omits `--format qcow2` (forcing that
+    // breaks LVM-thin and ZFS, the most common production PVE storage
+    // layouts). The buggy local copy `import_disk_to_proxmox` is gone.
+    crate::vms::manager::pve_import_and_attach_disk(vmid, &os_disk, storage, "scsi0")
+        .map_err(|e| {
+            let _ = Command::new("qm").args(["destroy", &vmid.to_string()]).output();
+            format!("OS disk import failed: {}. VM {} rolled back.", e, vmid)
+        })?;
+
+    // Set boot device to the imported OS disk.
+    let boot = Command::new("qm")
+        .args(["set", &vmid.to_string(), "--boot", "order=scsi0"])
+        .output()
+        .map_err(|e| format!("qm set boot failed to start: {}", e))?;
+    if !boot.status.success() {
+        // Non-fatal — VM exists and has a disk, operator can set boot
+        // manually. Log instead of failing the whole restore.
+        warn!("qm set --boot for {} failed: {} — operator may need to set boot device manually",
+            vmid, String::from_utf8_lossy(&boot.stderr).trim());
+    }
+
+    // 6) Import extra disks (scsi1, scsi2, …). The slot name comes
+    //    from the portable config's extra_disks entries — bus is
+    //    preserved where possible.
+    let mut next_slot_by_bus: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
+    next_slot_by_bus.insert("scsi".into(), 1);  // scsi0 already used by OS disk
+    next_slot_by_bus.insert("virtio".into(), 0);
+    next_slot_by_bus.insert("ide".into(), 0);
+    next_slot_by_bus.insert("sata".into(), 0);
+    for extra in &config.extra_disks {
+        // N2: same archive-field validation as the libvirt restore path.
+        if let Err(e) = validate_archive_path_field(&extra.name, "extra_disks[].name") {
+            warn!("Proxmox restore: skipping extra disk — {}", e);
+            continue;
+        }
+        if let Err(e) = validate_archive_path_field(&extra.format, "extra_disks[].format") {
+            warn!("Proxmox restore: skipping extra disk '{}' — {}", extra.name, e);
+            continue;
+        }
+        let extra_path = work_dir.join(format!("{}.{}", extra.name, extra.format));
+        if !extra_path.exists() {
+            warn!("extra disk {} listed in config but not present in archive — skipped",
+                extra.name);
+            continue;
+        }
+        let bus = if next_slot_by_bus.contains_key(extra.bus.as_str()) {
+            extra.bus.clone()
+        } else {
+            "scsi".to_string()
+        };
+        let slot_num = next_slot_by_bus.get(bus.as_str()).copied().unwrap_or(0);
+        let slot_name = format!("{}{}", bus, slot_num);
+        next_slot_by_bus.insert(bus.clone(), slot_num + 1);
+        if let Err(e) = crate::vms::manager::pve_import_and_attach_disk(
+            vmid, &extra_path, storage, &slot_name)
+        {
+            warn!("extra disk {} import failed: {} — operator must attach manually",
+                extra.name, e);
+        }
+    }
+
+    Ok(format!(
+        "VM '{}' restored to Proxmox as VMID {} on storage '{}' (boot device: scsi0). \
+         Start it with `qm start {}` or via the WolfStack VM list.",
+        vm_name, vmid, storage, vmid))
+}
+
+// `import_disk_to_proxmox` and `allocate_free_proxmox_vmid` were
+// removed in the C2/C3 fix round — both duplicated logic that already
+// existed (correctly) in vms::manager, and both had subtle bugs:
+//   • allocate_free_proxmox_vmid scanned local files and raced the
+//     cluster — replaced by `next_pve_vmid` (uses `pvesh /cluster/nextid`)
+//   • import_disk_to_proxmox passed `--format qcow2` which breaks
+//     LVM-thin and ZFS — replaced by `pve_import_and_attach_disk`
 
 /// Restore WolfStack configuration from backup
 pub fn restore_config_backup(entry: &BackupEntry) -> Result<String, String> {

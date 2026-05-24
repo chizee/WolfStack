@@ -5454,6 +5454,8 @@ function renderVms(vms) {
                          <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#ef4444;" onclick="vmAction('${vm.name}', 'stop', this)" title="Stop (graceful ACPI shutdown)"><span class="ws-icon-clean-wrap" data-icon="stop"></span></button>
                          <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#b91c1c;" onclick="vmForceStopConfirm('${vm.name}', this)" title="Force Stop (power off immediately)"><span class="ws-icon-clean-wrap" data-icon="stop"></span></button>` :
                 `<button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="showVmSettings('${vm.name}')" title="Settings"><span class="ws-icon-clean-wrap" data-icon="settings"></span></button>
+                         <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#a855f7;" onclick="backupSingleVm('${vm.name}')" title="Back up this VM now (portable tar.gz to local storage)"><span class="ws-icon-clean-wrap" data-icon="save"></span></button>
+                         <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#eab308;" onclick="cloneVm('${vm.name}')" title="Clone this VM (full copy of disks, fresh MACs)"><span class="ws-icon-clean-wrap" data-icon="copy"></span></button>
                          <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#3b82f6;" onclick="migrateVm('${vm.name}')" title="Migrate to another node"><span class="ws-icon-clean-wrap" data-icon="migrate"></span></button>
                          <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#06b6d4;" onclick="migrateVmDiskStorage('${vm.name}')" title="Move disk to different storage (same node)"><span class="ws-icon-clean-wrap" data-icon="migrate"></span></button>
                          <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;color:#22c55e;" onclick="vmAction('${vm.name}', 'start', this)" title="Start">▶️</button>
@@ -19813,8 +19815,10 @@ function vmCardHtml(vm) {
             <button class="btn btn-sm" style="${!isRunning ? bd : bs}" ${!isRunning ? 'disabled' : `onclick="openVmConsole('${vm.name}')"`} title="Serial terminal (guest must have serial console enabled)"><span class="ws-icon-clean-wrap" data-icon="terminal"></span></button>
             <button class="btn btn-sm" style="${bs}" onclick="showVmSettings('${vm.name}')" title="Settings"><span class="ws-icon-clean-wrap" data-icon="settings"></span></button>
             <button class="btn btn-sm" style="${bs}" onclick="showVmLogs('${vm.name}')" title="Logs"><span class="ws-icon-clean-wrap" data-icon="logs"></span></button>
-            <button class="btn btn-sm" style="${bs}" onclick="migrateVm('${vm.name}')" title="Migrate to another node"><span class="ws-icon-clean-wrap" data-icon="migrate"></span></button>
-            <button class="btn btn-sm" style="${bs}" onclick="migrateVmDiskStorage('${vm.name}')" title="Move disk to different storage (same node)"><span class="ws-icon-clean-wrap" data-icon="migrate"></span></button>
+            <button class="btn btn-sm" style="${!isRunning ? bs : bd}color:#a855f7;" ${!isRunning ? `onclick="backupSingleVm('${vm.name}')"` : 'disabled'} title="${!isRunning ? 'Back up this VM now (portable tar.gz to local storage)' : 'Stop the VM first — backup of a running VM produces an inconsistent disk image'}"><span class="ws-icon-clean-wrap" data-icon="save"></span></button>
+            <button class="btn btn-sm" style="${!isRunning ? bs : bd}color:#eab308;" ${!isRunning ? `onclick="cloneVm('${vm.name}')"` : 'disabled'} title="${!isRunning ? 'Clone this VM (full copy of disks, fresh MACs)' : 'Stop the VM first — cloning a running VM produces an inconsistent disk image'}"><span class="ws-icon-clean-wrap" data-icon="copy"></span></button>
+            <button class="btn btn-sm" style="${!isRunning ? bs : bd}" ${!isRunning ? `onclick="migrateVm('${vm.name}')"` : 'disabled'} title="${!isRunning ? 'Migrate to another node' : 'Stop the VM first — migration must export a consistent disk image'}"><span class="ws-icon-clean-wrap" data-icon="migrate"></span></button>
+            <button class="btn btn-sm" style="${!isRunning ? bs : bd}" ${!isRunning ? `onclick="migrateVmDiskStorage('${vm.name}')"` : 'disabled'} title="${!isRunning ? 'Move disk to different storage (same node)' : 'Stop the VM first — moving a live disk would corrupt it'}"><span class="ws-icon-clean-wrap" data-icon="migrate"></span></button>
             ${!isRunning ? `<button class="btn btn-sm" style="${bs}color:#ef4444;" onclick="deleteVm('${vm.name}')" title="Delete"><span class="ws-icon-clean-wrap" data-icon="trash"></span></button>` : ''}
         </div>
         <div style="padding:10px 12px;">
@@ -22662,6 +22666,135 @@ async function doMigrateLxc(name) {
         }
     }
 }
+
+// ─── VM Backup (per-VM quick backup) ───
+//
+// Stage F: a one-click "back up this VM now" action wired straight to
+// the per-VM row. Calls POST /api/backups with a Local-storage default
+// at /var/lib/wolfstack/backups — the operator picks fancier storage
+// (S3 / NFS / PBS) from the Backups page. The backend dispatches by
+// platform (native / Proxmox / libvirt) and produces a portable
+// WolfStack-format archive that restores cleanly anywhere.
+async function backupSingleVm(vmName) {
+    if (!await wolfConfirm(
+        `Back up VM "${vmName}" now to local storage (/var/lib/wolfstack/backups)?\n\n` +
+        `The backup is a portable tar.gz archive: VM config + every disk as qcow2. ` +
+        `It restores cleanly on this host (native KVM, Proxmox, or libvirt) AND on ` +
+        `any other WolfStack node — the file is platform-independent.\n\n` +
+        `For S3 / NFS / PBS destinations, use the Backups page directly.`,
+        'Backup VM', { okText: 'Backup now' }
+    )) return;
+    const storage = { type: 'local', path: '/var/lib/wolfstack/backups' };
+    const target = { target_type: 'vm', name: vmName, hostname: null, state: null, specs: null };
+    // The /api/backups endpoint is synchronous (it returns once the
+    // tarball is written). On a stopped Proxmox VM with multi-GB
+    // disks this can run for minutes, and previously the button just
+    // sat there with no feedback. Show an in-flight toast so the
+    // user knows it's running.
+    showToast(`Backing up "${vmName}" — this may take a few minutes for large disks…`, 'info');
+    try {
+        const r = await fetch(apiUrl('/api/backups'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({ target, storage }),
+        });
+        const data = await r.json();
+        if (!r.ok) {
+            const errMsg = (data && data.error) || ('HTTP ' + r.status);
+            showToast(`Backup failed for "${vmName}": ${errMsg}`, 'error');
+            return;
+        }
+        // Response contains entries with status / size / file path —
+        // surface the real result instead of saying "queued" (the
+        // /api/backups endpoint is synchronous, the backup is DONE
+        // by the time this fires).
+        const entry = (data && data.entries && data.entries[0]) || {};
+        // S4 fix: backend field is `size_bytes`, not `size`. Pre-fix the
+        // toast always showed "0 MB" because `entry.size` was undefined.
+        const sizeMb = entry.size_bytes ? Math.round(entry.size_bytes / (1024 * 1024)) : null;
+        const sizeNote = sizeMb !== null ? ` — ${sizeMb} MB` : '';
+        if (entry.status === 'failed') {
+            showToast(
+                `Backup failed for "${vmName}": ${entry.error || 'unknown error'}`,
+                'error'
+            );
+        } else {
+            showToast(
+                `Backup completed for "${vmName}"${sizeNote}. See the Backups page for the archive.`,
+                'success'
+            );
+        }
+    } catch (e) {
+        showToast(`Backup failed: ${e.message || e}`, 'error');
+    }
+}
+window.backupSingleVm = backupSingleVm;
+
+// Clone a VM on this host. Always a full clone — full copies are safe
+// to start/stop/delete independently; linked clones (Proxmox thin-overlay,
+// available via `qm clone --full 0`) tie the child to the source and
+// break if the source is removed. Defer that toggle until there's a real
+// ask for it. Backend dispatches by platform: qm clone / virt-clone /
+// native file-copy. Long operation — handler is wrapped in web::block.
+async function cloneVm(vmName) {
+    const suggested = `${vmName}-clone`;
+    const newName = await wolfPrompt(
+        `New name for the clone of "${vmName}":\n\n` +
+        `Allowed: A-Z a-z 0-9 _ . - + :  (no spaces, no slashes). ` +
+        `On Proxmox this runs \`qm clone\`; on libvirt \`virt-clone --auto-clone\`; ` +
+        `on native KVM the OS disk + extra disks are file-copied and the MAC ` +
+        `addresses are regenerated so both VMs can run side-by-side.\n\n` +
+        `Full clone — the new VM is independent of the source.`,
+        suggested, 'Clone VM', { okText: 'Clone', placeholder: suggested }
+    );
+    if (!newName) return;
+    const trimmed = newName.trim();
+    if (!trimmed) return;
+    // Client-side mirror of the backend validator so the user sees the
+    // error before we hit the API. The backend re-validates regardless.
+    // `-` is escaped explicitly so a future `/u` flag (which makes
+    // unescaped `-` adjacency a SyntaxError) doesn't surprise us.
+    // Leading `-` is also forbidden so a name can't be argv-injected
+    // into `qm clone … --name <name>` on the backend.
+    if (!/^[A-Za-z0-9_.+:\-]+$/.test(trimmed)
+        || trimmed.startsWith('.') || trimmed.startsWith('-')
+        || trimmed.includes('..'))
+    {
+        showToast(
+            `Invalid name "${trimmed}" — use A-Z a-z 0-9 _ . - + : (no leading dot or dash, no '..').`,
+            'error'
+        );
+        return;
+    }
+    if (trimmed === vmName) {
+        showToast('Clone name must differ from the source.', 'error');
+        return;
+    }
+    showToast(`Cloning "${vmName}" → "${trimmed}" — this may take a few minutes for large disks…`, 'info');
+    try {
+        const r = await fetch(apiUrl(`/api/vms/${encodeURIComponent(vmName)}/clone`), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({ new_name: trimmed, full: true }),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) {
+            const errMsg = (data && data.error) || ('HTTP ' + r.status);
+            showToast(`Clone failed: ${errMsg}`, 'error');
+            return;
+        }
+        showToast(`Cloned "${vmName}" → "${trimmed}". The new VM is stopped — start it from the VM list.`, 'success');
+        // Refresh the VM list so the new clone appears without a
+        // manual reload. Both the datacenter table and the per-server
+        // card view ultimately come from loadVms() → renderVmCards().
+        if (typeof loadVms === 'function') { try { loadVms(); } catch (_) {} }
+    } catch (e) {
+        showToast(`Clone failed: ${e.message || e}`, 'error');
+    }
+}
+window.cloneVm = cloneVm;
 
 // ─── VM Migration ───
 

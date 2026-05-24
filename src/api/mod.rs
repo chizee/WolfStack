@@ -13854,7 +13854,19 @@ pub async fn backup_create(
         }
     }
     backup::merge_pbs_secrets(&mut storage);
-    let entries = backup::create_backup(body.target.clone(), storage);
+    // W6 fix: backup::create_backup runs `qemu-img convert` for VM
+    // disks — potentially many minutes for a multi-GB image. Wrap in
+    // web::block so the actix worker isn't pinned for the duration.
+    // The blocking pool exists exactly for this.
+    let target_clone = body.target.clone();
+    let entries = match web::block(move || backup::create_backup(target_clone, storage)).await {
+        Ok(e) => e,
+        Err(e) => {
+            return HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": format!("backup task: {}", e),
+            }));
+        }
+    };
     let success_count = entries.iter().filter(|e| e.status == backup::BackupStatus::Completed).count();
     let fail_count = entries.iter().filter(|e| e.status == backup::BackupStatus::Failed).count();
     HttpResponse::Ok().json(serde_json::json!({
