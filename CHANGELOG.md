@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v24.7.8: WolfRouter — fix torn-write that corrupted config.json on all nodes** _(2026-05-25 — [`fd9dbde`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/fd9dbde75465f0930ecd0258e00d664c850c9414))_
 - **v24.7.7: drop sudo from WolfStack-executed paths (Proxmox minimal has no sudo)** _(2026-05-25 — [`5c7d015`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/5c7d015d1fe9d43d46beb98b5fe7d58761b3d57c))_
 - **v24.7.6: View upgrade log button on the in-progress upgrade modal** _(2026-05-25 — [`2e3b8af`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/2e3b8af3f2d7682b69bc81bb7a4a77f935b2a21b))_
 - **v24.7.5: AV install 404 (double-proxy URL) + capture upgrade output to a log** _(2026-05-25 — [`8fc76ab`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/8fc76ab981debd656d6a8de4b495721a3b5cd98a))_
