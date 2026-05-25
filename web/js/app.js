@@ -31910,6 +31910,22 @@ async function issuesUpgradeNode(nodeId) {
                 + '</div>';
         }
     }
+    // "View upgrade log" link \u2014 opens a small inline viewer that polls
+    // /api/upgrade/log for the tail of setup.sh stdout/stderr. Only
+    // useful for self-upgrades; for remote-node upgrades, the log lives
+    // on the remote (we can still proxy to it via /api/nodes/{id}/proxy/
+    // upgrade/log).
+    var logHref = (node && !node.is_self)
+        ? '/api/nodes/' + encodeURIComponent(nodeId) + '/proxy/upgrade/log'
+        : '/api/upgrade/log';
+    var logBtnHtml = '<div style="margin-top:14px; text-align:center;">'
+        + '<button type="button" onclick="openUpgradeLogViewer(\'' + safeId + '\', \'' + escapeAttr(logHref) + '\')" '
+        + 'style="background:transparent; color:var(--text-muted); border:1px dashed var(--border); border-radius:6px; padding:6px 12px; cursor:pointer; font-size:12px;">'
+        + '\uD83D\uDCDC View upgrade log'
+        + '</button>'
+        + '<div id="upgrade-log-viewer-' + safeId + '" style="display:none; margin-top:8px; text-align:left;"></div>'
+        + '</div>';
+
     modal.setFooter('<div style="background:rgba(234,179,8,0.1); border:1px solid rgba(234,179,8,0.3); border-radius:10px; padding:16px; text-align:center;">'
         + '<div style="font-size:24px; margin-bottom:8px;">\u23F3</div>'
         + '<div style="font-weight:600; color:var(--text-primary); font-size:14px; margin-bottom:4px;">Please wait approximately 5 minutes</div>'
@@ -31923,9 +31939,68 @@ async function issuesUpgradeNode(nodeId) {
               + '<div style="font-size:11px; color:var(--text-muted); margin-top:6px;">Click after ~5 minutes once the upgrade finishes</div>'
               + '</div>'
             : '<div style="color:var(--text-secondary); font-size:12px; margin-top:6px;">Refresh your browser once complete.</div>')
+        + logBtnHtml
         + redirectExplainer
         + '</div>');
     modal.showDone();
+}
+
+// Open / refresh the inline upgrade-log viewer. Polls the log endpoint
+// every 3s while the pane is open; auto-stops if the modal is closed
+// (the viewer div disappears with it). Restartable \u2014 clicking the
+// button again resumes from the latest tail.
+async function openUpgradeLogViewer(safeId, logHref) {
+    const pane = document.getElementById('upgrade-log-viewer-' + safeId);
+    if (!pane) return;
+    if (pane._polling) {
+        // Toggle off \u2014 second click hides the viewer.
+        pane._polling = false;
+        pane.style.display = 'none';
+        return;
+    }
+    pane.style.display = 'block';
+    pane._polling = true;
+    pane.innerHTML = '<pre style="background:#0b1220; color:#cde7ff; border:1px solid var(--border); border-radius:6px; padding:8px 10px; margin:0; font-size:11px; line-height:1.4; max-height:280px; overflow:auto; white-space:pre-wrap; word-break:break-word;">Loading\u2026</pre>';
+    const pre = pane.querySelector('pre');
+    const meta = document.createElement('div');
+    meta.style.cssText = 'font-size:10px; color:var(--text-muted); margin-top:4px;';
+    pane.appendChild(meta);
+
+    async function tick() {
+        if (!pane.isConnected || !pane._polling) return;
+        try {
+            const r = await fetch(logHref + '?tail=131072', { cache: 'no-store' });
+            if (r.ok) {
+                const d = await r.json();
+                if (d.exists) {
+                    pre.textContent = d.content || '(empty)';
+                    // Stick to bottom \u2014 operator wants the latest line visible.
+                    pre.scrollTop = pre.scrollHeight;
+                    const sizeKb = ((d.size_bytes || 0) / 1024).toFixed(1);
+                    const mod = d.modified_at ? ' \u2014 modified ' + d.modified_at : '';
+                    const trunc = d.truncated ? ' (showing tail only)' : '';
+                    meta.textContent = sizeKb + ' KB at ' + (d.path || '/var/log/wolfstack-upgrade.log') + mod + trunc;
+                } else {
+                    pre.textContent = d.message || 'No upgrade log yet.';
+                    meta.textContent = '';
+                }
+            } else if (r.status === 404) {
+                // The remote may not have the new endpoint yet (upgrading
+                // from a version that lacks /api/upgrade/log). Stop
+                // polling and explain so the operator doesn't see a
+                // permanent "Loading\u2026" or repeated 404 spam.
+                pre.textContent = 'Upgrade-log endpoint not available on this node (likely pre-v24.7.5). The upgrade is still running \u2014 check /var/log/wolfstack-upgrade.log via ssh.';
+                pane._polling = false;
+                return;
+            } else {
+                meta.textContent = 'log fetch HTTP ' + r.status;
+            }
+        } catch (e) {
+            meta.textContent = 'log fetch error: ' + (e && e.message || e);
+        }
+        setTimeout(tick, 3000);
+    }
+    tick();
 }
 
 async function issuesUpgradeAll() {
