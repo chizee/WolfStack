@@ -1273,6 +1273,21 @@ echo ""
 echo "Please Refresh your browser if upgrading..."
 
 # ─── Restart service if upgrading (must be last!) ────────────────────────────
+#
+# See setup.sh for the rationale. PapaSchlumpf 2026-05-25:
+# closing the upgrade-console browser tab before the sleep
+# elapsed killed the pending restart along with the pty.
+# systemd-run is owned by PID 1, so the restart survives.
 if [ "$RESTART_SERVICE" = "true" ]; then
-    nohup bash -c "sleep 3 && systemctl restart wolfstack" &>/dev/null &
+    if command -v systemd-run >/dev/null 2>&1; then
+        systemd-run --quiet --no-block \
+            --on-active=3s \
+            --unit="wolfstack-self-restart-$$.timer" \
+            /bin/systemctl restart wolfstack >/dev/null 2>&1 || \
+        setsid bash -c "sleep 3 && systemctl restart wolfstack" \
+            </dev/null >/dev/null 2>&1 &
+    else
+        setsid bash -c "sleep 3 && systemctl restart wolfstack" \
+            </dev/null >/dev/null 2>&1 &
+    fi
 fi

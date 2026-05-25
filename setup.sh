@@ -2176,6 +2176,35 @@ echo ""
 echo "Please Refresh your browser if upgrading..."
 
 # ─── Restart service if upgrading (must be last!) ────────────────────────────
+#
+# Detach properly. PapaSchlumpf 2026-05-25: upgrading from 24.7.7 to
+# 24.7.9 via the in-app console, closing the browser tab before the
+# 3-second sleep elapsed killed the pending restart along with the
+# pty session — the new binary was installed but the service kept
+# running the old one, so the dashboard kept showing 24.7.7.
+#
+# `nohup ... &` is NOT enough. The console session is a pty spawned
+# by wolfstack itself; when the browser closes, wolfstack tears down
+# the pty and every child in its session/cgroup is signalled. `nohup`
+# only ignores SIGHUP, not SIGTERM/SIGKILL that come from cgroup
+# cleanup. Schedule via a transient systemd timer so the restart is
+# owned by PID 1 and cannot be killed by the pty closing.
+#
+# Fallback (no systemd-run) uses `setsid` to start a new session
+# detached from the pty plus full stdio redirection — the best a
+# plain shell can do.
 if [ "$RESTART_SERVICE" = "true" ]; then
-    nohup bash -c "sleep 3 && systemctl restart wolfstack" >/dev/null 2>&1 &
+    if command -v systemd-run >/dev/null 2>&1; then
+        # Transient one-shot timer owned by systemd; survives the pty
+        # closing because its parent is PID 1, not our shell.
+        systemd-run --quiet --no-block \
+            --on-active=3s \
+            --unit="wolfstack-self-restart-$$.timer" \
+            /bin/systemctl restart wolfstack >/dev/null 2>&1 || \
+        setsid bash -c "sleep 3 && systemctl restart wolfstack" \
+            </dev/null >/dev/null 2>&1 &
+    else
+        setsid bash -c "sleep 3 && systemctl restart wolfstack" \
+            </dev/null >/dev/null 2>&1 &
+    fi
 fi
