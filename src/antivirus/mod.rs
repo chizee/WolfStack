@@ -852,6 +852,23 @@ pub fn install_tools(state: &AntivirusState) -> InstallResult {
         };
     }
 
+    // Customer report 2026-05-25 (klasSponsor): logrotate refused to run
+    // because /etc/logrotate.d/clamav-freshclam references the `clamav`
+    // user via `su clamav clamav` but the user didn't exist on his box.
+    // Almost certainly a partial install at some point (apt postinst
+    // interrupted, dpkg --force-confold left a half state, etc.) — the
+    // Debian package's postinst would have created it via adduser.
+    //
+    // Self-heal: ensure the clamav user+group exist after a successful
+    // package install. Idempotent — `getent passwd clamav` succeeds
+    // when the user already exists and we skip the create. Limited to
+    // debian-family because clamav's group/user naming is consistent
+    // there (Fedora/RHEL ship via clamupdate group; Arch uses clamav
+    // already; suse uses vscan — none have hit this bug).
+    if family == "debian" {
+        ensure_clamav_user(state);
+    }
+
     // Seed ClamAV signatures (best-effort).
     if which("freshclam").is_some() {
         state.push_install_line("==> freshclam (seeding ClamAV signatures)".into());
@@ -1330,6 +1347,61 @@ fn finalize_install(state: &AntivirusState, ok: bool, error: Option<String>) {
 fn systemd_is_active(unit: &str) -> bool {
     Command::new("systemctl").args(["is-active", "--quiet", unit])
         .status().map(|s| s.success()).unwrap_or(false)
+}
+
+/// Make sure the `clamav` system user + group exist on Debian/Ubuntu
+/// after the package install. Normally the .deb's postinst handles this,
+/// but a partial install (interrupted apt, dpkg --force flags, manual
+/// user cleanup) can leave the user missing while the logrotate config
+/// in /etc/logrotate.d/clamav-freshclam still references it — logrotate
+/// then refuses to rotate freshclam.log and ALL logrotate runs fail.
+///
+/// Idempotent: `getent passwd clamav` returns 0 when the user exists,
+/// in which case we don't touch anything. `adduser --system --group`
+/// (Debian's wrapper) is the canonical create form and is also a
+/// no-op if the user already exists. Logs each step so the operator
+/// sees what we did.
+fn ensure_clamav_user(state: &AntivirusState) {
+    let user_exists = Command::new("getent").args(["passwd", "clamav"])
+        .status().map(|s| s.success()).unwrap_or(false);
+    let group_exists = Command::new("getent").args(["group", "clamav"])
+        .status().map(|s| s.success()).unwrap_or(false);
+    if user_exists && group_exists {
+        return; // healthy — nothing to do
+    }
+    state.push_install_line(
+        "==> 'clamav' user/group missing — creating (logrotate's clamav-freshclam.conf needs it)".into());
+    // adduser --system --quiet --group is Debian's wrapper for creating
+    // a system user with a matching primary group. The home directory
+    // defaults to /var/lib/clamav (set in adduser.conf via DSHELL_VAR
+    // on Debian); --no-create-home prevents adduser from clobbering
+    // an existing directory if the package created /var/lib/clamav
+    // already.
+    let ok = run_streaming(state, "adduser",
+        &["adduser", "--system", "--quiet", "--group",
+          "--no-create-home", "--home", "/var/lib/clamav",
+          "clamav"],
+        &[]);
+    if !ok {
+        // useradd is the lower-level fallback if adduser isn't installed
+        // (rare — Debian/Ubuntu base have adduser by default).
+        let _ = run_streaming(state, "useradd",
+            &["useradd", "--system",
+              "--home-dir", "/var/lib/clamav",
+              "--no-create-home",
+              "--user-group",
+              "--shell", "/usr/sbin/nologin",
+              "clamav"],
+            &[]);
+    }
+    // Fix ownership on the directories the package would have chowned.
+    // Errors are tolerated — if the dirs don't exist yet, the package
+    // postinst will create them with the right owner on its next run.
+    for path in &["/var/log/clamav", "/var/lib/clamav", "/var/run/clamav"] {
+        if std::path::Path::new(path).exists() {
+            let _ = Command::new("chown").args(["-R", "clamav:clamav", path]).status();
+        }
+    }
 }
 
 /// Best-effort: who currently holds the dpkg lock? Returns a short
