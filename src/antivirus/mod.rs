@@ -553,19 +553,38 @@ fn build_install_cmd_family(family: &str, packages: &[&str]) -> Option<Vec<Strin
     match family {
         "debian" => {
             // DEBIAN_FRONTEND=noninteractive is set by the caller via env.
-            // -q                       : quieter output (still useful, less noise)
-            // -y                       : assume yes
-            // --no-install-recommends  : keep the install minimal
-            // Dpkg::Options force-conf*: never prompt about modified
-            //                            config files; keep the
-            //                            currently-installed version
-            //                            on conflict (safe default).
+            // -q                          : quieter output (still useful, less noise)
+            // -y                          : assume yes
+            // --no-install-recommends     : keep the install minimal
+            // Dpkg::Options force-conf*   : never prompt about modified
+            //                               config files; keep the
+            //                               currently-installed version
+            //                               on conflict (safe default).
+            // DPkg::Lock::Timeout=600     : wait up to 10 min for the apt /
+            //                               dpkg lock. WITHOUT THIS Ubuntu
+            //                               installs race-fail against
+            //                               unattended-upgrades / apt-daily
+            //                               with "Could not get lock
+            //                               /var/lib/dpkg/lock-frontend".
+            //                               Proxmox doesn't ship those
+            //                               timers so the same code worked
+            //                               there but blew up on Ubuntu.
+            //                               10 min covers most realistic
+            //                               unattended-upgrades sessions
+            //                               (including kernel + initramfs
+            //                               rebuilds). Available in apt
+            //                               1.9+ (Ubuntu 20.04 / Debian 11
+            //                               and newer; ignored as an
+            //                               unknown option on older apt
+            //                               rather than failing — apt
+            //                               silently drops unknown -o keys).
             let mut v = vec![
                 "apt-get".into(), "install".into(),
                 "-q".into(), "-y".into(),
                 "--no-install-recommends".into(),
                 "-o".into(), "Dpkg::Options::=--force-confdef".into(),
                 "-o".into(), "Dpkg::Options::=--force-confold".into(),
+                "-o".into(), "DPkg::Lock::Timeout=600".into(),
             ];
             v.extend(packages.iter().map(|s| s.to_string()));
             Some(v)
@@ -799,8 +818,22 @@ pub fn install_tools(state: &AntivirusState) -> InstallResult {
     // apt-get update first (apt only — dnf/pacman/zypper handle this
     // implicitly on install).
     if family == "debian" {
-        state.push_install_line("==> apt-get update".into());
-        run_streaming(state, "apt-update", &["apt-get", "update", "-q"], apt_env);
+        // Show the operator what (if anything) is currently holding the
+        // dpkg lock so a wait isn't a silent stare. apt itself emits
+        // "Waiting for cache lock: …" every 10s on stderr; this line
+        // explains WHY at the start instead of mid-stream.
+        if let Some(holder) = current_dpkg_lock_holder() {
+            state.push_install_line(format!(
+                "==> dpkg/apt lock currently held by {} — will wait up to 10 min for it",
+                holder));
+        }
+        state.push_install_line("==> apt-get update (waits up to 10 min for the apt/dpkg lock — Ubuntu's unattended-upgrades / apt-daily may be running)".into());
+        // Same DPkg::Lock::Timeout reasoning as build_install_cmd_family —
+        // apt-get update grabs the lists lock, and on Ubuntu the apt-daily
+        // timer races us for it on a fresh boot.
+        run_streaming(state, "apt-update",
+            &["apt-get", "update", "-q", "-o", "DPkg::Lock::Timeout=600"],
+            apt_env);
     }
 
     // Actual install.
@@ -1297,6 +1330,36 @@ fn finalize_install(state: &AntivirusState, ok: bool, error: Option<String>) {
 fn systemd_is_active(unit: &str) -> bool {
     Command::new("systemctl").args(["is-active", "--quiet", unit])
         .status().map(|s| s.success()).unwrap_or(false)
+}
+
+/// Best-effort: who currently holds the dpkg lock? Returns a short
+/// description like "PID 1234 (unattended-upgr)" or None when free /
+/// not detectable. Used to make the install log informative when
+/// DPkg::Lock::Timeout kicks in so the operator sees WHY we're waiting.
+/// fuser is preferred (definitive, single-line) with a fallback to lsof.
+/// Both are usually installed on Ubuntu/Debian; if neither is present
+/// we just return None and the operator sees apt's own progress lines.
+fn current_dpkg_lock_holder() -> Option<String> {
+    const LOCK: &str = "/var/lib/dpkg/lock-frontend";
+    if !std::path::Path::new(LOCK).exists() { return None; }
+    // fuser prints just "PID" on the lock file when held. -v adds
+    // a header to stderr we can ignore; we read stdout for the PID.
+    if let Ok(out) = Command::new("fuser").arg(LOCK).output() {
+        let pid_text = String::from_utf8_lossy(&out.stdout);
+        let pid = pid_text.split_whitespace().next().unwrap_or("").trim();
+        if !pid.is_empty() {
+            // Resolve PID → comm via /proc/<pid>/comm for a friendly name.
+            let comm = std::fs::read_to_string(format!("/proc/{}/comm", pid))
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            return Some(match comm {
+                Some(c) => format!("PID {} ({})", pid, c),
+                None => format!("PID {}", pid),
+            });
+        }
+    }
+    None
 }
 
 // ══════════════════════════════════════════════════════════
@@ -2772,6 +2835,30 @@ mod tests {
         let suse = build_install_cmd_family("suse", pkgs).unwrap();
         assert_eq!(suse[0], "zypper");
         assert!(build_install_cmd_family("plan9", pkgs).is_none());
+    }
+
+    /// Regression: customer report 2026-05-25 — clamav install on Ubuntu
+    /// failed because apt-daily / unattended-upgrades held the dpkg lock.
+    /// Proxmox doesn't ship those timers so the same install code worked
+    /// there. Fix: pass DPkg::Lock::Timeout so apt-get *waits* for the
+    /// lock instead of erroring immediately.
+    #[test]
+    fn debian_install_cmd_sets_dpkg_lock_timeout() {
+        let argv = build_install_cmd_family("debian", &["clamav"]).unwrap();
+        // The option is passed as two consecutive tokens: -o then K=V.
+        let timeout_pair = argv.windows(2).find(|w|
+            w[0] == "-o" && w[1].starts_with("DPkg::Lock::Timeout="));
+        let pair = timeout_pair.unwrap_or_else(|| panic!(
+            "debian install command must set DPkg::Lock::Timeout — without it \
+             apt races unattended-upgrades on Ubuntu and fails to acquire \
+             /var/lib/dpkg/lock-frontend. argv was: {:?}", argv));
+        // Value must be >= 60 to be useful; <60 means we'd give up before
+        // unattended-upgrades finishes one apt step.
+        let val: u64 = pair[1].trim_start_matches("DPkg::Lock::Timeout=")
+            .parse().expect("DPkg::Lock::Timeout value must parse as u64");
+        assert!(val >= 60,
+            "DPkg::Lock::Timeout={} is too short to ride out an active \
+             unattended-upgrades — must be >= 60s", val);
     }
 
     #[test]
