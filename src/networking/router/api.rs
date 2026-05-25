@@ -6823,11 +6823,23 @@ async fn commit_artifact_reconstruction(
             let bak = format!("{}.bak.{}", live, ts);
             let _ = std::fs::copy(&live, &bak);
         }
-        let tmp = format!("{}.tmp", live);
-        std::fs::write(&tmp, json)
-            .map_err(|e| format!("write failed: {}", e))?;
-        std::fs::rename(&tmp, &live)
-            .map_err(|e| format!("atomic rename failed: {}", e))?;
+        // Unique tmp suffix — see save() in router/mod.rs. A fixed
+        // `.tmp` path races against concurrent save() callers and
+        // produces torn writes (trailing characters from the longer
+        // write tailing the shorter one).
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp = format!("{}.tmp.{}.{}", live, std::process::id(), nanos);
+        if let Err(e) = std::fs::write(&tmp, json) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("write failed: {}", e));
+        }
+        if let Err(e) = std::fs::rename(&tmp, &live) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("atomic rename failed: {}", e));
+        }
         Ok(r)
     }).await.unwrap_or_else(|_| Err("reconstruction task panicked".into()));
 

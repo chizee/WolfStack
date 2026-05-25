@@ -642,13 +642,35 @@ impl RouterConfig {
             }
         }
 
-        let tmp = format!("{}.tmp", path);
+        // Unique tmp filename per save. Two save() calls can land on
+        // different threads at the same instant (the in-memory write
+        // lock serialises API write paths, but `topology::ensure_
+        // default_zones` saves a snapshot without holding it — and
+        // `compute_local` runs on the blocking pool, so multiple
+        // topology polls can race). A fixed `config.json.tmp` path
+        // produces torn writes: thread A truncates+writes 867 B,
+        // thread B truncates+writes 820 B starting at offset 0, and
+        // the rename leaves a 867-B file whose first 820 B are B's
+        // JSON and last 47 B are A's trailing `}` plus garbage —
+        // serde_json reports "trailing characters at line N col 1".
+        // Per-call unique suffix means no two writers share a
+        // destination; rename is still atomic so the final file is
+        // exactly one save's content, never a mix.
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp = format!("{}.tmp.{}.{}", path, std::process::id(), nanos);
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| format!("Serialize failed: {}", e))?;
-        std::fs::write(&tmp, json)
-            .map_err(|e| format!("Write failed: {}", e))?;
-        std::fs::rename(&tmp, &path)
-            .map_err(|e| format!("Atomic rename failed: {}", e))?;
+        if let Err(e) = std::fs::write(&tmp, json) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("Write failed: {}", e));
+        }
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("Atomic rename failed: {}", e));
+        }
         Ok(())
     }
 }
