@@ -8,6 +8,10 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v24.7.7: drop sudo from WolfStack-executed paths (Proxmox minimal has no sudo)** _(2026-05-25 — [`5c7d015`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/5c7d015d1fe9d43d46beb98b5fe7d58761b3d57c))_
+- **v24.7.6: View upgrade log button on the in-progress upgrade modal** _(2026-05-25 — [`2e3b8af`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/2e3b8af3f2d7682b69bc81bb7a4a77f935b2a21b))_
+- **v24.7.5: AV install 404 (double-proxy URL) + capture upgrade output to a log** _(2026-05-25 — [`8fc76ab`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/8fc76ab981debd656d6a8de4b495721a3b5cd98a))_
+- **v24.7.4: self-heal missing clamav user post-install (logrotate fix)** _(2026-05-25 — [`6f5ac83`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/6f5ac837ec65cfd03e4b5d547d07b8795335510d))_
 - **v24.7.3: AV install on Ubuntu — wait for unattended-upgrades' dpkg lock** _(2026-05-25 — [`8f836c0`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/8f836c077ea60189914a222e076e1ca400f4dd5b))_
 - **v24.7.2: normalise primary-NIC topology on VM export (cross-host restore)** _(2026-05-24 — [`064d6d8`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/064d6d8c7cd61e155f5f4785d3187d4001a717af))_
 - **v24.7.1: surface existing extra NICs in the VM editor (Proxmox + libvirt)** _(2026-05-24 — [`4940bae`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/4940baefdcaae0422b6c0d86ba1750fd6ac437a1))_
