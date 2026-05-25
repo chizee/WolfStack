@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v24.7.9: WolfRouter — startup self-heal from rolling backup when config.json is corrupt** _(2026-05-25 — [`3a9891f`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/3a9891fe52a2df1b0a64e3f999c79c13eb8fa986))_
 - **v24.7.8: WolfRouter — fix torn-write that corrupted config.json on all nodes** _(2026-05-25 — [`fd9dbde`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/fd9dbde75465f0930ecd0258e00d664c850c9414))_
 - **v24.7.7: drop sudo from WolfStack-executed paths (Proxmox minimal has no sudo)** _(2026-05-25 — [`5c7d015`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/5c7d015d1fe9d43d46beb98b5fe7d58761b3d57c))_
 - **v24.7.6: View upgrade log button on the in-progress upgrade modal** _(2026-05-25 — [`2e3b8af`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/2e3b8af3f2d7682b69bc81bb7a4a77f935b2a21b))_
