@@ -470,14 +470,27 @@ fn default_safe_mode_seconds() -> u32 { 30 }
 /// * `Loaded` — file existed and parsed cleanly. Safe to save.
 /// * `Fresh` — file did not exist (first run, fresh install). Safe
 ///   to save once the user actually edits something.
-/// * `ParseError` — file existed but failed to deserialize. The
-///   on-disk JSON is preserved (via quarantine) and the in-memory
-///   config falls back to `Default`. **Must NOT save** — doing so
-///   would atomic-rename the empty default over the user's last
-///   known-good config and lose it forever. The original silent
-///   `unwrap_or_default()` did exactly that on every update where a
-///   field/enum representation drifted, wiping WolfRouter configs
-///   (PapaSchlumpf 2026-05-06).
+/// * `ParseError` — file existed but failed to deserialize and no
+///   `.bak.<ts>` snapshot parsed cleanly either. The on-disk JSON is
+///   preserved (via quarantine) and the in-memory config falls back
+///   to `Default`. **Must NOT save** — doing so would atomic-rename
+///   the empty default over the user's last known-good config and
+///   lose it forever. The original silent `unwrap_or_default()` did
+///   exactly that on every update where a field/enum representation
+///   drifted, wiping WolfRouter configs (PapaSchlumpf 2026-05-06).
+/// * `AutoRecovered` — file existed but failed to parse, AND one of
+///   the rolling `.bak.<ts>` snapshots did parse cleanly. The newest
+///   parseable backup has been atomic-renamed into `config.json`,
+///   the broken file is preserved as `.broken-<ts>`, and saves are
+///   allowed normally. The UI surfaces a soft banner with the
+///   recovery details so the operator can audit what happened
+///   without being forced into a manual rollback flow.
+///   Added v24.7.9 after klasSponsor's cluster (14 nodes) hit the
+///   v24.7.8 torn-write corruption and had to be hand-recovered
+///   per node — the fix prevents future torn writes but does
+///   nothing for an already-corrupted file. Auto-recovery from a
+///   verified backup is strictly safer than leaving the cluster in
+///   manual-only recovery mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoadOutcome {
     Loaded,
@@ -490,6 +503,19 @@ pub enum LoadOutcome {
         /// recovery API so the operator can see exactly which field
         /// or enum variant tripped the parser.
         error: String,
+    },
+    AutoRecovered {
+        /// Absolute path of the `.bak.<ts>` snapshot that was
+        /// promoted to be the live `config.json`. Surfaced in the
+        /// UI so the operator can see which backup was adopted.
+        from_backup: String,
+        /// Unix-seconds timestamp parsed out of the backup filename.
+        from_timestamp: u64,
+        /// Where the original (broken) file was preserved.
+        broken_quarantine: String,
+        /// The serde error that triggered the recovery. Verbatim so
+        /// support can paste it into a bug report.
+        parse_error: String,
     },
 }
 
@@ -552,42 +578,81 @@ impl RouterConfig {
                 (cfg, LoadOutcome::Loaded)
             }
             Err(e) => {
+                let parse_error = e.to_string();
                 let ts = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
                 let quarantine = format!("{}/config.json.broken-{}", ROUTER_DIR, ts);
-                LOAD_FAILED.store(true, Ordering::SeqCst);
                 let quarantine_path = match std::fs::write(&quarantine, &raw) {
                     Ok(()) => {
                         error!(
                             "WolfRouter: {} failed to deserialize ({}). \
-                             Original file copied to {} for recovery. \
-                             Refusing to apply, save, or auto-rewrite — use \
-                             `--wolfrouter-recover` (CLI) or the rollback \
-                             banner in the WolfRouter UI to pick a known-good \
-                             snapshot.",
-                            path, e, quarantine,
+                             Original file copied to {} for inspection. \
+                             Attempting auto-recovery from rolling backups…",
+                            path, parse_error, quarantine,
                         );
                         quarantine
                     }
                     Err(qe) => {
                         error!(
                             "WolfRouter: {} failed to deserialize ({}). \
-                             COULD NOT QUARANTINE the original file ({}). \
-                             The on-disk file is left untouched — DO NOT \
-                             trigger any save() until you've copied {} to \
-                             a safe location manually.",
-                            path, e, qe, path,
+                             COULD NOT QUARANTINE the original file ({}) — \
+                             still attempting auto-recovery from rolling \
+                             backups (the broken file is left untouched on \
+                             disk regardless).",
+                            path, parse_error, qe,
                         );
                         String::new()
                     }
                 };
+
+                // Self-heal: walk `.bak.<ts>` newest-first, adopt the
+                // first one that parses with the current binary. Saves
+                // the operator from having to hand-rollback per node
+                // across an entire cluster. The broken file is already
+                // preserved as `.broken-<ts>` above; restoring it
+                // afterwards is still possible via the recovery UI.
+                if let Some((bak_path, bak_ts, recovered_cfg)) =
+                    try_auto_recover_from_backup(&path)
+                {
+                    LOAD_FAILED.store(false, Ordering::SeqCst);
+                    warn!(
+                        "WolfRouter: auto-recovered {} from {} (backup taken \
+                         at unix={}). The broken file is preserved at {} for \
+                         forensics. Saves are now permitted; review the \
+                         WolfRouter dashboard to confirm the restored \
+                         config matches expectations.",
+                        path, bak_path, bak_ts, quarantine_path,
+                    );
+                    return (
+                        recovered_cfg,
+                        LoadOutcome::AutoRecovered {
+                            from_backup: bak_path,
+                            from_timestamp: bak_ts,
+                            broken_quarantine: quarantine_path,
+                            parse_error,
+                        },
+                    );
+                }
+
+                // No backup parsed either — fall back to the manual
+                // recovery flow so the operator can inspect quarantined
+                // files or trigger artefact reconstruction.
+                LOAD_FAILED.store(true, Ordering::SeqCst);
+                error!(
+                    "WolfRouter: no rolling backup in {} parsed with the \
+                     current binary. Refusing to apply, save, or auto-rewrite \
+                     — use `--wolfrouter-recover` (CLI) or the rollback \
+                     banner in the WolfRouter UI to pick a known-good \
+                     snapshot or reconstruct from artefacts.",
+                    ROUTER_DIR,
+                );
                 (
                     Self::default(),
                     LoadOutcome::ParseError {
                         quarantine_path,
-                        error: e.to_string(),
+                        error: parse_error,
                     },
                 )
             }
@@ -660,7 +725,18 @@ impl RouterConfig {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let tmp = format!("{}.tmp.{}.{}", path, std::process::id(), nanos);
+        // Include ThreadId as defense-in-depth: `as_nanos()` is
+        // ns-resolution but clock-source granularity could in theory
+        // return the same value to two threads racing on close cores.
+        // ThreadId is unique per live thread in a process so the
+        // combination is safe regardless.
+        let tmp = format!(
+            "{}.tmp.{}.{}.{:?}",
+            path,
+            std::process::id(),
+            nanos,
+            std::thread::current().id(),
+        );
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| format!("Serialize failed: {}", e))?;
         if let Err(e) = std::fs::write(&tmp, json) {
@@ -673,6 +749,114 @@ impl RouterConfig {
         }
         Ok(())
     }
+}
+
+/// Walk `.bak.<ts>` files newest-first and return the first one
+/// that deserializes as a `RouterConfig` with the current binary.
+/// On success the chosen backup is atomic-renamed into the live
+/// `config.json` path so the next process restart loads it cleanly
+/// without re-running recovery. Returns `(backup_path, ts, cfg)`.
+///
+/// Called from `load_with_status` when the live file fails to
+/// parse. The caller is responsible for having already preserved
+/// the broken file as `.broken-<ts>` before invoking this — that
+/// way a future rollback can still reach the corrupted version if
+/// the operator decides the auto-recovery picked the wrong one.
+///
+/// Sponsor klasSponsor 2026-05-25: 14-node cluster hit a torn write
+/// across every node simultaneously. v24.7.8 prevented future
+/// torn writes but did nothing for the already-corrupted state —
+/// every node remained stuck in manual recovery mode. This helper
+/// makes the cluster self-heal on next restart without any operator
+/// action, because picking the most recent verified backup is what
+/// every operator would do manually anyway.
+fn try_auto_recover_from_backup(
+    live_path: &str,
+) -> Option<(String, u64, RouterConfig)> {
+    let dir = std::fs::read_dir(ROUTER_DIR).ok()?;
+    let mut backups: Vec<(u64, std::path::PathBuf)> = Vec::new();
+    for entry in dir.flatten() {
+        let name = match entry.file_name().into_string() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        if let Some(ts_str) = name.strip_prefix("config.json.bak.") {
+            if let Ok(ts) = ts_str.parse::<u64>() {
+                backups.push((ts, entry.path()));
+            }
+        }
+    }
+    // Newest first — we want the closest-to-live-state backup that
+    // parses, not the oldest one we still have lying around.
+    backups.sort_by(|a, b| b.0.cmp(&a.0));
+
+    for (ts, bak_path) in backups {
+        let bak_str = bak_path.to_string_lossy().to_string();
+        let raw = match std::fs::read_to_string(&bak_path) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    "WolfRouter auto-recovery: could not read {} ({}); \
+                     trying older backup",
+                    bak_str, e,
+                );
+                continue;
+            }
+        };
+        let cfg: RouterConfig = match serde_json::from_str(&raw) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    "WolfRouter auto-recovery: {} does not parse with \
+                     this binary ({}); trying older backup",
+                    bak_str, e,
+                );
+                continue;
+            }
+        };
+
+        // Promote this backup to the live file via a unique tmp +
+        // atomic rename — same pattern as save(), so even if another
+        // thread somehow raced a save() at this instant the result
+        // would still be a complete file (just whichever rename
+        // landed last). The original `.bak.<ts>` is left in place
+        // as a recovery target.
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp = format!(
+            "{}.tmp.recovery.{}.{}.{:?}",
+            live_path,
+            std::process::id(),
+            nanos,
+            std::thread::current().id(),
+        );
+        if let Err(e) = std::fs::write(&tmp, &raw) {
+            warn!(
+                "WolfRouter auto-recovery: write tmp {} failed ({}). \
+                 The in-memory config still reflects the backup, but \
+                 the live file remains broken and the next restart \
+                 will retry recovery.",
+                tmp, e,
+            );
+            let _ = std::fs::remove_file(&tmp);
+            return Some((bak_str, ts, cfg));
+        }
+        if let Err(e) = std::fs::rename(&tmp, live_path) {
+            warn!(
+                "WolfRouter auto-recovery: atomic rename of {} to {} \
+                 failed ({}). The in-memory config still reflects the \
+                 backup; live file remains broken and recovery will be \
+                 retried on next restart.",
+                tmp, live_path, e,
+            );
+            let _ = std::fs::remove_file(&tmp);
+            return Some((bak_str, ts, cfg));
+        }
+        return Some((bak_str, ts, cfg));
+    }
+    None
 }
 
 /// Keep at most `keep` `config.json.bak.*` snapshots in
@@ -893,6 +1077,29 @@ pub struct RouterState {
     /// Exposed via `/api/router/recovery` so the UI can render a
     /// banner with the serde error and a list of rollback targets.
     pub load_error: RwLock<Option<LoadError>>,
+    /// Populated when `load_with_status` returns `AutoRecovered`.
+    /// Surfaced via `/api/router/recovery` so the UI can render a
+    /// soft "auto-recovered from backup X" banner the operator can
+    /// audit and dismiss. Cleared once the operator acknowledges
+    /// (POST /api/router/recovery/acknowledge-auto).
+    pub auto_recovery: RwLock<Option<AutoRecoveryNotice>>,
+}
+
+/// Persisted-on-load detail — mirror of `LoadOutcome::AutoRecovered`
+/// minus the variant wrapper, ready for the recovery API to serialise.
+/// Used by the UI to render the soft self-heal banner.
+#[derive(Debug, Clone, Serialize)]
+pub struct AutoRecoveryNotice {
+    /// Backup file that was promoted to be the live `config.json`.
+    pub from_backup: String,
+    /// Unix-second timestamp parsed out of the backup filename.
+    pub from_timestamp: u64,
+    /// Where the original (broken) file was preserved for forensics.
+    pub broken_quarantine: String,
+    /// Serde error that triggered the recovery.
+    pub parse_error: String,
+    /// Unix seconds when the recovery happened (process start time).
+    pub observed_at: u64,
 }
 
 /// Persisted-on-load failure detail — mirror of `LoadOutcome::ParseError`
@@ -946,19 +1153,37 @@ pub struct ValidationFinding {
 impl RouterState {
     pub fn new() -> Self {
         let (cfg, outcome) = RouterConfig::load_with_status();
-        let (clean, load_err) = match outcome {
-            LoadOutcome::Loaded => (true, None),
-            LoadOutcome::Fresh => (true, None), // First run — saves are fine.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let (clean, load_err, auto_rec) = match outcome {
+            LoadOutcome::Loaded => (true, None, None),
+            LoadOutcome::Fresh => (true, None, None),
+            LoadOutcome::AutoRecovered {
+                from_backup,
+                from_timestamp,
+                broken_quarantine,
+                parse_error,
+            } => (
+                true,
+                None,
+                Some(AutoRecoveryNotice {
+                    from_backup,
+                    from_timestamp,
+                    broken_quarantine,
+                    parse_error,
+                    observed_at: now,
+                }),
+            ),
             LoadOutcome::ParseError { quarantine_path, error } => (
                 false,
                 Some(LoadError {
                     quarantine_path,
                     error,
-                    observed_at: SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0),
+                    observed_at: now,
                 }),
+                None,
             ),
         };
         RouterState {
@@ -970,6 +1195,7 @@ impl RouterState {
             last_validation: RwLock::new(None),
             loaded_clean: AtomicBool::new(clean),
             load_error: RwLock::new(load_err),
+            auto_recovery: RwLock::new(auto_rec),
         }
     }
 

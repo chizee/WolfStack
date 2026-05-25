@@ -267,6 +267,85 @@
             .replace(/'/g, '&#39;');
     }
 
+    // Soft (non-blocking) banner shown when the backend auto-recovered
+    // config.json from a `.bak.<ts>` snapshot at startup. v24.7.9
+    // sponsor klasSponsor's 14-node cluster hit a torn write that
+    // corrupted every node's config.json simultaneously; v24.7.8
+    // prevented future torn writes but did nothing for the already-
+    // corrupted state. With this banner, the operator audits and
+    // dismisses — no per-node manual rollback. Dismiss POSTs to
+    // /api/router/recovery/acknowledge-auto.
+    function wrRenderAutoRecoveryBanner(rec) {
+        const host = document.getElementById('page-wolfrouter');
+        if (!host) return;
+        const note = rec && rec.auto_recovery;
+        let bar = document.getElementById('wr-auto-recovery-banner');
+        if (!note) {
+            // Notice was cleared (or never present) — drop any stale banner.
+            if (bar) bar.remove();
+            return;
+        }
+        if (!bar) {
+            bar = document.createElement('div');
+            bar.id = 'wr-auto-recovery-banner';
+            host.insertBefore(bar, host.firstChild);
+        }
+        const ts = Number(note.from_timestamp || 0);
+        const when = ts > 0 ? new Date(ts * 1000).toLocaleString() : 'unknown';
+        const err = note.parse_error || '';
+        const fromBak = note.from_backup || '';
+        const broken = note.broken_quarantine || '';
+        bar.innerHTML = `
+            <div style="background:#fffbeb;border:2px solid #f59e0b;border-radius:6px;padding:14px 18px;margin:0 0 16px 0;">
+                <div style="display:flex;align-items:flex-start;gap:12px;">
+                    <div style="flex:1;">
+                        <div style="font-size:15px;font-weight:700;color:#92400e;">
+                            WolfRouter auto-recovered config.json from a backup at startup
+                        </div>
+                        <div style="font-size:13px;color:#78350f;margin-top:4px;">
+                            The live <code>config.json</code> failed to parse, so
+                            the most recent backup that did parse was promoted
+                            into place automatically. Review the LANs / WANs /
+                            zones / rules below and confirm they match what you
+                            expected — then dismiss this banner.
+                        </div>
+                        <div style="font-size:12px;color:#78350f;margin-top:8px;">
+                            <div>Backup adopted: <code>${escapeHtml(fromBak)}</code> (taken ${escapeHtml(when)})</div>
+                            ${broken ? `<div style="margin-top:2px;">Broken file preserved at: <code>${escapeHtml(broken)}</code></div>` : ''}
+                        </div>
+                        <details style="margin-top:8px;">
+                            <summary style="cursor:pointer;color:#78350f;font-size:12px;">
+                                Original parser error
+                            </summary>
+                            <pre style="background:#fff;border:1px solid #fde68a;padding:8px;border-radius:4px;font-size:11px;color:#78350f;white-space:pre-wrap;margin-top:6px;">${escapeHtml(err)}</pre>
+                        </details>
+                        <div style="margin-top:10px;display:flex;gap:8px;">
+                            <button class="btn btn-sm btn-primary"
+                                    onclick="wrAcknowledgeAutoRecovery()">
+                                Dismiss — config looks correct
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>`;
+    }
+
+    async function wrAcknowledgeAutoRecovery() {
+        try {
+            await fetch(wrUrl('/api/router/recovery/acknowledge-auto', {local:true}), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+            });
+        } catch (_) {
+            // Best-effort: even if the POST fails, drop the local banner so
+            // the operator isn't stuck looking at it. Reloading the page
+            // will resurface it from the backend.
+        }
+        const bar = document.getElementById('wr-auto-recovery-banner');
+        if (bar) bar.remove();
+    }
+    window.wrAcknowledgeAutoRecovery = wrAcknowledgeAutoRecovery;
+
     async function wrRestoreSnapshot(path) {
         if (!confirm(`Restore this snapshot?\n\n${path}\n\nThe currently-live config.json will be saved to a fresh .bak.<ts> first so this rollback is itself reversible.`)) {
             return;
@@ -430,6 +509,10 @@
                 // the live rack — but every save endpoint returns an
                 // error until they pick a snapshot, so we leave the
                 // banner pinned to the top of the page.
+            } else if (rec && rec.auto_recovery) {
+                // Soft self-heal banner — saves are allowed; the
+                // operator just needs to audit and dismiss.
+                wrRenderAutoRecoveryBanner(rec);
             }
             wrClearDiagnosticsPanel();
             const pf = await wrRunPreflight();
@@ -468,6 +551,7 @@
         try {
             const rec = await wrFetchRecoveryState();
             if (rec && rec.load_failed) wrRenderRecoveryBanner(rec);
+            else if (rec && rec.auto_recovery) wrRenderAutoRecoveryBanner(rec);
             wrClearDiagnosticsPanel();
             const pf = await wrRunPreflight();
             await wrLoadAll();

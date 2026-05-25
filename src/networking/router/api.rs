@@ -6629,6 +6629,7 @@ pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
         // artefact-reconstructed config when no snapshot is left.
         .route("/api/router/recovery",                      web::get().to(get_recovery_state))
         .route("/api/router/recovery/restore",              web::post().to(restore_recovery))
+        .route("/api/router/recovery/acknowledge-auto",     web::post().to(acknowledge_auto_recovery))
         .route("/api/router/recovery/reconstruct",          web::get().to(preview_artifact_reconstruction))
         .route("/api/router/recovery/reconstruct",          web::post().to(commit_artifact_reconstruction));
 }
@@ -6656,6 +6657,12 @@ struct RecoveryState {
     /// Detail of the load failure (serde error + quarantine path)
     /// when `load_failed=true`. Null otherwise.
     load_error: Option<super::LoadError>,
+    /// Detail of an auto-recovery that happened at startup — set
+    /// when `config.json` failed to parse but a `.bak.<ts>` snapshot
+    /// did and was promoted to the live file. The UI surfaces a
+    /// soft banner so the operator can audit and dismiss. Null
+    /// when there's nothing to audit. Added v24.7.9.
+    auto_recovery: Option<super::AutoRecoveryNotice>,
     /// All available recovery targets (`.bak.<ts>` rolling backups
     /// and `.broken-<ts>` quarantined parse failures), newest first.
     snapshots: Vec<super::RecoverySnapshot>,
@@ -6672,6 +6679,8 @@ async fn get_recovery_state(
     if let Err(resp) = crate::api::require_auth(&req, &state) { return resp; }
     let load_failed = super::save_blocked_by_load_failure();
     let load_error = state.router.load_error.read().ok()
+        .and_then(|g| g.clone());
+    let auto_recovery = state.router.auto_recovery.read().ok()
         .and_then(|g| g.clone());
     // Snapshot listing is fast (a single readdir + per-entry parse
     // probe of small JSON files), safe to run inline. The artefact
@@ -6692,9 +6701,25 @@ async fn get_recovery_state(
     actix_web::HttpResponse::Ok().json(RecoveryState {
         load_failed,
         load_error,
+        auto_recovery,
         snapshots,
         artifact_reconstruction_available: recon_available,
     })
+}
+
+/// POST /api/router/recovery/acknowledge-auto — clear the soft
+/// auto-recovery banner once the operator has audited the restored
+/// config. Idempotent; returns `{ ok: true }` whether or not a
+/// notice was set. Added v24.7.9 alongside startup self-heal.
+async fn acknowledge_auto_recovery(
+    req: actix_web::HttpRequest,
+    state: actix_web::web::Data<crate::api::AppState>,
+) -> actix_web::HttpResponse {
+    if let Err(resp) = crate::api::require_auth(&req, &state) { return resp; }
+    if let Ok(mut g) = state.router.auto_recovery.write() {
+        *g = None;
+    }
+    actix_web::HttpResponse::Ok().json(serde_json::json!({ "ok": true }))
 }
 
 #[derive(serde::Deserialize)]
@@ -6737,6 +6762,30 @@ async fn restore_recovery(
             *state.router.config.write().unwrap() = cfg;
             match outcome {
                 super::LoadOutcome::Loaded | super::LoadOutcome::Fresh => {
+                    state.router.mark_clean();
+                }
+                super::LoadOutcome::AutoRecovered {
+                    from_backup, from_timestamp, broken_quarantine, parse_error,
+                } => {
+                    // Restore wrote a parseable file to disk, but then the
+                    // very next load_with_status above ALSO hit an auto-
+                    // recover path? That means restore_recovery_snapshot's
+                    // direct write got clobbered (it doesn't use the unique
+                    // tmp + atomic rename pattern). Treat as clean — the
+                    // in-memory cfg is now whatever the latest auto-recovery
+                    // pulled out of a backup — and surface the notice so
+                    // the operator can audit.
+                    if let Ok(mut g) = state.router.auto_recovery.write() {
+                        *g = Some(super::AutoRecoveryNotice {
+                            from_backup,
+                            from_timestamp,
+                            broken_quarantine,
+                            parse_error,
+                            observed_at: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs()).unwrap_or(0),
+                        });
+                    }
                     state.router.mark_clean();
                 }
                 super::LoadOutcome::ParseError { error, .. } => {
@@ -6831,7 +6880,15 @@ async fn commit_artifact_reconstruction(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let tmp = format!("{}.tmp.{}.{}", live, std::process::id(), nanos);
+        // ThreadId added as defense-in-depth alongside pid+nanos —
+        // see RouterConfig::save() for the rationale.
+        let tmp = format!(
+            "{}.tmp.{}.{}.{:?}",
+            live,
+            std::process::id(),
+            nanos,
+            std::thread::current().id(),
+        );
         if let Err(e) = std::fs::write(&tmp, json) {
             let _ = std::fs::remove_file(&tmp);
             return Err(format!("write failed: {}", e));
