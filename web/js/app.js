@@ -10620,16 +10620,23 @@ async function loadNodeVersionInfo(node) {
             badgeEl.style.background = 'rgba(239,168,68,0.15)';
             badgeEl.style.color = '#f59e0b';
 
-            const targetLabel = node.is_self ? 'this server' : node.hostname;
+            const clusterLabel = node.cluster_name || 'WolfStack';
+            const clusterPeerCount = allNodes.filter(n =>
+                (n.cluster_name || 'WolfStack') === clusterLabel
+                && (n.node_type === 'wolfstack' || n.is_self)
+            ).length;
+            const fleetNote = clusterPeerCount > 1
+                ? `This upgrades <strong>all ${clusterPeerCount} nodes in cluster ${escapeHtml(clusterLabel)}</strong> in one fan-out — keeping a multi-node cluster on a single version avoids inter-node RPC drift.`
+                : `Cluster <strong>${escapeHtml(clusterLabel)}</strong> currently has only this one WolfStack node.`;
             actionEl.style.display = 'block';
             actionEl.innerHTML = `
                 <div style="background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.2);border-radius:8px;padding:10px 12px;margin-bottom:8px;font-size:0.82em;color:#f59e0b;line-height:1.5;">
                     <strong>v${latestVersion}</strong> is available (installed: v${installedVersion}).
-                    Upgrading will download and install the latest WolfStack binary on <strong>${targetLabel}</strong>.
-                    A terminal window will open to show progress.
+                    ${fleetNote}
+                    The upgrade runs detached on each node — safe to close this dialog or the browser; each node restarts itself when its new binary is ready.
                 </div>
                 <button class="btn" style="background:#f59e0b;color:#000;font-weight:600;width:100%;" onclick="upgradeNode('${node.id}')">
-                    ⬆️ Upgrade ${targetLabel} to v${latestVersion}
+                    ⬆️ Upgrade ${clusterPeerCount > 1 ? `${clusterPeerCount} nodes in ${escapeHtml(clusterLabel)}` : 'this server'} to v${latestVersion}
                 </button>
             `;
         }
@@ -10638,100 +10645,64 @@ async function loadNodeVersionInfo(node) {
         badgeEl.style.color = 'var(--text-muted,#888)';
 
         // Still offer upgrade button when version can't be determined
-        const targetLabel = node.is_self ? 'this server' : node.hostname;
+        const clusterLabel = node.cluster_name || 'WolfStack';
+        const clusterPeerCount = allNodes.filter(n =>
+            (n.cluster_name || 'WolfStack') === clusterLabel
+            && (n.node_type === 'wolfstack' || n.is_self)
+        ).length;
         const versionNote = latestVersion ? `Latest: v${latestVersion}. ` : '';
+        const fleetNote = clusterPeerCount > 1
+            ? `Will upgrade <strong>all ${clusterPeerCount} nodes in cluster ${escapeHtml(clusterLabel)}</strong> in one fan-out.`
+            : '';
         actionEl.style.display = 'block';
         actionEl.innerHTML = `
             <div style="background:rgba(59,130,246,0.08);border:1px solid rgba(59,130,246,0.2);border-radius:8px;padding:10px 12px;margin-bottom:8px;font-size:0.82em;color:#60a5fa;line-height:1.5;">
-                ℹ️ ${versionNote}Could not detect the installed version on <strong>${targetLabel}</strong>.
-                You can still run the upgrade script to install or update WolfStack.
+                ℹ️ ${versionNote}Could not detect the installed version on this server.
+                ${fleetNote}
             </div>
             <button class="btn" style="background:#3b82f6;color:#fff;font-weight:600;width:100%;" onclick="upgradeNode('${node.id}')">
-                ⬆️ Install / Upgrade WolfStack on ${targetLabel}
+                ⬆️ Install / Upgrade ${clusterPeerCount > 1 ? `${clusterPeerCount} nodes in ${escapeHtml(clusterLabel)}` : 'this server'}
             </button>
         `;
     }
 }
 
 async function upgradeNode(nodeId) {
-    const node = allNodes.find(n => n.id === nodeId);
-    if (!node) return;
-
-    const machine = node.is_self ? 'this machine (local)' : (node.hostname + ' (' + node.address + ')');
-    if (!(await showConfirm('Upgrade WolfStack on ' + machine + '?\n\n'
-        + 'The upgrade runs in the background and may take several minutes '
-        + '(up to ~50 minutes on slow hardware like a Raspberry Pi). '
-        + 'The server will restart automatically once the new binary is built. '
-        + 'You can safely close this modal — progress is tracked in the task log '
-        + 'and survives a browser refresh.\n\nProceed?'))) return;
-
-    // Record current version for comparison
-    const oldVersion = node.metrics?.hostname ? (allNodes.find(n => n.id === nodeId)?.metrics?.hostname || '') : '';
-
-    // Open console popup with type=upgrade
-    let url = '/console.html?type=upgrade&name=wolfstack';
-    if (!node.is_self) {
-        url += '&node_id=' + encodeURIComponent(nodeId);
-    }
-    window.open(url, 'upgrade_console_' + nodeId, 'width=960,height=600,menubar=no,toolbar=no');
-
-    // Track in task log — type 'upgrade' tells loadTaskLog not to
-    // flip this to 'failed' if the browser reloads mid-upgrade (the
-    // backend is deliberately restarting, it hasn't actually failed).
-    const taskId = addTaskLogEntry({
-        cluster: node.cluster_name || 'WolfStack',
-        node: node.hostname || node.address,
-        description: 'Upgrading WolfStack...',
-        status: 'running',
-        type: 'upgrade',
-    });
-
-    // Persist a tracker so _startUpgradeTracking picks this up after
-    // a page reload — otherwise the task-log entry sits in 'running'
-    // forever with no poller driving it to completion.
-    {
-        const persisted = JSON.parse(localStorage.getItem('wolfstack_upgrade_trackers') || '[]');
-        persisted.push({
-            nodeId: nodeId,
-            hostname: node.hostname || node.address,
-            cluster: node.cluster_name || 'WolfStack',
-            startedAt: Date.now(),
-            taskId: taskId,
-            done: false,
-        });
-        localStorage.setItem('wolfstack_upgrade_trackers', JSON.stringify(persisted));
+    // Per-node settings button — route through the SAME fleet upgrade
+    // engine as the Issues-page "Upgrade All" button. Upgrading one
+    // node at a time leaves the cluster on mixed versions until the
+    // operator clicks through every node, and inter-node RPC has
+    // subtle compatibility expectations within a minor band; better
+    // to fan out across the clicked node's cluster in one go.
+    //
+    // PapaSchlumpf 2026-05-25: the old per-node path opened a
+    // /console.html pty upgrade that died when the operator closed
+    // the tab before the post-install restart fired. Sharing the
+    // canonical fleet path (via issuesUpgradeAll's overrideTargets
+    // parameter) means there's only one upgrade pipeline to keep
+    // working, and it uses the detached /api/upgrade route that
+    // survives the browser closing.
+    const clicked = allNodes.find(n => n.id === nodeId);
+    if (!clicked) return;
+    const clusterName = clicked.cluster_name || 'WolfStack';
+    const targets = allNodes
+        .filter(n => (n.cluster_name || 'WolfStack') === clusterName
+                     && (n.node_type === 'wolfstack' || n.is_self))
+        .map(n => ({
+            node_id: n.id,
+            hostname: n.hostname || n.address,
+            version: n.metrics?.wolfstack_version || n.metrics?.version || '?',
+        }));
+    if (targets.length === 0) {
+        showToast('No WolfStack-managed nodes found in cluster ' + clusterName, 'warning');
+        return;
     }
 
-    showToast('Upgrade started for ' + machine, 'info');
+    // Close the per-node settings modal before the progress modal opens.
+    const settingsModal = document.getElementById('node-settings-modal');
+    if (settingsModal) settingsModal.remove();
 
-    // Poll node status to track upgrade progress
-    let wasOffline = false;
-    let startTime = Date.now();
-    const pollTimer = setInterval(() => {
-        const elapsed = Math.floor((Date.now() - startTime) / 1000);
-        const mins = Math.floor(elapsed / 60);
-        const secs = elapsed % 60;
-        const timeStr = mins > 0 ? mins + 'm ' + secs + 's' : secs + 's';
-        const currentNode = allNodes.find(n => n.id === nodeId);
-        if (!currentNode) return;
-
-        if (!currentNode.online && !wasOffline) {
-            wasOffline = true;
-            updateTaskLogEntry(taskId, { description: 'Restarting... (' + timeStr + ')', status: 'running' });
-        } else if (currentNode.online && wasOffline) {
-            clearInterval(pollTimer);
-            updateTaskLogEntry(taskId, {
-                description: 'Upgrade complete (' + timeStr + ')',
-                status: 'success',
-            });
-        } else if (currentNode.online && !wasOffline) {
-            updateTaskLogEntry(taskId, { description: 'Compiling... (' + timeStr + ')', status: 'running' });
-        }
-    }, 5000);
-
-    // Close the settings modal
-    const modal = document.getElementById('node-settings-modal');
-    if (modal) modal.remove();
+    return issuesUpgradeAll(targets);
 }
 
 async function saveNodeSettings() {
@@ -32003,14 +31974,28 @@ async function openUpgradeLogViewer(safeId, logHref) {
     tick();
 }
 
-async function issuesUpgradeAll() {
-    if (!issuesScanResults || issuesScanResults.length === 0) {
-        showToast('Run a scan first.', 'warning');
-        return;
+// Fleet upgrade — fan out `/api/upgrade` to every node in `overrideTargets`
+// (or every node in the most recent Issues-page scan, if no override).
+// `overrideTargets` is `[{ node_id, hostname, version }]` — same shape
+// the scan produces. The per-node settings "Upgrade" button uses the
+// override to push every node in the clicked node's cluster through
+// this single canonical path instead of duplicating the fan-out logic.
+// PapaSchlumpf 2026-05-25: the old per-node path opened a pty console
+// upgrade that died when the operator closed the tab before the
+// post-install restart; routing both buttons through this one engine
+// kills that whole class of bug.
+async function issuesUpgradeAll(overrideTargets) {
+    var targets;
+    if (Array.isArray(overrideTargets) && overrideTargets.length > 0) {
+        targets = overrideTargets.filter(function (r) { return r && r.node_id; });
+    } else {
+        if (!issuesScanResults || issuesScanResults.length === 0) {
+            showToast('Run a scan first.', 'warning');
+            return;
+        }
+        // Upgrade ALL scanned nodes (force reinstall regardless of version)
+        targets = issuesScanResults.filter(function (r) { return r.node_id; });
     }
-
-    // Upgrade ALL scanned nodes (force reinstall regardless of version)
-    var targets = issuesScanResults.filter(function (r) { return r.node_id; });
 
     if (targets.length === 0) {
         showToast('No nodes found — run a scan first.', 'warning');
