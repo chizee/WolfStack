@@ -8,6 +8,9 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v24.7.16: WolfFlow — bulk Docker container update (all / selected) in one step** _(2026-05-26 — [`92ec033`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/92ec0339df718279afebc3ef1b363850bc8a85ff))_
+- **v24.7.15: ensure_lxc_bridge — log every failure, self-heal every 60s, re-master orphan veths** _(2026-05-26 — [`cf144ee`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/cf144eee8bf9ce2603e77a96a518c5fcfce767ef))_
+- **v24.7.14: LXC clone — dismiss the progress modal on success instead of leaving the page blurred** _(2026-05-26 — [`930738c`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/930738ccee5ee4b43743a6859e237a31687e9db7))_
 - **v24.7.13: native LXC — bare-integer CPU cores is now a CFS quota, not a host-CPU pin** _(2026-05-26 — [`c399b9a`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/c399b9ad1b5f5da450db72f76e9a21e7a0cd2104))_
 - **v24.7.12: LXC settings — explain CPU cpuset notation and show resolved CPU count live** _(2026-05-26 — [`d367f3c`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/d367f3ceb55f11669a802b74b6c67bf38a69a9b1))_
 - **v24.7.11: per-node Upgrade button now fans out across the cluster via the same engine as 'Upgrade All'** _(2026-05-26 — [`c76d467`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/c76d467224e327a6f23160c891edfd0806446bb4))_
