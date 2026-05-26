@@ -22890,13 +22890,17 @@ async function doCloneLxc(name) {
         document.getElementById('lxc-op-close').style.display = '';
 
         if (resp.ok) {
-            statusEl.textContent = 'Clone complete!';
-            resultEl.style.display = 'block';
-            resultEl.style.background = 'rgba(16,185,129,0.15)';
-            resultEl.style.color = '#10b981';
-            resultEl.textContent = data.message || `Cloned as '${newName}'`;
+            // Success: dismiss the blocking blur overlay and confirm via
+            // toast. Leaving the modal up forces the operator to click
+            // Close before the page is usable — they often don't, and
+            // the page sits behind backdrop-filter:blur(4px) until they
+            // notice. Match the Docker clone's toast-only behaviour.
+            document.getElementById('lxc-op-modal')?.remove();
+            showToast(data.message || `Cloned as '${newName}'`, 'success');
             setTimeout(loadLxcContainers, 500);
         } else {
+            // Failure: keep the modal open so the error message is
+            // readable — the user needs to see what went wrong.
             statusEl.textContent = 'Clone failed';
             resultEl.style.display = 'block';
             resultEl.style.background = 'rgba(239,68,68,0.15)';
