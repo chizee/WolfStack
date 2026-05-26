@@ -22074,10 +22074,12 @@ async function openLxcSettings(name) {
                     <div class="form-group">
                         <label>CPU Cores</label>
                         <input type="text" id="lxc-cpus" class="form-control" value="${escapeHtml(cfg.cpus)}"
-                            placeholder="${cfg.proxmox ? 'e.g. 4' : 'e.g. 4   —  or 0-3 / 0,2 to pin'}">
+                            placeholder="${cfg.proxmox ? 'e.g. 4' : 'e.g. 4   —  or 0-3 / 0,2 to pin'}"
+                            ${cfg.proxmox ? '' : `oninput="updateLxcCpuSummary(this.value)"`}>
                         <small style="color:var(--text-muted);margin-top:4px;display:block;">${cfg.proxmox
                             ? 'Number of cores. Leave blank for unlimited. Restart the container to apply.'
-                            : 'A plain number is that many cores (4 → cores 0-3). A cpuset like 0-3 or 0,2 pins specific cores. Blank = unlimited. Restart the container to apply.'}</small>
+                            : 'Plain number = that many cores (e.g. <b>4</b> assigns CPUs 0,1,2,3 — 4 cores total). A cpuset list pins specific CPUs: <b>0-3</b> is the <i>range</i> 0,1,2,3 (4 cores), <b>0,3</b> is the <i>list</i> CPU 0 and CPU 3 only (2 cores). Blank = unlimited. Restart the container to apply.'}</small>
+                        ${cfg.proxmox ? '' : `<small id="lxc-cpu-summary" style="color:var(--accent-color,#7c3aed);margin-top:4px;display:block;font-weight:500;"></small>`}
                     </div>
                 </div>
 
@@ -22184,9 +22186,59 @@ async function openLxcSettings(name) {
         (cfg.network_interfaces || []).forEach(function (nic) {
             if (nic.vsw_uplink) vswUplinkChanged(nic.index);
         });
+
+        // Paint the CPU summary line ("= N CPUs") from the loaded value.
+        if (!cfg.proxmox) updateLxcCpuSummary(cfg.cpus || '');
     } catch (e) {
         body.innerHTML = `<p style="color:#ef4444;">Failed to load config: ${e.message}</p>`;
     }
+}
+
+// Resolve a CPU Cores field value to a human-readable summary. The field
+// accepts either a count (4 → CPUs 0,1,2,3) or a cpuset list/range
+// (0-3 → 4 CPUs, 0,3 → 2 CPUs). The summary spells out which CPUs are
+// actually being assigned so "0-26" isn't read as "CPU 0 and CPU 26".
+function updateLxcCpuSummary(raw) {
+    var el = document.getElementById('lxc-cpu-summary');
+    if (!el) return;
+    var s = (raw || '').trim();
+    if (s === '') { el.textContent = '= unlimited (all host CPUs)'; return; }
+    // Bare count: N → CPUs 0..N-1.
+    if (/^\d+$/.test(s)) {
+        var n = parseInt(s, 10);
+        if (n === 0) { el.textContent = '= unlimited (all host CPUs)'; return; }
+        if (n === 1) { el.textContent = '= 1 CPU (CPU 0 only)'; return; }
+        el.textContent = '= ' + n + ' CPUs (CPUs 0–' + (n - 1) + ')';
+        return;
+    }
+    // Cpuset list/range. Validate, then count distinct CPUs.
+    var parts = s.split(',');
+    var cpus = new Set();
+    for (var i = 0; i < parts.length; i++) {
+        var p = parts[i].trim();
+        var m = p.match(/^(\d+)-(\d+)$/);
+        if (m) {
+            var lo = parseInt(m[1], 10), hi = parseInt(m[2], 10);
+            if (hi < lo) { el.textContent = 'Invalid cpuset (range ' + p + ' is reversed)'; return; }
+            for (var c = lo; c <= hi; c++) cpus.add(c);
+        } else if (/^\d+$/.test(p)) {
+            cpus.add(parseInt(p, 10));
+        } else {
+            el.textContent = 'Invalid cpuset — use a number, range (0-3), or list (0,2,4)';
+            return;
+        }
+    }
+    var count = cpus.size;
+    if (count === 1) {
+        el.textContent = '= 1 CPU (CPU ' + cpus.values().next().value + ' only)';
+        return;
+    }
+    // Show the resolved list, capped so a huge range doesn't blow out the line.
+    var list = Array.from(cpus).sort(function (a, b) { return a - b; });
+    var shown = list.length <= 12
+        ? list.join(', ')
+        : (list.slice(0, 6).join(', ') + ', …, ' + list.slice(-2).join(', '));
+    el.textContent = '= ' + count + ' CPUs (' + shown + ')';
 }
 
 // Ensure a vSwitch VLAN's L2 plumbing exists; returns { name, mtu } for
