@@ -1223,7 +1223,9 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
                             // and the old code would happily map
                             // container_b → container_a — poisoning
                             // routes.json on receivers.
-                            if wolfnet_ips.len() > 1 {
+                            let self_cluster = cluster.get_self_cluster_name();
+                            let peer_cluster = node.cluster_name.as_deref().unwrap_or("WolfStack");
+                            if peer_cluster == self_cluster && wolfnet_ips.len() > 1 {
                                 let host_wn_ip = &wolfnet_ips[0];
                                 let host_ok = !host_wn_ip.is_empty()
                                     && host_wn_ip.parse::<std::net::Ipv4Addr>().is_ok();

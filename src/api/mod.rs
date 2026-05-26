@@ -8146,7 +8146,10 @@ pub async fn wolfnet_routes_announce(
     body: web::Json<WolfnetRouteAnnounce>,
 ) -> HttpResponse {
     // Cluster-secret only — this is an inter-node call and must never
-    // be reachable via session/UI auth.
+    // be reachable via session/UI auth. WolfNet is intentionally
+    // cluster-scoped: container routes don't propagate across cluster
+    // boundaries even when the wolfnet mesh is shared, so a peer in a
+    // different cluster cannot inject routes here.
     if let Err(resp) = require_cluster_auth(&req, &state) { return resp; }
 
     let announce = body.into_inner();
@@ -8223,8 +8226,10 @@ pub async fn announce_wolfnet_routes_to_peers(
     cluster: std::sync::Arc<crate::agent::ClusterState>,
     cluster_secret: String,
 ) {
-    // Snapshot peers + local routes under their respective locks, then
-    // release both before any HTTP work.
+    // Push to every online wolfstack peer in OUR cluster. Cluster-scoped
+    // by design — wolfnet routes don't propagate cross-cluster even
+    // when a wolfnet mesh happens to span clusters.
+    let self_cluster = cluster.get_self_cluster_name();
     let peers: Vec<(String, u16)> = {
         let nodes = cluster.nodes.read().unwrap();
         nodes
@@ -8232,6 +8237,7 @@ pub async fn announce_wolfnet_routes_to_peers(
             .filter(|n| !n.is_self)
             .filter(|n| n.node_type == "wolfstack")
             .filter(|n| n.online)
+            .filter(|n| n.cluster_name.as_deref().unwrap_or("WolfStack") == self_cluster)
             .map(|n| (n.address.clone(), n.port))
             .collect()
     };
