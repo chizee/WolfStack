@@ -1172,15 +1172,18 @@ async fn main() -> std::io::Result<()> {
         // for the container's IP. Push closes the gap from the SOURCE
         // side, so the sender doesn't need the receiver's poll path
         // to be healthy.
+        // Re-load the cluster secret from disk on every push instead of
+        // capturing the boot-time value — see the equivalent comment on
+        // the poll loop above. A cluster_secret rotation should take
+        // effect without a wolfstack restart.
         let cluster_for_push = app_state.cluster.clone();
-        let secret_for_push = cluster_secret.clone();
         tokio::spawn(async move {
             // Initial push so peers learn our routes on boot without
             // waiting for the heartbeat or for a route change.
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             crate::api::announce_wolfnet_routes_to_peers(
                 cluster_for_push.clone(),
-                secret_for_push.clone(),
+                auth::load_cluster_secret(),
             ).await;
             loop {
                 tokio::select! {
@@ -1189,7 +1192,7 @@ async fn main() -> std::io::Result<()> {
                 }
                 crate::api::announce_wolfnet_routes_to_peers(
                     cluster_for_push.clone(),
-                    secret_for_push.clone(),
+                    auth::load_cluster_secret(),
                 ).await;
             }
         });
@@ -1554,14 +1557,27 @@ async fn main() -> std::io::Result<()> {
             }
         });
 
-        // Background: poll remote nodes
+        // Background: poll remote nodes.
+        //
+        // Re-load the cluster secret from disk on every iteration. The
+        // pre-fix version held a boot-time `cluster_secret.clone()` for
+        // the lifetime of the process, which meant a secret rotation
+        // (Settings -> Security, or fleet rotation API) only took
+        // effect on the SENDER side after a full wolfstack restart —
+        // even though receivers already re-read disk on every auth call
+        // (`validate_inter_node_secret`). That asymmetry quietly broke
+        // route propagation across an entire fleet: the poll kept
+        // sending the pre-rotation secret, every peer's receiver
+        // returned 403, mouse never learned dreamer's container routes,
+        // dreamer never learned mouse's. `sweep_push_cluster_names`
+        // gets this right (line ~1588) — bringing the poll into line.
         let cluster_poll = cluster.clone();
-        let secret_poll = cluster_secret.clone();
         let ai_agent_poll = ai_agent.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(10)).await;
-                agent::poll_remote_nodes(cluster_poll.clone(), secret_poll.clone(), Some(ai_agent_poll.clone())).await;
+                let secret = auth::load_cluster_secret();
+                agent::poll_remote_nodes(cluster_poll.clone(), secret, Some(ai_agent_poll.clone())).await;
             }
         });
 
