@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v24.7.17: WolfNet routes — event-driven push so peers learn container routes when the pull silently fails** _(2026-05-26 — [`3367caf`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/3367cafded63a24b94da819c4b0fa3edecd5abbd))_
 - **v24.7.16: WolfFlow — bulk Docker container update (all / selected) in one step** _(2026-05-26 — [`92ec033`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/92ec0339df718279afebc3ef1b363850bc8a85ff))_
 - **v24.7.15: ensure_lxc_bridge — log every failure, self-heal every 60s, re-master orphan veths** _(2026-05-26 — [`cf144ee`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/cf144eee8bf9ce2603e77a96a518c5fcfce767ef))_
 - **v24.7.14: LXC clone — dismiss the progress modal on success instead of leaving the page blurred** _(2026-05-26 — [`930738c`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/930738ccee5ee4b43743a6859e237a31687e9db7))_
