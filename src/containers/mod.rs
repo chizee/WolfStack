@@ -1703,16 +1703,155 @@ fn ensure_lxc_bridge_checked() -> Result<(), String> {
         );
     }
 
-    // We just (re)brought lxcbr0 up. Existing containers' host-side
-    // veth endpoints survived the deletion but are now orphans — they
-    // have no master and won't carry traffic until re-attached. Walk
-    // every running LXC container and re-master its veth to lxcbr0.
+    // We just (re)brought lxcbr0 up. Two pieces of state the kernel
+    // tore down when lxcbr0 vanished and that we have to put back:
+    //
+    //   1. Container veth peers — survived the deletion but are now
+    //      unmastered orphans, no traffic until re-attached. Walk
+    //      every running LXC container and re-master its veth.
+    //
+    //   2. Per-container host /32 routes (inside the container too).
+    //      `reapply_wolfnet_routes` walks every running container's
+    //      .wolfnet/ip marker and shells out to lxc-attach + `ip` to
+    //      re-add the address inside the container AND the host /32
+    //      route. Heavy (a 2s readiness sleep per container) but
+    //      thorough; only worth running when we just created the
+    //      bridge.
+    //
+    // Steady-state ticks (bridge already up) skip both.
     if needs_create {
         lxc_remaster_orphan_veths();
+        reapply_wolfnet_routes();
     }
+
+    // ALWAYS, even on steady-state ticks: verify the host /32 routes
+    // that deliver inbound WolfNet traffic to each running container
+    // are present, and reinstall any that are missing. This is the
+    // light path — no lxc-attach, no readiness sleep, just one `ip
+    // route show` per container plus an `ip route replace` for any
+    // that drifted. mouse 2026-05-26: regions80 on dreamer could ping
+    // 10.10.10.2 on mouse but not 10.10.10.200 / .3 / .4 — bridge was
+    // up but those three `/32` routes were silently gone, so wolfnet
+    // packets arrived at mouse's wolfnet0 and the kernel had nowhere
+    // to deliver them. Without this verification step the only path
+    // to recovery was restarting each affected container.
+    ensure_host_wolfnet_routes();
 
     ensure_lxcbr0_services(used_lxc_net);
     Ok(())
+}
+
+/// For every running LXC container that owns a WolfNet IP, verify the
+/// host has a `/32` route delivering that IP via `lxcbr0`. Reinstall
+/// any that are missing using the bridge-IP/WolfNet-IP last-octet
+/// convention (`10.10.10.X → 10.0.3.X`). Cheap: skips containers whose
+/// routes are already correct.
+fn ensure_host_wolfnet_routes() {
+    for base_path in lxc_storage_paths() {
+        let entries = match std::fs::read_dir(&base_path) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let container = match entry.file_name().into_string() {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            // Skip dotted dirs (staging, tombstones, etc.).
+            if container.starts_with('.') {
+                continue;
+            }
+
+            let ip_file = entry.path().join(".wolfnet/ip");
+            let wolfnet_ip = match std::fs::read_to_string(&ip_file) {
+                Ok(s) if !s.trim().is_empty() => s.trim().to_string(),
+                _ => continue,
+            };
+            if wolfnet_ip.parse::<std::net::Ipv4Addr>().is_err() {
+                continue;
+            }
+
+            // Only act on RUNNING containers — a stopped one has no
+            // veth, so a host route would just black-hole.
+            let mut info_args: Vec<String> =
+                vec!["lxc-info".to_string()];
+            if base_path != LXC_DEFAULT_PATH {
+                info_args.push("-P".to_string());
+                info_args.push(base_path.clone());
+            }
+            info_args.push("-n".to_string());
+            info_args.push(container.clone());
+            info_args.push("-sH".to_string());
+            let running = Command::new(&info_args[0])
+                .args(&info_args[1..])
+                .output()
+                .map(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .trim()
+                        .to_uppercase()
+                        .contains("RUNNING")
+                })
+                .unwrap_or(false);
+            if !running {
+                continue;
+            }
+
+            // Already routed via lxcbr0? Skip.
+            let route_present = Command::new("ip")
+                .args(["route", "show", &format!("{}/32", wolfnet_ip)])
+                .output()
+                .map(|o| {
+                    let s = String::from_utf8_lossy(&o.stdout);
+                    s.contains("dev lxcbr0")
+                })
+                .unwrap_or(false);
+            if route_present {
+                continue;
+            }
+
+            // Derive bridge IP via the WolfNet-IP last-octet convention
+            // (`assign_container_bridge_ip` enforces this on every
+            // attach; legacy containers without that convention will
+            // still fail until manually fixed — but the alternative is
+            // shelling into the container, which makes this tick slow).
+            let last_octet = match wolfnet_ip.rsplit('.').next() {
+                Some(o) => o,
+                None => continue,
+            };
+            let bridge_ip = format!("10.0.3.{}", last_octet);
+
+            let out = Command::new("ip")
+                .args([
+                    "route",
+                    "replace",
+                    &format!("{}/32", wolfnet_ip),
+                    "via",
+                    &bridge_ip,
+                    "dev",
+                    "lxcbr0",
+                ])
+                .output();
+            match out {
+                Ok(o) if o.status.success() => {
+                    info!(
+                        "ensure_host_wolfnet_routes: re-added /32 route for {} via {} dev lxcbr0 (container '{}')",
+                        wolfnet_ip, bridge_ip, container
+                    );
+                }
+                Ok(o) => {
+                    warn!(
+                        "ensure_host_wolfnet_routes: `ip route replace {}/32 via {} dev lxcbr0` failed: {}",
+                        wolfnet_ip,
+                        bridge_ip,
+                        String::from_utf8_lossy(&o.stderr).trim()
+                    );
+                }
+                Err(e) => {
+                    warn!("ensure_host_wolfnet_routes: spawn `ip route`: {}", e);
+                }
+            }
+        }
+    }
 }
 
 /// True if `name` exists as a link of any kind on the host.
