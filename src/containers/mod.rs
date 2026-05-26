@@ -5552,7 +5552,20 @@ pub fn lxc_parse_config(container: &str) -> Option<LxcParsedConfig> {
                         cfg.swap_limit = val.to_string();
                     }
                 }
-                if key.contains("cpuset.cpus") {
+                // CPU limit can be either a CFS quota (cpu.max) or a
+                // hard pin (cpuset.cpus). Prefer cpu.max if present —
+                // round-trip it as the bare integer the operator typed
+                // ("27" → "2700000 100000" → "27") so re-saving keeps
+                // the quota semantics. A pin is shown verbatim ("0-3").
+                if key.contains("cpu.max") {
+                    if let Some(n) = lxc_quota_cores_from_cpu_max(val) {
+                        cfg.cpus = n.to_string();
+                    } else if cfg.cpus.is_empty() {
+                        // Unrecognised quota shape — surface the raw
+                        // value so the operator can see/edit it.
+                        cfg.cpus = val.to_string();
+                    }
+                } else if key.contains("cpuset.cpus") && cfg.cpus.is_empty() {
                     cfg.cpus = val.to_string();
                 }
                 if key.contains("cpu.shares") || key.contains("cpu.weight") {
@@ -5980,10 +5993,14 @@ pub fn lxc_update_settings(container: &str, settings: &LxcSettingsUpdate) -> Res
         "nfsd", "proc:rw sys:rw cgroup:rw",
     ];
 
-    // Cgroup resource keys
+    // Cgroup resource keys we manage. Both "cpuset.cpus" and "cpu.max"
+    // are listed so a switch between pinning and CFS-quota modes leaves
+    // no stale line behind — without this, an old `cpuset.cpus = 0-26`
+    // could survive next to a fresh `cpu.max = 2700000 100000` and the
+    // kernel would still enforce the pin.
     let resource_patterns = [
         "memory.limit", "memory.max", "memory.memsw", "swap",
-        "cpuset.cpus", "cpu.shares", "cpu.weight",
+        "cpuset.cpus", "cpu.shares", "cpu.weight", "cpu.max",
     ];
 
     let mut preserved: Vec<String> = Vec::new();
@@ -6128,13 +6145,14 @@ pub fn lxc_update_settings(container: &str, settings: &LxcSettingsUpdate) -> Res
         }
     }
 
-    // A bare integer N here means "N cpus" and expands to the cpuset
-    // 0-(N-1); an explicit cpuset spec ("0-3", "0,2") is kept as-is.
-    // Writing the value verbatim turned a "28" core count into
-    // `cpuset.cpus = 28` — pinning the container to host CPU #28 alone.
+    // A bare integer N is a CFS-quota soft limit (N cores' worth of CPU
+    // time, scheduler free to use any host CPU). An explicit cpuset
+    // spec ("0-3", "0,2") is hard pinning. See LxcCpuLimit for the
+    // history of why bare-integer is NOT pinning any more.
     let cpus = settings.cpus.as_deref().unwrap_or(&current.cpus);
-    if let Some(cpuset) = lxc_cpuset_spec(cpus) {
-        preserved.push(format!("lxc.cgroup2.cpuset.cpus = {}", cpuset));
+    if let Some(limit) = lxc_parse_cpu_input(cpus) {
+        let (key, value) = limit.cgroup_entry();
+        preserved.push(format!("{} = {}", key, value));
     }
 
     // Features
@@ -7658,8 +7676,9 @@ pub fn lxc_create(name: &str, distribution: &str, release: &str, architecture: &
             // NB: do NOT inject a default `lxc.cgroup2.cpu.weight = 100` here.
             // It used to confuse lxc_set_resource_limits's "if line missing,
             // append" check — the user's chosen core count would get silently
-            // dropped at creation time. CPU pinning now goes via
-            // `cpuset.cpus` from lxc_set_resource_limits / Settings UI.
+            // dropped at creation time. CPU limits now go via `cpu.max`
+            // (CFS quota, bare-integer N) or `cpuset.cpus` (explicit pin)
+            // from lxc_set_resource_limits / Settings UI — see LxcCpuLimit.
             if modified {
                 let _ = std::fs::write(&cfg_path, cfg_content);
             }
@@ -8255,28 +8274,68 @@ fn lxc_replace_or_append(config: &mut String, key: &str, value: &str) -> bool {
     changed
 }
 
-/// Normalise a CPU spec for `lxc.cgroup2.cpuset.cpus`. A bare integer N
-/// means "N cpus" and expands to `0-(N-1)`; an explicit cpuset spec
-/// ("0-3", "0,2,4") passes through unchanged. Empty — or 0 — yields
-/// None: no pinning, so the container may use every host CPU.
+/// CFS period used for `lxc.cgroup2.cpu.max`. The kernel default is also
+/// 100ms; matching it keeps the quota arithmetic trivial — `N * PERIOD`
+/// microseconds buys exactly N cores' worth of CPU time per period.
+const LXC_CPU_PERIOD_US: u32 = 100_000;
+
+/// The two distinct meanings of the CPU Cores UI field. A bare integer
+/// is a *soft limit*: cap the container's CPU time to N cores' worth via
+/// `cpu.max`, leaving the scheduler free to spread it across any host
+/// CPU. An explicit cpuset list/range is *pinning*: restrict the
+/// container to exactly those host CPUs via `cpuset.cpus`.
 ///
-/// Both CPU write paths (`lxc_set_resource_limits` and the Settings UI
-/// writer `lxc_update_settings`) MUST funnel through this — otherwise a
-/// core *count* like "28" gets written verbatim as `cpuset.cpus = 28`,
-/// pinning the container to host CPU #28 alone.
-fn lxc_cpuset_spec(cpu: &str) -> Option<String> {
+/// History: bare-integer N used to expand to `cpuset.cpus = 0-(N-1)` —
+/// hard pinning, not a quota. On a 32-core host, every container with a
+/// numeric core setting was silently restricted to the same low-numbered
+/// CPUs, while higher-numbered CPUs sat idle and the kernel could not
+/// migrate work to relieve them. Multiple containers all sharing
+/// `0-26` thrashed each other for 27 CPUs. Switched to a CFS-quota soft
+/// limit to match operator expectation (and Proxmox's `pct set --cores`
+/// semantics).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LxcCpuLimit {
+    Quota(u32),
+    Pin(String),
+}
+
+impl LxcCpuLimit {
+    /// The cgroup key + value to write into the container's lxc.config.
+    fn cgroup_entry(&self) -> (&'static str, String) {
+        match self {
+            // cpu.max value format is `$MAX $PERIOD` in microseconds.
+            // `2700000 100000` = 27 cores' worth of CPU time per 100ms.
+            LxcCpuLimit::Quota(n) => (
+                "lxc.cgroup2.cpu.max",
+                format!("{} {}", n * LXC_CPU_PERIOD_US, LXC_CPU_PERIOD_US),
+            ),
+            LxcCpuLimit::Pin(s) => ("lxc.cgroup2.cpuset.cpus", s.clone()),
+        }
+    }
+
+    /// Round-trip label for status messages / logs.
+    fn describe(&self) -> String {
+        match self {
+            LxcCpuLimit::Quota(n) => format!("{} cores (CFS quota)", n),
+            LxcCpuLimit::Pin(s) => format!("pinned to CPUs {}", s),
+        }
+    }
+}
+
+/// Interpret the CPU Cores UI field. Bare integer → CFS-quota soft
+/// limit; explicit cpuset spec → pinning; empty / 0 / malformed → None.
+fn lxc_parse_cpu_input(cpu: &str) -> Option<LxcCpuLimit> {
     let cpu = cpu.trim();
     if cpu.is_empty() {
         return None;
     }
     match cpu.parse::<u32>() {
         Ok(0) => None,
-        Ok(1) => Some("0".to_string()),
-        Ok(n) => Some(format!("0-{}", n - 1)),
+        Ok(n) => Some(LxcCpuLimit::Quota(n)),
         // Not a bare count — accept an explicit cpuset spec, but only a
         // well-formed one. Junk ("-1", "abc", "4.5", "0-") must never
         // reach the kernel as cpuset.cpus and break the container.
-        Err(_) => is_valid_cpuset(cpu).then(|| cpu.to_string()),
+        Err(_) => is_valid_cpuset(cpu).then(|| LxcCpuLimit::Pin(cpu.to_string())),
     }
 }
 
@@ -8284,53 +8343,104 @@ fn lxc_cpuset_spec(cpu: &str) -> Option<String> {
 /// CPU numbers and/or `lo-hi` ranges, e.g. "0-3", "0,2,4", "8-15".
 fn is_valid_cpuset(s: &str) -> bool {
     !s.is_empty() && s.split(',').all(|part| match part.split_once('-') {
-        Some((lo, hi)) => lo.parse::<u32>().is_ok() && hi.parse::<u32>().is_ok(),
+        Some((lo, hi)) => {
+            // Both halves must parse, the range must be non-empty,
+            // and "0-" / "-3" must not slip through (empty halves).
+            !lo.is_empty() && !hi.is_empty()
+                && lo.parse::<u32>().is_ok() && hi.parse::<u32>().is_ok()
+        }
         None => part.parse::<u32>().is_ok(),
     })
 }
 
+/// Decode a value previously written by `LxcCpuLimit::Quota(n)` back to
+/// N, so the UI can round-trip a saved quota as the same bare integer
+/// the operator originally typed. Returns None for shapes we don't
+/// model (unequal MAX/PERIOD, fractional cores, "max" sentinel).
+fn lxc_quota_cores_from_cpu_max(val: &str) -> Option<u32> {
+    let mut it = val.split_whitespace();
+    let max: u32 = it.next()?.parse().ok()?;
+    let period: u32 = it.next()?.parse().ok()?;
+    if it.next().is_some() { return None; }
+    if period != LXC_CPU_PERIOD_US { return None; }
+    if max == 0 || max % period != 0 { return None; }
+    Some(max / period)
+}
+
 #[cfg(test)]
-mod cpuset_spec_tests {
-    use super::lxc_cpuset_spec;
+mod cpu_limit_tests {
+    use super::{lxc_parse_cpu_input, lxc_quota_cores_from_cpu_max, LxcCpuLimit};
 
     #[test]
-    fn bare_integer_expands_to_a_zero_based_range() {
-        assert_eq!(lxc_cpuset_spec("28").as_deref(), Some("0-27"));
-        assert_eq!(lxc_cpuset_spec("4").as_deref(), Some("0-3"));
-        assert_eq!(lxc_cpuset_spec("1").as_deref(), Some("0"));
+    fn bare_integer_is_a_cfs_quota_not_a_pin() {
+        assert_eq!(lxc_parse_cpu_input("28"), Some(LxcCpuLimit::Quota(28)));
+        assert_eq!(lxc_parse_cpu_input("4"), Some(LxcCpuLimit::Quota(4)));
+        assert_eq!(lxc_parse_cpu_input("1"), Some(LxcCpuLimit::Quota(1)));
     }
 
     #[test]
-    fn empty_or_zero_means_no_pinning() {
-        assert_eq!(lxc_cpuset_spec(""), None);
-        assert_eq!(lxc_cpuset_spec("   "), None);
-        assert_eq!(lxc_cpuset_spec("0"), None);
+    fn quota_writes_cpu_max_with_matching_period() {
+        let (k, v) = LxcCpuLimit::Quota(27).cgroup_entry();
+        assert_eq!(k, "lxc.cgroup2.cpu.max");
+        assert_eq!(v, "2700000 100000");
+        let (k, v) = LxcCpuLimit::Quota(1).cgroup_entry();
+        assert_eq!(k, "lxc.cgroup2.cpu.max");
+        assert_eq!(v, "100000 100000");
     }
 
     #[test]
-    fn explicit_cpuset_specs_pass_through_unchanged() {
-        assert_eq!(lxc_cpuset_spec("0-3").as_deref(), Some("0-3"));
-        assert_eq!(lxc_cpuset_spec("0,2,4").as_deref(), Some("0,2,4"));
-        assert_eq!(lxc_cpuset_spec("8-15").as_deref(), Some("8-15"));
+    fn empty_or_zero_means_no_limit() {
+        assert_eq!(lxc_parse_cpu_input(""), None);
+        assert_eq!(lxc_parse_cpu_input("   "), None);
+        assert_eq!(lxc_parse_cpu_input("0"), None);
+    }
+
+    #[test]
+    fn explicit_cpuset_specs_become_pin_not_quota() {
+        assert_eq!(lxc_parse_cpu_input("0-3"), Some(LxcCpuLimit::Pin("0-3".into())));
+        assert_eq!(lxc_parse_cpu_input("0,2,4"), Some(LxcCpuLimit::Pin("0,2,4".into())));
+        assert_eq!(lxc_parse_cpu_input("8-15"), Some(LxcCpuLimit::Pin("8-15".into())));
+    }
+
+    #[test]
+    fn pin_writes_cpuset_cpus_verbatim() {
+        let (k, v) = LxcCpuLimit::Pin("0,3,7".into()).cgroup_entry();
+        assert_eq!(k, "lxc.cgroup2.cpuset.cpus");
+        assert_eq!(v, "0,3,7");
     }
 
     #[test]
     fn malformed_specs_are_rejected() {
-        assert_eq!(lxc_cpuset_spec("-1"), None);
-        assert_eq!(lxc_cpuset_spec("abc"), None);
-        assert_eq!(lxc_cpuset_spec("4.5"), None);
-        assert_eq!(lxc_cpuset_spec("0-"), None);
-        assert_eq!(lxc_cpuset_spec("0--3"), None);
+        assert_eq!(lxc_parse_cpu_input("-1"), None);
+        assert_eq!(lxc_parse_cpu_input("abc"), None);
+        assert_eq!(lxc_parse_cpu_input("4.5"), None);
+        assert_eq!(lxc_parse_cpu_input("0-"), None);
+        assert_eq!(lxc_parse_cpu_input("0--3"), None);
+        assert_eq!(lxc_parse_cpu_input("-3"), None);
+    }
+
+    #[test]
+    fn cpu_max_round_trips_back_to_the_bare_count() {
+        assert_eq!(lxc_quota_cores_from_cpu_max("2700000 100000"), Some(27));
+        assert_eq!(lxc_quota_cores_from_cpu_max("100000 100000"), Some(1));
+        // Different period — we don't try to map a foreign quota back to
+        // the bare-count UI field; let the cpuset.cpus path or raw editor
+        // handle it.
+        assert_eq!(lxc_quota_cores_from_cpu_max("100000 50000"), None);
+        // "max" or absent → not a finite quota we can show as N.
+        assert_eq!(lxc_quota_cores_from_cpu_max("max 100000"), None);
+        // Fractional cores aren't reachable from the UI today.
+        assert_eq!(lxc_quota_cores_from_cpu_max("50000 100000"), None);
     }
 }
 
-/// Persist memory + CPU limits in the container's lxc.config. CPU is
-/// expressed as `lxc.cgroup2.cpuset.cpus = 0-(N-1)` so an integer "4"
-/// pins the container to 4 host CPUs — same convention the Settings →
-/// Resources UI uses (lxc_update_settings). Previously this used
-/// cpu.weight (relative scheduler weight) AND skipped writing if the
-/// line already existed, so the default `cpu.weight = 100` added at
-/// create time silently swallowed every user-specified value.
+/// Persist memory + CPU limits in the container's lxc.config. Bare
+/// integer N becomes a CFS-quota soft limit via `lxc.cgroup2.cpu.max`;
+/// an explicit cpuset spec ("0-3", "0,2") becomes hard pinning via
+/// `lxc.cgroup2.cpuset.cpus`. The two are mutually exclusive — when
+/// switching modes we strip both keys before writing the new one so a
+/// stale `cpuset.cpus` can't survive next to a fresh `cpu.max` and pin
+/// the container against the operator's intent.
 pub fn lxc_set_resource_limits(container: &str, memory: Option<&str>, cpus: Option<&str>) -> Result<Option<String>, String> {
     let mut messages = Vec::new();
 
@@ -8354,11 +8464,18 @@ pub fn lxc_set_resource_limits(container: &str, memory: Option<&str>, cpus: Opti
         }
     }
 
-    if let Some(cpuset) = cpus.and_then(lxc_cpuset_spec) {
-        let applied = lxc_replace_or_append(&mut config, "lxc.cgroup2.cpuset.cpus", &cpuset);
-        if applied {
+    if let Some(limit) = cpus.and_then(lxc_parse_cpu_input) {
+        // Strip both possible old CPU keys so a switch between
+        // pinning <-> quota leaves no stale line behind.
+        let before = config.clone();
+        config = lxc_strip_lines_with_key_prefix(&config, "lxc.cgroup2.cpuset.cpus");
+        config = lxc_strip_lines_with_key_prefix(&config, "lxc.cgroup2.cpu.max");
+        let stripped = config != before;
+        let (key, value) = limit.cgroup_entry();
+        let applied = lxc_replace_or_append(&mut config, key, &value);
+        if applied || stripped {
             modified = true;
-            messages.push(format!("CPU pinning set to {}", cpuset));
+            messages.push(format!("CPU limit set: {}", limit.describe()));
         }
     }
 
@@ -8373,6 +8490,25 @@ pub fn lxc_set_resource_limits(container: &str, memory: Option<&str>, cpus: Opti
     } else {
         Ok(Some(messages.join(", ")))
     }
+}
+
+/// Remove every line whose key (the part before `=`) starts with the
+/// given prefix, regardless of whitespace around the `=`. Used to clear
+/// stale cgroup keys before writing a new value of a different shape.
+fn lxc_strip_lines_with_key_prefix(config: &str, key_prefix: &str) -> String {
+    let mut out = String::with_capacity(config.len());
+    for line in config.lines() {
+        let trimmed = line.trim_start();
+        let matches = trimmed.starts_with(key_prefix) && {
+            let rest = trimmed[key_prefix.len()..].trim_start();
+            rest.starts_with('=')
+        };
+        if !matches {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 /// Stop an LXC container

@@ -22078,7 +22078,7 @@ async function openLxcSettings(name) {
                             ${cfg.proxmox ? '' : `oninput="updateLxcCpuSummary(this.value)"`}>
                         <small style="color:var(--text-muted);margin-top:4px;display:block;">${cfg.proxmox
                             ? 'Number of cores. Leave blank for unlimited. Restart the container to apply.'
-                            : 'Plain number = that many cores (e.g. <b>4</b> assigns CPUs 0,1,2,3 — 4 cores total). A cpuset list pins specific CPUs: <b>0-3</b> is the <i>range</i> 0,1,2,3 (4 cores), <b>0,3</b> is the <i>list</i> CPU 0 and CPU 3 only (2 cores). Blank = unlimited. Restart the container to apply.'}</small>
+                            : 'Plain number = soft CPU limit (e.g. <b>4</b> caps the container at 4 cores\' worth of CPU time, but the kernel can schedule it on <i>any</i> host CPU). A cpuset list <i>pins</i> the container to specific CPUs: <b>0-3</b> is the range 0,1,2,3 (4 CPUs, pinned); <b>0,3</b> is the list CPU 0 and CPU 3 only (2 CPUs, pinned). Pinning is rarely what you want — prefer a plain number unless you specifically need affinity. Blank = unlimited. Restart the container to apply.'}</small>
                         ${cfg.proxmox ? '' : `<small id="lxc-cpu-summary" style="color:var(--accent-color,#7c3aed);margin-top:4px;display:block;font-weight:500;"></small>`}
                     </div>
                 </div>
@@ -22194,24 +22194,25 @@ async function openLxcSettings(name) {
     }
 }
 
-// Resolve a CPU Cores field value to a human-readable summary. The field
-// accepts either a count (4 → CPUs 0,1,2,3) or a cpuset list/range
-// (0-3 → 4 CPUs, 0,3 → 2 CPUs). The summary spells out which CPUs are
-// actually being assigned so "0-26" isn't read as "CPU 0 and CPU 26".
+// Resolve a CPU Cores field value to a human-readable summary. A bare
+// number is a soft CFS-quota limit ("cap at N cores' worth of CPU
+// time"). A cpuset list/range is hard pinning ("only run on these
+// specific host CPUs"). Spelled out so "0-26" isn't read as "CPU 0 and
+// CPU 26", and so the operator sees pin-vs-quota explicitly in the UI.
 function updateLxcCpuSummary(raw) {
     var el = document.getElementById('lxc-cpu-summary');
     if (!el) return;
     var s = (raw || '').trim();
-    if (s === '') { el.textContent = '= unlimited (all host CPUs)'; return; }
-    // Bare count: N → CPUs 0..N-1.
+    if (s === '') { el.textContent = '= unlimited (no CPU cap)'; return; }
+    // Bare count: soft CFS-quota limit; not pinning.
     if (/^\d+$/.test(s)) {
         var n = parseInt(s, 10);
-        if (n === 0) { el.textContent = '= unlimited (all host CPUs)'; return; }
-        if (n === 1) { el.textContent = '= 1 CPU (CPU 0 only)'; return; }
-        el.textContent = '= ' + n + ' CPUs (CPUs 0–' + (n - 1) + ')';
+        if (n === 0) { el.textContent = '= unlimited (no CPU cap)'; return; }
+        var label = n === 1 ? '1 core' : (n + ' cores');
+        el.textContent = '= soft limit: up to ' + label + ' of CPU time (scheduler may use any host CPU)';
         return;
     }
-    // Cpuset list/range. Validate, then count distinct CPUs.
+    // Cpuset list/range — hard pinning. Validate, then count distinct CPUs.
     var parts = s.split(',');
     var cpus = new Set();
     for (var i = 0; i < parts.length; i++) {
@@ -22229,16 +22230,15 @@ function updateLxcCpuSummary(raw) {
         }
     }
     var count = cpus.size;
-    if (count === 1) {
-        el.textContent = '= 1 CPU (CPU ' + cpus.values().next().value + ' only)';
-        return;
-    }
-    // Show the resolved list, capped so a huge range doesn't blow out the line.
     var list = Array.from(cpus).sort(function (a, b) { return a - b; });
     var shown = list.length <= 12
         ? list.join(', ')
         : (list.slice(0, 6).join(', ') + ', …, ' + list.slice(-2).join(', '));
-    el.textContent = '= ' + count + ' CPUs (' + shown + ')';
+    if (count === 1) {
+        el.textContent = '= pinned to 1 CPU (CPU ' + list[0] + ' only) — hard affinity, not a quota';
+        return;
+    }
+    el.textContent = '= pinned to ' + count + ' specific CPUs (' + shown + ') — hard affinity, not a quota';
 }
 
 // Ensure a vSwitch VLAN's L2 plumbing exists; returns { name, mtu } for
