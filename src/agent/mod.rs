@@ -1296,9 +1296,24 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
 
     // Build updated route table. Strategy:
     // - Start from existing routes (preserves routes for nodes we couldn't reach)
-    // - Remove entries for nodes we successfully polled (we have fresh data)
+    // - Remove entries for nodes we successfully polled AND got container
+    //   routes from (we have fresh authoritative data for those hosts)
     // - Add all fresh routes (local + successfully polled remote nodes)
-    // This cleans up stale routes without losing routes during temporary outages.
+    //
+    // IMPORTANT interaction with the push path:
+    //   The push handler (wolfnet_routes_announce) modifies WOLFNET_ROUTES
+    //   in-place between poll cycles. This replace_wolfnet_routes call is
+    //   authoritative and overwrites the cache. Routes from the push are
+    //   preserved IFF the poll ALSO collected routes for that host (they
+    //   end up in subnet_routes). If the poll returned only the host IP
+    //   (no containers), the host is NOT in fresh_hosts, so any routes
+    //   the push delivered for that host survive the replace.
+    //
+    //   The one race: if a container was JUST created, the push fires
+    //   instantly (WOLFNET_ROUTES_CHANGED), but the poll's StatusReport
+    //   cache (5s TTL) may still be stale. The poll then overwrites the
+    //   push-delivered route with stale data. This heals on the next
+    //   poll cycle (10s) when the StatusReport cache refreshes.
 
     // 1. Add LOCAL container/VM/VIP IPs → this node's wolfnet IP
     let local_ips = crate::containers::wolfnet_used_ips_cached();
@@ -1314,8 +1329,13 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
 
     // 2. subnet_routes now has: local container routes + remote container routes
 
-    // 3. Build the safe replacement: existing routes minus polled nodes, plus fresh data
-    //    Collect which host IPs we have fresh data for (local + successfully polled remotes)
+    // 3. Build the safe replacement.
+    //    Collect which host IPs we have AUTHORITATIVE fresh data for:
+    //    - Our own local wolfnet IP (always authoritative — we just scanned)
+    //    - Gateway IPs from subnet_routes (only populated when
+    //      wolfnet_ips.len() > 1, i.e. the peer reported containers)
+    //    A host NOT in this set keeps its existing routes — they came
+    //    from either a previous poll or a push, both are valid.
     let mut fresh_hosts: std::collections::HashSet<String> = std::collections::HashSet::new();
     if !local_wn_ip.is_empty() {
         fresh_hosts.insert(local_wn_ip);
@@ -1334,15 +1354,17 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
             continue;
         }
         if !fresh_hosts.contains(v) {
-            // Keep routes for hosts we COULDN'T poll (stale but better than nothing)
+            // Keep routes for hosts we COULDN'T poll or that returned
+            // no container data — stale/push-delivered but better than nothing
             final_routes.insert(k.clone(), v.clone());
         }
     }
-    // Add all fresh routes
+    // Add all fresh routes (overwrites stale entries for the same container IP)
     final_routes.extend(subnet_routes);
 
     // Replace atomically
     crate::containers::replace_wolfnet_routes(final_routes);
+
 
     // After polling, detect state changes and send emails
     // Only the node with the lowest ID sends emails to avoid duplicates

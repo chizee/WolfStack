@@ -1176,8 +1176,39 @@ async fn main() -> std::io::Result<()> {
         // capturing the boot-time value — see the equivalent comment on
         // the poll loop above. A cluster_secret rotation should take
         // effect without a wolfstack restart.
+
+        // Seed WOLFNET_ROUTES with local container routes before the
+        // first push fires (T+5). On a tmpfs system /var/run/wolfnet/
+        // routes.json is lost on reboot, so WOLFNET_ROUTES starts empty.
+        // Without this seed the T+5 push sends an empty announce, and
+        // the receiver's wolfnet_routes_announce handler wipes all
+        // existing routes for this host via cache.retain().  Seeding
+        // here closes the window: the push at T+5 sends real local
+        // routes instead of an empty set.
+        //
+        // Uses update_wolfnet_routes (merge) rather than replace so we
+        // don't stomp any routes that were legitimately seeded from
+        // an existing routes.json (non-tmpfs systems).
+        {
+            let local_ips = containers::wolfnet_used_ips_cached();
+            if local_ips.len() > 1 {
+                let host_ip = &local_ips[0];
+                let mut local_routes = std::collections::HashMap::new();
+                for ip in &local_ips[1..] {
+                    if !ip.is_empty() && ip != host_ip {
+                        local_routes.insert(ip.clone(), host_ip.clone());
+                    }
+                }
+                if !local_routes.is_empty() {
+                    containers::update_wolfnet_routes(&local_routes);
+                    info!("WolfNet: seeded {} local container route(s) into cache before first push", local_routes.len());
+                }
+            }
+        }
+
         let cluster_for_push = app_state.cluster.clone();
         tokio::spawn(async move {
+
             // Initial push so peers learn our routes on boot without
             // waiting for the heartbeat or for a route change.
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
