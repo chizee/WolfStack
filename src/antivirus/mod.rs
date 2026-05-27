@@ -1412,6 +1412,53 @@ fn clamav_user_present() -> bool {
     user_exists && group_exists
 }
 
+/// Startup self-heal for the clamav-user → logrotate failure mode.
+///
+/// piranhaSponsor reported (2026-05-27) that v24.7.4's fix didn't take
+/// on his cluster: his nodes already had clamav installed in the
+/// partial-install state BEFORE upgrading WolfStack, so neither
+/// `do_install_packages` (no apt install happens — already installed)
+/// nor `scheduled_scan_recover` (his DB is fine, scans don't fail)
+/// ever exercises the heal. logrotate keeps failing daily on its own
+/// systemd timer, fully outside WolfStack's view.
+///
+/// Match every other WolfStack startup hook (LXC bridges, WolfNet
+/// routes, WolfRouter config): re-assert the desired state on every
+/// boot. Narrow scope — only act when the clamav-freshclam logrotate
+/// config is actually present, so we don't create the user on hosts
+/// that don't have ClamAV at all. Debian-family only because that's
+/// where the user-naming convention matches (Fedora/RHEL use clamupdate,
+/// SUSE uses vscan).
+///
+/// Idempotent and silent — every WolfStack restart runs it; healthy
+/// hosts no-op in microseconds.
+pub fn startup_self_heal_clamav_user() {
+    if !std::path::Path::new("/etc/logrotate.d/clamav-freshclam").exists() {
+        return;
+    }
+    let (distro, id_like) = parse_os_release();
+    if distro_family_with_idlike(&distro, &id_like) != "debian" {
+        return;
+    }
+    if clamav_user_present() {
+        return;
+    }
+    // User missing despite the logrotate config being installed — heal
+    // before the next logrotate cron/timer tick. Log via tracing so the
+    // action shows up in journalctl for post-mortem if needed.
+    tracing::warn!(
+        "ClamAV 'clamav' user missing despite /etc/logrotate.d/clamav-freshclam being installed; \
+         creating user to stop logrotate failures (piranhaSponsor 2026-05-27)"
+    );
+    let healed = ensure_clamav_user_silent();
+    if !healed {
+        tracing::error!(
+            "Failed to auto-create the 'clamav' user; logrotate's clamav-freshclam config will keep failing. \
+             Hand-fix with: `adduser --system --group clamav`"
+        );
+    }
+}
+
 /// Silent counterpart to `ensure_clamav_user` for use outside the
 /// install path (e.g. the scan-time auto-recovery). Same idempotent
 /// logic, but without the install-log side effects. Returns whether

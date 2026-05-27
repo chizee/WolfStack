@@ -1287,6 +1287,14 @@ async fn main() -> std::io::Result<()> {
         // the tailer at startup so findings keep flowing to the UI.
         crate::antivirus::resume_on_access_tailer_if_enabled(app_state.antivirus.clone());
 
+        // Startup self-heal: if /etc/logrotate.d/clamav-freshclam is
+        // installed but the `clamav` user isn't, recreate the user so
+        // the daily logrotate run stops failing. v24.7.4 only healed
+        // post-apt-install; piranhaSponsor's nodes were already in the
+        // broken state before upgrading WolfStack, so the install-time
+        // hook never fired. Idempotent — no-op on healthy hosts.
+        tokio::task::spawn_blocking(crate::antivirus::startup_self_heal_clamav_user);
+
         // Security scanner background loop — runs posture + active-attack
         // checks on a timer and fires alerts via Discord/Slack/Telegram/
         // email when a critical-severity finding appears (SSH brute-force,
