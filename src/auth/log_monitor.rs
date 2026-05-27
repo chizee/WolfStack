@@ -9,10 +9,17 @@
 //!
 //!   - WolfStack web UI (8553) — handled by login_limiter directly
 //!   - SSH (22)                — this module taps sshd's auth events
-//!   - Proxmox web UI (8006)   — this module taps pvedaemon's events
+//!   - Proxmox web UI (8006)   — this module taps pveproxy + pvedaemon
 //!
 //! All three feed `record_failure_with()` so kernel-block + fleet
 //! propagation are identical regardless of which surface was hit.
+//!
+//! pveproxy is the HTTP frontend on 8006; pvedaemon is the API worker
+//! behind it. Both call the same `PVE::AccessControl` Perl path and
+//! emit the same `authentication failure; rhost=… user=…` syslog line,
+//! but which one logs depends on where in the request lifecycle the
+//! credential check ran. Tapping both is the only way to guarantee no
+//! failed Proxmox login slips past.
 //!
 //! ## Why journald and not /var/log/auth.log
 //!
@@ -28,6 +35,7 @@
 //!                   — only when there was a password attempt; pure
 //!                     pre-auth disconnects are bots and don't count.
 //! - pvedaemon:     `authentication failure; rhost=<IP> user=<user> ...`
+//! - pveproxy:      `authentication failure; rhost=<IP> user=<user> ...`
 //!
 //! We deduplicate within a 2-second window to avoid double-counting
 //! the multiple log lines a single failed attempt usually produces
@@ -101,6 +109,7 @@ fn run_one_journal_session(
             "_COMM=sshd",
             "_COMM=sshd-session",
             "_COMM=pvedaemon",
+            "_COMM=pveproxy",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -159,19 +168,32 @@ fn parse_failure(line: &str) -> Option<(String, String, &'static str)> {
             return Some((ip, user, "sshd-invalid-user"));
         }
     }
-    // pvedaemon: ... "authentication failure; rhost=<IP> user=<user> ..."
-    if line.contains("pvedaemon") && line.contains("authentication failure") {
-        // rhost=<IP>
-        let rhost = line.find("rhost=").map(|i| &line[i + 6..])?;
-        let ip = rhost.split_whitespace().next()?
-            .trim_end_matches(';')
-            .to_string();
-        // user=<user> (might not be present; default to "")
-        let user = line.find("user=").map(|i| &line[i + 5..])
-            .and_then(|s| s.split_whitespace().next())
-            .unwrap_or("")
-            .to_string();
-        return Some((ip, user, "pvedaemon"));
+    // pvedaemon / pveproxy: ... "authentication failure; rhost=<IP> user=<user> ..."
+    // Both daemons share PVE::AccessControl and emit identical lines;
+    // which one logs depends on where in the request the check ran.
+    // pveproxy is checked first so the more specific label wins when
+    // a line somehow mentions both daemons (e.g. forwarded log).
+    let pve_source: Option<&'static str> = if line.contains("pveproxy") {
+        Some("pveproxy")
+    } else if line.contains("pvedaemon") {
+        Some("pvedaemon")
+    } else {
+        None
+    };
+    if let Some(source) = pve_source {
+        if line.contains("authentication failure") {
+            // rhost=<IP>
+            let rhost = line.find("rhost=").map(|i| &line[i + 6..])?;
+            let ip = rhost.split_whitespace().next()?
+                .trim_end_matches(';')
+                .to_string();
+            // user=<user> (might not be present; default to "")
+            let user = line.find("user=").map(|i| &line[i + 5..])
+                .and_then(|s| s.split_whitespace().next())
+                .unwrap_or("")
+                .to_string();
+            return Some((ip, user, source));
+        }
     }
     None
 }
@@ -258,6 +280,15 @@ mod tests {
         assert_eq!(r.0, "158.173.240.177");
         assert_eq!(r.1, "root@pam");
         assert_eq!(r.2, "pvedaemon");
+    }
+
+    #[test]
+    fn parse_pveproxy_failure() {
+        let line = "pveproxy[5678]: authentication failure; rhost=158.173.240.177 user=admin@pam msg=no such user ('admin@pam')";
+        let r = parse_failure(line).expect("must parse");
+        assert_eq!(r.0, "158.173.240.177");
+        assert_eq!(r.1, "admin@pam");
+        assert_eq!(r.2, "pveproxy");
     }
 
     #[test]
