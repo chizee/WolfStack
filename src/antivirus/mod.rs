@@ -1362,11 +1362,7 @@ fn systemd_is_active(unit: &str) -> bool {
 /// no-op if the user already exists. Logs each step so the operator
 /// sees what we did.
 fn ensure_clamav_user(state: &AntivirusState) {
-    let user_exists = Command::new("getent").args(["passwd", "clamav"])
-        .status().map(|s| s.success()).unwrap_or(false);
-    let group_exists = Command::new("getent").args(["group", "clamav"])
-        .status().map(|s| s.success()).unwrap_or(false);
-    if user_exists && group_exists {
+    if clamav_user_present() {
         return; // healthy — nothing to do
     }
     state.push_install_line(
@@ -1394,9 +1390,60 @@ fn ensure_clamav_user(state: &AntivirusState) {
               "clamav"],
             &[]);
     }
-    // Fix ownership on the directories the package would have chowned.
-    // Errors are tolerated — if the dirs don't exist yet, the package
-    // postinst will create them with the right owner on its next run.
+    chown_clamav_dirs();
+    // Verify — if both adduser AND useradd failed silently (e.g. a
+    // half-existing entry where the passwd row is present but the
+    // matching group row isn't), freshclam will fail seconds later
+    // with "Can't drop privileges". Surface it now so the operator
+    // can see exactly which step needs hand-fixing.
+    if !clamav_user_present() {
+        state.push_install_line(
+            "✗ Failed to create 'clamav' user/group — freshclam will not be able to update signatures. \
+             Hand-fix with: `adduser --system --group clamav` then re-run the installer.".into());
+    }
+}
+
+/// Return true if both the `clamav` user and `clamav` group exist.
+fn clamav_user_present() -> bool {
+    let user_exists = Command::new("getent").args(["passwd", "clamav"])
+        .status().map(|s| s.success()).unwrap_or(false);
+    let group_exists = Command::new("getent").args(["group", "clamav"])
+        .status().map(|s| s.success()).unwrap_or(false);
+    user_exists && group_exists
+}
+
+/// Silent counterpart to `ensure_clamav_user` for use outside the
+/// install path (e.g. the scan-time auto-recovery). Same idempotent
+/// logic, but without the install-log side effects. Returns whether
+/// the user is present after the call.
+fn ensure_clamav_user_silent() -> bool {
+    if clamav_user_present() { return true; }
+    // adduser (Debian wrapper) first, then useradd as a fallback.
+    let ok = Command::new("adduser")
+        .args(["--system", "--quiet", "--group",
+               "--no-create-home", "--home", "/var/lib/clamav",
+               "clamav"])
+        .status().map(|s| s.success()).unwrap_or(false);
+    if !ok {
+        let _ = Command::new("useradd")
+            .args(["--system",
+                   "--home-dir", "/var/lib/clamav",
+                   "--no-create-home",
+                   "--user-group",
+                   "--shell", "/usr/sbin/nologin",
+                   "clamav"])
+            .status();
+    }
+    chown_clamav_dirs();
+    clamav_user_present()
+}
+
+/// Re-chown the directories the clamav package would have owned. Used
+/// after creating the missing user — freshclam needs to write into
+/// /var/lib/clamav as the clamav user, so the directory must be owned
+/// by it. Errors are tolerated: missing directories will be created
+/// by the package postinst (or by freshclam itself) on a later run.
+fn chown_clamav_dirs() {
     for path in &["/var/log/clamav", "/var/lib/clamav", "/var/run/clamav"] {
         if std::path::Path::new(path).exists() {
             let _ = Command::new("chown").args(["-R", "clamav:clamav", path]).status();
@@ -2450,6 +2497,66 @@ pub struct ScanRunSummary {
     pub errors: Vec<String>,
 }
 
+/// Detect the "ClamAV signature DB is missing" failure mode from a
+/// `run_clamav_scan` error string and attempt to recover by running
+/// `freshclam` once. Returns `true` if freshclam succeeded and the
+/// caller should retry the scan.
+///
+/// The error we recognise is clamscan exit code 2 with stderr
+/// containing `LibClamAV Error: cli_loaddbdir: No supported database
+/// files found in /var/lib/clamav` — which happens when the clamav
+/// package is installed but `freshclam` has never run (or its service
+/// is disabled), so /var/lib/clamav has no .cvd / .cld signatures.
+///
+/// On Debian/Ubuntu the `clamav-freshclam` daemon holds an exclusive
+/// lock on the signature DB, so we stop it before the one-shot run
+/// and start it again afterwards. If it wasn't running at all we
+/// enable it so future scans don't hit the same problem.
+fn try_recover_clamav_signatures(state: &AntivirusState, err: &str) -> bool {
+    let lower = err.to_lowercase();
+    let missing_db = lower.contains("no supported database files")
+        || lower.contains("cli_loaddbdir");
+    if !missing_db { return false; }
+    if which("freshclam").is_none() { return false; }
+
+    {
+        let mut s = state.scan_state.write().unwrap();
+        s.progress_message =
+            "ClamAV signature DB missing — running freshclam to recover…".into();
+    }
+
+    // freshclam drops privileges to the `clamav` user (set via
+    // `DatabaseOwner clamav` in /etc/clamav/freshclam.conf on Debian).
+    // If a partial package install left the user missing, freshclam
+    // exits before writing any signature, and the next clamscan hits
+    // exactly the "No supported database files" error we just saw.
+    // Self-heal: recreate the user before retrying freshclam.
+    let (distro, id_like) = parse_os_release();
+    if distro_family_with_idlike(&distro, &id_like) == "debian" {
+        ensure_clamav_user_silent();
+    }
+
+    let svc_was_active = systemd_is_active("clamav-freshclam.service")
+        || systemd_is_active("clamav-freshclam-daemon.service");
+    if svc_was_active {
+        let _ = Command::new("systemctl")
+            .args(["stop", "clamav-freshclam.service"]).status();
+    }
+
+    let fc_ok = Command::new("freshclam").status()
+        .map(|s| s.success()).unwrap_or(false);
+
+    if svc_was_active {
+        let _ = Command::new("systemctl")
+            .args(["start", "clamav-freshclam.service"]).status();
+    } else if fc_ok {
+        let _ = Command::new("systemctl")
+            .args(["enable", "--now", "clamav-freshclam.service"]).status();
+    }
+
+    fc_ok
+}
+
 /// Run every configured scanner sequentially. ClamAV first (longest
 /// runner gets started while other tools could be skipped), then the
 /// rootkit checks. New findings are appended to the persisted history.
@@ -2488,7 +2595,21 @@ pub fn run_full_scan(state: &AntivirusState) -> ScanRunSummary {
             s.active_scanner = Some("clamav".into());
             s.progress_message = "Running ClamAV signature scan…".into();
         }
-        match run_clamav_scan(state, &cfg) {
+        let mut scan_result = run_clamav_scan(state, &cfg);
+        // Auto-recover from the "signature DB never seeded" failure
+        // mode: freshclam has never run, /var/lib/clamav is empty, and
+        // every clamscan exits 2. Run freshclam once and retry.
+        if let Err(ref e) = scan_result {
+            if try_recover_clamav_signatures(state, e) {
+                {
+                    let mut s = state.scan_state.write().unwrap();
+                    s.progress_message =
+                        "Retrying ClamAV scan with refreshed signatures…".into();
+                }
+                scan_result = run_clamav_scan(state, &cfg);
+            }
+        }
+        match scan_result {
             Ok(hits) => {
                 summary.clamav_hits = hits.len();
                 handle_clamav_hits(state, &cfg, &hits, &mut summary);
