@@ -30,7 +30,7 @@ use crate::auth::LoginRateLimiter;
 
 /// Port to bind when enabled. Picked well above the typical scanner
 /// top-N port lists so opportunistic sweeps don't hit it accidentally.
-const PORT: u16 = 41910;
+pub const PORT: u16 = 41910;
 const STATE_PATH: &str = "/etc/wolfstack/diag.json";
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const REBIND_BACKOFF: Duration = Duration::from_secs(30);

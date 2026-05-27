@@ -16862,10 +16862,19 @@ async function securityRefreshLockouts() {
         : `<span style="color:#22c55e;">Lockout active.</span> ${cfg.max_failures} failures in ${cfg.window_seconds}s triggers a ${Math.round(cfg.lockout_seconds / 3600)}h kernel block. ${cfg.trusted_ips?.length || 0} trusted IP${cfg.trusted_ips?.length === 1 ? '' : 's'} configured.`;
     document.getElementById('security-lockout-status').innerHTML = status;
 
-    // 24-hour block-activity chart (one bar per hour). Source: audit
-    // entries with was_locked=true, bucketed by the hour they fired.
-    // Uses absolute hour-of-day labels so an attack burst is visible
-    // against the operator's local clock.
+    // 24-hour block-activity chart (one bar per hour). Counts every
+    // audit entry that represents an IP being NEWLY blocked — brute-
+    // force trips, fleet propagation, and auto-blocks. The `was_locked`
+    // field is unreliable for this (existing code sets it false for
+    // trips, true for already-locked-attempt entries) so we match the
+    // reason string instead.
+    const isBlockEvent = (e) => {
+        if (e.success) return false;
+        const r = e.reason || '';
+        return r === 'auto-block'
+            || r.includes('threshold hit')
+            || r.startsWith('kernel-blocked');
+    };
     const chartEl = document.getElementById('security-block-chart');
     if (chartEl) {
         const now = new Date();
@@ -16878,7 +16887,7 @@ async function securityRefreshLockouts() {
         }
         const startMs = now.getTime() - 24 * 3600 * 1000;
         for (const e of audit) {
-            if (!e.was_locked) continue;
+            if (!isBlockEvent(e)) continue;
             const tsMs = (e.timestamp || 0) * 1000;
             if (tsMs < startMs) continue;
             const idx = 23 - Math.floor((now.getTime() - tsMs) / (3600 * 1000));
@@ -17062,6 +17071,7 @@ window.securityUnblockIp = securityUnblockIp;
 async function gandalfRefresh() {
     const cb = document.getElementById('gandalf-checkbox');
     const status = document.getElementById('gandalf-status');
+    const portEl = document.getElementById('gandalf-port');
     if (!cb || !status) return;
     try {
         const r = await fetch(apiUrl('/api/security/gandalf'));
@@ -17072,6 +17082,7 @@ async function gandalfRefresh() {
         const d = await r.json();
         cb.checked = !!d.enabled;
         status.textContent = d.enabled ? 'on' : 'off';
+        if (portEl && d.port) portEl.textContent = `(port ${d.port})`;
     } catch (e) {
         status.textContent = 'unavailable';
     }
@@ -17097,7 +17108,7 @@ async function gandalfToggle(enabled) {
         const d = await r.json();
         if (cb) cb.checked = !!d.enabled;
         if (status) status.textContent = d.enabled ? 'on' : 'off';
-        showToast(`Gandalf ${d.enabled ? 'enabled' : 'disabled'}`, 'success');
+        showToast(`NMAP Protection ${d.enabled ? 'enabled' : 'disabled'}`, 'success');
     } catch (e) {
         if (status) status.textContent = 'error';
         showToast(`Toggle failed: ${e.message || e}`, 'error');

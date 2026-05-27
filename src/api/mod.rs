@@ -988,6 +988,7 @@ pub async fn gandalf_get(
     if let Err(e) = require_auth(&req, &state) { return e; }
     HttpResponse::Ok().json(serde_json::json!({
         "enabled": state.diag_control.is_enabled(),
+        "port": crate::diag::PORT,
     }))
 }
 
@@ -1001,6 +1002,7 @@ pub async fn gandalf_set(
     state.diag_control.set_enabled(body.enabled);
     HttpResponse::Ok().json(serde_json::json!({
         "enabled": state.diag_control.is_enabled(),
+        "port": crate::diag::PORT,
     }))
 }
 
