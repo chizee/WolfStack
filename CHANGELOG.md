@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v24.7.28: WolfRouter — auto-recover from "trailing characters" torn write** _(2026-05-27 — [`416810f`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/416810fd40e046a828f1601955026cd557fa5096))_
 - **v24.7.27: bring AI knowledge base up to date** _(2026-05-27 — [`cc26e99`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/cc26e99d1951b7c3f0842f101a9c31e4e633b108))_
 - **v24.7.26: ClamAV repair button, on-access pre-seed, cross-cluster subnet route diagnostics** _(2026-05-27 — [`4f49709`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/4f49709d54ec9ca4dbcc8e5036962280b7194223))_
 - **v24.7.25: startup self-heal for clamav user (logrotate fix, gen 2)** _(2026-05-27 — [`d885274`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/d885274d68a9f53f1abddb2eb27f1375a40e0811))_
