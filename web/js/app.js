@@ -29136,11 +29136,18 @@ async function loadAiConfig() {
         var resp = await fetch('/api/ai/config');
         var cfg = await resp.json();
         var el;
+        // agent_enabled defaults to true server-side; tolerate missing
+        // field on older nodes by treating undefined as enabled.
+        if ((el = document.getElementById('ai-agent-enabled'))) {
+            el.checked = (cfg.agent_enabled !== false);
+        }
         if ((el = document.getElementById('ai-provider'))) el.value = cfg.provider || 'claude';
         if ((el = document.getElementById('ai-claude-key'))) el.value = cfg.has_claude_key ? cfg.claude_api_key : '';
         if ((el = document.getElementById('ai-gemini-key'))) el.value = cfg.has_gemini_key ? cfg.gemini_api_key : '';
         if ((el = document.getElementById('ai-openrouter-key'))) el.value = cfg.has_openrouter_key ? cfg.openrouter_api_key : '';
         if ((el = document.getElementById('ai-openai-key'))) el.value = cfg.has_openai_key ? cfg.openai_api_key : '';
+        if ((el = document.getElementById('ai-cloudflare-account'))) el.value = cfg.cloudflare_account_id || '';
+        if ((el = document.getElementById('ai-cloudflare-key'))) el.value = cfg.has_cloudflare_key ? (cfg.cloudflare_api_key || '') : '';
         if ((el = document.getElementById('ai-local-url'))) el.value = cfg.local_url || '';
         if ((el = document.getElementById('ai-local-key'))) el.value = cfg.has_local_url ? (cfg.local_api_key || '') : '';
         // Show/hide provider-specific fields
@@ -29150,6 +29157,8 @@ async function loadAiConfig() {
         if (orFields) orFields.style.display = (cfg.provider === 'openrouter') ? '' : 'none';
         const oaFields = document.getElementById('ai-openai-fields');
         if (oaFields) oaFields.style.display = (cfg.provider === 'openai') ? '' : 'none';
+        const cfFields = document.getElementById('ai-cloudflare-fields');
+        if (cfFields) cfFields.style.display = (cfg.provider === 'cloudflare') ? '' : 'none';
         if ((el = document.getElementById('ai-email-enabled'))) el.checked = cfg.email_enabled || false;
         if ((el = document.getElementById('ai-email-to'))) el.value = cfg.email_to || '';
         if ((el = document.getElementById('ai-smtp-host'))) el.value = cfg.smtp_host || '';
@@ -29174,32 +29183,49 @@ async function loadAiConfig() {
 
 async function fetchAiModels(provider, selectedModel) {
     var select = document.getElementById('ai-model');
+    var customInput = document.getElementById('ai-model-custom');
     if (!select) return;
+    // Reset the custom-model input — re-shown only if the user picks "__custom__"
+    if (customInput) {
+        customInput.style.display = 'none';
+        customInput.value = '';
+    }
     select.innerHTML = '<option value="">Loading models...</option>';
     try {
         var resp = await fetch('/api/ai/models?provider=' + encodeURIComponent(provider));
         var data = await resp.json();
-        if (data.error && (!data.models || !data.models.length)) {
-            select.innerHTML = '<option value="">Enter API key and save to load models</option>';
-            return;
-        }
         var models = data.models || [];
-        if (!models.length) {
-            select.innerHTML = '<option value="">No models found — check API key</option>';
-            return;
-        }
         select.innerHTML = '';
-        models.forEach(function (m) {
+        if (!models.length) {
+            // No models from the API (no key yet, or provider doesn't
+            // enumerate) — still let the operator type a model name.
             var opt = document.createElement('option');
-            opt.value = m;
-            opt.textContent = m;
+            opt.value = '';
+            opt.textContent = (data.error || 'Enter API key, or pick Custom to type a model name');
+            opt.disabled = true;
             select.appendChild(opt);
-        });
-        // Select the saved model if it exists in the list
+        } else {
+            models.forEach(function (m) {
+                var opt = document.createElement('option');
+                opt.value = m;
+                opt.textContent = m;
+                select.appendChild(opt);
+            });
+        }
+        // Always append the Custom option — KO4BSR's ask: enable Cloudflare
+        // model that's not in the dropdown by typing the model name.
+        var customOpt = document.createElement('option');
+        customOpt.value = '__custom__';
+        customOpt.textContent = 'Custom… (type a model name)';
+        select.appendChild(customOpt);
+
+        // Restore the previously saved model if any.
         if (selectedModel) {
             select.value = selectedModel;
-            // If the saved model isn't in the list, add it
             if (select.value !== selectedModel) {
+                // Saved model isn't in the curated list — surface it as
+                // a "(saved)" option AND prefill the custom input so the
+                // operator can edit it directly.
                 var opt = document.createElement('option');
                 opt.value = selectedModel;
                 opt.textContent = selectedModel + ' (saved)';
@@ -29209,20 +29235,75 @@ async function fetchAiModels(provider, selectedModel) {
         }
     } catch (e) {
         select.innerHTML = '<option value="">Error loading models</option>';
+        var customOpt = document.createElement('option');
+        customOpt.value = '__custom__';
+        customOpt.textContent = 'Custom… (type a model name)';
+        select.appendChild(customOpt);
         console.error('Failed to fetch models:', e);
     }
 }
 
-async function saveAiConfig() {
-    var config = {
+// Toggle the custom-model text input when the operator picks "Custom…"
+// from the dropdown. Keeps the dropdown as the primary UI but lets the
+// user enter any model name a provider supports — Cloudflare Workers AI
+// has hundreds, Ollama users add private models, etc.
+function onAiModelChange() {
+    var select = document.getElementById('ai-model');
+    var customInput = document.getElementById('ai-model-custom');
+    if (!select || !customInput) return;
+    if (select.value === '__custom__') {
+        customInput.style.display = '';
+        customInput.focus();
+    } else {
+        customInput.style.display = 'none';
+        customInput.value = '';
+    }
+}
+window.onAiModelChange = onAiModelChange;
+
+
+// Validate that the operator picked a real model — "Custom…" without a
+// typed name, or an unfilled dropdown, are both invalid. Returns the
+// model string on success, or null after showing an inline toast.
+// Skipped entirely when the master agent toggle is off — the operator
+// is allowed to save partial settings while the agent is disabled so
+// they can flip the switch and come back to finish configuring later.
+function _validateAiModelOrToast() {
+    var enabledEl = document.getElementById('ai-agent-enabled');
+    var enabled = enabledEl ? enabledEl.checked : true;
+    var select = document.getElementById('ai-model');
+    var customInput = document.getElementById('ai-model-custom');
+    var value;
+    if (select && select.value === '__custom__') {
+        value = (customInput && customInput.value || '').trim();
+        if (!value && enabled) {
+            showToast('Type a model name in the Custom field, or pick one from the list', 'error');
+            if (customInput) customInput.focus();
+            return null;
+        }
+    } else {
+        value = (select && select.value || '').trim();
+    }
+    if (!value && enabled) {
+        showToast('Pick a model from the dropdown before saving', 'error');
+        return null;
+    }
+    return value;
+}
+
+function _buildAiConfigPayload(model) {
+    return {
+        agent_enabled: !!(document.getElementById('ai-agent-enabled') || {}).checked,
         provider: (document.getElementById('ai-provider') || {}).value || 'claude',
         claude_api_key: (document.getElementById('ai-claude-key') || {}).value || '',
         gemini_api_key: (document.getElementById('ai-gemini-key') || {}).value || '',
         openrouter_api_key: (document.getElementById('ai-openrouter-key') || {}).value || '',
         openai_api_key: (document.getElementById('ai-openai-key') || {}).value || '',
+        cloudflare_account_id: (document.getElementById('ai-cloudflare-account') || {}).value || '',
+        cloudflare_api_key: (document.getElementById('ai-cloudflare-key') || {}).value || '',
         local_url: (document.getElementById('ai-local-url') || {}).value || '',
         local_api_key: (document.getElementById('ai-local-key') || {}).value || '',
-        model: (document.getElementById('ai-model') || {}).value || '',
+        model: model,
         email_enabled: (document.getElementById('ai-email-enabled') || {}).checked || false,
         email_to: (document.getElementById('ai-email-to') || {}).value || '',
         smtp_host: (document.getElementById('ai-smtp-host') || {}).value || '',
@@ -29230,10 +29311,22 @@ async function saveAiConfig() {
         smtp_user: (document.getElementById('ai-smtp-user') || {}).value || '',
         smtp_pass: (document.getElementById('ai-smtp-pass') || {}).value || '',
         smtp_tls: (document.getElementById('ai-smtp-tls') || {}).value || 'starttls',
-        check_interval_minutes: parseInt((document.getElementById('ai-check-interval') || {}).value) || 60,
+        // 0 is a real, explicit "Off" value for health checks — don't
+        // collapse to the 60-minute default via `|| 60`.
+        check_interval_minutes: (function () {
+            var raw = (document.getElementById('ai-check-interval') || {}).value;
+            var parsed = parseInt(raw, 10);
+            return Number.isFinite(parsed) ? parsed : 60;
+        })(),
         agent_max_tool_calls: Math.min(100, Math.max(1, parseInt((document.getElementById('ai-agent-max-tool-calls') || {}).value) || 6)),
         agent_tool_call_limit_enabled: !!(document.getElementById('ai-agent-limit-enabled') || {}).checked,
     };
+}
+
+async function saveAiConfig() {
+    var model = _validateAiModelOrToast();
+    if (model === null) return;
+    var config = _buildAiConfigPayload(model);
     try {
         var resp = await fetch('/api/ai/config', {
             method: 'POST',
@@ -29244,9 +29337,12 @@ async function saveAiConfig() {
         if (data.status === 'saved') {
             showModal('Settings Saved');
             loadAiStatus();
-            // Show the AI chat bubble now that it's configured
+            // Show/hide the AI chat bubble based on the master toggle.
+            // Server-side `is_configured()` already gates the backend;
+            // hiding the bubble here is the visible-feedback half so
+            // the operator immediately sees the agent come on or off.
             var bubble = document.getElementById('ai-chat-bubble');
-            if (bubble) bubble.style.display = 'flex';
+            if (bubble) bubble.style.display = config.agent_enabled ? 'flex' : 'none';
             // Refresh models list after save (in case key changed)
             fetchAiModels(config.provider, config.model);
         } else {
@@ -29312,26 +29408,9 @@ async function loadAiAlerts() {
 async function testAiConnection() {
     // Save current settings first so the backend tests against what
     // the user just typed in the form.
-    var config = {
-        provider: (document.getElementById('ai-provider') || {}).value || 'claude',
-        claude_api_key: (document.getElementById('ai-claude-key') || {}).value || '',
-        gemini_api_key: (document.getElementById('ai-gemini-key') || {}).value || '',
-        openrouter_api_key: (document.getElementById('ai-openrouter-key') || {}).value || '',
-        openai_api_key: (document.getElementById('ai-openai-key') || {}).value || '',
-        local_url: (document.getElementById('ai-local-url') || {}).value || '',
-        local_api_key: (document.getElementById('ai-local-key') || {}).value || '',
-        model: (document.getElementById('ai-model') || {}).value || '',
-        email_enabled: (document.getElementById('ai-email-enabled') || {}).checked || false,
-        email_to: (document.getElementById('ai-email-to') || {}).value || '',
-        smtp_host: (document.getElementById('ai-smtp-host') || {}).value || '',
-        smtp_port: parseInt((document.getElementById('ai-smtp-port') || {}).value) || 587,
-        smtp_user: (document.getElementById('ai-smtp-user') || {}).value || '',
-        smtp_pass: (document.getElementById('ai-smtp-pass') || {}).value || '',
-        smtp_tls: (document.getElementById('ai-smtp-tls') || {}).value || 'starttls',
-        check_interval_minutes: parseInt((document.getElementById('ai-check-interval') || {}).value) || 60,
-        agent_max_tool_calls: Math.min(100, Math.max(1, parseInt((document.getElementById('ai-agent-max-tool-calls') || {}).value) || 6)),
-        agent_tool_call_limit_enabled: !!(document.getElementById('ai-agent-limit-enabled') || {}).checked,
-    };
+    var model = _validateAiModelOrToast();
+    if (model === null) return;
+    var config = _buildAiConfigPayload(model);
 
     // Show an in-progress modal IMMEDIATELY so the operator knows
     // something is happening — KO4BSR's report was that they got
@@ -29435,6 +29514,8 @@ function onAiProviderChange() {
     if (orFields) orFields.style.display = provider === 'openrouter' ? '' : 'none';
     const oaFields = document.getElementById('ai-openai-fields');
     if (oaFields) oaFields.style.display = provider === 'openai' ? '' : 'none';
+    const cfFields = document.getElementById('ai-cloudflare-fields');
+    if (cfFields) cfFields.style.display = provider === 'cloudflare' ? '' : 'none';
     fetchAiModels(provider, '');
 }
 

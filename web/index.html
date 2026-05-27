@@ -5851,12 +5851,24 @@
                                 <h4 style="margin:0 0 16px 0;font-size:14px;color:var(--accent-light);">LLM Provider
                                 </h4>
                                 <div class="form-group" style="margin-bottom:16px;">
+                                    <label style="display:flex;align-items:center;gap:8px;">
+                                        <input type="checkbox" id="ai-agent-enabled" checked>
+                                        Enable AI agent
+                                    </label>
+                                    <small style="color:var(--text-muted);font-size:11px;">
+                                        Turn the entire agent off without clearing your keys.
+                                        Hides the chat bubble and pauses health checks; flip
+                                        back on to resume.
+                                    </small>
+                                </div>
+                                <div class="form-group" style="margin-bottom:16px;">
                                     <label>Provider</label>
                                     <select id="ai-provider" class="form-control" onchange="onAiProviderChange()">
                                         <option value="claude">Claude (Anthropic)</option>
                                         <option value="gemini">Gemini (Google)</option>
                                         <option value="openai">ChatGPT (OpenAI)</option>
                                         <option value="openrouter">OpenRouter (100+ models)</option>
+                                        <option value="cloudflare">Cloudflare Workers AI</option>
                                         <option value="local">Local AI (Ollama / LM Studio / LocalAI)</option>
                                     </select>
                                 </div>
@@ -5892,6 +5904,29 @@
                                         </small>
                                     </div>
                                 </div>
+                                <div id="ai-cloudflare-fields" style="display:none;">
+                                    <div class="form-group" style="margin-bottom:16px;">
+                                        <label>Cloudflare Account ID</label>
+                                        <input type="text" id="ai-cloudflare-account" class="form-control"
+                                            placeholder="your-account-id">
+                                        <small style="color:var(--text-muted);">
+                                            Find it in the Cloudflare dashboard's right-hand sidebar.
+                                            WolfStack builds the endpoint URL automatically:
+                                            <code>https://api.cloudflare.com/client/v4/accounts/{id}/ai</code>
+                                        </small>
+                                    </div>
+                                    <div class="form-group" style="margin-bottom:16px;">
+                                        <label>Cloudflare API Token</label>
+                                        <input type="password" id="ai-cloudflare-key" class="form-control"
+                                            placeholder="Workers AI token">
+                                        <small style="color:var(--text-muted);">
+                                            Create at <a href="https://dash.cloudflare.com/profile/api-tokens"
+                                            target="_blank" style="color:var(--accent);">dash.cloudflare.com/profile/api-tokens</a>
+                                            &mdash; needs the "Workers AI" permission. Free tier offers
+                                            a daily usage allowance that suits most homelab workloads.
+                                        </small>
+                                    </div>
+                                </div>
                                 <div id="ai-local-fields" style="display:none;">
                                     <div class="form-group" style="margin-bottom:16px;">
                                         <label>Local AI Server URL</label>
@@ -5912,9 +5947,12 @@
                                 </div>
                                 <div class="form-group" style="margin-bottom:16px;">
                                     <label>Model</label>
-                                    <select id="ai-model" class="form-control">
+                                    <select id="ai-model" class="form-control" onchange="onAiModelChange()">
                                         <option value="">Select a provider and enter API key first</option>
                                     </select>
+                                    <input type="text" id="ai-model-custom" class="form-control"
+                                        placeholder="Type a model name (e.g. @cf/meta/llama-3.3-70b-instruct-fp8-fast)"
+                                        style="display:none;margin-top:6px;">
                                 </div>
                                 <div class="form-group" style="margin-bottom:16px;">
                                     <label style="display:flex;align-items:center;gap:8px;">
@@ -5936,12 +5974,18 @@
                                 <div class="form-group" style="margin-bottom:16px;">
                                     <label>Health Check Interval</label>
                                     <select id="ai-check-interval" class="form-control">
+                                        <option value="0">Off (chat only — no automated health checks)</option>
                                         <option value="15">Every 15 minutes</option>
                                         <option value="30">Every 30 minutes</option>
                                         <option value="60" selected>Every hour</option>
                                         <option value="360">Every 6 hours</option>
                                         <option value="1440">Daily</option>
                                     </select>
+                                    <small style="color:var(--text-muted);font-size:11px;">
+                                        "Off" disables the periodic LLM probe but keeps the chat
+                                        agent fully usable — useful when running against a metered
+                                        or free-tier backend.
+                                    </small>
                                 </div>
                             </div>
 
@@ -9491,8 +9535,13 @@ region = us-east-1"></textarea>
                         || cfg.has_gemini_key
                         || cfg.has_openai_key
                         || cfg.has_openrouter_key
+                        || cfg.has_cloudflare_key
                         || cfg.has_local_url;
-                    if (anyProvider && cfg.model) {
+                    // Respect the master agent-enabled toggle: when the
+                    // operator has switched it off, the bubble stays
+                    // hidden even with valid keys/model on file.
+                    var enabled = cfg.agent_enabled !== false;
+                    if (enabled && anyProvider && cfg.model) {
                         bubble.style.display = 'flex';
                     }
                 }).catch(function () { });

@@ -90,7 +90,16 @@ fn ai_config_path() -> String { crate::paths::get().ai_config }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiConfig {
-    pub provider: String,         // "claude", "gemini", "openai", "openrouter", or "local"
+    /// Master on/off switch for the AI agent. When false, `is_configured()`
+    /// returns false so the chat bubble hides, the health-check loop
+    /// idles, and tool-using flows decline cleanly — but the rest of
+    /// the config (keys, model, account IDs) is preserved so re-enabling
+    /// is one click. Default `true` so existing installs that already
+    /// had AI configured keep working after upgrade. KO4BSR's v24.7.x
+    /// ask: temporarily disable the agent without clearing config.
+    #[serde(default = "default_true")]
+    pub agent_enabled: bool,
+    pub provider: String,         // "claude", "gemini", "openai", "openrouter", "cloudflare", or "local"
     pub claude_api_key: String,
     pub gemini_api_key: String,
     /// OpenAI (ChatGPT) API key — https://platform.openai.com/api-keys
@@ -99,6 +108,17 @@ pub struct AiConfig {
     /// OpenRouter API key (https://openrouter.ai — access hundreds of models via one API)
     #[serde(default)]
     pub openrouter_api_key: String,
+    /// Cloudflare account ID — used to build the Worker AI endpoint URL
+    /// `https://api.cloudflare.com/client/v4/accounts/{ID}/ai`. Visible in
+    /// the Cloudflare dashboard's right-hand sidebar.
+    #[serde(default)]
+    pub cloudflare_account_id: String,
+    /// Cloudflare API token with Workers AI read permission. Stored
+    /// separately from `local_api_key` so picking provider=cloudflare
+    /// doesn't bleed credentials between a self-hosted Ollama and a
+    /// CF account.
+    #[serde(default)]
+    pub cloudflare_api_key: String,
     /// URL of a local/self-hosted AI server (OpenAI-compatible API)
     /// Supports: Ollama (http://localhost:11434/v1), LM Studio (http://localhost:1234/v1),
     /// LocalAI, vLLM, text-generation-webui, or any OpenAI-compatible endpoint
@@ -150,14 +170,30 @@ fn default_agent_max_tool_calls() -> u32 { 6 }
 
 fn default_scan_schedule() -> String { "off".to_string() }
 
+fn default_true() -> bool { true }
+
+/// Build the Workers AI OpenAI-compatible base URL for a given Cloudflare
+/// account ID. `call_local_inner` later appends `/v1/chat/completions`, so
+/// returning the `…/ai` root (without `/v1`) lets the existing local-URL
+/// plumbing handle the rest unchanged.
+pub fn cloudflare_base_url(account_id: &str) -> String {
+    format!(
+        "https://api.cloudflare.com/client/v4/accounts/{}/ai",
+        account_id.trim()
+    )
+}
+
 impl Default for AiConfig {
     fn default() -> Self {
         Self {
+            agent_enabled: true,
             provider: "claude".to_string(),
             claude_api_key: String::new(),
             gemini_api_key: String::new(),
             openai_api_key: String::new(),
             openrouter_api_key: String::new(),
+            cloudflare_account_id: String::new(),
+            cloudflare_api_key: String::new(),
             local_url: String::new(),
             local_api_key: String::new(),
             model: "claude-sonnet-4-20250514".to_string(),
@@ -234,11 +270,14 @@ impl AiConfig {
     /// Return config with API keys masked for frontend display
     pub fn masked(&self) -> serde_json::Value {
         serde_json::json!({
+            "agent_enabled": self.agent_enabled,
             "provider": self.provider,
             "claude_api_key": mask_key(&self.claude_api_key),
             "gemini_api_key": mask_key(&self.gemini_api_key),
             "openai_api_key": mask_key(&self.openai_api_key),
             "openrouter_api_key": mask_key(&self.openrouter_api_key),
+            "cloudflare_account_id": self.cloudflare_account_id,
+            "cloudflare_api_key": mask_key(&self.cloudflare_api_key),
             "local_url": self.local_url,
             "local_api_key": mask_key(&self.local_api_key),
             "model": self.model,
@@ -257,6 +296,7 @@ impl AiConfig {
             "has_gemini_key": !self.gemini_api_key.is_empty(),
             "has_openai_key": !self.openai_api_key.is_empty(),
             "has_openrouter_key": !self.openrouter_api_key.is_empty(),
+            "has_cloudflare_key": !self.cloudflare_api_key.is_empty(),
             "has_local_url": !self.local_url.is_empty(),
             "has_smtp_pass": !self.smtp_pass.is_empty(),
         })
@@ -267,25 +307,38 @@ impl AiConfig {
             "local" => if self.local_api_key.is_empty() { "local" } else { &self.local_api_key },
             "openrouter" => &self.openrouter_api_key,
             "openai" => &self.openai_api_key,
+            "cloudflare" => &self.cloudflare_api_key,
             "gemini" => &self.gemini_api_key,
             _ => &self.claude_api_key,
         }
     }
 
     pub fn is_configured(&self) -> bool {
+        if !self.agent_enabled { return false; }
         match self.provider.as_str() {
             "local" => !self.local_url.is_empty(),
             "openrouter" => !self.openrouter_api_key.is_empty(),
             "openai" => !self.openai_api_key.is_empty(),
+            "cloudflare" => {
+                !self.cloudflare_account_id.trim().is_empty()
+                    && !self.cloudflare_api_key.is_empty()
+            }
             _ => !self.active_key().is_empty(),
         }
     }
 
-    /// Validate provider and model compatibility, check required API keys
+    /// Validate provider and model compatibility, check required API keys.
+    /// When the agent is disabled via `agent_enabled = false` the config
+    /// is dormant — let the operator save partial settings (e.g. a fresh
+    /// install that wants the agent off by default) without forcing them
+    /// to fully configure a provider just to flip the switch off.
     pub fn validate(&self) -> Result<(), String> {
+        if !self.agent_enabled {
+            return Ok(());
+        }
         // Validate provider exists
         match self.provider.as_str() {
-            "claude" | "gemini" | "openai" | "openrouter" | "local" => {}
+            "claude" | "gemini" | "openai" | "openrouter" | "cloudflare" | "local" => {}
             _ => return Err(format!("Invalid provider: {}", self.provider)),
         }
 
@@ -312,6 +365,21 @@ impl AiConfig {
                 // OpenRouter accepts any model format, just needs the key
                 if self.openrouter_api_key.is_empty() {
                     return Err("OpenRouter provider selected but API key is not set".to_string());
+                }
+            }
+            "cloudflare" => {
+                // Cloudflare Workers AI accepts any model the account has
+                // bound. Model names are `@cf/...` (and friends); the
+                // model list is too large + churns too often to enumerate,
+                // so we only check that account ID + token are present.
+                if self.cloudflare_account_id.trim().is_empty() {
+                    return Err("Cloudflare provider selected but Account ID is not set".to_string());
+                }
+                if self.cloudflare_api_key.is_empty() {
+                    return Err("Cloudflare provider selected but API token is not set".to_string());
+                }
+                if self.model.trim().is_empty() {
+                    return Err("Cloudflare provider selected but no model is set (e.g. @cf/meta/llama-3.1-8b-instruct)".to_string());
                 }
             }
             "local" => {
@@ -771,7 +839,13 @@ impl AiAgent {
         // can't fit. Cloud providers (Claude / Gemini / OpenAI /
         // OpenRouter) keep the full KB; their context windows are
         // 100K+ tokens and the KB is genuinely useful for grounding.
-        let system_prompt = if config.provider == "local" {
+        // Cloudflare Workers AI joins `local` on the small-context-window
+        // side: the most common chat models (`@cf/meta/llama-3.1-8b-instruct`,
+        // the Qwen / Gemma variants) ship with 8K windows that can't hold
+        // the full knowledge base alongside a real conversation. Larger
+        // CF models tolerate the full prompt fine — but defaulting to the
+        // compact one is the safer choice across the catalogue.
+        let system_prompt = if config.provider == "local" || config.provider == "cloudflare" {
             build_compact_system_prompt(system_context)
         } else {
             build_system_prompt(&self.knowledge_base, system_context)
@@ -792,6 +866,10 @@ impl AiAgent {
                 }
                 "openai" => {
                     call_local_with_tools(&self.client, "https://api.openai.com/v1", &config.openai_api_key, &config.model, &system_prompt, &history, &current_msg).await?
+                }
+                "cloudflare" => {
+                    let url = cloudflare_base_url(&config.cloudflare_account_id);
+                    call_local_with_tools(&self.client, &url, &config.cloudflare_api_key, &config.model, &system_prompt, &history, &current_msg).await?
                 }
                 "local" => {
                     call_local_with_tools(&self.client, &config.local_url, &config.local_api_key, &config.model, &system_prompt, &history, &current_msg).await?
@@ -1400,6 +1478,10 @@ impl AiAgent {
             "gemini" => call_gemini(&self.client, &config.gemini_api_key, &config.model, system, &[], &prompt).await,
             "openrouter" => call_local(&self.client, "https://openrouter.ai/api/v1", &config.openrouter_api_key, &config.model, system, &[], &prompt).await,
             "openai" => call_local(&self.client, "https://api.openai.com/v1", &config.openai_api_key, &config.model, system, &[], &prompt).await,
+            "cloudflare" => {
+                let url = cloudflare_base_url(&config.cloudflare_account_id);
+                call_local(&self.client, &url, &config.cloudflare_api_key, &config.model, system, &[], &prompt).await
+            }
             "local" => call_local(&self.client, &config.local_url, &config.local_api_key, &config.model, system, &[], &prompt).await,
             _ => call_claude(&self.client, &config.claude_api_key, &config.model, system, &[], &prompt).await,
         };
@@ -1653,6 +1735,10 @@ impl AiAgent {
             "gemini" => call_gemini(&self.client, &config.gemini_api_key, &config.model, system, &[], issue_description).await,
             "openrouter" => call_local(&self.client, "https://openrouter.ai/api/v1", &config.openrouter_api_key, &config.model, system, &[], issue_description).await,
             "openai" => call_local(&self.client, "https://api.openai.com/v1", &config.openai_api_key, &config.model, system, &[], issue_description).await,
+            "cloudflare" => {
+                let url = cloudflare_base_url(&config.cloudflare_account_id);
+                call_local(&self.client, &url, &config.cloudflare_api_key, &config.model, system, &[], issue_description).await
+            }
             "local" => call_local(&self.client, &config.local_url, &config.local_api_key, &config.model, system, &[], issue_description).await,
             _ => call_claude(&self.client, &config.claude_api_key, &config.model, system, &[], issue_description).await,
         };
@@ -2303,6 +2389,10 @@ pub async fn simple_chat(
         "gemini" => call_gemini(client, &config.gemini_api_key, &config.model, system_prompt, history, user_message).await,
         "openrouter" => call_local(client, "https://openrouter.ai/api/v1", &config.openrouter_api_key, &config.model, system_prompt, history, user_message).await,
         "openai" => call_local(client, "https://api.openai.com/v1", &config.openai_api_key, &config.model, system_prompt, history, user_message).await,
+        "cloudflare" => {
+            let url = cloudflare_base_url(&config.cloudflare_account_id);
+            call_local(client, &url, &config.cloudflare_api_key, &config.model, system_prompt, history, user_message).await
+        }
         "local" => call_local(client, &config.local_url, &config.local_api_key, &config.model, system_prompt, history, user_message).await,
         // Default to Claude (also covers empty/default provider string).
         _ => call_claude(client, &config.claude_api_key, &config.model, system_prompt, history, user_message).await,

@@ -2582,14 +2582,27 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
             // Wait 30 seconds after startup before first check
             tokio::time::sleep(Duration::from_secs(30)).await;
             loop {
-                let (is_configured, interval) = {
+                // `check_interval_minutes == 0` is the operator's "Off"
+                // setting for health checks (KO4BSR ask): the chat agent
+                // stays usable but the periodic LLM probe is skipped so
+                // a free/quota'd backend doesn't burn budget on idle hosts.
+                // We still loop on a 5-minute cadence so re-enabling the
+                // interval (or flipping agent_enabled back on) takes
+                // effect within one cycle rather than at next process
+                // restart.
+                let (run_check, interval) = {
                     let config = ai_agent_bg.config.lock().unwrap();
                     let configured = config.is_configured();
-                    let mins = if configured { config.check_interval_minutes as u64 * 60 } else { 300u64 };
-                    (configured, mins)
+                    let mins = config.check_interval_minutes;
+                    let secs = if configured && mins > 0 {
+                        mins as u64 * 60
+                    } else {
+                        300u64
+                    };
+                    (configured && mins > 0, secs)
                 };
 
-                if is_configured {
+                if run_check {
                     // Collect local metrics (sync — release mutex before any .await)
                     let ai_sc = ai_state.clone();
                     let (hostname, cpu_pct, mem_used_gb, mem_total_gb, disk_used_gb, disk_total_gb,

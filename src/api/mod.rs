@@ -9995,8 +9995,19 @@ pub async fn ai_save_config(
         let mut config = state.ai_agent.config.lock().unwrap();
 
         // Update fields — only update keys if not masked values
+        if let Some(v) = body.get("agent_enabled").and_then(|v| v.as_bool()) {
+            config.agent_enabled = v;
+        }
         if let Some(v) = body.get("provider").and_then(|v| v.as_str()) {
             config.provider = v.to_string();
+        }
+        if let Some(v) = body.get("cloudflare_account_id").and_then(|v| v.as_str()) {
+            config.cloudflare_account_id = v.trim().to_string();
+        }
+        if let Some(v) = body.get("cloudflare_api_key").and_then(|v| v.as_str()) {
+            if !v.contains("••••") && !v.is_empty() {
+                config.cloudflare_api_key = v.to_string();
+            }
         }
         if let Some(v) = body.get("claude_api_key").and_then(|v| v.as_str()) {
             if !v.contains("••••") && !v.is_empty() {
@@ -10202,6 +10213,7 @@ pub async fn ai_test_connection(
         "local" => config.local_url.clone(),
         "openai" => "https://api.openai.com/v1".to_string(),
         "openrouter" => "https://openrouter.ai/api/v1".to_string(),
+        "cloudflare" => crate::ai::cloudflare_base_url(&config.cloudflare_account_id),
         "gemini" => format!("https://generativelanguage.googleapis.com/.../{}:generateContent", config.model),
         _ => "https://api.anthropic.com/v1/messages".to_string(),
     };
@@ -10898,6 +10910,26 @@ pub async fn ai_models(
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let config = state.ai_agent.config.lock().unwrap().clone();
     let provider = query.get("provider").map(|s| s.as_str()).unwrap_or(&config.provider);
+
+    // Cloudflare Workers AI exposes ~100 models across multiple modalities
+    // (chat / embeddings / vision / image / TTS). The `/v1/models` listing
+    // is enormous and includes models that aren't chat-completion-compatible,
+    // so we return a short curated list of well-known chat models and let
+    // the operator type any other model name they want — Workers AI also
+    // adds new models faster than we can keep a list up to date.
+    if provider == "cloudflare" {
+        return HttpResponse::Ok().json(serde_json::json!({
+            "models": [
+                "@cf/meta/llama-3.1-8b-instruct",
+                "@cf/meta/llama-3.1-70b-instruct",
+                "@cf/meta/llama-3.2-3b-instruct",
+                "@cf/mistralai/mistral-small-3.1-24b-instruct",
+                "@cf/qwen/qwen1.5-14b-chat-awq",
+                "@cf/google/gemma-7b-it",
+            ],
+            "note": "Cloudflare Workers AI offers many more models — pick 'Custom…' to type a model ID (e.g. @cf/meta/llama-3.3-70b-instruct-fp8-fast). See https://developers.cloudflare.com/workers-ai/models/"
+        }));
+    }
 
     // Local AI: fetch models from the local server's /v1/models endpoint
     if provider == "local" {
