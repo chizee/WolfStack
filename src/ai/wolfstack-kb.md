@@ -275,14 +275,54 @@
 - Disk-space check: only on source-build fallback (when prebuilt binary download fails). Requires ~3 GB at the build dir; prompts to continue if less.
 
 ## AI Agent
-- Three providers: Claude (Anthropic), Gemini (Google), Local AI (self-hosted)
+- Six providers: Claude (Anthropic), Gemini (Google), OpenAI (ChatGPT), OpenRouter (100+ models), Cloudflare Workers AI, Local AI (self-hosted)
 - Local AI supports any OpenAI-compatible server: Ollama, LM Studio, LocalAI, vLLM, text-generation-webui, llama.cpp
 - Common local URLs: Ollama http://localhost:11434, LM Studio http://localhost:1234/v1, LocalAI http://localhost:8080/v1
-- Auto-detects available models from the local server's /v1/models endpoint
-- API key optional for most local servers
-- Expert knowledge base shipped with WolfStack — AI gives deep answers about the platform
-- AI can execute read-only commands on the server via [EXEC] tags
-- Health monitoring: periodic scans with AI-generated recommendations
+- Cloudflare Workers AI: enter the account ID and a Workers-AI-permission API token — WolfStack builds the endpoint URL automatically (`https://api.cloudflare.com/client/v4/accounts/{id}/ai`). Compact system prompt is used since most CF chat models ship with 8K context windows. Free tier covers most homelabs.
+- Auto-detects available models from each provider's models API; CF returns a curated short list (the full Workers AI catalogue churns too fast to enumerate reliably).
+- Every model dropdown ends with a `Custom…` option that reveals a text input — type any model name the provider accepts (private Ollama tags, brand-new releases, `@cf/…` IDs not in the curated list).
+- API key optional for most local servers.
+- Expert knowledge base shipped with WolfStack — AI gives deep answers about the platform.
+- AI can execute read-only commands on the server via [EXEC] tags.
+- Health monitoring: periodic scans with AI-generated recommendations. Interval can be set to **Off** to keep the chat agent live but skip the periodic LLM probe — useful for metered or free-tier backends.
+- **Master enable/disable toggle** (v24.7.24): "Enable AI agent" checkbox at the top of Settings → AI Agent. When off, the chat bubble hides, the health-check loop pauses, validation is skipped on save (so a fresh install can save partial config while disabled), but every key/model/account-ID is preserved. One click brings it back.
+- **Tool-call cap** (per-turn round limit): off by default; tick to apply a 1–100 cap. Default cap is 6 once enabled. Raise for reasoning-heavy investigations (Opus / o-series / GPT-5); tighten for misbehaving local models that loop forever. Hand-edited bad values clamped to [1, 100] on load.
+- Alerts go to email + Discord / Telegram / Slack on private channels — NEVER auto-posted to the public status page (host internals must not leak to anonymous viewers).
+- "Cleared" notifications on the alert→OK transition so no silent recoveries.
+
+## Antivirus / Rootkit Scanning
+- Full antivirus + rootkit stack: ClamAV (signatures), rkhunter, chkrootkit. Installed on demand from the Security page.
+- **On-access scanning** via clamonacc + clamd. Real-time fanotify-based scan of files as they're written. WolfStack manages the clamd.conf block between `# === WolfStack on-access begin/end ===` markers; rediscovers non-local mounts on every apply.
+- **🛠 Repair ClamAV button** (v24.7.26, Security page next to scan): runs `ensure_clamav_user` → `freshclam` → verify DB present. Step-by-step log + structured error so the operator sees exactly which step failed (freshclam missing, network blocked, perms wrong, etc).
+- **Startup self-heal** (v24.7.25): on every WolfStack restart, if `/etc/logrotate.d/clamav-freshclam` exists but the `clamav` user doesn't, recreates the user. Stops the daily logrotate failures that operators don't otherwise see.
+- **On-access apply pre-seeds signatures** (v24.7.26): if `/var/lib/clamav` is empty when enabling on-access, runs the repair flow before starting clamd. Stops the cascade where clamd dies on missing DB → clamonacc dies because clamd is dead.
+- **Auto-recovery surfaces failure reason** (v24.7.26): when a scan hits "No supported database files", the auto-retry calls the same repair flow; if it fails, the actual reason (freshclam blocked, perms wrong, etc.) is appended to the scan error rather than swallowed.
+- **Auto-actions**:
+  - Auto-quarantine confirmed ClamAV hits to `/var/quarantine/wolfstack` (preserved as evidence, not executable). One-click restore for false positives.
+  - Auto-kill processes whose executable matches a hit (SIGTERM, then SIGKILL after grace period). Configurable; some operators prefer "alert only" first.
+  - Cluster propagation: one node's finding fans out to peers via the cluster secret.
+- **Alert routing**: findings go to email + Discord / Telegram / Slack. NEVER auto-posted to public status pages.
+- **Scheduled scans**: per-node configurable interval. Walks `/`, skips `/proc`, `/sys`, `/dev`, network mounts (NFS/CIFS/FUSE/S3FS/overlay/tmpfs), and live VM disk images. Streams progress (current file being scanned) so the UI isn't a frozen "scanning…" message.
+- **API endpoints**:
+  - `POST /api/antivirus/install` — install the AV stack (apt/dnf/pacman)
+  - `POST /api/antivirus/scan` — run a full scan on this node
+  - `POST /api/antivirus/clamav/repair` — run the repair flow synchronously, returns step-by-step lines + outcome
+  - `POST /api/antivirus/on-access` — toggle on-access scanning
+  - `GET /api/antivirus/status` — installed tools + scan progress
+  - `GET /api/antivirus/findings` — recent findings, newest first
+  - `GET /api/antivirus/quarantine` — current quarantine inventory
+- **/tmp + /dev/shm exec alarm**: any running process whose `/proc/$PID/exe` resolves under `/tmp` or `/dev/shm` is a Compromise-class finding (classic malware staging path). Reports PID, ppid, cmdline, real user, sha256, file mtime/mode/size, lsof open files + sockets. Never auto-kills (legit dev tools sometimes use these paths). `/var/tmp` and `/run/user/*` are intentionally out of scope.
+
+## Cluster firewall coordination
+- **3-strike auto-block**: three failed-auth events from the same source IP inside the lockout window → kernel-level `iptables -j DROP`. Block propagates to every peer in the cluster within seconds via inter-node secret.
+- **FORWARD-chain coverage** (post-v23.12): not just INPUT — containers and VMs behind a node's bridge are protected too. macvlan/ipvlan containers bypass the host FORWARD chain by kernel design; Phase-2 fix will inject the DROP inside such containers via `pct exec` / `docker exec`.
+- Survives restarts: lockouts persist to disk and reload on startup.
+- Failed-login monitor unifies WolfStack web UI, sshd, and Proxmox pvedaemon — lockouts apply to every entrypoint at once.
+
+## Abuse reporting (MANUAL-ONLY, locked at code level)
+- When the scanner flags a confirmed attack source, WolfStack pre-fills an abuse report to the source AS's `abuse@` contact with evidence (timestamps, observed activity, source/dest IPs, WolfStack version fingerprint).
+- **Operator-pressed Send is the ONLY trigger.** No scheduled batch send, no scanner-triggered auto-send, no confidence-threshold rule.
+- Locked at the code level: a build-time test fails if any code path can trigger an outbound abuse email without a signed operator action token. Same rule for regulator filings and customer-notification emails.
 
 ## Pricing & Tiers (v22.10.0+ rebrand)
 Five-tier model on Stripe. Pro renamed to MSP; new Team tier added in the middle. Pre-rebrand `tier=pro` licences alias to `msp` in the binary.
