@@ -1484,8 +1484,20 @@ impl VmManager {
                         let out = Command::new("qm").args(["set", &vmid_str, "--net0", &val]).output()
                             .map_err(|e| format!("qm set --net0 failed: {}", e))?;
                         if !out.status.success() {
+                            // Propagate the PVE error instead of warning-and-
+                            // succeeding. klasSponsor 2026-05-28 reported
+                            // "settings saved but settings have not been
+                            // changed" — the silent warn here is why: qm
+                            // rejected the change (e.g., bridge missing on the
+                            // host, running-VM restriction, perms) and the
+                            // handler still returned 200, so the UI showed
+                            // success while PVE kept the old config.
                             let stderr = String::from_utf8_lossy(&out.stderr);
-                            warn!("qm set --net0 for VMID {} failed: {}", vmid, stderr.trim());
+                            return Err(format!(
+                                "qm set --net0 for VMID {} failed: {}",
+                                vmid,
+                                stderr.trim()
+                            ));
                         }
                     }
                 }
@@ -1541,21 +1553,58 @@ impl VmManager {
                         if !wip.is_empty() {
                             self.ensure_dnsmasq_installed();
                             let bridge = Self::wn_bridge_name(&vmid_str);
-                            if let Err(e) = self.setup_wolfnet_bridge(&bridge, wip) {
-                                warn!("WolfNet bridge reconcile (qm) for VMID {} failed: {}", vmid, e);
-                            } else {
-                                let _ = Command::new("qm").args([
-                                    "set", &vmid_str, "--net1",
-                                    &format!("virtio,bridge={}", bridge)
-                                ]).output();
+                            // Bridge setup or `qm set --net1` failures used
+                            // to be swallowed silently — the UI showed
+                            // "settings saved" with no actual NIC change.
+                            // Surface both so the operator sees the real
+                            // reason (klasSponsor 2026-05-28).
+                            self.setup_wolfnet_bridge(&bridge, wip).map_err(|e| {
+                                format!(
+                                    "WolfNet bridge reconcile (qm) for VMID {} failed: {}",
+                                    vmid, e
+                                )
+                            })?;
+                            let out = Command::new("qm").args([
+                                "set", &vmid_str, "--net1",
+                                &format!("virtio,bridge={}", bridge)
+                            ]).output()
+                                .map_err(|e| format!("qm set --net1 failed: {}", e))?;
+                            if !out.status.success() {
+                                let stderr = String::from_utf8_lossy(&out.stderr);
+                                return Err(format!(
+                                    "qm set --net1 for VMID {} failed: {}",
+                                    vmid,
+                                    stderr.trim()
+                                ));
                             }
                         }
                     }
                 } else {
                     // Mode is explicitly non-wolfnet — drop net1 if present.
-                    // qm errors when net1 doesn't exist; the result is
-                    // ignored on purpose (the desired state IS "no net1").
-                    let _ = Command::new("qm").args(["set", &vmid_str, "--delete", "net1"]).output();
+                    // qm errors when net1 doesn't exist; that specific case
+                    // is the desired state and stays ignored, but any other
+                    // failure (e.g., permissions) needs to surface so the
+                    // UI doesn't report a false success.
+                    let out = Command::new("qm").args(["set", &vmid_str, "--delete", "net1"]).output();
+                    if let Ok(o) = &out {
+                        if !o.status.success() {
+                            let stderr = String::from_utf8_lossy(&o.stderr);
+                            let stderr_trim = stderr.trim();
+                            // PVE phrases the "net1 not in config" rejection
+                            // as `unable to find net1 in config`; treat that
+                            // as a no-op since the desired state is already
+                            // met.
+                            let is_already_gone = stderr_trim.contains("net1")
+                                && (stderr_trim.contains("not in config")
+                                    || stderr_trim.contains("does not exist"));
+                            if !is_already_gone {
+                                return Err(format!(
+                                    "qm set --delete net1 for VMID {} failed: {}",
+                                    vmid, stderr_trim
+                                ));
+                            }
+                        }
+                    }
                     let bridge = Self::wn_bridge_name(&vmid_str);
                     self.cleanup_wolfnet_bridge(&bridge, wolfnet_ip.as_deref());
                 }
@@ -3014,6 +3063,15 @@ impl VmManager {
             let lease_file = format!("/run/dnsmasq-{}.leases", tap);
             let _ = std::fs::remove_file(&lease_file);
             let dns_server = "8.8.8.8";
+            // `.status()`, not `.spawn()`: dnsmasq daemonizes by double-
+            // fork, so the immediate child we launched exits the moment
+            // the daemon is forked. If we `.spawn()` and never `.wait()`
+            // on the Child, that initial process becomes a `<defunct>`
+            // zombie parented to wolfstack — one per TAP setup, forever.
+            // KO4BSR 2026-05-28 saw 1300+ accumulate under wolfstack.
+            // `.status()` blocks for the ~100ms it takes dnsmasq to
+            // fork-and-exit, reaps the parent, and the daemonized child
+            // gets reparented to init as normal.
             let dnsmasq_result = Command::new("dnsmasq")
                 .args([
                     &format!("--interface={}", tap),
@@ -3040,14 +3098,15 @@ impl VmManager {
                 ])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
-                .spawn();
+                .status();
 
             match dnsmasq_result {
-                Ok(_child) => {
-                    // `Command::spawn()` returns Ok the moment fork+exec
-                    // succeeds — but dnsmasq can still abort a moment
-                    // later if its bind() fails (`Address already in
-                    // use`, missing perms, kernel misconfig, etc.).
+                Ok(_status) => {
+                    // `.status()` returns once the parent dnsmasq has
+                    // exited the daemonize fork — but dnsmasq can still
+                    // abort a moment later if its bind() fails (`Address
+                    // already in use`, missing perms, kernel misconfig,
+                    // etc.).
                     // Verify the daemon actually stayed up and the pid
                     // file points at a live process bound to OUR tap.
                     // If it didn't, log loudly so the predictive

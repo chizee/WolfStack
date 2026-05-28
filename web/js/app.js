@@ -26225,9 +26225,16 @@ async function showVmSettings(name) {
                 </div>
             </div>
 
-            <!-- Footer (always visible) -->
-            <div style="display:flex; gap:8px; margin-top:16px; padding-top:12px; border-top:1px solid var(--border);">
-                <button class="btn btn-primary" onclick="saveVmSettings('${vm.name}')">Save</button>
+            <!-- Footer pinned to the bottom of the scrollable modal-body.
+                 Was a plain inline div that scrolled with the rest of the
+                 content — on smaller viewports (or with the Boot Options +
+                 passthrough lists expanded) the Save button could end up
+                 below the visible area, and klasSponsor 2026-05-28 hit
+                 exactly that: "unable to click save button" while changing
+                 a VM's network setting. Sticky positioning keeps Save/Cancel
+                 reachable no matter where the user has scrolled to. -->
+            <div style="display:flex; gap:8px; padding:12px 24px; margin:16px -24px -24px -24px; border-top:1px solid var(--border); position:sticky; bottom:-24px; background:var(--bg-card); z-index:5;">
+                <button class="btn btn-primary" onclick="saveVmSettings('${escapeAttr(vm.name)}')">Save</button>
                 <button class="btn" onclick="closeContainerDetail()">Cancel</button>
             </div>
         `;

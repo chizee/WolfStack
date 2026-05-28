@@ -789,11 +789,81 @@ pub fn get_wolfnet_local_info() -> Option<serde_json::Value> {
     }))
 }
 
+/// Atomic + backup write of `/etc/wolfnet/config.toml`. Every code
+/// path that updates the WolfNet config goes through here.
+///
+/// Three guarantees on top of a plain `fs::write`:
+///   1. **No empty replaces.** If the caller hands us a blank or
+///      whitespace-only payload we refuse the write outright. A
+///      truncated payload that survives serialisation but is missing
+///      the [network]/[security] sections also fails the load-check
+///      below, so the original file stays intact. klasSponsor
+///      2026-05-28 reported `config.toml` being wiped after a port
+///      edit on one node — wolfnet then exited on next start because
+///      it had no config to load. This check makes that class of
+///      regression impossible regardless of which call site is at
+///      fault.
+///   2. **`config.toml.bak` snapshot before every replace.** Always
+///      written when the on-disk file is non-empty. Manual recovery
+///      becomes `cp config.toml.bak config.toml`, and the wolfnet
+///      daemon also picks it up automatically (see wolfnet's
+///      `Config::load_from_file`).
+///   3. **Atomic rename**, not in-place truncate. A crash partway
+///      through the write can no longer leave the live config
+///      truncated/empty — the previous file remains visible until
+///      the rename completes.
+fn write_wolfnet_config_atomic(content: &str) -> Result<(), String> {
+    const PATH: &str = "/etc/wolfnet/config.toml";
+    const TMP: &str = "/etc/wolfnet/config.toml.tmp";
+    const BAK: &str = "/etc/wolfnet/config.toml.bak";
+
+    if content.trim().is_empty() {
+        return Err(
+            "Refusing to write empty WolfNet config (would brick the daemon). \
+             Existing config left untouched.".to_string(),
+        );
+    }
+
+    // Sanity-check: a real wolfnet config always carries at least
+    // [network] and [security] sections. Anything missing both is a
+    // tell-tale of a serialisation bug upstream — fail fast rather
+    // than overwrite a working file with garbage.
+    if !content.contains("[network]") || !content.contains("[security]") {
+        return Err(
+            "Refusing to write WolfNet config missing [network]/[security] sections. \
+             Existing config left untouched.".to_string(),
+        );
+    }
+
+    // Make sure /etc/wolfnet exists — write to .tmp first.
+    if let Some(parent) = std::path::Path::new(PATH).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(TMP, content)
+        .map_err(|e| format!("Failed to stage WolfNet config at {}: {}", TMP, e))?;
+
+    // Snapshot the previous good config to .bak — best-effort: an
+    // absent .bak isn't fatal, but we want a recovery copy after
+    // every successful replace.
+    if std::path::Path::new(PATH).exists() {
+        let _ = std::fs::copy(PATH, BAK);
+    }
+
+    // Atomic rename — POSIX guarantees this is either fully visible
+    // or fully not.
+    std::fs::rename(TMP, PATH).map_err(|e| {
+        format!(
+            "Failed to install new {} (staged copy left at {}): {}",
+            PATH, TMP, e
+        )
+    })?;
+
+    Ok(())
+}
+
 /// Save the raw WolfNet config file
 pub fn save_wolfnet_config(content: &str) -> Result<String, String> {
-    std::fs::write("/etc/wolfnet/config.toml", content)
-        .map_err(|e| format!("Failed to write WolfNet config: {}", e))?;
-
+    write_wolfnet_config_atomic(content)?;
     Ok("Configuration saved".to_string())
 }
 
@@ -1054,8 +1124,7 @@ pub fn add_wolfnet_peer(name: &str, endpoint: PeerEndpoint, ip: &str, public_key
         // whether we cleared an endpoint (see above).
         let output = toml::to_string_pretty(&doc)
             .map_err(|e| format!("Failed to serialize config: {}", e))?;
-        std::fs::write(config_path, &output)
-            .map_err(|e| format!("Failed to write config: {}", e))?;
+        write_wolfnet_config_atomic(&output)?;
         if cleared_endpoint {
             restart_wolfnet();
         } else {
@@ -1103,8 +1172,7 @@ pub fn add_wolfnet_peer(name: &str, endpoint: PeerEndpoint, ip: &str, public_key
     // Write back
     let output = toml::to_string_pretty(&doc)
         .map_err(|e| format!("Failed to serialize config: {}", e))?;
-    std::fs::write(config_path, &output)
-        .map_err(|e| format!("Failed to write config: {}", e))?;
+    write_wolfnet_config_atomic(&output)?;
 
     // Apply config: try SIGHUP hot-reload, fall back to restart for older wolfnet
     reload_or_restart_wolfnet();
@@ -1394,8 +1462,7 @@ pub fn reconcile_wolfnet_peers_batch(
     // Write the whole updated config once.
     let output = toml::to_string_pretty(&doc)
         .map_err(|e| format!("Failed to serialize config: {}", e))?;
-    std::fs::write(config_path, &output)
-        .map_err(|e| format!("Failed to write config: {}", e))?;
+    write_wolfnet_config_atomic(&output)?;
 
     // ONE reload/restart at the end. If any peer was cleared and we're
     // running against a pre-0.5.22 wolfnet whose SIGHUP handler doesn't
@@ -1478,8 +1545,7 @@ pub fn remove_wolfnet_peer(name: &str) -> Result<String, String> {
     }
 
     let new_content = result_lines.join("\n");
-    std::fs::write(config_path, &new_content)
-        .map_err(|e| format!("Failed to write config: {}", e))?;
+    write_wolfnet_config_atomic(&new_content)?;
 
 
 

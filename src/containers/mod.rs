@@ -1897,6 +1897,14 @@ fn ensure_lxcbr0_services(_used_lxc_net: bool) {
 
     if !dns_in_use && !dnsmasq_running {
         let _ = std::fs::create_dir_all("/run/lxc");
+        // `.status()`, not `.spawn()`: dnsmasq daemonizes by double-fork,
+        // and its initial process exits the moment it has forked the
+        // daemon. If we `.spawn()` and drop the Child handle we never
+        // reap that initial process — it stays as a `<defunct>` zombie
+        // parented to wolfstack. KO4BSR 2026-05-28: 1300+ defunct
+        // dnsmasq under wolfstack on a node where this reconcile fires
+        // every minute. `.status()` blocks just long enough for the
+        // daemonize fork to complete (typically <100ms) and reaps it.
         let _ = Command::new("dnsmasq")
             .args([
                 "--strict-order",
@@ -1912,7 +1920,7 @@ fn ensure_lxcbr0_services(_used_lxc_net: bool) {
                 "--interface=lxcbr0",
                 "--conf-file=", // avoid reading /etc/dnsmasq.conf
             ])
-            .spawn();
+            .status();
     }
 
     // Forwarding sysctl on the bridge — separate from global ip_forward
