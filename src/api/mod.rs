@@ -7432,6 +7432,207 @@ pub async fn github_backup_test(req: HttpRequest, state: web::Data<AppState>) ->
     }
 }
 
+// ─── Dashboard Sync ─────────────────────────────────────────────────────
+//
+// Operator picks target nodes in the UI, hits "Push now", and the
+// curated config bundle ships to those peers via X-WolfStack-Secret.
+// No on-write replication, no pull. See src/dashboard_sync/mod.rs for
+// the bundle definition and apply logic.
+
+/// GET /api/dashboard-sync/targets — current target list, the file
+/// bundle the UI should display under "what gets pushed", and the
+/// last-push outcome per target.
+pub async fn dashboard_sync_get(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let cfg = crate::dashboard_sync::DashboardSyncConfig::load();
+    HttpResponse::Ok().json(serde_json::json!({
+        "targets": cfg.targets,
+        "last_push": cfg.last_push,
+        "bundle_files": crate::dashboard_sync::BUNDLE_FILES,
+        "self_node": state.cluster.self_id.clone(),
+    }))
+}
+
+/// POST /api/dashboard-sync/targets — replace the target list. Body:
+/// `{ "targets": ["node-id", ...] }`. Self-id is silently filtered out
+/// — pushing to ourselves is a no-op that would only confuse the UI.
+pub async fn dashboard_sync_save_targets(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<serde_json::Value>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let raw: Vec<String> = body.get("targets")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+    // Dedupe, drop self-id, and keep order stable so the UI tree
+    // renders predictably across reloads.
+    let self_id = state.cluster.self_id.clone();
+    let mut seen = std::collections::HashSet::new();
+    let targets: Vec<String> = raw.into_iter()
+        .filter(|id| id != &self_id && seen.insert(id.clone()))
+        .collect();
+
+    let mut cfg = crate::dashboard_sync::DashboardSyncConfig::load();
+    cfg.targets = targets;
+    if let Err(e) = cfg.save() {
+        return HttpResponse::InternalServerError()
+            .json(serde_json::json!({ "error": format!("save failed: {}", e) }));
+    }
+    HttpResponse::Ok().json(serde_json::json!({ "targets": cfg.targets }))
+}
+
+/// POST /api/dashboard-sync/push — build the bundle on this node and
+/// fan it out to every target in the saved list. Returns a per-target
+/// outcome map; the same map is persisted so the UI can show "last
+/// pushed X ago" without a fresh attempt.
+pub async fn dashboard_sync_push(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+
+    let mut cfg = crate::dashboard_sync::DashboardSyncConfig::load();
+    if cfg.targets.is_empty() {
+        return HttpResponse::BadRequest()
+            .json(serde_json::json!({ "error": "no targets selected" }));
+    }
+
+    // Build once, send many. base64 lets us reuse the encoded body
+    // for every peer without re-encoding per call.
+    let self_id = state.cluster.self_id.clone();
+    let bundle = crate::dashboard_sync::build_bundle();
+    let file_count = bundle.len();
+    let payload = crate::dashboard_sync::encode_payload(self_id.clone(), bundle);
+    let body = match serde_json::to_vec(&payload) {
+        Ok(b) => b,
+        Err(e) => return HttpResponse::InternalServerError()
+            .json(serde_json::json!({ "error": format!("serialise: {}", e) })),
+    };
+
+    let nodes = state.cluster.get_all_nodes();
+    let secret = state.cluster_secret.clone();
+    let client = &*API_HTTP_CLIENT;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // Resolve target IDs to addresses up front so we can record an
+    // outcome even for targets the cluster has never heard of (the
+    // operator may have pasted a stale id, or the peer hasn't
+    // checked in yet).
+    let mut futures = Vec::with_capacity(cfg.targets.len());
+    for target_id in &cfg.targets {
+        let target_id = target_id.clone();
+        let node = nodes.iter().find(|n| n.id == target_id).cloned();
+        let secret = secret.clone();
+        let client = client.clone();
+        let body = body.clone();
+        futures.push(async move {
+            let Some(node) = node else {
+                return (target_id, crate::dashboard_sync::PushOutcome {
+                    at: now, ok: false, files: 0,
+                    error: Some("node not found in cluster".into()),
+                });
+            };
+            if !node.online {
+                return (target_id, crate::dashboard_sync::PushOutcome {
+                    at: now, ok: false, files: 0,
+                    error: Some("node offline".into()),
+                });
+            }
+            let urls = build_node_urls(&node.address, node.port, "/api/dashboard-sync/receive");
+            let mut last_err = String::new();
+            for url in &urls {
+                let res = client.post(url)
+                    .header("X-WolfStack-Secret", &secret)
+                    .header("Content-Type", "application/json")
+                    .timeout(std::time::Duration::from_secs(60))
+                    .body(body.clone())
+                    .send().await;
+                match res {
+                    Ok(r) if r.status().is_success() => {
+                        // Receiver reports a file count — use that, not
+                        // the count we sent, so a target running an
+                        // older build that allowlists fewer files is
+                        // visible to the operator.
+                        let txt = r.text().await.unwrap_or_default();
+                        let n = serde_json::from_str::<serde_json::Value>(&txt)
+                            .ok()
+                            .and_then(|v| v.get("files").and_then(|f| f.as_u64()))
+                            .unwrap_or(file_count as u64) as u32;
+                        return (target_id, crate::dashboard_sync::PushOutcome {
+                            at: now, ok: true, files: n, error: None,
+                        });
+                    }
+                    Ok(r) => {
+                        let status = r.status();
+                        let body = r.text().await.unwrap_or_default();
+                        last_err = serde_json::from_str::<serde_json::Value>(&body)
+                            .ok()
+                            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(|s| s.to_string()))
+                            .unwrap_or_else(|| format!("HTTP {}", status));
+                    }
+                    Err(e) => last_err = format!("{}", e),
+                }
+            }
+            (target_id, crate::dashboard_sync::PushOutcome {
+                at: now, ok: false, files: 0,
+                error: Some(if last_err.is_empty() { "unreachable".into() } else { last_err }),
+            })
+        });
+    }
+
+    let results: Vec<(String, crate::dashboard_sync::PushOutcome)> =
+        futures::future::join_all(futures).await;
+    for (id, outcome) in &results {
+        cfg.last_push.insert(id.clone(), outcome.clone());
+    }
+    if let Err(e) = cfg.save() {
+        tracing::warn!("dashboard-sync: failed to persist last_push: {}", e);
+    }
+
+    let outcomes: std::collections::HashMap<String, crate::dashboard_sync::PushOutcome> =
+        results.into_iter().collect();
+    HttpResponse::Ok().json(serde_json::json!({
+        "outcomes": outcomes,
+        "bundle_files": file_count,
+    }))
+}
+
+/// POST /api/dashboard-sync/receive — peer endpoint. Auth: cluster
+/// secret only (no session). Validates filenames against the bundle
+/// allowlist on this node and writes files via paths::write_secure.
+///
+/// Takes the body as `web::Bytes` instead of `web::Json<…>` because
+/// actix-web's JSON extractor caps at 32 KB by default and a real
+/// bundle is hundreds of KB or more. The 2 GB `PayloadConfig` set in
+/// `main.rs` covers raw-bytes extractors like this one.
+pub async fn dashboard_sync_receive(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Bytes,
+) -> HttpResponse {
+    // Cluster-secret-only: this endpoint mutates on-disk config under
+    // /etc/wolfstack/, so we deliberately do NOT accept session-cookie
+    // or API-key auth. Only a peer with the cluster secret can push.
+    if let Err(resp) = require_cluster_auth(&req, &state) { return resp; }
+    let payload: crate::dashboard_sync::PushPayload = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(e) => return HttpResponse::BadRequest()
+            .json(serde_json::json!({ "error": format!("decode payload: {}", e) })),
+    };
+    match crate::dashboard_sync::apply_bundle(&payload) {
+        Ok(n) => {
+            tracing::info!("dashboard-sync: applied {} files from peer '{}'", n, payload.from_node);
+            HttpResponse::Ok().json(serde_json::json!({
+                "files": n,
+                "from_node": payload.from_node,
+            }))
+        }
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    }
+}
+
 // ─── Control Panel (cluster-wide apps view) ─────────────────────────────
 
 /// GET /api/control-panel/inventory — every VM, LXC and Docker container
@@ -31961,6 +32162,10 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/github-backup/push", web::post().to(github_backup_push_now))
         .route("/api/github-backup/restore", web::post().to(github_backup_restore))
         .route("/api/github-backup/test", web::get().to(github_backup_test))
+        .route("/api/dashboard-sync/targets", web::get().to(dashboard_sync_get))
+        .route("/api/dashboard-sync/targets", web::post().to(dashboard_sync_save_targets))
+        .route("/api/dashboard-sync/push",    web::post().to(dashboard_sync_push))
+        .route("/api/dashboard-sync/receive", web::post().to(dashboard_sync_receive))
         .route("/api/control-panel/inventory", web::get().to(control_panel_inventory))
         .route("/api/control-panel/inventory/node/{id}", web::get().to(control_panel_inventory_node))
         .route("/api/control-panel/nodes", web::get().to(control_panel_nodes))

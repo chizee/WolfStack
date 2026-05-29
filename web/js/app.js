@@ -1868,7 +1868,7 @@ function selectView(page) {
     document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
     document.querySelector(`.nav-item[data-page="${page}"]`)?.classList.add('active');
 
-    const titles = { datacenter: 'Datacenter', settings: 'Settings', docs: 'Help & Documentation', appstore: 'App Store', issues: 'Issues', inbox: 'Predictive Inbox', 'global-wolfnet': 'Global View', kubernetes: 'WolfKube', topology: '3D Server Room', wolfflow: 'WolfFlow', wolfagents: 'WolfAgents', 'cluster-browser': 'Cluster Browser', databases: 'Databases', 'control-panel': 'Control Panel', array: 'Storage Array', xopools: 'XO Pools', tenants: 'Tenants', 'fleet-security': 'Fleet Security' };
+    const titles = { datacenter: 'Datacenter', settings: 'Settings', docs: 'Help & Documentation', appstore: 'App Store', issues: 'Issues', inbox: 'Predictive Inbox', 'global-wolfnet': 'Global View', kubernetes: 'WolfKube', topology: '3D Server Room', wolfflow: 'WolfFlow', wolfagents: 'WolfAgents', 'cluster-browser': 'Cluster Browser', databases: 'Databases', 'control-panel': 'Control Panel', array: 'Storage Array', xopools: 'XO Pools', tenants: 'Tenants', 'fleet-security': 'Fleet Security', 'dashboard-sync': 'Dashboard Sync' };
     document.getElementById('page-title').textContent = titles[page] || page;
 
     if (page === 'datacenter') {
@@ -1926,6 +1926,8 @@ function selectView(page) {
         renderTenants();
     } else if (page === 'fleet-security') {
         renderFleetSecurity();
+    } else if (page === 'dashboard-sync') {
+        dashboardSyncLoad();
     }
 
     // Restore task log toggle button when leaving topology
@@ -60503,6 +60505,10 @@ const APP_DRAWER_TILES = [
         desc: 'Aggregator dashboard across every customer cluster you federate to.',
     },
     {
+        id: 'dashboard-sync', icon: '', name: 'Dashboard Sync',
+        desc: 'Push this node\'s dashboard to chosen peer nodes so you can log in to any of them and see the same view.',
+    },
+    {
         id: 'databases', icon: '', name: 'Databases',
         desc: 'Query any configured SQL connection across the cluster.',
     },
@@ -60656,6 +60662,235 @@ function appDrawerNav(pageId) {
 window.openAppDrawer = openAppDrawer;
 window.closeAppDrawer = closeAppDrawer;
 window.appDrawerNav = appDrawerNav;
+
+// ─── Dashboard Sync ───────────────────────────────────────────────
+//
+// Operator picks which peer nodes mirror this node's dashboard, then
+// presses Push now. Nothing automatic — no on-write replication, no
+// pull. The page is a checkbox tree of every known node grouped by
+// cluster, plus the last-push outcome per ticked node.
+
+const _dsState = {
+    config: null,        // {targets, last_push, bundle_files, self_node}
+    nodes: [],           // /api/nodes payload
+    selection: new Set(),// node ids currently ticked in the UI
+};
+
+function dsAgoLabel(unixSec) {
+    if (!unixSec) return '';
+    const diff = Math.max(0, Math.floor(Date.now() / 1000 - unixSec));
+    if (diff < 60) return `${diff}s ago`;
+    if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+    if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+    return `${Math.floor(diff / 86400)}d ago`;
+}
+
+async function dashboardSyncLoad() {
+    const tree = document.getElementById('dashboard-sync-tree');
+    if (tree) tree.innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:30px;">Loading…</div>';
+    try {
+        const [cfgR, nodesR] = await Promise.all([
+            fetch(apiUrl('/api/dashboard-sync/targets')),
+            fetch(apiUrl('/api/nodes')),
+        ]);
+        if (!cfgR.ok) throw new Error(`targets: HTTP ${cfgR.status}`);
+        if (!nodesR.ok) throw new Error(`nodes: HTTP ${nodesR.status}`);
+        _dsState.config = await cfgR.json();
+        const np = await nodesR.json();
+        _dsState.nodes = Array.isArray(np.nodes) ? np.nodes : [];
+        // Initialise the in-memory selection from the persisted list so
+        // the operator can tick/untick freely and only press Save when
+        // they want the change to land.
+        _dsState.selection = new Set(_dsState.config.targets || []);
+    } catch (e) {
+        if (tree) tree.innerHTML = `<div style="color:var(--danger,#ef4444);padding:20px;">Failed to load: ${escapeHtml(e.message || String(e))}</div>`;
+        return;
+    }
+    dashboardSyncRender();
+}
+
+function dashboardSyncRender() {
+    const tree = document.getElementById('dashboard-sync-tree');
+    const bundle = document.getElementById('dashboard-sync-bundle-list');
+    if (!tree || !_dsState.config) return;
+
+    const selfId = _dsState.config.self_node;
+    const lastPush = _dsState.config.last_push || {};
+
+    // Group nodes by cluster_name (fall back to "Unassigned").
+    const groups = new Map();
+    for (const n of _dsState.nodes) {
+        const key = n.cluster_name || 'Unassigned';
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(n);
+    }
+    // Stable order: alphabetical cluster, hostname within.
+    const orderedClusters = Array.from(groups.keys()).sort((a, b) => a.localeCompare(b));
+
+    const rows = [];
+    rows.push(`
+        <div style="background:var(--bg-secondary,#16181f);border:1px solid var(--border-color,#2d2f3a);border-radius:8px;padding:12px 14px;">
+            <div style="font-size:12px;color:var(--text-muted);">This node</div>
+            <div style="font-size:14px;font-weight:600;margin-top:2px;">
+                ${escapeHtml(selfId || 'unknown')}
+                <span style="background:#16a34a;color:#fff;font-size:10px;font-weight:700;padding:2px 8px;border-radius:8px;margin-left:8px;text-transform:uppercase;letter-spacing:0.5px;">Origin</span>
+            </div>
+        </div>
+    `);
+
+    for (const cluster of orderedClusters) {
+        const members = groups.get(cluster)
+            .filter(n => n.id !== selfId)
+            .sort((a, b) => (a.hostname || a.id).localeCompare(b.hostname || b.id));
+        if (members.length === 0) continue;
+
+        const ticked = members.filter(n => _dsState.selection.has(n.id)).length;
+        const clusterState = ticked === 0 ? 'none' : (ticked === members.length ? 'all' : 'some');
+        const clusterMark = clusterState === 'all'
+            ? '<span style="color:#3b82f6;">☑</span>'
+            : (clusterState === 'some'
+                ? '<span style="color:#3b82f6;">◪</span>'
+                : '<span style="color:var(--text-muted);">☐</span>');
+
+        const memberRows = members.map(n => {
+            const isOn = _dsState.selection.has(n.id);
+            const mark = isOn
+                ? '<span style="color:#3b82f6;">☑</span>'
+                : '<span style="color:var(--text-muted);">☐</span>';
+            const out = lastPush[n.id];
+            let statusHtml = '<span style="color:var(--text-muted);">No push yet</span>';
+            if (out) {
+                if (out.ok) {
+                    statusHtml = `<span style="color:#16a34a;">&#10003; ${out.files} files · ${escapeHtml(dsAgoLabel(out.at))}</span>`;
+                } else {
+                    statusHtml = `<span style="color:#ef4444;" title="${escapeAttr(out.error || '')}">&#10007; ${escapeHtml(out.error || 'error')} · ${escapeHtml(dsAgoLabel(out.at))}</span>`;
+                }
+            }
+            const onlineDot = n.online
+                ? '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#16a34a;margin-right:6px;"></span>'
+                : '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#ef4444;margin-right:6px;" title="Offline"></span>';
+            return `
+                <div onclick="dashboardSyncToggleNode('${escapeAttr(n.id)}')"
+                     style="display:flex;align-items:center;gap:10px;padding:8px 12px 8px 28px;cursor:pointer;border-radius:6px;"
+                     onmouseenter="this.style.background='var(--bg-tertiary,#2d2f3a)'"
+                     onmouseleave="this.style.background='transparent'">
+                    <span style="font-size:16px;line-height:1;">${mark}</span>
+                    ${onlineDot}
+                    <span style="font-weight:600;flex:1;">${escapeHtml(n.hostname || n.id)}</span>
+                    <span style="font-size:12px;">${statusHtml}</span>
+                </div>
+            `;
+        }).join('');
+
+        rows.push(`
+            <div style="background:var(--bg-secondary,#16181f);border:1px solid var(--border-color,#2d2f3a);border-radius:8px;overflow:hidden;">
+                <div onclick="dashboardSyncToggleCluster('${escapeAttr(cluster)}')"
+                     style="display:flex;align-items:center;gap:10px;padding:10px 12px;cursor:pointer;background:var(--bg-tertiary,#2d2f3a);"
+                     onmouseenter="this.style.filter='brightness(1.1)'"
+                     onmouseleave="this.style.filter='brightness(1.0)'">
+                    <span style="font-size:16px;line-height:1;">${clusterMark}</span>
+                    <span style="font-weight:600;flex:1;">${escapeHtml(cluster)}</span>
+                    <span style="font-size:11px;color:var(--text-muted);">${ticked}/${members.length} ticked</span>
+                </div>
+                ${memberRows}
+            </div>
+        `);
+    }
+
+    if (rows.length === 1) {
+        rows.push('<div style="color:var(--text-muted);text-align:center;padding:30px;">No peer nodes known to this dashboard yet.</div>');
+    }
+    tree.innerHTML = rows.join('');
+
+    // Bundle-file disclosure. Pure data list — backend is the source
+    // of truth so a build that adds a new file shows up here without
+    // a frontend change.
+    if (bundle) {
+        const files = _dsState.config.bundle_files || [];
+        bundle.innerHTML = files.length === 0
+            ? '<em>(bundle file list unavailable)</em>'
+            : files.map(f => `<code style="background:var(--bg-tertiary,#2d2f3a);padding:1px 6px;border-radius:4px;margin:0 4px 4px 0;display:inline-block;">${escapeHtml(f)}</code>`).join('');
+    }
+}
+
+function dashboardSyncToggleNode(nodeId) {
+    if (_dsState.selection.has(nodeId)) _dsState.selection.delete(nodeId);
+    else _dsState.selection.add(nodeId);
+    dashboardSyncRender();
+}
+
+function dashboardSyncToggleCluster(cluster) {
+    const selfId = _dsState.config && _dsState.config.self_node;
+    const members = _dsState.nodes
+        .filter(n => (n.cluster_name || 'Unassigned') === cluster && n.id !== selfId);
+    const allOn = members.every(n => _dsState.selection.has(n.id));
+    for (const n of members) {
+        if (allOn) _dsState.selection.delete(n.id);
+        else _dsState.selection.add(n.id);
+    }
+    dashboardSyncRender();
+}
+
+async function dashboardSyncSaveTargets(silent = false) {
+    const statusEl = document.getElementById('dashboard-sync-status');
+    const targets = Array.from(_dsState.selection);
+    try {
+        const r = await fetch(apiUrl('/api/dashboard-sync/targets'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ targets }),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+        if (!silent) {
+            showToast(`Saved ${j.targets.length} target${j.targets.length === 1 ? '' : 's'}.`, 'success');
+        }
+        if (statusEl) statusEl.textContent = '';
+        if (_dsState.config) _dsState.config.targets = j.targets;
+        return true;
+    } catch (e) {
+        showToast(`Save failed: ${e.message || String(e)}`, 'error', 8000);
+        if (statusEl) statusEl.innerHTML = `<div style="color:var(--danger,#ef4444);">Save failed: ${escapeHtml(e.message || String(e))}</div>`;
+        return false;
+    }
+}
+
+async function dashboardSyncPushNow() {
+    const statusEl = document.getElementById('dashboard-sync-status');
+    // Save first (silent — we only want the failure toast, not the
+    // success one, since the user pressed Push, not Save). If save
+    // fails, abort: pushing with stale targets would be confusing.
+    const saved = await dashboardSyncSaveTargets(true);
+    if (!saved) return;
+    if (statusEl) statusEl.innerHTML = '<div style="color:var(--text-muted);">Pushing…</div>';
+    try {
+        const r = await fetch(apiUrl('/api/dashboard-sync/push'), { method: 'POST' });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+        const outcomes = j.outcomes || {};
+        const ok = Object.values(outcomes).filter(o => o.ok).length;
+        const fail = Object.values(outcomes).filter(o => !o.ok).length;
+        if (fail === 0 && ok > 0) {
+            showToast(`Pushed to ${ok} node${ok === 1 ? '' : 's'}.`, 'success');
+        } else if (ok > 0) {
+            showToast(`Pushed to ${ok} node${ok === 1 ? '' : 's'}, ${fail} failed.`, 'error', 8000);
+        } else {
+            showToast(`Push failed on all ${fail} target${fail === 1 ? '' : 's'}.`, 'error', 8000);
+        }
+        if (statusEl) statusEl.textContent = '';
+        // Refresh to show the new per-target last_push line.
+        await dashboardSyncLoad();
+    } catch (e) {
+        showToast(`Push failed: ${e.message || String(e)}`, 'error', 8000);
+        if (statusEl) statusEl.innerHTML = `<div style="color:var(--danger,#ef4444);">Push failed: ${escapeHtml(e.message || String(e))}</div>`;
+    }
+}
+
+window.dashboardSyncLoad = dashboardSyncLoad;
+window.dashboardSyncSaveTargets = dashboardSyncSaveTargets;
+window.dashboardSyncPushNow = dashboardSyncPushNow;
+window.dashboardSyncToggleNode = dashboardSyncToggleNode;
+window.dashboardSyncToggleCluster = dashboardSyncToggleCluster;
 
 // ─── Shares (WolfStack Gateway) ───────────────────────────────────
 //

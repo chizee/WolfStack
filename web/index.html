@@ -2758,6 +2758,44 @@
             </div>
         </div>
 
+        <!-- ═══ Dashboard Sync (operator-driven push to chosen peers) ═══ -->
+        <div id="page-dashboard-sync" class="page-view" style="display:none;">
+            <div class="card" style="margin-bottom:16px;">
+                <div class="card-body" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;">
+                    <div>
+                        <h2 style="margin:0;display:flex;align-items:center;gap:10px;">
+                            <span style="font-size:28px;"><span class="ws-icon-clean-wrap" data-icon="cluster"></span></span>Dashboard Sync
+                        </h2>
+                        <p style="margin:6px 0 0;color:var(--text-muted);font-size:13px;max-width:780px;">
+                            Push this node's dashboard configuration to chosen peers so logging in to any of them
+                            shows the same view. Nothing happens automatically — tick the nodes you want, press
+                            <strong>Push now</strong>, done. Targets ticked here receive your full operator view
+                            (cluster registry, sponsor identity, users, status pages, alerting, and more); do not
+                            tick nodes where untrusted users have accounts.
+                        </p>
+                    </div>
+                    <div style="display:flex;gap:8px;align-items:center;">
+                        <button class="btn btn-sm" onclick="dashboardSyncLoad()" title="Refresh"><span class="ws-icon-clean-wrap" data-icon="refresh"></span></button>
+                        <button class="btn btn-sm" onclick="dashboardSyncSaveTargets()">Save targets</button>
+                        <button class="btn btn-sm btn-primary" onclick="dashboardSyncPushNow()">Push now</button>
+                    </div>
+                </div>
+            </div>
+            <div id="dashboard-sync-status" role="status" aria-live="polite" style="margin-bottom:12px;"></div>
+            <div id="dashboard-sync-tree" style="display:flex;flex-direction:column;gap:8px;">
+                <div style="color:var(--text-muted);text-align:center;padding:30px;">Loading…</div>
+            </div>
+            <details style="margin-top:18px;background:var(--bg-secondary,#16181f);border:1px solid var(--border-color,#2d2f3a);border-radius:8px;padding:10px 14px;">
+                <summary style="cursor:pointer;font-size:13px;font-weight:600;">What gets pushed</summary>
+                <div id="dashboard-sync-bundle-list" style="margin-top:10px;font-size:12px;color:var(--text-muted);line-height:1.6;"></div>
+                <div style="margin-top:10px;font-size:12px;color:var(--text-muted);line-height:1.6;">
+                    <strong style="color:var(--text-primary);">Not pushed:</strong>
+                    cluster secret, TLS certs, join token, per-node hardware state, active sessions,
+                    per-node antivirus findings or active lockouts.
+                </div>
+            </details>
+        </div>
+
         <!-- ═══ Storage Array Page (mdadm / NoNRAID) ═══ -->
         <div id="page-array" class="page-view" style="display:none;">
             <div class="card" style="margin-bottom:16px;">

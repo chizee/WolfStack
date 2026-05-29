@@ -50,6 +50,7 @@ mod whatsapp_bot;
 mod mcp;
 mod wolfnote;
 mod wolfusb;
+mod dashboard_sync;
 mod paths;
 mod ports;
 mod reverse_proxy;
