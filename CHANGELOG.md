@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v24.7.33: site-aware WolfNet cluster sync (klasSponsor multi-VLAN fix Part 2)** _(2026-05-29 — [`19adba9`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/19adba99858bc595359286c89fbde650d4c02a41))_
 - **v24.7.32: dnsmasq zombie leak + wolfnet config save + VM network save** _(2026-05-28 — [`6d9003a`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/6d9003af5723ab52e82cf3a51cce143c9df67149))_
 - **v24.7.31: security page — fix 24h block chart, surface NMAP Protection port** _(2026-05-27 — [`c49b673`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/c49b673013b55e45391aa4ec65eaa14066272fff))_
 - **v24.7.30: code tidy** _(2026-05-27 — [`a8c9c69`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/a8c9c69e9c32d1007e176985a2ff8aac8440b1b6))_
