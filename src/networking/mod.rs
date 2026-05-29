@@ -893,6 +893,52 @@ pub enum PeerEndpoint {
 /// needed because only one WolfStack instance touches the file.
 static WOLFNET_CONFIG_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Compute a node's effective site tag for cluster-sync endpoint
+/// selection. Used by `pick_wolfnet_endpoint` to decide whether two
+/// nodes can dial each other at their LAN address (same site) or
+/// must go via the public IP (different sites).
+///
+/// Rules:
+/// * If the operator declared an explicit `site` string, that wins.
+/// * Otherwise, auto-derive from the first three octets of `address`
+///   when `address` is an RFC1918 IPv4 literal. Two nodes that share
+///   a /24 get the same auto-tag (`auto:192.168.10`) and are treated
+///   as same-LAN — this preserves pre-Site behaviour for single-LAN
+///   clusters without any operator action.
+/// * For public IPv4 / IPv6 / unparseable / empty addresses, return
+///   `None` — there's no LAN context to infer, so the node will
+///   match no one on auto-tag and the cluster-sync will route via
+///   the public path.
+///
+/// The auto-tag is namespaced with the `auto:` prefix so operators
+/// can't accidentally type a value that collides with an
+/// auto-derived one (e.g. `192.168.10`); explicit tags never carry
+/// that prefix.
+pub fn effective_site(site: &Option<String>, address: &str) -> Option<String> {
+    if let Some(s) = site.as_ref() {
+        if !s.is_empty() {
+            return Some(s.clone());
+        }
+    }
+    let ip: std::net::Ipv4Addr = match address.parse() {
+        Ok(ip) => ip,
+        Err(_) => return None,
+    };
+    // Narrow to true RFC1918 — loopback (127/8) and link-local
+    // (169.254/16) are not meaningful site anchors even though
+    // `is_private_ip` calls them private. JS `autoSiteHint` applies
+    // the same narrow check so the UI hint matches the Rust value
+    // exactly.
+    let oct = ip.octets();
+    let rfc1918 = oct[0] == 10
+        || (oct[0] == 172 && (16..=31).contains(&oct[1]))
+        || (oct[0] == 192 && oct[1] == 168);
+    if !rfc1918 {
+        return None;
+    }
+    Some(format!("auto:{}.{}.{}", oct[0], oct[1], oct[2]))
+}
+
 /// Read the local wolfnet `(address, prefix_length)` from
 /// `/etc/wolfnet/config.toml`. Used by `decide_peer_endpoint` to
 /// detect the routing-loop case where a peer's `public_ip` lands
@@ -4015,6 +4061,76 @@ mod tests {
     #[test]
     fn is_in_subnet_zero_prefix_matches_all() {
         assert!(is_in_subnet(ip("8.8.8.8"), ip("0.0.0.0"), 0));
+    }
+
+    // ─── effective_site ───
+
+    #[test]
+    fn effective_site_explicit_wins() {
+        let s = effective_site(&Some("office-vlan10".to_string()), "10.10.5.42");
+        assert_eq!(s.as_deref(), Some("office-vlan10"));
+    }
+
+    #[test]
+    fn effective_site_empty_explicit_falls_back_to_auto() {
+        // Operator clearing the tag (empty string) drops back to auto-derive.
+        let s = effective_site(&Some(String::new()), "192.168.10.42");
+        assert_eq!(s.as_deref(), Some("auto:192.168.10"));
+    }
+
+    #[test]
+    fn effective_site_auto_from_rfc1918_24() {
+        assert_eq!(
+            effective_site(&None, "192.168.10.42").as_deref(),
+            Some("auto:192.168.10")
+        );
+        assert_eq!(
+            effective_site(&None, "10.10.5.7").as_deref(),
+            Some("auto:10.10.5")
+        );
+        assert_eq!(
+            effective_site(&None, "172.20.0.1").as_deref(),
+            Some("auto:172.20.0")
+        );
+    }
+
+    #[test]
+    fn effective_site_none_for_public_address() {
+        // Public-IP-only nodes (a VPS) have no LAN context to auto-tag,
+        // so they get None — the cluster-sync routes to/from them via
+        // the public path regardless of any other peer's site.
+        assert_eq!(effective_site(&None, "203.0.113.5"), None);
+        assert_eq!(effective_site(&None, "8.8.8.8"), None);
+    }
+
+    #[test]
+    fn effective_site_none_for_unparseable_or_empty() {
+        assert_eq!(effective_site(&None, ""), None);
+        assert_eq!(effective_site(&None, "not-an-ip"), None);
+    }
+
+    #[test]
+    fn effective_site_none_for_loopback_and_link_local() {
+        // is_private_ip considers 127/8 and 169.254/16 private, but
+        // they aren't meaningful site anchors — no node is reachable
+        // to a peer via either range. The JS autoSiteHint helper
+        // intentionally rejects them too; this test pins the parity.
+        assert_eq!(effective_site(&None, "127.0.0.1"), None);
+        assert_eq!(effective_site(&None, "127.0.0.42"), None);
+        assert_eq!(effective_site(&None, "169.254.1.1"), None);
+    }
+
+    #[test]
+    fn effective_site_same_24_matches_different_24_doesnt() {
+        // The core property the cluster-sync relies on: same /24 → same
+        // auto-tag → LAN-dial; different /24 → different tag → public-dial.
+        // This is what kills klasSponsor's multi-VLAN flap when no
+        // explicit site is set.
+        let a = effective_site(&None, "192.168.10.5");
+        let b = effective_site(&None, "192.168.10.99");
+        let c = effective_site(&None, "192.168.20.5");
+        assert_eq!(a, b, "same /24 must produce the same auto-tag");
+        assert_ne!(a, c, "different /24s must produce different auto-tags");
     }
 
     // ─── decide_peer_endpoint guards ───

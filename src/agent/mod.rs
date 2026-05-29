@@ -197,6 +197,24 @@ pub struct Node {
     /// deserialize this as an empty Vec.
     #[serde(default)]
     pub workload_subnets: Vec<String>,
+    /// Optional physical-location tag declared by the operator. Two
+    /// nodes that share a `site` are considered to be on the same
+    /// L2/L3 LAN and can dial each other directly at their
+    /// `lan_address`; nodes with different sites (or one tagged + one
+    /// untagged in a way that doesn't match) must go via public IP.
+    ///
+    /// Drives `pick_wolfnet_endpoint` in the cluster-sync. When `None`,
+    /// `networking::effective_site` falls back to the first three
+    /// octets of `address` (e.g. `auto:192.168.10`) so single-LAN
+    /// clusters keep their pre-tag behaviour — all members share an
+    /// auto-derived site and dial directly. The operator-set value
+    /// overrides the auto-derived one and is what shows up in the
+    /// UI's "Site" field.
+    ///
+    /// Backward-compat: serializes/deserializes as missing for older
+    /// configs and older peers (gossip stays compatible).
+    #[serde(default)]
+    pub site: Option<String>,
 }
 
 fn default_node_type() -> String { "wolfstack".to_string() }
@@ -223,6 +241,7 @@ impl ClusterState {
     fn nodes_file() -> String { crate::paths::get().nodes_config }
     fn deleted_file() -> String { crate::paths::get().deleted_nodes_config }
     fn self_cluster_file() -> String { crate::paths::get().self_cluster_config }
+    fn self_site_file() -> String { crate::paths::get().self_site_config }
     const SELF_LOGIN_DISABLED_FILE: &'static str = "/etc/wolfstack/login_disabled";
 
     pub fn new(self_id: String, self_address: String, port: u16) -> Self {
@@ -346,6 +365,13 @@ impl ClusterState {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let prev_login_disabled = nodes.get(&self.self_id).map(|n| n.login_disabled);
         let prev_update_script = nodes.get(&self.self_id).and_then(|n| n.update_script.clone());
+        // Site is persisted to disk via the same path as cluster_name —
+        // in-memory if present, else the file written by
+        // `update_node_settings`, else None (which lets the cluster-sync
+        // auto-derive the site from this node's address).
+        let prev_site = nodes.get(&self.self_id)
+            .and_then(|n| n.site.clone())
+            .or_else(Self::load_self_site);
         nodes.insert(self.self_id.clone(), Node {
             id: self.self_id.clone(),
             hostname: metrics.hostname.clone(),
@@ -382,6 +408,7 @@ impl ClusterState {
             // bridges live on this node. Other peers consume this via
             // gossip to detect missing subnet_routes.
             workload_subnets: crate::networking::collect_workload_subnets(),
+            site: prev_site,
         });
     }
 
@@ -507,6 +534,10 @@ impl ClusterState {
             // Filled in on first successful poll from the peer's status report.
             self_id: None,
             workload_subnets: Vec::new(),
+            // Site arrives on the first successful poll (gossip carries
+            // each peer's own declared site). Until then we don't know
+            // it; effective_site() will auto-derive from the address.
+            site: None,
         });
         drop(nodes);
         self.save_nodes();
@@ -728,8 +759,8 @@ impl ProxmoxCleanupNotice {
 
 impl ClusterState {
 
-    /// Update node settings (hostname, address, port, token, fingerprint, cluster name)
-    pub fn update_node_settings(&self, id: &str, hostname: Option<String>, address: Option<String>, port: Option<u16>, pve_token: Option<String>, pve_fingerprint: Option<Option<String>>, cluster_name: Option<String>, login_disabled: Option<bool>, update_script: Option<String>) -> bool {
+    /// Update node settings (hostname, address, port, token, fingerprint, cluster name, site)
+    pub fn update_node_settings(&self, id: &str, hostname: Option<String>, address: Option<String>, port: Option<u16>, pve_token: Option<String>, pve_fingerprint: Option<Option<String>>, cluster_name: Option<String>, login_disabled: Option<bool>, update_script: Option<String>, site: Option<String>) -> bool {
         let mut nodes = self.nodes.write().unwrap();
         if let Some(node) = nodes.get_mut(id) {
             if let Some(h) = hostname { node.hostname = h; }
@@ -739,6 +770,12 @@ impl ClusterState {
             if let Some(fp) = pve_fingerprint { node.pve_fingerprint = fp; }
             if let Some(disabled) = login_disabled { node.login_disabled = disabled; }
             if let Some(script) = update_script { node.update_script = if script.is_empty() { None } else { Some(script) }; }
+            if let Some(s) = site.as_ref() {
+                // Empty string clears the explicit tag — effective_site
+                // will fall back to the auto-derived value. Anything
+                // non-empty is the operator's chosen label.
+                node.site = if s.is_empty() { None } else { Some(s.clone()) };
+            }
             if let Some(ref name) = cluster_name {
                 // Update both cluster_name fields so sidebar grouping works
                 node.cluster_name = Some(name.clone());
@@ -749,11 +786,18 @@ impl ClusterState {
             // If updating self node's cluster name, persist it so it survives reinstalls
             let is_self = node.is_self;
             let final_cluster = node.cluster_name.clone();
+            let final_site = node.site.clone();
             drop(nodes);
             self.save_nodes();
             if is_self {
                 if let Some(ref name) = final_cluster {
                     Self::save_self_cluster_name(name);
+                }
+                // Persist site for self node — save_nodes skips self so
+                // we need a dedicated file (same pattern as cluster_name
+                // and login_disabled).
+                if site.is_some() {
+                    Self::save_self_site(final_site.as_deref().unwrap_or(""));
                 }
                 // Persist login_disabled for self node (since save_nodes skips self)
                 if let Some(disabled) = login_disabled {
@@ -787,6 +831,40 @@ impl ClusterState {
         if let Ok(json) = serde_json::to_string(name) {
             if let Err(e) = std::fs::write(&path, json) {
                 warn!("Failed to save self cluster name: {}", e);
+            }
+        }
+    }
+
+    /// Load persisted self site tag from disk. Same path/format as
+    /// cluster_name persistence so the two are consistent. Returns
+    /// `None` for missing/empty/malformed files; callers fall through
+    /// to the auto-derived site.
+    fn load_self_site() -> Option<String> {
+        if let Ok(data) = std::fs::read_to_string(Self::self_site_file()) {
+            if let Ok(name) = serde_json::from_str::<String>(&data) {
+                if !name.is_empty() {
+                    return Some(name);
+                }
+            }
+        }
+        None
+    }
+
+    /// Persist self site tag to disk (survives reinstalls). Empty
+    /// string is treated as "clear the file" so the operator can
+    /// remove an explicit tag and fall back to auto-derived.
+    pub fn save_self_site(site: &str) {
+        let path = Self::self_site_file();
+        if let Some(dir) = std::path::Path::new(&path).parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if site.is_empty() {
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+        if let Ok(json) = serde_json::to_string(site) {
+            if let Err(e) = std::fs::write(&path, json) {
+                warn!("Failed to save self site: {}", e);
             }
         }
     }
@@ -850,6 +928,11 @@ pub enum AgentMessage {
         /// `networking::collect_workload_subnets`.
         #[serde(default)]
         workload_subnets: Vec<String>,
+        /// Operator-declared physical-location tag — see `Node::site`.
+        /// `None` from older peers; the cluster-sync site decision
+        /// falls back to auto-derive from address in that case.
+        #[serde(default)]
+        site: Option<String>,
         /// Enterprise license key — propagated to cluster nodes that don't have one
         #[serde(default)]
         license_key: Option<String>,
@@ -1001,7 +1084,7 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
                         continue;
                     }
                     if let Ok(msg) = resp.json::<AgentMessage>().await {
-                        if let AgentMessage::StatusReport { node_id: peer_self_id, hostname, metrics, components, docker_count, lxc_count, vm_count, public_ip, known_nodes, deleted_ids, wolfnet_ips, has_docker, has_lxc, has_kvm, workload_subnets: peer_workload_subnets, license_key } = msg {
+                        if let AgentMessage::StatusReport { node_id: peer_self_id, hostname, metrics, components, docker_count, lxc_count, vm_count, public_ip, known_nodes, deleted_ids, wolfnet_ips, has_docker, has_lxc, has_kvm, workload_subnets: peer_workload_subnets, site: peer_site, license_key } = msg {
                             let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                             // Detect TLS by the URL scheme that actually
                             // answered. v23.12 chain is HTTPS → HTTP-over-
@@ -1062,6 +1145,13 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
                                     Some(peer_self_id)
                                 },
                                 workload_subnets: peer_workload_subnets,
+                                // Peer's own declared site (None for
+                                // older peers and for nodes the
+                                // operator hasn't tagged yet). We
+                                // trust the peer's self-report —
+                                // that's the source of truth for a
+                                // node's own location.
+                                site: peer_site,
                             });
 
                             // Reset fail count on success
@@ -1188,6 +1278,7 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
                                             known.cluster_name.clone(),
                                             None,  // don't propagate login_disabled via gossip
                                             None,  // don't propagate update_script via gossip
+                                            None,  // site is propagated via StatusReport, not nested gossip
                                         );
                                     }
                                 } else {

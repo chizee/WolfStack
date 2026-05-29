@@ -10455,6 +10455,11 @@ function openNodeSettings(nodeId) {
                     <small style="color: var(--text-muted);">Change to move this node to a different cluster group</small>
                 </div>
                 <div class="form-group">
+                    <label>Site</label>
+                    <input type="text" class="form-control" id="node-settings-site" value="${node.site || ''}" placeholder="${autoSiteHint(node.address) || 'unset'}" style="font-family:'JetBrains Mono',monospace;font-size:12px;">
+                    <small style="color: var(--text-muted);">Physical location tag (e.g. <code>home</code>, <code>office-vlan10</code>, <code>hetzner-vps</code>). Nodes sharing a site are dialled at their LAN address; different sites go via public IP. Leave blank to auto-derive from address (currently <code>${autoSiteHint(node.address) || 'none'}</code>).</small>
+                </div>
+                <div class="form-group">
                     <label>Update Script</label>
                     <input type="text" class="form-control" id="node-settings-update-script" value="${node.update_script || ''}" placeholder="curl -sSL https://raw.githubusercontent.com/wolfsoftwaresystemsltd/WolfStack/master/setup.sh | sudo bash" style="font-family:'JetBrains Mono',monospace;font-size:12px;">
                     <small style="color: var(--text-muted);">Command to run when upgrading this node. Leave blank for the default setup script.</small>
@@ -10705,6 +10710,23 @@ async function upgradeNode(nodeId) {
     return issuesUpgradeAll(targets);
 }
 
+// Client-side mirror of networking::effective_site for the UI hint —
+// shows the operator what WolfNet would auto-derive when the explicit
+// Site field is left blank. Returns null for public/unparseable
+// addresses (no LAN context to infer). Two nodes whose addresses share
+// a /24 will surface the same hint here.
+function autoSiteHint(address) {
+    if (!address) return null;
+    const m = String(address).match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.\d{1,3}$/);
+    if (!m) return null;
+    const a = parseInt(m[1], 10), b = parseInt(m[2], 10);
+    const isPriv = (a === 10)
+        || (a === 172 && b >= 16 && b <= 31)
+        || (a === 192 && b === 168);
+    if (!isPriv) return null;
+    return `auto:${m[1]}.${m[2]}.${m[3]}`;
+}
+
 async function saveNodeSettings() {
     const modal = document.getElementById('node-settings-modal');
     if (!modal) return;
@@ -10757,6 +10779,17 @@ async function saveNodeSettings() {
         if (loginDisabledEl.checked !== wasDisabled) {
             updates.login_disabled = loginDisabledEl.checked;
         }
+    }
+
+    // Site tag — empty string is meaningful (clears the explicit
+    // value, falls back to auto-derived), so we always include it
+    // when it differs from the node's current value.
+    const siteEl = document.getElementById('node-settings-site');
+    if (siteEl) {
+        const node = allNodes.find(n => n.id === nodeId);
+        const oldSite = node ? (node.site || '') : '';
+        const newSite = siteEl.value.trim();
+        if (newSite !== oldSite) updates.site = newSite;
     }
 
     if (Object.keys(updates).length === 0) {

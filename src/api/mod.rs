@@ -1150,6 +1150,34 @@ pub async fn login_disabled_status(state: web::Data<AppState>) -> HttpResponse {
     HttpResponse::Ok().json(serde_json::json!({ "login_disabled": disabled }))
 }
 
+/// POST /api/settings/site — set the operator-declared site tag on
+/// this node. Called by the master node when an admin edits a remote
+/// node's Site field (push path for immediate effect; gossip still
+/// propagates the value if the push happens to miss). Empty string
+/// clears the tag.
+pub async fn set_site(req: HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let site_raw = body.get("site").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    // Cap at 64 chars so a malformed payload can't bloat the on-disk
+    // file or the gossip payload. Operators use short labels in
+    // practice ("home", "office-vlan10"); anything longer is a typo
+    // or an abuse attempt.
+    if site_raw.len() > 64 {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "site tag too long (max 64 chars)"
+        }));
+    }
+    let new_site = if site_raw.is_empty() { None } else { Some(site_raw.clone()) };
+    {
+        let mut nodes = state.cluster.nodes.write().unwrap();
+        if let Some(node) = nodes.get_mut(&state.cluster.self_id) {
+            node.site = new_site.clone();
+        }
+    }
+    crate::agent::ClusterState::save_self_site(&site_raw);
+    HttpResponse::Ok().json(serde_json::json!({ "site": new_site }))
+}
+
 /// POST /api/settings/login-disabled — set login_disabled on this node (cluster-auth required)
 pub async fn set_login_disabled(req: HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
     // Accept both cluster auth (from remote dashboard) and session auth (local admin)
@@ -3613,11 +3641,26 @@ pub struct UpdateNodeSettings {
     pub cluster_name: Option<String>,
     pub login_disabled: Option<bool>,
     pub update_script: Option<String>,
+    /// Site tag — see `agent::Node::site`. Empty string clears any
+    /// previously-set tag (falls back to auto-derived). Frontend
+    /// sends this from the "Site" field on the node settings card.
+    pub site: Option<String>,
 }
 
 pub async fn update_node_settings(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>, body: web::Json<UpdateNodeSettings>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let id = path.into_inner();
+
+    // Same length cap as the inter-node `set_site` endpoint. Admins
+    // editing via PATCH must not be able to write a longer value
+    // than the propagation push will accept.
+    if let Some(ref s) = body.site {
+        if s.len() > 64 {
+            return HttpResponse::BadRequest().json(serde_json::json!({
+                "error": "site tag too long (max 64 chars)"
+            }));
+        }
+    }
 
     let fp = if body.pve_fingerprint.is_some() {
         Some(body.pve_fingerprint.clone())
@@ -3642,6 +3685,7 @@ pub async fn update_node_settings(req: HttpRequest, state: web::Data<AppState>, 
         cluster_name.clone(),
         body.login_disabled,
         body.update_script.clone(),
+        body.site.clone(),
     ) {
         // If cluster name changed, rename all cluster-scoped data to match.
         // All nodes in the cluster share the same name, so wolfrun services,
@@ -3668,9 +3712,62 @@ pub async fn update_node_settings(req: HttpRequest, state: web::Data<AppState>, 
                     if node.cluster_name.as_deref() == Some(old_name.as_str()) {
                         state.cluster.update_node_settings(
                             &node.id, None, None, None, None, None,
-                            Some(new_name.clone()), None, None,
+                            Some(new_name.clone()), None, None, None,
                         );
                     }
+                }
+            }
+        }
+        // Propagate site to remote WolfStack node so its own
+        // StatusReport carries the new tag immediately — without
+        // this the next gossip tick would still carry the peer's
+        // old site value (or None) and cluster-sync decisions would
+        // lag by a poll cycle.
+        //
+        // Asymmetric-state caveat: gossip only ever carries each
+        // node's OWN site outward, never the master's view of a
+        // remote inward. If this push fails (remote temporarily
+        // unreachable) the remote's self-knowledge stays stale and
+        // its NEXT direct StatusReport will gossip the old value.
+        // The master's local view is still correct, so cluster-sync
+        // initiated from the master uses the new value — but a sync
+        // initiated from the unreached remote would not. We log on
+        // total failure so operators have a trace; no retry queue.
+        if let Some(ref site) = body.site {
+            let node = state.cluster.get_node(&id);
+            if let Some(node) = node {
+                if !node.is_self && node.node_type == "wolfstack" {
+                    let secret = state.cluster_secret.clone();
+                    let address = node.address.clone();
+                    let port = node.port;
+                    let hostname = node.hostname.clone();
+                    let site_val = site.clone();
+                    tokio::spawn(async move {
+                        let client = &*API_HTTP_CLIENT;
+                        let urls = build_node_urls(&address, port, "/api/settings/site");
+                        let payload = serde_json::json!({ "site": site_val });
+                        let mut delivered = false;
+                        for url in &urls {
+                            if let Ok(resp) = client.post(url)
+                                .timeout(std::time::Duration::from_secs(5))
+                                .header("X-WolfStack-Secret", &secret)
+                                .header("Content-Type", "application/json")
+                                .body(payload.to_string())
+                                .send()
+                                .await
+                            {
+                                let _ = resp.bytes().await;
+                                delivered = true;
+                                break;
+                            }
+                        }
+                        if !delivered {
+                            tracing::warn!(
+                                "site propagation push to '{}' ({}:{}) failed on all URLs — remote will keep its previous site until next direct StatusReport",
+                                hostname, address, port
+                            );
+                        }
+                    });
                 }
             }
         }
@@ -3827,6 +3924,11 @@ pub async fn wolfnet_sync_cluster(req: HttpRequest, state: web::Data<AppState>, 
         /// Peers currently in this node's WolfNet config (name, allowed_ip).
         /// Used to prune entries that aren't members of this cluster.
         current_peers: Vec<(String, String)>,
+        /// Operator-declared site tag (or None to auto-derive) — see
+        /// `networking::effective_site` and `pick_wolfnet_endpoint`.
+        /// Drives the LAN-vs-public endpoint decision per (target, peer)
+        /// pair: same effective site → LAN dial; different → public.
+        site: Option<String>,
     }
 
     /// Extract (name, allowed_ip) for every peer in a /local-info response.
@@ -3844,36 +3946,41 @@ pub async fn wolfnet_sync_cluster(req: HttpRequest, state: web::Data<AppState>, 
     /// for `peer`. `None` means "no static endpoint — let WolfNet learn
     /// it via roaming".
     ///
-    /// Two cases:
-    ///   * Target is on a LAN (RFC1918) → peers in the same LAN dial
-    ///     each other directly at their LAN addresses; the LAN
-    ///     gateway / WolfNet relay handles the rest. We keep the
-    ///     pre-22.14.8 behaviour here because the loop / NAT-traversal
-    ///     guards in `decide_peer_endpoint` are oriented at the
-    ///     public-self perspective and would Clear unnecessarily for
-    ///     a same-LAN peer with a public_ip that differs from its
-    ///     lan_address (a perfectly common case behind shared NAT).
-    ///   * Target is on the public internet → delegate to
-    ///     `decide_peer_endpoint` so the wolfnet-subnet-loop and
-    ///     behind-NAT guards fire identically with the auto-reconciler
-    ///     path. This is the only place those guards matter for the
-    ///     sync (the LAN-target case is structurally safe).
+    /// Site-aware decision (klasSponsor 2026-05-29 multi-VLAN fix):
+    ///   * Both target and peer share an effective_site (operator-set
+    ///     or auto-derived from /24 of `lan_address`) → they're on
+    ///     the same physical LAN, so dial peer at its `lan_address`.
+    ///     That's the only configuration where the LAN address is
+    ///     actually reachable from the target.
+    ///   * Different sites (or one untagged in a way that can't match)
+    ///     → fall through to `decide_peer_endpoint` so the public-IP
+    ///     + safety-guards path applies for both LAN-side and
+    ///     public-side targets. Pre-Site, the LAN-target branch
+    ///     unconditionally wrote `peer.lan_address` — on klasSponsor's
+    ///     UniFi multi-VLAN cluster that meant target VLAN 10 dialed
+    ///     a peer at its VLAN 20 address (unreachable), wolfnet roamed
+    ///     to the public IP, then every reload reverted to the
+    ///     unreachable LAN — observable as the endpoint flapping
+    ///     between local and public.
+    ///
+    /// Backward-compat for single-LAN clusters: all nodes share a /24,
+    /// so all auto-derived sites match, so the LAN branch fires
+    /// exactly as before without any operator action.
     fn pick_wolfnet_endpoint(target: &NodeWnInfo, peer: &NodeWnInfo) -> Option<String> {
-        use std::net::Ipv4Addr;
-        let target_addr_priv = target.lan_address.parse::<Ipv4Addr>()
-            .map(crate::networking::is_private_ip)
-            .unwrap_or(true); // unparseable → assume private, keep old behaviour
+        let t_site = crate::networking::effective_site(&target.site, &target.lan_address);
+        let p_site = crate::networking::effective_site(&peer.site, &peer.lan_address);
+        let same_site = matches!((t_site.as_deref(), p_site.as_deref()),
+            (Some(a), Some(b)) if a == b);
 
-        if target_addr_priv {
+        if same_site {
             return Some(format!("{}:{}", peer.lan_address, peer.wolfnet_port));
         }
 
-        // Public-internet target — use the shared decision function so
-        // the loop / NAT / loopback guards apply. We pass our local
-        // wolfnet subnet as a proxy for target's (one cluster = one
-        // wolfnet subnet in practice). Map the result back to
-        // Option<String> for the call site that expects `None` =
-        // "wipe / roaming".
+        // Different sites (or one without a site at all). Use the
+        // shared decision function so the loop / NAT / loopback
+        // guards apply identically with the auto-reconciler path.
+        // Local wolfnet subnet is a proxy for target's (one cluster
+        // = one wolfnet subnet in practice).
         let decision = crate::networking::decide_peer_endpoint(
             &target.lan_address,
             crate::networking::get_local_wolfnet_subnet(),
@@ -3937,6 +4044,7 @@ pub async fn wolfnet_sync_cluster(req: HttpRequest, state: web::Data<AppState>, 
                         public_ip: node.public_ip.clone(),
                         port: node.port,
                         current_peers: extract_peers(&info),
+                        site: node.site.clone(),
                     });
                 }
                 None => {
@@ -3979,6 +4087,7 @@ pub async fn wolfnet_sync_cluster(req: HttpRequest, state: web::Data<AppState>, 
                                 public_ip: node.public_ip.clone(),
                                 port: node.port,
                                 current_peers: extract_peers(&info),
+                                site: node.site.clone(),
                             });
                             fetched = true;
                             break;
@@ -5266,6 +5375,10 @@ pub async fn agent_status(req: HttpRequest, state: web::Data<AppState>) -> HttpR
         // this to decide whether their subnet_routes are complete — see
         // predictive::missing_subnet_route for the analyzer.
         workload_subnets: crate::networking::collect_workload_subnets(),
+        // Self's declared site tag, gossiped so the cluster-sync on
+        // peers can decide whether to dial us at our LAN address or
+        // route over the public IP.
+        site: state.cluster.get_node(&state.cluster.self_id).and_then(|n| n.site),
         license_key: if crate::compat::platform_ready() {
             std::fs::read_to_string(crate::compat::dm_path()).ok().map(|s| s.trim().to_string())
         } else { None },
@@ -8740,6 +8853,7 @@ async fn lxc_remote_clone(
                     update_script: None,
                     self_id: None,
                     workload_subnets: Vec::new(),
+                    site: None,
                 }
             } else {
                 return HttpResponse::NotFound().json(serde_json::json!({"error": "Target node not found"}));
@@ -31301,6 +31415,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/threat-intel/fleet-status", web::get().to(threat_intel_fleet_status))
         .route("/api/settings/login-disabled", web::get().to(login_disabled_status))
         .route("/api/settings/login-disabled", web::post().to(set_login_disabled))
+        .route("/api/settings/site", web::post().to(set_site))
         .route("/api/auth/smtp-configured", web::get().to(smtp_configured))
         .route("/api/auth/forgot-password", web::post().to(forgot_password))
         .route("/api/auth/reset-password", web::post().to(reset_password))
