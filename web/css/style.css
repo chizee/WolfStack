@@ -3963,7 +3963,7 @@ body.sidebar-collapsed #task-log-footer {
 .learn-sidebar {
     flex: 0 0 280px; display: flex; flex-direction: column;
     border: 1px solid var(--border); border-radius: var(--radius-lg);
-    background: var(--bg-card); overflow: hidden;
+    background-color: #0a0e1a; background-image: linear-gradient(var(--bg-card), var(--bg-card)); overflow: hidden;
 }
 .learn-head { padding: 16px 16px 12px; border-bottom: 1px solid var(--border); }
 .learn-head-title { font-size: 16px; font-weight: 700; color: var(--text-primary); }
@@ -4005,7 +4005,7 @@ body.sidebar-collapsed #task-log-footer {
 /* Reading pane */
 .learn-main {
     flex: 1; min-width: 0; overflow-y: auto;
-    border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--bg-card);
+    border: 1px solid var(--border); border-radius: var(--radius-lg); background-color: #0a0e1a; background-image: linear-gradient(var(--bg-card), var(--bg-card));
 }
 .learn-content { padding: 32px 40px; max-width: 760px; margin: 0 auto; width: 100%; outline: none; }
 .learn-loading, .learn-error { padding: 40px; text-align: center; color: var(--text-muted); }
@@ -4074,7 +4074,7 @@ body.sidebar-collapsed #task-log-footer {
     position: fixed; top: 0; right: 0; bottom: 0;
     width: var(--learn-drawer-w); max-width: 100vw;
     display: flex; flex-direction: column;
-    background: var(--bg-card); border-left: 1px solid var(--border);
+    background-color: #0a0e1a; background-image: linear-gradient(var(--bg-card), var(--bg-card)); border-left: 1px solid var(--border);
     box-shadow: -12px 0 40px rgba(0, 0, 0, 0.4);
     z-index: 160;
     transform: translateX(100%);
@@ -4114,8 +4114,12 @@ body.learn-drawer-open #task-log-footer { right: var(--learn-drawer-w) !importan
 .learn-d-content .learn-h1 { font-size: 22px; }
 .learn-d-content .learn-h2 { font-size: 17px; }
 .learn-d-toc {
-    position: absolute; inset: 0; overflow-y: auto;
-    padding: 8px; background: var(--bg-card);
+    position: absolute; inset: 0; overflow-y: auto; padding: 8px;
+    /* Opaque even on translucent themes (glass sets --bg-card to rgba ~0.72):
+       a solid base under the theme card tint, so the lessons list never lets
+       the lesson text behind it bleed through and become unreadable. */
+    background-color: #0a0e1a;
+    background-image: linear-gradient(var(--bg-card), var(--bg-card));
 }
 .learn-d-toc[hidden] { display: none; }
 
