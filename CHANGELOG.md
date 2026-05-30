@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v24.12.0: one-click Let's Encrypt in the proxy editor + Galera cluster manager** _(2026-05-30 — [`73dc3d3`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/73dc3d398b24279a8cf7fb5d3530220ba1c16ebd))_
 - **v24.11.0: restore from a folder / to a different place (disaster recovery)** _(2026-05-30 — [`9c12421`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/9c12421cc6884bdcc111114297ba9080637c3c68))_
 - **v24.10.1: fix unreadable lessons menu on translucent themes** _(2026-05-30 — [`aa58129`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/aa58129004e12765828b5170b8ffc0ea69fbfeae))_
 - **v24.10.0: configurable local backup directory + hide server address in top bar** _(2026-05-30 — [`9cea370`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/9cea370502e2acae387624ab31183a3eb83cd78e))_
