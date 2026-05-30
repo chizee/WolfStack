@@ -267,6 +267,7 @@
                 <button class="btn btn-icon" onclick="selectView('settings')" title="Settings"><span class="ws-icon-clean-wrap" data-icon="settings"></span></button>
                 <button class="btn btn-icon" onclick="window.open('https://wolfscale.org', '_blank')"
                     title="Help & Docs"><span class="ws-icon-clean-wrap" data-icon="help"></span></button>
+                <button class="btn btn-icon" onclick="selectView('learn')" title="Getting Started"><span class="ws-icon-clean-wrap" data-icon="compass"></span></button>
                 <button class="btn btn-icon" onclick="openAddServerModal()" title="Add Server"><span class="ws-icon-clean-wrap" data-icon="add"></span></button>
                 <button class="btn btn-icon mobile-only" onclick="toggleTaskLogMobile()" title="Task Log" id="sidebar-tasklog-btn"><span class="ws-icon-clean-wrap" data-icon="clipboard"></span></button>
                 <button class="btn btn-icon" onclick="handleLogout()" title="Sign Out"><span class="ws-icon-clean-wrap" data-icon="door"></span></button>
@@ -395,6 +396,21 @@
                      still disabled. Dismissible via localStorage. -->
                 <div id="dc-docker-updates-nudge" style="display:none;"></div>
 
+                <!-- Getting Started nudge. Shown to new operators until they
+                     dismiss it or complete a few lessons. Dismiss state lives
+                     in localStorage. Mirrors the docker-updates nudge pattern
+                     above — caught here, the overwhelmed first-timer finds the
+                     course before they bounce back to a bare hypervisor. -->
+                <div id="dc-learn-banner" class="learn-banner" style="display:none;" role="region" aria-label="Getting started with WolfStack">
+                    <span class="learn-banner-icon" aria-hidden="true"><span class="ws-icon-clean-wrap" data-icon="compass"></span></span>
+                    <div class="learn-banner-text">
+                        <strong>New to WolfStack?</strong>
+                        <span>Take the short Getting Started course — one calm step at a time, nothing overwhelming.</span>
+                    </div>
+                    <button type="button" class="learn-banner-go" onclick="selectView('learn')">Start here →</button>
+                    <button type="button" class="learn-banner-dismiss" onclick="dismissLearnBanner()" title="Dismiss" aria-label="Dismiss getting started banner">&times;</button>
+                </div>
+
                 <!-- Map + Bookmarks Row -->
                 <div class="dc-top-row" style="display: grid; grid-template-columns: 1fr 2fr; gap: 12px; margin-bottom: 12px;">
                     <!-- World Map -->
@@ -518,7 +534,36 @@
             </div>
 
             <!-- ═══ Dashboard Page (per-server) ═══ -->
-            <div id="page-dashboard" class="page-view" style="display:none;">
+            <!-- ===================== Getting Started course ("Learn") =====================
+             Renders the bundled markdown lessons from /learn/*.md one at a time.
+             Built to rescue first-time users who find the full UI overwhelming:
+             a single calm step per lesson, never a wall of options. Progress is
+             tracked client-side in localStorage. Logic lives in app.js (learn*). -->
+        <div id="page-learn" class="page-view" style="display:none;">
+            <div class="learn-wrap">
+                <aside class="learn-sidebar">
+                    <div class="learn-head">
+                        <div class="learn-head-title">Getting Started</div>
+                        <div class="learn-head-sub">A calm, one-step-at-a-time tour of WolfStack.</div>
+                    </div>
+                    <div class="learn-progress">
+                        <div class="learn-progress-track"><span id="learn-progress-fill" class="learn-progress-fill"></span></div>
+                        <div id="learn-progress-label" class="learn-progress-label">0 of 0 complete</div>
+                    </div>
+                    <nav id="learn-toc" class="learn-toc" aria-label="Course lessons"></nav>
+                    <button type="button" class="learn-reset" onclick="learnResetProgress()">Reset progress</button>
+                </aside>
+                <main class="learn-main">
+                    <article id="learn-content" class="learn-content" tabindex="-1"></article>
+                    <div class="learn-footer-nav">
+                        <button type="button" id="learn-prev" class="learn-btn learn-btn-secondary" onclick="learnPrev()">&larr; Previous</button>
+                        <button type="button" id="learn-complete" class="learn-btn learn-btn-primary" onclick="learnCompleteAndNext()">Mark complete &amp; continue &rarr;</button>
+                    </div>
+                </main>
+            </div>
+        </div>
+
+        <div id="page-dashboard" class="page-view" style="display:none;">
 
                 <!-- System Details (Neofetch) -->
                 <div class="card"

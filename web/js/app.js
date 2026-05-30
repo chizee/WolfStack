@@ -1868,7 +1868,7 @@ function selectView(page) {
     document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
     document.querySelector(`.nav-item[data-page="${page}"]`)?.classList.add('active');
 
-    const titles = { datacenter: 'Datacenter', settings: 'Settings', docs: 'Help & Documentation', appstore: 'App Store', issues: 'Issues', inbox: 'Predictive Inbox', 'global-wolfnet': 'Global View', kubernetes: 'WolfKube', topology: '3D Server Room', wolfflow: 'WolfFlow', wolfagents: 'WolfAgents', 'cluster-browser': 'Cluster Browser', databases: 'Databases', 'control-panel': 'Control Panel', array: 'Storage Array', xopools: 'XO Pools', tenants: 'Tenants', 'fleet-security': 'Fleet Security', 'dashboard-sync': 'Dashboard Sync' };
+    const titles = { datacenter: 'Datacenter', learn: 'Getting Started', settings: 'Settings', docs: 'Help & Documentation', appstore: 'App Store', issues: 'Issues', inbox: 'Predictive Inbox', 'global-wolfnet': 'Global View', kubernetes: 'WolfKube', topology: '3D Server Room', wolfflow: 'WolfFlow', wolfagents: 'WolfAgents', 'cluster-browser': 'Cluster Browser', databases: 'Databases', 'control-panel': 'Control Panel', array: 'Storage Array', xopools: 'XO Pools', tenants: 'Tenants', 'fleet-security': 'Fleet Security', 'dashboard-sync': 'Dashboard Sync' };
     document.getElementById('page-title').textContent = titles[page] || page;
 
     if (page === 'datacenter') {
@@ -1928,6 +1928,8 @@ function selectView(page) {
         renderFleetSecurity();
     } else if (page === 'dashboard-sync') {
         dashboardSyncLoad();
+    } else if (page === 'learn') {
+        learnInit();
     }
 
     // Restore task log toggle button when leaving topology
@@ -3544,6 +3546,11 @@ function renderDatacenterOverview() {
     document.getElementById('dc-online-servers').textContent = onlineCount;
     document.getElementById('dc-offline-servers').textContent = nodes.length - onlineCount;
     document.getElementById('dc-total-components').textContent = totalComponents;
+
+    // Nudge first-time operators toward the Getting Started course. Lives
+    // here (not just in selectView) so it also fires on initial dashboard
+    // load. Self-gates on the dismiss flag + lessons completed.
+    if (typeof maybeShowLearnBanner === 'function') maybeShowLearnBanner();
 
     const container = document.getElementById('datacenter-servers');
     if (nodes.length === 0) {
@@ -51312,6 +51319,377 @@ async function wolfAgentsLoadMemory(id) {
 // fenced code blocks, inline code, bold/italic, links, bullet + numbered
 // lists, and simple headings. Deliberately does NOT try to be a full
 // markdown parser — misformatted edge cases degrade to escaped text.
+// ===================================================================
+// Getting Started course ("Learn" view).
+//
+// Renders the bundled markdown lessons under web/learn/*.md one at a
+// time, with localStorage progress. Built to rescue first-time users
+// who find the full WolfStack UI overwhelming — one calm step per
+// lesson, never a wall of options. Entry points: the compass button in
+// the sidebar footer, the Apps & Tools drawer tile, and the dismissible
+// dashboard banner. Content is the single source of truth (markdown) so
+// it can also be mirrored onto the public website unchanged.
+// ===================================================================
+const LEARN_COURSE = [
+    { title: 'Find your feet', lessons: [
+        { id: '1-1', title: 'What WolfStack is', mins: 3, file: '1-1-what-is-wolfstack.md' },
+        { id: '1-2', title: 'A 2-minute tour of the screen', mins: 2, file: '1-2-screen-tour.md' },
+        { id: '1-3', title: 'The only six things you need', mins: 3, file: '1-3-six-things.md' },
+    ] },
+    { title: 'Your servers', lessons: [
+        { id: '2-1', title: 'You already have a server', mins: 2, file: '2-1-you-have-a-server.md' },
+        { id: '2-2', title: 'Adding another server', mins: 4, file: '2-2-add-a-server.md' },
+    ] },
+    { title: 'Your first app', lessons: [
+        { id: '3-1', title: 'Install from the App Store', mins: 5, file: '3-1-install-from-app-store.md' },
+        { id: '3-2', title: 'Find it and open it', mins: 3, file: '3-2-find-and-open-it.md' },
+    ] },
+    { title: 'Build a container yourself', lessons: [
+        { id: '4-1', title: 'Docker, LXC or VM?', mins: 4, file: '4-1-docker-lxc-vm.md' },
+        { id: '4-2', title: 'Make a Docker container', mins: 5, file: '4-2-make-docker.md' },
+        { id: '4-3', title: 'Make an LXC container', mins: 5, file: '4-3-make-lxc.md' },
+    ] },
+    { title: 'Get a terminal', lessons: [
+        { id: '5-1', title: 'Open a shell on a server', mins: 3, file: '5-1-server-shell.md' },
+        { id: '5-2', title: 'Open a shell in a container', mins: 3, file: '5-2-container-shell.md' },
+    ] },
+    { title: 'Keep your data safe', lessons: [
+        { id: '6-1', title: 'Back something up now', mins: 4, file: '6-1-backup-now.md' },
+        { id: '6-2', title: 'Automatic backups', mins: 3, file: '6-2-schedule-backups.md' },
+    ] },
+    { title: 'Stay ahead of problems', lessons: [
+        { id: '7-1', title: 'The Issues page', mins: 3, file: '7-1-issues-page.md' },
+        { id: '7-2', title: 'Get alerts on your phone', mins: 4, file: '7-2-alerts.md' },
+        { id: '7-3', title: 'Put up a status page', mins: 5, file: '7-3-status-page.md' },
+    ] },
+    { title: 'When you are ready for more', lessons: [
+        { id: '8-1', title: 'The map of everything else', mins: 4, file: '8-1-the-map.md' },
+        { id: '8-2', title: 'How to get unstuck', mins: 3, file: '8-2-getting-unstuck.md' },
+    ] },
+];
+
+const LEARN_PROGRESS_KEY = 'wolfstack_learn_progress';
+const LEARN_LAST_KEY = 'wolfstack_learn_last';
+const LEARN_BANNER_KEY = 'wolfstack_learn_banner_dismissed';
+let _learnCache = {};
+let _learnCurrentId = null;
+
+function learnFlatLessons() {
+    const out = [];
+    LEARN_COURSE.forEach(m => m.lessons.forEach(l => out.push(l)));
+    return out;
+}
+
+function learnLoadProgress() {
+    try {
+        const raw = localStorage.getItem(LEARN_PROGRESS_KEY);
+        return raw ? JSON.parse(raw) : {};
+    } catch (_) { return {}; }
+}
+
+function learnSaveProgress(p) {
+    try { localStorage.setItem(LEARN_PROGRESS_KEY, JSON.stringify(p)); } catch (_) {}
+}
+
+function learnIsDone(id) {
+    return !!learnLoadProgress()[id];
+}
+
+// Entry hook from selectView('learn'). Safe to call repeatedly.
+function learnInit() {
+    learnRenderToc();
+    learnUpdateProgress();
+    // Resume at the last-viewed lesson; otherwise the first not-yet-done
+    // lesson; otherwise lesson one.
+    const flat = learnFlatLessons();
+    let target = null;
+    try { target = localStorage.getItem(LEARN_LAST_KEY); } catch (_) {}
+    if (!target || !flat.some(l => l.id === target)) {
+        const prog = learnLoadProgress();
+        const firstIncomplete = flat.find(l => !prog[l.id]);
+        target = firstIncomplete ? firstIncomplete.id : flat[0].id;
+    }
+    learnOpenLesson(target);
+}
+
+function learnRenderToc() {
+    const toc = document.getElementById('learn-toc');
+    if (!toc) return;
+    const prog = learnLoadProgress();
+    let html = '';
+    LEARN_COURSE.forEach(mod => {
+        html += `<div class="learn-toc-mod">${escapeHtml(mod.title)}</div>`;
+        mod.lessons.forEach(l => {
+            const done = !!prog[l.id];
+            const active = l.id === _learnCurrentId;
+            html += `<button type="button" class="learn-toc-item${active ? ' active' : ''}${done ? ' done' : ''}" onclick="learnOpenLesson('${l.id}')">`
+                + `<span class="learn-toc-check" aria-hidden="true">${done ? '&#10003;' : ''}</span>`
+                + `<span class="learn-toc-label">${escapeHtml(l.title)}</span>`
+                + `<span class="learn-toc-mins">${l.mins}m</span>`
+                + `</button>`;
+        });
+    });
+    toc.innerHTML = html;
+}
+
+function learnUpdateProgress() {
+    const flat = learnFlatLessons();
+    const prog = learnLoadProgress();
+    const done = flat.filter(l => prog[l.id]).length;
+    const total = flat.length;
+    const pct = total ? Math.round((done / total) * 100) : 0;
+    const fill = document.getElementById('learn-progress-fill');
+    const label = document.getElementById('learn-progress-label');
+    if (fill) fill.style.width = pct + '%';
+    if (label) label.textContent = `${done} of ${total} complete`;
+}
+
+async function learnOpenLesson(id) {
+    const flat = learnFlatLessons();
+    const lesson = flat.find(l => l.id === id);
+    if (!lesson) return;
+    _learnCurrentId = id;
+    try { localStorage.setItem(LEARN_LAST_KEY, id); } catch (_) {}
+    learnRenderToc();
+    const content = document.getElementById('learn-content');
+    if (!content) return;
+    let md = _learnCache[lesson.file];
+    if (md === undefined) {
+        content.innerHTML = '<div class="learn-loading">Loading lesson&hellip;</div>';
+        try {
+            const r = await fetch('/learn/' + lesson.file, { cache: 'no-store' });
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            md = await r.text();
+            _learnCache[lesson.file] = md;
+        } catch (e) {
+            // Visible, copyable error in the DOM — never a silent console-only failure.
+            content.innerHTML = `<div class="learn-error" role="alert">`
+                + `<strong>Couldn't load this lesson.</strong><br>`
+                + `${escapeHtml(String((e && e.message) || e))}.<br>`
+                + `Please check your connection and try again.</div>`;
+            learnUpdateNavButtons();
+            return;
+        }
+    }
+    content.innerHTML = learnMd(md);
+    learnUpdateNavButtons();
+    // Scroll the lesson into view and move focus for keyboard/SR users.
+    const main = document.querySelector('.learn-main');
+    if (main) main.scrollTop = 0;
+    try { content.focus({ preventScroll: true }); } catch (_) {}
+}
+
+function learnUpdateNavButtons() {
+    const flat = learnFlatLessons();
+    const idx = flat.findIndex(l => l.id === _learnCurrentId);
+    const prevBtn = document.getElementById('learn-prev');
+    const compBtn = document.getElementById('learn-complete');
+    if (prevBtn) prevBtn.style.visibility = idx > 0 ? 'visible' : 'hidden';
+    if (compBtn) {
+        const done = learnIsDone(_learnCurrentId);
+        const isLast = idx === flat.length - 1;
+        if (isLast && done) {
+            compBtn.innerHTML = '&#10003; Course complete';
+        } else if (isLast) {
+            compBtn.innerHTML = 'Mark complete &amp; finish &#10003;';
+        } else {
+            compBtn.innerHTML = done ? 'Next lesson &rarr;' : 'Mark complete &amp; continue &rarr;';
+        }
+    }
+}
+
+function learnPrev() {
+    const flat = learnFlatLessons();
+    const idx = flat.findIndex(l => l.id === _learnCurrentId);
+    if (idx > 0) learnOpenLesson(flat[idx - 1].id);
+}
+
+function learnCompleteAndNext() {
+    const prog = learnLoadProgress();
+    prog[_learnCurrentId] = true;
+    learnSaveProgress(prog);
+    learnUpdateProgress();
+    const flat = learnFlatLessons();
+    const idx = flat.findIndex(l => l.id === _learnCurrentId);
+    if (idx > -1 && idx < flat.length - 1) {
+        learnOpenLesson(flat[idx + 1].id);
+    } else {
+        // Finished the final lesson — celebrate and stay put.
+        learnRenderToc();
+        learnUpdateNavButtons();
+        if (typeof showToast === 'function') {
+            showToast('\u{1F389} You finished the Getting Started course. Nicely done.', 'success');
+        }
+    }
+}
+
+async function learnResetProgress() {
+    let ok = true;
+    if (typeof showConfirm === 'function') {
+        ok = await showConfirm('Reset your course progress? This only clears the ticks — the lessons stay.', 'Reset progress');
+    }
+    if (!ok) return;
+    try { localStorage.removeItem(LEARN_PROGRESS_KEY); } catch (_) {}
+    learnUpdateProgress();
+    learnRenderToc();
+    learnUpdateNavButtons();
+    if (typeof showToast === 'function') showToast('Course progress reset.', 'info');
+}
+
+// Dashboard banner: shown until the operator dismisses it or completes a
+// few lessons. Called from selectView's datacenter branch.
+function maybeShowLearnBanner() {
+    const el = document.getElementById('dc-learn-banner');
+    if (!el) return;
+    let dismissed = false;
+    try { dismissed = localStorage.getItem(LEARN_BANNER_KEY) === '1'; } catch (_) {}
+    const prog = learnLoadProgress();
+    const doneCount = Object.keys(prog).filter(k => prog[k]).length;
+    el.style.display = (dismissed || doneCount >= 3) ? 'none' : 'flex';
+}
+
+function dismissLearnBanner() {
+    try { localStorage.setItem(LEARN_BANNER_KEY, '1'); } catch (_) {}
+    const el = document.getElementById('dc-learn-banner');
+    if (el) el.style.display = 'none';
+}
+
+// Build (possibly nested) list HTML from a contiguous run of markdown list
+// lines starting at `start`. Nesting is by leading indentation, so a numbered
+// list keeps counting correctly across nested bullet sub-lists instead of
+// restarting at 1. Returns [html, nextIndex]. Inline markup in each item was
+// already converted before the line loop, so item text is spliced verbatim.
+function learnBuildList(lines, start) {
+    const itemRe = /^(\s*)(?:[-*]|\d+\.)\s+(.*)$/;
+    const ordRe = /^\s*\d+\.\s+/;
+    const items = [];
+    let i = start;
+    while (i < lines.length) {
+        const m = lines[i].match(itemRe);
+        if (!m) break;
+        items.push({ indent: m[1].replace(/\t/g, '    ').length, ordered: ordRe.test(lines[i]), text: m[2] });
+        i++;
+    }
+    return [learnRenderListItems(items, 0, items.length), i];
+}
+
+// Recursively render items[lo..hi) as one list level; deeper-indented runs
+// become nested lists attached inside their parent <li>.
+function learnRenderListItems(items, lo, hi) {
+    if (lo >= hi) return '';
+    const ordered = items[lo].ordered;
+    const baseIndent = items[lo].indent;
+    let body = '';
+    let k = lo;
+    while (k < hi) {
+        let j = k + 1;
+        while (j < hi && items[j].indent > baseIndent) j++;
+        let li = items[k].text;
+        if (j > k + 1) li += learnRenderListItems(items, k + 1, j);
+        body += `<li>${li}</li>`;
+        k = j;
+    }
+    const tag = ordered ? 'ol' : 'ul';
+    return `<${tag} class="learn-list">${body}</${tag}>`;
+}
+
+// Lesson markdown renderer. Modeled on _wolfAgentsMarkdown (escape-first,
+// fenced-code placeholders) but emits class-based elements so lesson
+// typography is fully theme-aware via CSS, and adds blockquote callouts
+// and pipe tables that the course uses. NOTE: source is HTML-escaped up
+// front, so blockquote markers arrive as "&gt;", matched accordingly.
+function learnMd(src) {
+    let s = escapeHtml(src || '');
+    // Fenced code blocks first — protect their contents from inline rules.
+    const blocks = [];
+    const nonce = Math.random().toString(36).slice(2, 12) + Math.random().toString(36).slice(2, 12);
+    s = s.replace(/```([a-zA-Z0-9_-]*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+        const idx = blocks.length;
+        blocks.push(code);
+        return `\u0000LC_${nonce}_${idx}\u0000`;
+    });
+    // Inline: code, bold, italic, links.
+    s = s.replace(/`([^`\n]+)`/g, '<code class="learn-code">$1</code>');
+    s = s.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+    s = s.replace(/(^|[^*\w])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>');
+    s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+|mailto:[^\s)]+)\)/g, (_, text, url) => {
+        const href = url
+            .replace(/&amp;/g, '&').replace(/&lt;/g, '%3C').replace(/&gt;/g, '%3E')
+            .replace(/&quot;/g, '%22').replace(/&#039;/g, '%27');
+        return `<a href="${href}" target="_blank" rel="noopener noreferrer">${text}</a>`;
+    });
+    // Headings.
+    s = s.replace(/(^|\n)### (.+)/g, '$1<h3 class="learn-h3">$2</h3>');
+    s = s.replace(/(^|\n)## (.+)/g, '$1<h2 class="learn-h2">$2</h2>');
+    s = s.replace(/(^|\n)# (.+)/g, '$1<h1 class="learn-h1">$2</h1>');
+    // Block elements, line by line: tables, lists, blockquotes.
+    const lines = s.split('\n');
+    const out = [];
+    let i = 0;
+    while (i < lines.length) {
+        const ln = lines[i];
+        const isList = /^\s*(?:[-*]|\d+\.)\s+/.test(ln);
+        const bq = ln.match(/^\s*&gt;\s?(.*)$/);
+        const isRow = /^\s*\|(.+)\|\s*$/.test(ln);
+        const sepNext = (i + 1 < lines.length)
+            && lines[i + 1].includes('-')
+            && /^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$/.test(lines[i + 1]);
+        if (isRow && sepNext) {
+            const cells = (row) => row.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|').map(c => c.trim());
+            const header = cells(ln);
+            i += 2; // header + separator
+            let body = '';
+            while (i < lines.length && /^\s*\|(.+)\|\s*$/.test(lines[i])) {
+                const r = cells(lines[i]);
+                body += '<tr>' + header.map((_, ci) => `<td>${r[ci] || ''}</td>`).join('') + '</tr>';
+                i++;
+            }
+            const head = '<tr>' + header.map(h => `<th>${h}</th>`).join('') + '</tr>';
+            out.push(`<table class="learn-table"><thead>${head}</thead><tbody>${body}</tbody></table>`);
+            continue;
+        }
+        if (isList) {
+            const built = learnBuildList(lines, i);
+            out.push(built[0]);
+            i = built[1];
+            continue;
+        }
+        if (bq) {
+            const items = [];
+            while (i < lines.length) {
+                const m = lines[i].match(/^\s*&gt;\s?(.*)$/);
+                if (!m) break;
+                items.push(m[1]);
+                i++;
+            }
+            out.push(`<blockquote class="learn-callout">${items.join('<br>')}</blockquote>`);
+            continue;
+        }
+        out.push(ln);
+        i++;
+    }
+    s = out.join('\n');
+    // Paragraphs.
+    s = s.replace(/\n{2,}/g, '</p><p class="learn-p">');
+    s = s.replace(/\n/g, '<br>');
+    s = '<p class="learn-p">' + s + '</p>';
+    // Lift block-level elements out of the paragraph wrappers the naive
+    // paragraph pass put them in: strip the <p> that opens immediately
+    // before a block and the </p> that closes immediately after one, then
+    // drop the empties. Done directionally (not as a balanced match) so a
+    // single <p> wrapping a nested <ol><li><ul>…</ul></li></ol> is handled.
+    const blk = '(?:h1|h2|h3|ul|ol|blockquote|table)';
+    s = s.replace(new RegExp(`<p class="learn-p">\\s*(<${blk}\\b)`, 'g'), '$1');
+    s = s.replace(new RegExp(`(</${blk}>)\\s*</p>`, 'g'), '$1');
+    s = s.replace(/<p class="learn-p">\s*<\/p>/g, '');
+    s = s.replace(new RegExp(`<br>\\s*(<${blk}\\b)`, 'g'), '$1');
+    s = s.replace(new RegExp(`(</${blk}>)\\s*<br>`, 'g'), '$1');
+    // Restore fenced code blocks.
+    const rx = new RegExp(`\\u0000LC_${nonce}_(\\d+)\\u0000`, 'g');
+    s = s.replace(rx, (_, idx) => `<pre class="learn-pre"><code>${blocks[parseInt(idx, 10)]}</code></pre>`);
+    return s;
+}
+
 function _wolfAgentsMarkdown(src) {
     let s = escapeHtml(src || '');
     // Fenced code blocks first — their contents should NOT get further
@@ -60501,6 +60879,10 @@ window.predTermClose = predTermClose;
 // drawer.
 
 const APP_DRAWER_TILES = [
+    {
+        id: 'learn', icon: '', name: 'Getting Started',
+        desc: 'New here? A short, calm course — one step at a time. Install an app, take a backup, set up alerts, without the overwhelm.',
+    },
     {
         id: 'fleet-security', icon: '', name: 'Fleet Security',
         desc: 'Fleet-wide root-password rotation, lockout policy, blocked IPs, exposed ports — every cluster you manage, one screen.',
