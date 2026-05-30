@@ -14818,6 +14818,18 @@ pub async fn galera_provision_stream(req: HttpRequest, state: web::Data<AppState
     })
 }
 
+/// Build the runtime context galera ops need to route per-node work to the host
+/// that runs each container (cross-host / migrated clusters). Captures the
+/// current tokio handle so the blocking galera code can drive inter-node HTTP.
+fn galera_op_ctx(state: &web::Data<AppState>) -> crate::galera::GaleraOpCtx {
+    crate::galera::GaleraOpCtx {
+        self_id: crate::agent::self_node_id(),
+        nodes: state.cluster.get_all_nodes(),
+        cluster_secret: state.cluster_secret.clone(),
+        rt: tokio::runtime::Handle::current(),
+    }
+}
+
 /// POST /api/galera/clusters/{id}/recover — evidence-based recovery: stop all
 /// nodes, bootstrap the most-advanced (highest grastate seqno), rejoin the rest.
 /// Refuses to act when no node reports a known position. SSE progress.
@@ -14828,9 +14840,10 @@ pub async fn galera_recover_stream(req: HttpRequest, state: web::Data<AppState>,
         Some(c) => c,
         None => return HttpResponse::NotFound().json(serde_json::json!({ "error": format!("cluster '{}' not found", id) })),
     };
+    let ctx = galera_op_ctx(&state);
     galera_stream_job(move |tx| {
         let _ = tx.send(format!("Recovering cluster '{}'…", cluster.name));
-        match crate::galera::recover_cluster(&cluster, &tx) {
+        match crate::galera::recover_cluster(&cluster, &tx, &ctx) {
             Ok(msg) => { let _ = tx.send(format!("RESULT:OK:{}", msg)); }
             Err(e) => { let _ = tx.send(format!("RESULT:ERR:{}", e)); }
         }
@@ -14838,7 +14851,7 @@ pub async fn galera_recover_stream(req: HttpRequest, state: web::Data<AppState>,
 }
 
 /// POST /api/galera/clusters/{id}/nodes/{container}/{action} — start/stop/restart
-/// MariaDB on one node of a managed cluster.
+/// MariaDB on one node, routed to the host that currently runs the container.
 pub async fn galera_node_action(req: HttpRequest, state: web::Data<AppState>, path: web::Path<(String, String, String)>) -> HttpResponse {
     if let Err(e) = require_auth(&req, &state) { return e; }
     let (id, container, action) = path.into_inner();
@@ -14846,8 +14859,27 @@ pub async fn galera_node_action(req: HttpRequest, state: web::Data<AppState>, pa
         Some(c) => c,
         None => return HttpResponse::NotFound().json(serde_json::json!({ "error": format!("cluster '{}' not found", id) })),
     };
-    match web::block(move || crate::galera::node_service(&cluster, &container, &action)).await {
+    let ctx = galera_op_ctx(&state);
+    match web::block(move || crate::galera::node_service(&cluster, &container, &action, &ctx)).await {
         Ok(Ok(_)) => HttpResponse::Ok().json(serde_json::json!({ "ok": true })),
+        Ok(Err(e)) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e.to_string() })),
+    }
+}
+
+/// POST /api/galera/local/{op}/{container} — run ONE galera node op on a
+/// container that lives on THIS host. The cluster-owning node calls this on
+/// peer hosts (over the inter-node channel) to manage nodes that sit elsewhere.
+/// Accepts a session OR the inter-node cluster secret (both via require_auth).
+pub async fn galera_local_node_op(req: HttpRequest, state: web::Data<AppState>, path: web::Path<(String, String)>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let (op_s, container) = path.into_inner();
+    let op = match crate::galera::NodeOp::from_str(&op_s) {
+        Some(o) => o,
+        None => return HttpResponse::BadRequest().json(serde_json::json!({ "error": format!("unknown galera node op '{}'", op_s) })),
+    };
+    match web::block(move || crate::galera::local_node_op(&container, op)).await {
+        Ok(Ok(output)) => HttpResponse::Ok().json(serde_json::json!({ "ok": true, "output": output })),
         Ok(Err(e)) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e.to_string() })),
     }
@@ -32583,6 +32615,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/galera/provision", web::post().to(galera_provision_stream))
         .route("/api/galera/clusters/{id}/recover", web::post().to(galera_recover_stream))
         .route("/api/galera/clusters/{id}/nodes/{container}/{action}", web::post().to(galera_node_action))
+        .route("/api/galera/local/{op}/{container}", web::post().to(galera_local_node_op))
         // PBS (Proxmox Backup Server) — must be before {id} routes
         .route("/api/backups/pbs/status", web::get().to(pbs_status))
         .route("/api/backups/pbs/snapshots", web::get().to(pbs_snapshots))

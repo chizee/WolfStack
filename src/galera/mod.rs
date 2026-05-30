@@ -24,6 +24,11 @@ use std::path::Path;
 const GALERA_CONFIG_PATH: &str = "/etc/wolfstack/galera.json";
 const GALERA_SECRET_PURPOSE: &[u8] = b"galera-cluster-secret-v1";
 
+/// Serializes read-modify-write cycles on galera.json so concurrent writers
+/// (a recovery self-heal racing an adopt/provision/delete) can't clobber each
+/// other's update. Held only across sync file IO — never across an `.await`.
+static GALERA_IO_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn default_mysql_port() -> u16 { 3306 }
 fn default_sst() -> String { "mariabackup".into() }
 fn default_db_user() -> String { "root".into() }
@@ -124,21 +129,25 @@ pub fn upsert_cluster(mut cluster: GaleraCluster, plain_password: Option<&str>) 
         }
     }
 
-    // Never trust a client-supplied ciphertext: the stored secret is derived
-    // ONLY from a fresh plaintext. When none is given (an edit that omits the
-    // password), preserve whatever we already had for this id.
-    let existing_enc = get_cluster(&cluster.id).map(|c| c.db_password_enc).unwrap_or_default();
-    cluster.db_password_enc = match plain_password {
-        Some(pw) if !pw.is_empty() => enc_secret(pw),
-        _ => existing_enc,
-    };
-
     for n in cluster.nodes.iter_mut() {
         if n.node_name.trim().is_empty() {
             n.node_name = n.container.clone();
         }
     }
+
+    // Hold the IO lock across the read-modify-write so a concurrent writer
+    // (e.g. a recovery self-heal) can't clobber this save. No `.await` inside.
+    let _io = GALERA_IO_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut cfg = load_config();
+    // Never trust a client-supplied ciphertext: the stored secret is derived
+    // ONLY from a fresh plaintext. When none is given (an edit that omits the
+    // password), preserve whatever we already had for this id.
+    let existing_enc = cfg.clusters.iter().find(|c| c.id == cluster.id)
+        .map(|c| c.db_password_enc.clone()).unwrap_or_default();
+    cluster.db_password_enc = match plain_password {
+        Some(pw) if !pw.is_empty() => enc_secret(pw),
+        _ => existing_enc,
+    };
     match cfg.clusters.iter_mut().find(|c| c.id == cluster.id) {
         Some(slot) => *slot = cluster.clone(),
         None => cfg.clusters.push(cluster.clone()),
@@ -148,6 +157,7 @@ pub fn upsert_cluster(mut cluster: GaleraCluster, plain_password: Option<&str>) 
 }
 
 pub fn delete_cluster(id: &str) -> Result<(), String> {
+    let _io = GALERA_IO_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut cfg = load_config();
     let before = cfg.clusters.len();
     cfg.clusters.retain(|c| c.id != id);
@@ -323,7 +333,9 @@ fn logln(log: &Sender<String>, msg: impl Into<String>) {
 /// Validate a name that will be interpolated into a shell command — keeps the
 /// provisioner from ever building a command from attacker-controlled input.
 fn safe_token(s: &str) -> Result<(), String> {
-    if s.is_empty() || s.len() > 64
+    // Reject `..` too: these names ride in inter-node URL path segments
+    // (/api/galera/local/{op}/{container}), so a `..` would be path traversal.
+    if s.is_empty() || s.len() > 64 || s.contains("..")
         || !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
     {
         return Err(format!("invalid name '{}' (allowed: letters, digits, - _ .)", s));
@@ -578,7 +590,56 @@ pub fn provision_cluster(p: &ProvisionRequest, log: &Sender<String>) -> Result<G
     Ok(saved)
 }
 
-// ── Lifecycle + evidence-based recovery ──────────────────────────────
+// ── Lifecycle + evidence-based recovery (host-aware) ─────────────────
+//
+// A cluster's containers can live on different WolfStack hosts (an adopted
+// cross-host cluster, or a provisioned one whose containers were later
+// migrated). lxc-attach only works on the host a container physically sits on,
+// so every per-node op is dispatched to that host: run locally if it's this
+// node, else POST to the host's `/api/galera/local/{op}/{container}` primitive
+// over the inter-node channel. We find a container's CURRENT host by probing
+// (so a migrated container is reached where it now lives) and self-heal the
+// stored host. This requires the container's host to be in the same WolfStack
+// cluster — otherwise there's nothing to route through.
+
+/// One atomic node operation, dispatched locally or to a peer host.
+#[derive(Clone, Copy, PartialEq)]
+pub enum NodeOp { Start, Stop, Restart, Bootstrap, Seqno, IsDown, Exists }
+
+impl NodeOp {
+    fn as_str(self) -> &'static str {
+        match self {
+            NodeOp::Start => "start", NodeOp::Stop => "stop", NodeOp::Restart => "restart",
+            NodeOp::Bootstrap => "bootstrap", NodeOp::Seqno => "seqno",
+            NodeOp::IsDown => "isdown", NodeOp::Exists => "exists",
+        }
+    }
+    pub fn from_str(s: &str) -> Option<NodeOp> {
+        Some(match s {
+            "start" => NodeOp::Start, "stop" => NodeOp::Stop, "restart" => NodeOp::Restart,
+            "bootstrap" => NodeOp::Bootstrap, "seqno" => NodeOp::Seqno,
+            "isdown" => NodeOp::IsDown, "exists" => NodeOp::Exists,
+            _ => return None,
+        })
+    }
+    /// Per-op remote timeout. Read-only probes are fast and shouldn't tie up a
+    /// blocking slot if a peer hangs; service/bootstrap ops legitimately take time.
+    fn timeout_secs(self) -> u64 {
+        match self {
+            NodeOp::Seqno | NodeOp::IsDown | NodeOp::Exists => 20,
+            NodeOp::Start | NodeOp::Stop | NodeOp::Restart | NodeOp::Bootstrap => 180,
+        }
+    }
+}
+
+/// Runtime context for routing per-node ops to the host that runs each
+/// container. Built once per request from AppState.
+pub struct GaleraOpCtx {
+    pub self_id: String,
+    pub nodes: Vec<crate::agent::Node>,
+    pub cluster_secret: String,
+    pub rt: tokio::runtime::Handle,
+}
 
 /// Read the last-committed seqno from a node's grastate.dat. Returns -1 when
 /// unknown (file missing, or the node crashed mid-transaction = `-1`).
@@ -589,44 +650,189 @@ fn node_seqno(container: &str) -> i64 {
         .unwrap_or(-1)
 }
 
-/// Recover a fully-stopped cluster. Stops every node, reads each grastate
-/// seqno, bootstraps the MOST-ADVANCED node, then rejoins the rest. Refuses to
-/// act if no node has a known position — guessing there is how data is lost.
-pub fn recover_cluster(cluster: &GaleraCluster, log: &Sender<String>) -> Result<String, String> {
+/// Is this LXC container present on THIS host?
+fn container_exists_local(container: &str) -> bool {
+    crate::containers::lxc_list_all_cached().iter().any(|c| c.name == container)
+}
+
+/// Is MariaDB stopped in this (local) container? Unreadable ⇒ false (can't
+/// confirm ⇒ treat as not-down, so recovery refuses rather than risks data).
+fn node_is_down_local(container: &str) -> bool {
+    lxc_exec(container, "if pgrep -x mariadbd >/dev/null 2>&1 || pgrep -x mysqld >/dev/null 2>&1; then echo UP; else echo DOWN; fi")
+        .map(|s| s.trim() == "DOWN")
+        .unwrap_or(false)
+}
+
+/// Bootstrap a NEW primary component on this (local) container. We force
+/// safe_to_bootstrap:1 deliberately — the caller has already proven (every node
+/// down + this one holding the highest committed seqno) what that flag certifies.
+fn bootstrap_local(container: &str) -> Result<String, String> {
+    lxc_exec(container, "sed -i 's/^safe_to_bootstrap:.*/safe_to_bootstrap: 1/' /var/lib/mysql/grastate.dat 2>/dev/null || true")?;
+    lxc_exec(container, "galera_new_cluster 2>/dev/null || (systemctl set-environment _WSREP_NEW_CLUSTER='--wsrep-new-cluster' >/dev/null 2>&1; systemctl start mariadb)")?;
+    Ok("bootstrapped".into())
+}
+
+/// Run ONE node op against a container that lives on THIS host. The single
+/// entry point the local-op HTTP primitive calls. `Exists` is the probe used to
+/// locate a container's host; every other op first requires the container here.
+pub fn local_node_op(container: &str, op: NodeOp) -> Result<String, String> {
+    safe_token(container)?;
+    if op == NodeOp::Exists {
+        return Ok(if container_exists_local(container) { "yes".into() } else { "no".into() });
+    }
+    if !container_exists_local(container) {
+        return Err(format!("container '{}' is not on this host", container));
+    }
+    match op {
+        NodeOp::Start => svc(container, "start"),
+        NodeOp::Stop => svc(container, "stop"),
+        NodeOp::Restart => svc(container, "restart"),
+        NodeOp::Seqno => Ok(node_seqno(container).to_string()),
+        NodeOp::IsDown => Ok(if node_is_down_local(container) { "down".into() } else { "up".into() }),
+        NodeOp::Bootstrap => bootstrap_local(container),
+        NodeOp::Exists => unreachable!(),
+    }
+}
+
+/// Run a node op on a peer host via its `/api/galera/local/{op}/{container}`
+/// primitive, authenticated with the cluster secret. Tries the standard URL
+/// fallback list (HTTPS / WolfNet / HTTP).
+fn remote_op(ctx: &GaleraOpCtx, host: &str, container: &str, op: NodeOp) -> Result<String, String> {
+    let target = ctx.nodes.iter().find(|n| n.id == host)
+        .ok_or_else(|| format!("host '{}' is not a node in this cluster", host))?;
+    let path = format!("/api/galera/local/{}/{}", op.as_str(), container);
+    let urls = crate::api::build_node_urls(&target.address, target.port, &path);
+    let secret = ctx.cluster_secret.clone();
+    ctx.rt.block_on(async move {
+        let mut last = format!("could not reach host '{}'", host);
+        for url in &urls {
+            match crate::api::API_HTTP_CLIENT.post(url)
+                .header("X-WolfStack-Secret", &secret)
+                .timeout(std::time::Duration::from_secs(op.timeout_secs()))
+                .send().await
+            {
+                Ok(resp) => {
+                    let ok = resp.status().is_success();
+                    let v: serde_json::Value = resp.json().await.unwrap_or_default();
+                    if ok {
+                        return Ok(v.get("output").and_then(|o| o.as_str()).unwrap_or("").to_string());
+                    }
+                    last = v.get("error").and_then(|e| e.as_str()).unwrap_or("remote error").to_string();
+                }
+                Err(e) => last = e.to_string(),
+            }
+        }
+        Err(last)
+    })
+}
+
+/// Run a node op against `host` — local fast-path when it's this node.
+fn run_op(ctx: &GaleraOpCtx, host: &str, container: &str, op: NodeOp) -> Result<String, String> {
+    if host.is_empty() || host == ctx.self_id {
+        local_node_op(container, op)
+    } else {
+        remote_op(ctx, host, container, op)
+    }
+}
+
+/// Does `host` currently run `container`? Local check for self, `Exists` probe
+/// for a peer. Unreachable peers answer "no" (skip), not an error.
+fn exists_on_host(ctx: &GaleraOpCtx, host: &str, container: &str) -> bool {
+    if host.is_empty() || host == ctx.self_id {
+        return container_exists_local(container);
+    }
+    remote_op(ctx, host, container, NodeOp::Exists)
+        .map(|o| o.trim() == "yes")
+        .unwrap_or(false)
+}
+
+/// Find which WolfStack host currently runs `container`. Tries the recorded
+/// host first (one check in the common case), then this node, then every other
+/// cluster node — so a migrated container is located where it now lives.
+fn locate_host(ctx: &GaleraOpCtx, container: &str, recorded: &str) -> Result<String, String> {
+    let mut candidates: Vec<String> = Vec::new();
+    for id in std::iter::once(recorded.to_string())
+        .chain(std::iter::once(ctx.self_id.clone()))
+        .chain(ctx.nodes.iter().map(|n| n.id.clone()))
+    {
+        if !id.is_empty() && !candidates.contains(&id) {
+            candidates.push(id);
+        }
+    }
+    for host in &candidates {
+        if exists_on_host(ctx, host, container) {
+            return Ok(host.clone());
+        }
+    }
+    Err(format!(
+        "container '{}' was not found on any WolfStack node in this cluster — \
+         confirm its host is part of this cluster and the container exists.",
+        container))
+}
+
+/// Self-heal the stored host for a container when discovery found it elsewhere
+/// (e.g. after a migration), so status + future ops target the right host.
+fn persist_node_host(cluster_id: &str, container: &str, host: &str) {
+    if host.is_empty() { return; }
+    let _io = GALERA_IO_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut cfg = load_config();
+    let mut changed = false;
+    if let Some(c) = cfg.clusters.iter_mut().find(|c| c.id == cluster_id)
+        && let Some(n) = c.nodes.iter_mut().find(|n| n.container == container)
+        && n.node_id != host
+    {
+        n.node_id = host.to_string();
+        changed = true;
+    }
+    if changed { let _ = save_config(&cfg); }
+}
+
+/// Recover a fully-stopped cluster. Locates each node's current host, stops
+/// every node, reads each grastate seqno, bootstraps the MOST-ADVANCED node,
+/// then rejoins the rest. Refuses to act unless every node is confirmed down
+/// and at least one reports a known position — guessing there is how data is lost.
+pub fn recover_cluster(cluster: &GaleraCluster, log: &Sender<String>, ctx: &GaleraOpCtx) -> Result<String, String> {
     if cluster.nodes.is_empty() {
         return Err("cluster has no nodes".into());
     }
+    // Resolve each node's CURRENT host once (handles migration) + self-heal.
+    let mut located: Vec<(GaleraNode, String)> = Vec::with_capacity(cluster.nodes.len());
     for n in &cluster.nodes {
+        let host = locate_host(ctx, &n.container, &n.node_id)
+            .map_err(|e| format!("[{}] {}", n.container, e))?;
+        persist_node_host(&cluster.id, &n.container, &host);
+        located.push((n.clone(), host));
+    }
+    for (n, host) in &located {
         logln(log, format!("[{}] stopping mariadb to flush its position…", n.container));
-        let _ = svc(&n.container, "stop");
+        let _ = run_op(ctx, host, &n.container, NodeOp::Stop);
     }
     // Verify every node is actually DOWN before reading positions. A node still
     // running reports seqno -1 (grastate is only written on clean shutdown), and
     // bootstrapping while another node is live corrupts the cluster. If we can't
-    // confirm a node is stopped (including: container unreachable), refuse — a
-    // wrong bootstrap here rolls the database back. Data safety > convenience.
-    for n in &cluster.nodes {
-        let down = lxc_exec(&n.container,
-            "if pgrep -x mariadbd >/dev/null 2>&1 || pgrep -x mysqld >/dev/null 2>&1; then echo UP; else echo DOWN; fi")
-            .map(|s| s.trim() == "DOWN")
-            .unwrap_or(false); // unreadable ⇒ can't confirm ⇒ treat as not-down
+    // confirm a node is stopped (including: host unreachable), refuse — a wrong
+    // bootstrap here rolls the database back. Data safety > convenience.
+    for (n, host) in &located {
+        let down = run_op(ctx, host, &n.container, NodeOp::IsDown)
+            .map(|s| s.trim() == "down").unwrap_or(false);
         if !down {
             return Err(format!(
                 "Node '{}' is still running or unreachable after stop — refusing to recover. \
                  A clean recovery needs every node stopped so its committed position is on disk. \
-                 Stop MariaDB there (and confirm the container is reachable), then retry.",
+                 Stop MariaDB there (and confirm its host is reachable), then retry.",
                 n.container));
         }
     }
-    let mut best: Option<(GaleraNode, i64)> = None;
-    for n in &cluster.nodes {
-        let seq = node_seqno(&n.container);
+    let mut best: Option<(GaleraNode, String, i64)> = None;
+    for (n, host) in &located {
+        let seq = run_op(ctx, host, &n.container, NodeOp::Seqno)
+            .ok().and_then(|s| s.trim().parse::<i64>().ok()).unwrap_or(-1);
         logln(log, format!("[{}] grastate seqno = {}", n.container, seq));
-        if best.as_ref().map(|(_, b)| seq > *b).unwrap_or(true) {
-            best = Some((n.clone(), seq));
+        if best.as_ref().map(|(_, _, b)| seq > *b).unwrap_or(true) {
+            best = Some((n.clone(), host.clone(), seq));
         }
     }
-    let (boot, boot_seq) = best.ok_or("could not read any node state")?;
+    let (boot, boot_host, boot_seq) = best.ok_or("could not read any node state")?;
     if boot_seq < 0 {
         return Err(
             "No node reports a known committed position (all seqno = -1). \
@@ -636,27 +842,29 @@ pub fn recover_cluster(cluster: &GaleraCluster, log: &Sender<String>) -> Result<
         );
     }
     logln(log, format!("[{}] is most-advanced (seqno {}) — bootstrapping it.", boot.container, boot_seq));
-    // We deliberately force safe_to_bootstrap:1 on the most-advanced survivor —
-    // overriding Galera's own guard — because the seqno evidence above (every
-    // node confirmed down + this one holding the highest committed position) is
-    // exactly what that flag is meant to certify.
-    lxc_exec(&boot.container, "sed -i 's/^safe_to_bootstrap:.*/safe_to_bootstrap: 1/' /var/lib/mysql/grastate.dat 2>/dev/null || true")?;
-    lxc_exec(&boot.container, "galera_new_cluster 2>/dev/null || (systemctl set-environment _WSREP_NEW_CLUSTER='--wsrep-new-cluster' >/dev/null 2>&1; systemctl start mariadb)")?;
-    for n in &cluster.nodes {
+    run_op(ctx, &boot_host, &boot.container, NodeOp::Bootstrap)?;
+    for (n, host) in &located {
         if n.container == boot.container { continue; }
         logln(log, format!("[{}] rejoining…", n.container));
-        let _ = svc(&n.container, "start");
+        let _ = run_op(ctx, host, &n.container, NodeOp::Start);
     }
     Ok(format!("Recovered from '{}' (seqno {}); rejoined {} node(s).", boot.container, boot_seq, cluster.nodes.len() - 1))
 }
 
-/// Start / stop / restart MariaDB on one node of a cluster (lifecycle).
-pub fn node_service(cluster: &GaleraCluster, container: &str, action: &str) -> Result<String, String> {
-    if !cluster.nodes.iter().any(|n| n.container == container) {
-        return Err(format!("'{}' is not a node of this cluster", container));
-    }
-    if !matches!(action, "start" | "stop" | "restart") {
-        return Err("action must be start, stop or restart".into());
-    }
-    svc(container, action)
+/// Start / stop / restart MariaDB on one node of a cluster (lifecycle),
+/// dispatched to the host that currently runs the container.
+pub fn node_service(cluster: &GaleraCluster, container: &str, action: &str, ctx: &GaleraOpCtx) -> Result<String, String> {
+    let recorded = match cluster.nodes.iter().find(|n| n.container == container) {
+        Some(n) => n.node_id.clone(),
+        None => return Err(format!("'{}' is not a node of this cluster", container)),
+    };
+    let op = match action {
+        "start" => NodeOp::Start,
+        "stop" => NodeOp::Stop,
+        "restart" => NodeOp::Restart,
+        _ => return Err("action must be start, stop or restart".into()),
+    };
+    let host = locate_host(ctx, container, &recorded)?;
+    persist_node_host(&cluster.id, container, &host);
+    run_op(ctx, &host, container, op)
 }

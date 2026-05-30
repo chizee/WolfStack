@@ -63252,9 +63252,11 @@ function galeraClusterCardHtml(c) {
         const cid = escapeAttr(c.id), cont = escapeAttr(n.container);
         const act = (label, action, cls) =>
             `<button class="btn btn-sm" title="${label} MariaDB on ${escapeAttr(n.container)}" data-galera-act="node" data-cid="${cid}" data-cont="${cont}" data-action="${action}" style="padding:2px 8px;font-size:11px;${cls || ''}">${label}</button>`;
+        const hostLabel = n.node_id ? galeraHostName(n.node_id) : '—';
         return `<tr style="border-top:1px solid var(--border);">
             <td style="padding:6px 8px;font-family:var(--font-mono,monospace);font-size:12px;">${escapeHtml(n.container)}</td>
             <td style="padding:6px 8px;font-family:var(--font-mono,monospace);font-size:12px;color:var(--text-muted);">${escapeHtml(n.address)}:${escapeHtml(String(n.port || 3306))}</td>
+            <td style="padding:6px 8px;font-size:12px;color:var(--text-muted);" title="Host that runs this container (updates automatically if it's migrated)">${escapeHtml(hostLabel)}</td>
             <td style="padding:6px 8px;">${galeraNodeStateBadge(ns)}</td>
             <td style="padding:6px 8px;font-size:12px;">${escapeHtml(String(prim))}</td>
             <td style="padding:6px 8px;font-size:12px;text-align:center;">${escapeHtml(String(size))}</td>
@@ -63293,12 +63295,13 @@ function galeraClusterCardHtml(c) {
                     <thead><tr style="text-align:left;color:var(--text-muted);font-size:11px;text-transform:uppercase;letter-spacing:.4px;">
                         <th style="padding:4px 8px;">Container</th>
                         <th style="padding:4px 8px;">Address</th>
+                        <th style="padding:4px 8px;">Host</th>
                         <th style="padding:4px 8px;">State</th>
                         <th style="padding:4px 8px;">Cluster</th>
                         <th style="padding:4px 8px;text-align:center;">Size</th>
                         <th style="padding:4px 8px;text-align:right;">Lifecycle</th>
                     </tr></thead>
-                    <tbody>${rows || `<tr><td colspan="6" style="padding:10px;color:var(--text-muted);">No nodes registered.</td></tr>`}</tbody>
+                    <tbody>${rows || `<tr><td colspan="7" style="padding:10px;color:var(--text-muted);">No nodes registered.</td></tr>`}</tbody>
                 </table>
             </div>
         </div>
