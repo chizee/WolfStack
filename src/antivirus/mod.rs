@@ -1457,6 +1457,12 @@ fn clamav_user_present() -> bool {
 ///
 /// Idempotent and silent — every WolfStack restart runs it; healthy
 /// hosts no-op in microseconds.
+///
+/// Two-step as of 2026-05-30 (Gary/KO4BSR): step 1 heals the cause
+/// (missing user), step 2 converges the *symptom* — a `logrotate.service`
+/// left in systemd's `failed` state, which the prior gens fixed the cause
+/// for but never cleared, so the dashboard stayed red for up to a day.
+/// See [`converge_stale_logrotate_failure`].
 pub fn startup_self_heal_clamav_user() {
     if !std::path::Path::new("/etc/logrotate.d/clamav-freshclam").exists() {
         return;
@@ -1465,22 +1471,104 @@ pub fn startup_self_heal_clamav_user() {
     if distro_family_with_idlike(&distro, &id_like) != "debian" {
         return;
     }
-    if clamav_user_present() {
-        return;
-    }
-    // User missing despite the logrotate config being installed — heal
-    // before the next logrotate cron/timer tick. Log via tracing so the
-    // action shows up in journalctl for post-mortem if needed.
-    tracing::warn!(
-        "ClamAV 'clamav' user missing despite /etc/logrotate.d/clamav-freshclam being installed; \
-         creating user to stop logrotate failures (piranhaSponsor 2026-05-27)"
-    );
-    let healed = ensure_clamav_user_silent();
-    if !healed {
-        tracing::error!(
-            "Failed to auto-create the 'clamav' user; logrotate's clamav-freshclam config will keep failing. \
-             Hand-fix with: `adduser --system --group clamav`"
+
+    // Step 1 — heal the cause. The clamav-freshclam logrotate snippet
+    // rotates as the clamav user (`su clamav clamav`), so a missing user
+    // fails that rotation and, because logrotate aborts the run on the
+    // first erroring config, takes the WHOLE logrotate.service down with
+    // it. Create the user if it's absent.
+    if !clamav_user_present() {
+        tracing::warn!(
+            "ClamAV 'clamav' user missing despite /etc/logrotate.d/clamav-freshclam being installed; \
+             creating user to stop logrotate failures (piranhaSponsor 2026-05-27)"
         );
+        if !ensure_clamav_user_silent() {
+            tracing::error!(
+                "Failed to auto-create the 'clamav' user; logrotate's clamav-freshclam config will keep failing. \
+                 Hand-fix with: `adduser --system --group clamav`"
+            );
+            return; // cause not fixed — nothing to converge yet
+        }
+    }
+
+    // Step 2 — converge the unit. Healing the cause does NOT un-fail a
+    // systemd oneshot: logrotate.service stays `failed` until its next
+    // successful run, which the daily timer may not deliver for ~24h —
+    // so the health monitor and dashboard keep showing red long after the
+    // problem is gone (Gary/KO4BSR, 2026-05-30). Re-run logrotate the way
+    // the timer would and clear the stale failure only if it genuinely
+    // succeeds; if it still fails, surface logrotate's own words so the
+    // journal carries a definitive cause (e.g. the modern "insecure
+    // permissions" check on an unrelated logdir, which user-creation can
+    // never fix) instead of a silent red unit.
+    converge_stale_logrotate_failure();
+}
+
+/// Clear a stale `logrotate.service` failure once its cause is healed,
+/// but only on real evidence — never by blindly masking the unit.
+///
+/// systemd keeps a failed oneshot red until its next *successful* run, so
+/// fixing the underlying config doesn't reset the state on its own. We
+/// re-run `logrotate /etc/logrotate.conf` exactly as the daily timer does
+/// — NO `--force`, so only due logs rotate and the exit code mirrors what
+/// the timer's next tick would produce. On exit 0 we `reset-failed` so the
+/// monitor reflects reality immediately. On any non-zero exit we log
+/// logrotate's stderr at error level (it names the true culprit) and leave
+/// the unit failed — an honest red beats a hidden one, and the line we
+/// emit becomes the diagnostic artifact for the next fix.
+///
+/// Gated on the unit actually being failed, so healthy hosts never run
+/// logrotate off-schedule. Errors invoking systemctl/logrotate are
+/// tolerated — worst case the unit simply stays red until the timer ticks.
+fn converge_stale_logrotate_failure() {
+    let is_failed = Command::new("systemctl")
+        .args(["is-failed", "logrotate.service"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "failed")
+        .unwrap_or(false);
+    if !is_failed {
+        return; // nothing stale to clear
+    }
+
+    // /etc/logrotate.conf is the canonical entrypoint and pulls in every
+    // /etc/logrotate.d/* snippet, so this exercises the same set the timer
+    // does. No --force: we want the timer's true success/fail semantics,
+    // not a forced rotation with side effects on logs that aren't due.
+    let run = Command::new("logrotate")
+        .arg("/etc/logrotate.conf")
+        .output();
+    match run {
+        Ok(o) if o.status.success() => {
+            let _ = Command::new("systemctl")
+                .args(["reset-failed", "logrotate.service"])
+                .status();
+            tracing::info!(
+                "logrotate ran cleanly after clamav self-heal; cleared stale logrotate.service failed state"
+            );
+        }
+        Ok(o) => {
+            // Still broken — keep the red and hand the operator the reason.
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let tail = stderr
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .rev()
+                .take(5)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join(" | ");
+            tracing::error!(
+                "logrotate still fails after clamav self-heal (exit {:?}); leaving logrotate.service failed. \
+                 logrotate said: {}",
+                o.status.code(),
+                if tail.is_empty() { "(no stderr captured)".to_string() } else { tail },
+            );
+        }
+        Err(e) => {
+            tracing::error!("could not run logrotate to verify clamav self-heal: {}", e);
+        }
     }
 }
 
