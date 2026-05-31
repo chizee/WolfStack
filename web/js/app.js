@@ -63217,16 +63217,16 @@ async function galeraLoadClusters() {
         lists.forEach((list, i) => {
             const fetchHost = targets[i];
             (Array.isArray(list) ? list : []).forEach(c => {
-                // Legacy clusters (built before owner_node existed) come back with
-                // no owner — they live on whichever host just returned them, so
-                // route ops there instead of falling back to the wrong node (404).
-                if (!c.owner_node && fetchHost) c.owner_node = fetchHost;
-                const auth = !fetchHost || c.owner_node === fetchHost;
-                const ex = byId[c.id];
-                if (!ex || (auth && !ex.auth)) byId[c.id] = { c, auth };
+                // Route this cluster's ops to the host we ACTUALLY found its
+                // config on — that host holds the galera.json definition (it just
+                // returned it), so status/recover/etc. resolve there. The stored
+                // owner_node can be stale or point at the build host rather than
+                // the config host (the cause of "owning host 404").
+                if (fetchHost) c.owner_node = fetchHost;
+                if (!byId[c.id]) byId[c.id] = c;
             });
         });
-        galeraState.clusters = Object.keys(byId).map(k => byId[k].c);
+        galeraState.clusters = Object.keys(byId).map(k => byId[k]);
     } catch (e) {
         if (myGen !== galeraState.gen) return;
         galeraState.clusters = [];
