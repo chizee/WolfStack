@@ -63223,7 +63223,7 @@ async function galeraLoadClusters() {
     galeraRender();
     // Live status per cluster → routed to the host that owns its definition.
     (galeraState.clusters || []).forEach(c => {
-        fetch(galeraNodeBase(c.owner_node, 'clusters/' + encodeURIComponent(c.id) + '/status'))
+        fetch(galeraNodeBase(galeraClusterOwner(c), 'clusters/' + encodeURIComponent(c.id) + '/status'))
             .then(r => (r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status))))
             .then(st => { if (myGen === galeraState.gen) { galeraState.statuses[c.id] = st; galeraRender(); } })
             .catch(e => { if (myGen === galeraState.gen) { galeraState.statusErrors[c.id] = (e && e.message) || 'unreachable'; galeraRender(); } });
@@ -63296,7 +63296,9 @@ function galeraClusterCardHtml(c) {
         </tr>`;
     }).join('');
 
-    const summary = st ? escapeHtml(st.summary || '') : 'Querying node status…';
+    const summary = st ? escapeHtml(st.summary || '')
+        : (statusErr ? `<span style="color:var(--danger);">Couldn't reach the owning host for status: ${escapeHtml(statusErr)}</span>`
+                     : 'Querying node status…');
     const splitWarn = st && st.split_brain
         ? `<div role="alert" style="margin:10px 0;padding:8px 12px;border:1px solid #ef4444;border-radius:6px;background:#ef444411;color:#fca5a5;font-size:12px;">
              Split-brain detected — the cluster has fractured into separate components. Use <b>Recover</b> to stop every node, find the most up-to-date one, and rebuild around it. WolfStack will refuse to bootstrap a node whose position is unknown.
@@ -63650,10 +63652,16 @@ async function galeraAdoptSubmit() {
 
 // ── Lifecycle + recovery ─────────────────────────────────────────────
 
-// Route a cluster's ops to the host whose galera.json owns its definition.
+// The host whose galera.json owns a cluster's definition. Falls back to the
+// first node's host for older configs written without owner_node.
+function galeraClusterOwner(c) {
+    return (c && c.owner_node) || (c && c.nodes && c.nodes[0] && c.nodes[0].node_id) || '';
+}
+
+// Route a cluster's ops to the host that owns its definition.
 function galeraOwnerBase(clusterId, path) {
     const c = (galeraState.clusters || []).find(x => x.id === clusterId);
-    return galeraNodeBase(c ? c.owner_node : '', path);
+    return galeraNodeBase(galeraClusterOwner(c), path);
 }
 
 async function galeraNodeAction(clusterId, container, action) {

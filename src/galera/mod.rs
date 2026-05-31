@@ -236,10 +236,12 @@ pub struct ClusterStatus {
 
 pub async fn cluster_status(cluster: &GaleraCluster) -> ClusterStatus {
     let pw = dec_secret(&cluster.db_password_enc);
-    let mut nodes = Vec::with_capacity(cluster.nodes.len());
-    for n in &cluster.nodes {
-        nodes.push(node_status(n, &cluster.db_user, &pw).await);
-    }
+    // Query every node CONCURRENTLY — a slow/unreachable node must not stack its
+    // 5s connect timeout onto the others and blow the node-proxy deadline (which
+    // surfaces as a useless "status unavailable" instead of per-node detail).
+    let nodes: Vec<NodeStatus> = futures::future::join_all(
+        cluster.nodes.iter().map(|n| node_status(n, &cluster.db_user, &pw))
+    ).await;
 
     let reachable: Vec<&NodeStatus> = nodes.iter().filter(|s| s.reachable).collect();
     let uuids: HashSet<&str> = reachable.iter()
@@ -536,14 +538,66 @@ fn wait_container_ready(container: &str) {
          done");
 }
 
-/// Install with a few retries — a transient dpkg lock or mirror hiccup on a
-/// brand-new container shouldn't abort the whole provision.
-fn run_install(container: &str, install: &str) -> Result<String, String> {
+/// Like `cexec`, but STREAMS the command's combined output line-by-line to the
+/// SSE log so the operator watches a long install/bootstrap happen live (a real
+/// terminal feel) instead of staring at a frozen "installing…". stderr is
+/// merged into stdout so we read a single pipe (no two-pipe deadlock).
+fn cexec_streamed(kind: &str, container: &str, cmd: &str, log: &Sender<String>) -> Result<(), String> {
+    use std::io::{BufReader, Read};
+    use std::process::Stdio;
+    let merged = format!("{{ {} ; }} 2>&1", cmd);
+    let mut command = if kind == "docker" {
+        let mut c = std::process::Command::new("docker");
+        c.arg("exec").arg(container).arg("sh").arg("-c").arg(&merged);
+        c
+    } else if std::process::Command::new("which").arg("pct").output().map(|o| o.status.success()).unwrap_or(false) {
+        let mut c = std::process::Command::new("pct");
+        c.arg("exec").arg(container).arg("--").arg("sh").arg("-c").arg(&merged);
+        c
+    } else {
+        let mut c = std::process::Command::new("lxc-attach");
+        c.arg("-n").arg(container).arg("--").arg("sh").arg("-c").arg(&merged);
+        c
+    };
+    command.stdout(Stdio::piped()).stderr(Stdio::null());
+    let mut child = command.spawn().map_err(|e| format!("{} exec {}: {}", kind, container, e))?;
+    if let Some(out) = child.stdout.take() {
+        let mut reader = BufReader::new(out);
+        let mut byte = [0u8; 1];
+        let mut line = String::new();
+        while reader.read(&mut byte).unwrap_or(0) > 0 {
+            let ch = byte[0] as char;
+            if ch == '\n' || ch == '\r' {
+                let t = line.trim_end();
+                if !t.is_empty() { let _ = log.send(format!("  {}", t)); }
+                line.clear();
+            } else {
+                line.push(ch);
+            }
+        }
+        let t = line.trim_end();
+        if !t.is_empty() { let _ = log.send(format!("  {}", t)); }
+    }
+    let status = child.wait().map_err(|e| format!("[{}] wait failed: {}", container, e))?;
+    if status.success() { Ok(()) } else { Err(format!("[{}] command failed (see output above)", container)) }
+}
+
+/// Install MariaDB+Galera with a few retries (a transient dpkg lock or mirror
+/// hiccup shouldn't abort the provision), streaming live output to the log.
+fn run_install(container: &str, install: &str, log: &Sender<String>) -> Result<(), String> {
     let mut last = String::new();
     for attempt in 1..=3 {
-        match lxc_exec(container, install) {
-            Ok(o) => return Ok(o),
-            Err(e) => { last = e; if attempt < 3 { let _ = lxc_exec(container, "sleep 5"); } }
+        match cexec_streamed("lxc", container, install, log) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last = e;
+                if attempt < 3 {
+                    logln(log, format!("[{}] install attempt {} failed — retrying in 5s…", container, attempt));
+                    // Host-side sleep: an in-container `sleep` would itself fail
+                    // when the container is the reason the install failed.
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                }
+            }
         }
     }
     Err(last)
@@ -588,13 +642,31 @@ pub fn provision_cluster(p: &ProvisionRequest, log: &Sender<String>) -> Result<G
         nodes.push(GaleraNode { node_id: p.node_id.clone(), container: cname.clone(), kind: "lxc".into(), address: ip, port: 3306, node_name: cname.clone() });
     }
 
+    // Persist the definition NOW — before the long install — so the cluster
+    // appears in the list immediately and survives the operator closing the
+    // progress window or a mid-build failure (they can watch it, retry, or
+    // forget it). Status shows "unreachable" until MariaDB is actually up.
+    logln(log, format!("Registered '{}' — building {} node(s)…", p.cluster_name, nodes.len()));
+    let saved = upsert_cluster(GaleraCluster {
+        id: cluster_id,
+        name: p.cluster_name.clone(),
+        cluster: p.cluster.clone(),
+        owner_node: String::new(), // filled by upsert_cluster = this (build) node
+        nodes: nodes.clone(),
+        sst_method: p.sst_method.clone(),
+        db_user: "root".into(),
+        db_password_enc: String::new(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        provisioned: true,
+    }, Some(&p.root_password))?;
+
     // 2. Install MariaDB + Galera on each node (after its init settles).
     let install = install_cmd(&p.distribution)?;
     for n in &nodes {
         logln(log, format!("[{}] waiting for container to be ready…", n.container));
         wait_container_ready(&n.container);
         logln(log, format!("[{}] installing MariaDB + Galera…", n.container));
-        run_install(&n.container, install)?;
+        run_install(&n.container, install, log)?;
         let _ = svc("lxc", &n.container, "stop"); // configure offline; bootstrap explicitly below
     }
 
@@ -642,19 +714,7 @@ pub fn provision_cluster(p: &ProvisionRequest, log: &Sender<String>) -> Result<G
         svc("lxc", &n.container, "start")?;
     }
 
-    logln(log, "Verifying cluster size…");
-    let saved = upsert_cluster(GaleraCluster {
-        id: cluster_id,
-        name: p.cluster_name.clone(),
-        cluster: p.cluster.clone(),
-        owner_node: String::new(), // filled by upsert_cluster = this (build) node
-        nodes,
-        sst_method: p.sst_method.clone(),
-        db_user: "root".into(),
-        db_password_enc: String::new(),
-        created_at: chrono::Utc::now().to_rfc3339(),
-        provisioned: true,
-    }, Some(&p.root_password))?;
+    logln(log, "All nodes joined — cluster is up.");
     Ok(saved)
 }
 
