@@ -357,6 +357,43 @@ mod tests {
         assert_eq!(format_pbs_fingerprint(&format!("  {coloned}\n")), coloned);
     }
 
+    fn pbs(user: &str, token: &str) -> BackupStorage {
+        BackupStorage {
+            storage_type: StorageType::Pbs,
+            pbs_user: user.to_string(),
+            pbs_token_name: token.to_string(),
+            pbs_server: "pbs.example.com".to_string(),
+            pbs_datastore: "store".to_string(),
+            ..BackupStorage::default()
+        }
+    }
+
+    #[test]
+    fn pbs_repo_token_form_when_user_has_realm_only() {
+        assert_eq!(pbs_repo_string(&pbs("root@pam", "wolfstack-backup")),
+                   "root@pam!wolfstack-backup@pbs.example.com:store");
+    }
+
+    #[test]
+    fn pbs_repo_does_not_double_the_token_when_user_already_has_it() {
+        // Operator pasted the whole `root@pam!wolfstack-backup` into the user
+        // field AND set the token name — must not produce a doubled `!token`.
+        assert_eq!(pbs_repo_string(&pbs("root@pam!wolfstack-backup", "wolfstack-backup")),
+                   "root@pam!wolfstack-backup@pbs.example.com:store");
+    }
+
+    #[test]
+    fn pbs_repo_full_token_in_user_with_no_token_name() {
+        assert_eq!(pbs_repo_string(&pbs("root@pam!wolfstack-backup", "")),
+                   "root@pam!wolfstack-backup@pbs.example.com:store");
+    }
+
+    #[test]
+    fn pbs_repo_password_auth_no_token() {
+        assert_eq!(pbs_repo_string(&pbs("root@pam", "")),
+                   "root@pam@pbs.example.com:store");
+    }
+
     #[test]
     fn pbs_fingerprint_non_sha256_passes_through_untouched() {
         // Not a clean 64-char hex string → returned trimmed, never mangled.
@@ -1962,7 +1999,12 @@ fn store_remote(local_path: &Path, remote_url: &str, filename: &str) -> Result<(
 
 /// Build the PBS repository string: user!token@server:datastore
 fn pbs_repo_string(storage: &BackupStorage) -> String {
-    if !storage.pbs_token_name.is_empty() {
+    // PBS token auth repo form: `user@realm!tokenid@server:datastore`.
+    // Only append the token id when the user field doesn't ALREADY carry it —
+    // operators often paste the whole `root@pam!wolfstack-backup` (the form the
+    // PBS UI shows) into the user field, and doubling the `!tokenid` produces an
+    // invalid principal that PBS rejects as "token disabled or expired".
+    if !storage.pbs_token_name.is_empty() && !storage.pbs_user.contains('!') {
         format!("{}!{}@{}:{}", storage.pbs_user, storage.pbs_token_name,
                 storage.pbs_server, storage.pbs_datastore)
     } else {
@@ -4722,8 +4764,13 @@ pub fn list_pbs_snapshots(storage: &BackupStorage) -> Result<serde_json::Value, 
         .map_err(|e| format!("Failed to run proxmox-backup-client: {}", e))?;
 
     if !output.status.success() {
-        return Err(format!("PBS snapshot list failed: {}",
-            String::from_utf8_lossy(&output.stderr)));
+        // Surface the exact repository (no secret — just user!token@host:store
+        // and the auth method) so a connection failure is self-diagnosing.
+        let auth = if !storage.pbs_token_secret.is_empty() { "API token" }
+                   else if !storage.pbs_password.is_empty() { "password" }
+                   else { "no credentials" };
+        return Err(format!("PBS snapshot list failed [repo {}, auth {}]: {}",
+            repo, auth, String::from_utf8_lossy(&output.stderr).trim()));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
