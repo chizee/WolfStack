@@ -8,6 +8,8 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v24.12.7: fix PBS token auth — doubled principal when the full token is in the name field** _(2026-05-31 — [`398f17d`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/398f17d961dc979dfee4b283648d123ac0020aef))_
+- **v24.12.6: Galera per-node SQL terminal, replication charts, and a tuning analyzer** _(2026-05-31 — [`9b4a7cc`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/9b4a7cc490fc5a8aa1dc65a8a4947d0f823b8e7f))_
 - **v24.12.5: Galera create — live terminal output, persist-on-create, faster status** _(2026-05-31 — [`304b881`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/304b881f41f17c44fd6b2e1aff83e666fffd9c72))_
 - **v24.12.4: PBS token-auth — don't double the token id, and show the repo on failure** _(2026-05-31 — [`14b5683`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/14b568331658c1044e437150998078245a635a1e))_
 - **v24.12.3: Galera is cluster-scoped — pick-from-list adopt, named create, LXC+Docker** _(2026-05-31 — [`db593ec`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/db593ec52886a7526442877e6aa951fc2c5e1a01))_
