@@ -14940,6 +14940,77 @@ pub async fn galera_local_node_op(req: HttpRequest, state: web::Data<AppState>, 
     }
 }
 
+/// GET /api/galera/clusters/{id}/analyze — per-node tuning analysis (advisory).
+pub async fn galera_analyze(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let id = path.into_inner();
+    let cluster = match crate::galera::get_cluster(&id) {
+        Some(c) => c,
+        None => return HttpResponse::NotFound().json(serde_json::json!({ "error": format!("cluster '{}' not found", id) })),
+    };
+    let sqls = crate::galera::analyze_sql(&cluster).await;
+    let ctx = galera_op_ctx(&state);
+    match web::block(move || crate::galera::build_analysis(&cluster, sqls, &ctx)).await {
+        Ok(a) => HttpResponse::Ok().json(a),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e.to_string() })),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct GaleraTuneReq { pub key: String, pub value: String }
+
+/// POST /api/galera/clusters/{id}/tune — apply one setting cluster-wide: SET
+/// GLOBAL live on every reachable node (dynamic settings) + persist to a managed
+/// config include so it survives restart. Allowlist-gated.
+pub async fn galera_apply_tuning(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>, body: web::Json<GaleraTuneReq>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let id = path.into_inner();
+    let b = body.into_inner();
+    let dynamic = match crate::galera::is_tunable(&b.key) {
+        Some(d) => d,
+        None => return HttpResponse::BadRequest().json(serde_json::json!({ "error": format!("'{}' is not a tunable setting", b.key) })),
+    };
+    if b.value.is_empty() || !b.value.chars().all(|c| c.is_ascii_digit()) {
+        return HttpResponse::BadRequest().json(serde_json::json!({ "error": "value must be a non-negative integer" }));
+    }
+    let cluster = match crate::galera::get_cluster(&id) {
+        Some(c) => c,
+        None => return HttpResponse::NotFound().json(serde_json::json!({ "error": format!("cluster '{}' not found", id) })),
+    };
+    // 1. Live SET GLOBAL (dynamic only).
+    let live = if dynamic { crate::galera::set_global_cluster(&cluster, &b.key, &b.value).await } else { vec![] };
+    // 2. Persist to the managed include on every node (host-aware).
+    let ctx = galera_op_ctx(&state);
+    let (cluster2, key2, val2) = (cluster.clone(), b.key.clone(), b.value.clone());
+    let persist = web::block(move || crate::galera::persist_tuning_cluster(&cluster2, &key2, &val2, &ctx)).await
+        .unwrap_or_else(|e| vec![(String::new(), Err(e.to_string()))]);
+
+    let mut map: std::collections::HashMap<String, (Option<bool>, Option<String>, Option<bool>, Option<String>)> = std::collections::HashMap::new();
+    for (c, r) in live { let e = map.entry(c).or_default(); e.0 = Some(r.is_ok()); e.1 = r.err(); }
+    for (c, r) in persist { let e = map.entry(c).or_default(); e.2 = Some(r.is_ok()); e.3 = r.err(); }
+    let nodes: Vec<_> = map.into_iter().map(|(c, (lo, le, po, pe))| serde_json::json!({
+        "container": c, "applied_live": lo, "live_error": le, "persisted": po, "persist_error": pe,
+    })).collect();
+    HttpResponse::Ok().json(serde_json::json!({ "ok": true, "key": b.key, "value": b.value, "dynamic": dynamic, "requires_restart": !dynamic, "nodes": nodes }))
+}
+
+/// POST /api/galera/local/tuning/{kind}/{container} — persist one setting into a
+/// container that lives on THIS host (called by the owner over the inter-node
+/// channel for cross-host nodes). Allowlist-gated.
+pub async fn galera_local_tuning(req: HttpRequest, state: web::Data<AppState>, path: web::Path<(String, String)>, body: web::Json<GaleraTuneReq>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let (kind, container) = path.into_inner();
+    if !matches!(kind.as_str(), "lxc" | "docker") {
+        return HttpResponse::BadRequest().json(serde_json::json!({ "error": format!("unknown container kind '{}'", kind) }));
+    }
+    let b = body.into_inner();
+    match web::block(move || crate::galera::write_tuning_local(&kind, &container, &b.key, &b.value)).await {
+        Ok(Ok(())) => HttpResponse::Ok().json(serde_json::json!({ "ok": true })),
+        Ok(Err(e)) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e.to_string() })),
+    }
+}
+
 /// DELETE /api/backups/{id} — delete a backup entry + file
 pub async fn backup_delete(
     req: HttpRequest, state: web::Data<AppState>,
@@ -32674,6 +32745,10 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/galera/provision", web::post().to(galera_provision_stream))
         .route("/api/galera/clusters/{id}/recover", web::post().to(galera_recover_stream))
         .route("/api/galera/clusters/{id}/nodes/{container}/{action}", web::post().to(galera_node_action))
+        .route("/api/galera/clusters/{id}/analyze", web::get().to(galera_analyze))
+        .route("/api/galera/clusters/{id}/tune", web::post().to(galera_apply_tuning))
+        // Static `tuning` segment registered BEFORE the {kind}/{op} catch-all.
+        .route("/api/galera/local/tuning/{kind}/{container}", web::post().to(galera_local_tuning))
         .route("/api/galera/local/{kind}/{op}/{container}", web::post().to(galera_local_node_op))
         // PBS (Proxmox Backup Server) — must be before {id} routes
         .route("/api/backups/pbs/status", web::get().to(pbs_status))

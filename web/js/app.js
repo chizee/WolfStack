@@ -63157,6 +63157,8 @@ function galeraNodeBase(hostId, path) {
 // Enter the Galera view for a WolfStack cluster (sidebar → cluster → Galera).
 async function showGaleraForCluster(clusterName) {
     if (typeof closeSidebarMobile === 'function') closeSidebarMobile();
+    // Fresh chart history when switching to a different cluster's view.
+    if (galeraState.cluster !== clusterName) galeraState.history = {};
     galeraState.cluster = clusterName;
     currentPage = 'galera-cluster';
     currentNodeId = null;
@@ -63173,6 +63175,13 @@ async function showGaleraForCluster(clusterName) {
         try { const r = await fetch('/api/nodes'); if (r.ok) allNodes = await r.json(); } catch (_) {}
     }
     await galeraLoadClusters();
+    // Periodic status refresh while viewing — keeps status live and grows the
+    // per-node replication charts. Self-cancels when you leave the view.
+    if (galeraState.timer) clearInterval(galeraState.timer);
+    galeraState.timer = setInterval(() => {
+        if (currentPage !== 'galera-cluster') { clearInterval(galeraState.timer); galeraState.timer = null; return; }
+        galeraRefreshStatus();
+    }, 12000);
 }
 
 // Refresh the currently-viewed cluster.
@@ -63225,8 +63234,76 @@ async function galeraLoadClusters() {
     (galeraState.clusters || []).forEach(c => {
         fetch(galeraNodeBase(galeraClusterOwner(c), 'clusters/' + encodeURIComponent(c.id) + '/status'))
             .then(r => (r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status))))
-            .then(st => { if (myGen === galeraState.gen) { galeraState.statuses[c.id] = st; galeraRender(); } })
+            .then(st => { if (myGen === galeraState.gen) { galeraState.statuses[c.id] = st; galeraPushHistory(st); galeraRender(); } })
             .catch(e => { if (myGen === galeraState.gen) { galeraState.statusErrors[c.id] = (e && e.message) || 'unreachable'; galeraRender(); } });
+    });
+}
+
+// Append the latest per-node replication metrics to a rolling history (capped),
+// so the sparklines build up over successive status refreshes.
+function galeraPushHistory(st) {
+    if (!st || !Array.isArray(st.nodes)) return;
+    galeraState.history = galeraState.history || {};
+    const CAP = 60;
+    st.nodes.forEach(ns => {
+        // Key by cluster id + container so two clusters with a same-named node
+        // don't share a history bucket.
+        const key = st.cluster_id + '|' + ns.container;
+        const h = galeraState.history[key] = galeraState.history[key] || { recvq: [], sendq: [] };
+        const up = ns.reachable;
+        h.recvq.push(up ? (ns.recv_queue_avg || 0) : 0);
+        h.sendq.push(up ? (ns.send_queue_avg || 0) : 0);
+        [h.recvq, h.sendq].forEach(a => { while (a.length > CAP) a.shift(); });
+    });
+}
+
+// Draw N series (each {series, color}) into a sparkline canvas, shared Y-scale.
+function galeraDrawSpark(canvas, lines) {
+    if (!canvas || !canvas.getContext) return;
+    const ctx = canvas.getContext('2d');
+    const w = canvas.width, h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+    let max = 1;
+    lines.forEach(l => (l.series || []).forEach(v => { if (v > max) max = v; }));
+    lines.forEach(l => {
+        const s = l.series || [];
+        if (s.length < 2) return;
+        ctx.beginPath();
+        s.forEach((v, i) => {
+            const x = (i / (s.length - 1)) * (w - 2) + 1;
+            const y = h - 1 - (v / max) * (h - 2);
+            if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        });
+        ctx.strokeStyle = l.color; ctx.lineWidth = 1.5; ctx.stroke();
+    });
+}
+
+// Redraw every node's replication sparkline from accumulated history.
+function galeraDrawSparklines() {
+    (galeraState.clusters || []).forEach(c => {
+        (c.nodes || []).forEach(n => {
+            const cv = document.getElementById('galera-spark-' + c.id + '-' + n.container);
+            const hist = (galeraState.history || {})[c.id + '|' + n.container];
+            if (cv && hist) {
+                galeraDrawSpark(cv, [
+                    { series: hist.recvq, color: '#60a5fa' },
+                    { series: hist.sendq, color: '#f59e0b' },
+                ]);
+            }
+        });
+    });
+}
+
+// Lightweight periodic status refresh (keeps status live + grows the charts)
+// WITHOUT re-aggregating the whole cluster list. Bound to the galera view.
+function galeraRefreshStatus() {
+    if (currentPage !== 'galera-cluster') { return; }
+    const myGen = galeraState.gen;
+    (galeraState.clusters || []).forEach(c => {
+        fetch(galeraNodeBase(galeraClusterOwner(c), 'clusters/' + encodeURIComponent(c.id) + '/status'))
+            .then(r => (r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status))))
+            .then(st => { if (galeraState.gen === myGen && currentPage === 'galera-cluster') { galeraState.statuses[c.id] = st; galeraState.statusErrors[c.id] = ''; galeraPushHistory(st); galeraRender(); } })
+            .catch(e => { if (galeraState.gen === myGen && currentPage === 'galera-cluster') { galeraState.statusErrors[c.id] = (e && e.message) || 'unreachable'; galeraRender(); } });
     });
 }
 
@@ -63288,7 +63365,12 @@ function galeraClusterCardHtml(c) {
             <td style="padding:6px 8px;">${galeraNodeStateBadge(ns)}</td>
             <td style="padding:6px 8px;font-size:12px;">${escapeHtml(String(prim))}</td>
             <td style="padding:6px 8px;font-size:12px;text-align:center;">${escapeHtml(String(size))}</td>
+            <td style="padding:6px 8px;white-space:nowrap;">
+                <canvas id="galera-spark-${c.id}-${n.container}" width="84" height="24" title="recv queue (blue) / send queue (orange) avg over time" style="vertical-align:middle;"></canvas>
+                ${ns && ns.reachable && (ns.flow_control_paused || 0) > 0.001 ? `<span style="color:#f59e0b;font-size:9px;margin-left:4px;" title="flow control paused fraction">fc ${((ns.flow_control_paused || 0) * 100).toFixed(0)}%</span>` : ''}
+            </td>
             <td style="padding:6px 8px;text-align:right;white-space:nowrap;">
+                <button class="btn btn-sm" title="Open a terminal on ${escapeAttr(n.container)} to run the MariaDB client" data-galera-act="console" data-cid="${cid}" data-cont="${cont}" data-kind="${escapeAttr(n.kind || 'lxc')}" data-host="${escapeAttr(n.node_id || '')}" style="padding:2px 8px;font-size:11px;border-color:var(--accent,#3b82f6);color:var(--accent,#60a5fa);">SQL</button>
                 ${act('Start', 'start')}
                 ${act('Stop', 'stop')}
                 ${act('Restart', 'restart')}
@@ -63314,6 +63396,7 @@ function galeraClusterCardHtml(c) {
                 </div>
                 <div style="display:flex;gap:6px;flex-wrap:wrap;">
                     <button class="btn btn-sm" data-galera-act="refresh" title="Refresh status">↻</button>
+                    <button class="btn btn-sm" data-galera-act="analyze" data-cid="${escapeAttr(c.id)}" title="Check cache, threads and other settings against this cluster's resources">Analyze</button>
                     <button class="btn btn-sm" data-galera-act="recover" data-cid="${escapeAttr(c.id)}" style="border-color:#f59e0b;color:#f59e0b;">Recover</button>
                     <button class="btn btn-sm" data-galera-act="forget" data-cid="${escapeAttr(c.id)}" title="Forget this cluster (does not destroy containers)" style="border-color:var(--danger);color:var(--danger);">Forget</button>
                 </div>
@@ -63329,9 +63412,10 @@ function galeraClusterCardHtml(c) {
                         <th style="padding:4px 8px;">State</th>
                         <th style="padding:4px 8px;">Cluster</th>
                         <th style="padding:4px 8px;text-align:center;">Size</th>
+                        <th style="padding:4px 8px;">Replication</th>
                         <th style="padding:4px 8px;text-align:right;">Lifecycle</th>
                     </tr></thead>
-                    <tbody>${rows || `<tr><td colspan="7" style="padding:10px;color:var(--text-muted);">No nodes registered.</td></tr>`}</tbody>
+                    <tbody>${rows || `<tr><td colspan="8" style="padding:10px;color:var(--text-muted);">No nodes registered.</td></tr>`}</tbody>
                 </table>
             </div>
         </div>
@@ -63363,6 +63447,7 @@ function galeraRender() {
     }
     content.innerHTML = html;
     galeraBindDelegation();
+    galeraDrawSparklines();
     // `data-icon` placeholders are hydrated automatically by the global
     // observeForDataIcons MutationObserver — no manual pass needed.
 }
@@ -63383,7 +63468,21 @@ function galeraBindDelegation() {
         else if (act === 'recover') galeraRecover(cid);
         else if (act === 'forget') galeraDelete(cid);
         else if (act === 'refresh') galeraLoadClusters();
+        else if (act === 'analyze') galeraAnalyze(cid);
+        else if (act === 'console') galeraOpenConsole(btn.getAttribute('data-cont') || '', btn.getAttribute('data-kind') || 'lxc', btn.getAttribute('data-host') || '');
     });
+}
+
+// Open a terminal into a node's container (on its host) — reuses the standard
+// container console, which already handles per-node routing + remote bridging.
+// The operator runs the MariaDB client there; we hint the exact command.
+function galeraOpenConsole(container, kind, host) {
+    if (!container) return;
+    let url = '/console.html?type=' + encodeURIComponent(kind || 'lxc') + '&name=' + encodeURIComponent(container);
+    const node = (Array.isArray(allNodes) ? allNodes : []).find(n => n.id === host);
+    if (host && node && !node.is_self) url += '&node_id=' + encodeURIComponent(host);
+    window.open(url, 'galera_sql_' + container.replace(/[^a-zA-Z0-9_.-]/g, '_'), 'width=980,height=620,menubar=no,toolbar=no');
+    showToast('Terminal opened on ' + container + ' — run:  mariadb -u root -p', 'info', 8000);
 }
 
 // ── Modal scaffolding ────────────────────────────────────────────────
@@ -63773,6 +63872,96 @@ async function galeraStreamJob(title, url, body) {
     galeraLoadClusters();
 }
 
+// ── Tuning analyzer ──────────────────────────────────────────────────
+
+function galeraFmtBytes(b) {
+    if (!b) return '?';
+    const G = 1 << 30, M = 1 << 20;
+    if (b >= G) return (b / G).toFixed(1) + 'G';
+    if (b >= M) return Math.round(b / M) + 'M';
+    if (b >= 1024) return Math.round(b / 1024) + 'K';
+    return b + 'B';
+}
+
+async function galeraAnalyze(clusterId) {
+    const c = (galeraState.clusters || []).find(x => x.id === clusterId);
+    const name = c ? c.name : clusterId;
+    galeraState.analyzeId = clusterId;
+    galeraOpenModal('Tuning analysis — ' + name,
+        '<div id="galera-analyze-body"><div style="color:var(--text-muted);padding:24px;text-align:center;">Analysing nodes…</div></div>', 720);
+    try {
+        const r = await fetch(galeraOwnerBase(clusterId, 'clusters/' + encodeURIComponent(clusterId) + '/analyze'));
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok || d.error) throw new Error(d.error || ('HTTP ' + r.status));
+        galeraRenderAnalysis(d);
+    } catch (e) {
+        const b = document.getElementById('galera-analyze-body');
+        if (b) b.innerHTML = `<div role="alert" style="color:var(--danger);padding:16px;">Analysis failed: ${escapeHtml((e && e.message) || String(e))}</div>`;
+    }
+}
+
+function galeraRenderAnalysis(a) {
+    const b = document.getElementById('galera-analyze-body');
+    if (!b) return;
+    if (!a.nodes || !a.nodes.length) { b.innerHTML = '<div style="padding:16px;color:var(--text-muted);">No nodes.</div>'; return; }
+    const sevColor = { ok: '#22c55e', improve: '#f59e0b', warn: '#ef4444' };
+    let html = '';
+    a.nodes.forEach(n => {
+        html += `<div style="margin-bottom:14px;">
+            <div style="font-weight:600;font-size:13px;margin-bottom:6px;">${escapeHtml(n.container)}
+                <span style="font-weight:400;color:var(--text-muted);font-size:11px;">${n.reachable ? (galeraFmtBytes(n.ram_bytes) + ' RAM · ' + escapeHtml(String(n.cores)) + ' cores') : 'unreachable'}</span>
+            </div>`;
+        if (!n.reachable) { html += `<div style="font-size:12px;color:var(--text-muted);padding:2px 0;">${escapeHtml(n.error || 'unreachable')}</div></div>`; return; }
+        const recs = n.recommendations || [];
+        const actionable = recs.filter(r => r.severity !== 'ok');
+        if (!actionable.length) { html += `<div style="font-size:12px;color:#22c55e;">All checked settings look good. ✓</div></div>`; return; }
+        actionable.forEach(rec => {
+            const col = sevColor[rec.severity] || '#9ca3af';
+            html += `<div style="border:1px solid var(--border);border-radius:6px;padding:8px 10px;margin-bottom:6px;">
+                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                    <span style="width:8px;height:8px;border-radius:50%;background:${col};display:inline-block;flex-shrink:0;"></span>
+                    <code style="font-size:12px;">${escapeHtml(rec.key)}</code>
+                    <span style="font-size:11px;color:var(--text-muted);">${escapeHtml(rec.current_display)} → <b style="color:${col};">${escapeHtml(rec.recommended_display)}</b></span>
+                    ${rec.dynamic ? '' : '<span style="font-size:10px;color:#f59e0b;" title="needs a node restart">restart</span>'}
+                    <button class="btn btn-sm galera-tune-btn" style="margin-left:auto;padding:2px 10px;font-size:11px;" data-galera-tune="${escapeAttr(rec.key)}" data-val="${escapeAttr(rec.recommended)}">Apply</button>
+                </div>
+                <div style="font-size:11px;color:var(--text-muted);margin-top:4px;line-height:1.4;">${escapeHtml(rec.why)}</div>
+            </div>`;
+        });
+        html += `</div>`;
+    });
+    html += `<div style="font-size:11px;color:var(--text-muted);margin-top:6px;line-height:1.5;">Apply sets the value live on every reachable node and writes it to a managed config include so it persists. <b>restart</b> settings are written to config only — restart the node to take effect.</div>`;
+    b.innerHTML = html;
+    b.querySelectorAll('.galera-tune-btn').forEach(btn => {
+        btn.addEventListener('click', () => galeraApplyTuning(galeraState.analyzeId, btn.getAttribute('data-galera-tune'), btn.getAttribute('data-val'), btn));
+    });
+}
+
+async function galeraApplyTuning(clusterId, key, value, btn) {
+    if (btn) { btn.disabled = true; btn.textContent = 'Applying…'; }
+    try {
+        const r = await fetch(galeraOwnerBase(clusterId, 'clusters/' + encodeURIComponent(clusterId) + '/tune'), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key, value }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok || d.error) throw new Error(d.error || ('HTTP ' + r.status));
+        const issues = (d.nodes || []).filter(n => n.applied_live === false || n.persisted === false);
+        if (issues.length) showToast(`${key}: applied with ${issues.length} node issue(s) — see analysis`, 'warning', 0);
+        else showToast(`${key} → ${value}` + (d.requires_restart ? ' — written to config; restart nodes to take effect' : ''), 'success');
+        // Re-analyse for dynamic settings (the runtime value changed). For
+        // restart-required ones the runtime value is unchanged, so re-analysing
+        // would just re-show the same recommendation — mark the row instead.
+        if (d.requires_restart) {
+            if (btn) { btn.textContent = 'Restart pending'; btn.disabled = true; btn.style.color = 'var(--text-muted)'; }
+        } else {
+            galeraAnalyze(clusterId);
+        }
+    } catch (e) {
+        showToast('Apply failed: ' + ((e && e.message) || e), 'error', 0);
+        if (btn) { btn.disabled = false; btn.textContent = 'Apply'; }
+    }
+}
+
 window.showGaleraForCluster = showGaleraForCluster;
 window.galeraInit = galeraInit;
 window.galeraLoadClusters = galeraLoadClusters;
@@ -63785,6 +63974,7 @@ window.galeraAdoptOpen = galeraAdoptOpen;
 window.galeraAdoptLoadInventory = galeraAdoptLoadInventory;
 window.galeraAdoptSubmit = galeraAdoptSubmit;
 window.galeraNodeAction = galeraNodeAction;
+window.galeraOpenConsole = galeraOpenConsole;
 window.galeraRecover = galeraRecover;
 window.galeraDelete = galeraDelete;
 window.galeraCloseModal = galeraCloseModal;

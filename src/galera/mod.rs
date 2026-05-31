@@ -220,6 +220,15 @@ pub struct NodeStatus {
     pub cluster_uuid: String,
     /// wsrep_connected.
     pub connected: bool,
+    // ── Metrics for per-node charts (0 when unavailable) ──
+    /// wsrep_local_recv_queue_avg — apply (write-set) backlog. Rising = this
+    /// node can't keep up applying replicated writes.
+    pub recv_queue_avg: f64,
+    /// wsrep_local_send_queue_avg — replication send backlog.
+    pub send_queue_avg: f64,
+    /// wsrep_flow_control_paused — fraction of time (0..1) the cluster was
+    /// paused by THIS node's flow control. High = this node throttles the rest.
+    pub flow_control_paused: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -295,6 +304,9 @@ async fn node_status(n: &GaleraNode, user: &str, password: &str) -> NodeStatus {
         ready: false,
         cluster_uuid: String::new(),
         connected: false,
+        recv_queue_avg: 0.0,
+        send_queue_avg: 0.0,
+        flow_control_paused: 0.0,
     };
     let params = crate::mysql_editor::ConnParams {
         host: n.address.clone(),
@@ -314,6 +326,10 @@ async fn node_status(n: &GaleraNode, user: &str, password: &str) -> NodeStatus {
             st.ready = m.get("wsrep_ready").map(|s| s.eq_ignore_ascii_case("ON")).unwrap_or(false);
             st.cluster_uuid = m.get("wsrep_cluster_state_uuid").cloned().unwrap_or_default();
             st.connected = m.get("wsrep_connected").map(|s| s.eq_ignore_ascii_case("ON")).unwrap_or(false);
+            let f = |k: &str| m.get(k).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+            st.recv_queue_avg = f("wsrep_local_recv_queue_avg");
+            st.send_queue_avg = f("wsrep_local_send_queue_avg");
+            st.flow_control_paused = f("wsrep_flow_control_paused");
         }
         Err(e) => st.error = e,
     }
@@ -733,7 +749,7 @@ pub fn provision_cluster(p: &ProvisionRequest, log: &Sender<String>) -> Result<G
 /// One atomic node operation, dispatched locally or to a peer host. `Address`
 /// resolves a container's reachable IP (used when adopting from the picker).
 #[derive(Clone, Copy, PartialEq)]
-pub enum NodeOp { Start, Stop, Restart, Bootstrap, Seqno, IsDown, Exists, Address }
+pub enum NodeOp { Start, Stop, Restart, Bootstrap, Seqno, IsDown, Exists, Address, Sysinfo }
 
 impl NodeOp {
     fn as_str(self) -> &'static str {
@@ -741,6 +757,7 @@ impl NodeOp {
             NodeOp::Start => "start", NodeOp::Stop => "stop", NodeOp::Restart => "restart",
             NodeOp::Bootstrap => "bootstrap", NodeOp::Seqno => "seqno",
             NodeOp::IsDown => "isdown", NodeOp::Exists => "exists", NodeOp::Address => "address",
+            NodeOp::Sysinfo => "sysinfo",
         }
     }
     pub fn from_str(s: &str) -> Option<NodeOp> {
@@ -748,6 +765,7 @@ impl NodeOp {
             "start" => NodeOp::Start, "stop" => NodeOp::Stop, "restart" => NodeOp::Restart,
             "bootstrap" => NodeOp::Bootstrap, "seqno" => NodeOp::Seqno,
             "isdown" => NodeOp::IsDown, "exists" => NodeOp::Exists, "address" => NodeOp::Address,
+            "sysinfo" => NodeOp::Sysinfo,
             _ => return None,
         })
     }
@@ -755,7 +773,7 @@ impl NodeOp {
     /// blocking slot if a peer hangs; service/bootstrap ops legitimately take time.
     fn timeout_secs(self) -> u64 {
         match self {
-            NodeOp::Seqno | NodeOp::IsDown | NodeOp::Exists | NodeOp::Address => 20,
+            NodeOp::Seqno | NodeOp::IsDown | NodeOp::Exists | NodeOp::Address | NodeOp::Sysinfo => 20,
             NodeOp::Start | NodeOp::Stop | NodeOp::Restart | NodeOp::Bootstrap => 180,
         }
     }
@@ -810,6 +828,14 @@ fn node_address_local(kind: &str, container: &str) -> String {
     }
 }
 
+/// Resolve a (local) container's total RAM (bytes) + CPU cores as `"BYTES CORES"`
+/// — what the tuning analyzer sizes the buffer pool / slave threads against.
+fn node_sysinfo_local(kind: &str, container: &str) -> String {
+    cexec(kind, container, "echo \"$(awk '/^MemTotal:/{print $2*1024}' /proc/meminfo 2>/dev/null) $(nproc 2>/dev/null || echo 1)\"")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
 /// Is MariaDB stopped in this (local) container? Unreadable ⇒ false (can't
 /// confirm ⇒ treat as not-down, so recovery refuses rather than risks data).
 fn node_is_down_local(kind: &str, container: &str) -> bool {
@@ -862,6 +888,7 @@ pub fn local_node_op(kind: &str, container: &str, op: NodeOp) -> Result<String, 
         NodeOp::IsDown => Ok(if node_is_down_local(kind, container) { "down".into() } else { "up".into() }),
         NodeOp::Bootstrap => bootstrap_local(kind, container),
         NodeOp::Address => Ok(node_address_local(kind, container)),
+        NodeOp::Sysinfo => Ok(node_sysinfo_local(kind, container)),
         NodeOp::Exists => unreachable!(),
     }
 }
@@ -1111,4 +1138,307 @@ pub fn adopt_cluster(
     };
     let pw = if db_password.is_empty() { None } else { Some(db_password) };
     upsert_cluster(cluster, pw)
+}
+
+// ── Tuning analyzer (advisory + one-click apply) ─────────────────────
+//
+// For each node we read SHOW GLOBAL VARIABLES + STATUS (over SQL) and the
+// container's RAM/cores (host-aware Sysinfo op), then flag the settings that
+// matter for a Galera node and recommend values. "Apply" is allowlist-gated:
+// SET GLOBAL live on every reachable node (dynamic settings) AND persist the
+// value to a managed include file so it survives a restart.
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Recommendation {
+    pub key: String,
+    pub current: String,
+    pub current_display: String,
+    pub recommended: String,
+    pub recommended_display: String,
+    /// "ok" | "improve" | "warn"
+    pub severity: String,
+    pub why: String,
+    /// SET GLOBAL applies live; otherwise it needs a node restart.
+    pub dynamic: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeAnalysis {
+    pub container: String,
+    pub reachable: bool,
+    pub error: String,
+    pub ram_bytes: u64,
+    pub cores: u32,
+    pub recommendations: Vec<Recommendation>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ClusterAnalysis {
+    pub cluster_id: String,
+    pub nodes: Vec<NodeAnalysis>,
+}
+
+/// Per-node SHOW GLOBAL VARIABLES + STATUS, gathered over SQL.
+pub struct NodeSql {
+    pub container: String,
+    pub kind: String,
+    pub node_id: String,
+    pub reachable: bool,
+    pub error: String,
+    pub vars: HashMap<String, String>,
+    pub status: HashMap<String, String>,
+}
+
+/// Settings the analyzer may recommend AND apply. Returns whether each is
+/// dynamic (SET GLOBAL-able). Anything not here is REFUSED by apply — we never
+/// set an arbitrary variable.
+pub fn is_tunable(key: &str) -> Option<bool> {
+    Some(match key {
+        "innodb_buffer_pool_size" => true,
+        "wsrep_slave_threads" => true,
+        "innodb_flush_log_at_trx_commit" => true,
+        "sync_binlog" => true,
+        "query_cache_type" => true,
+        "query_cache_size" => true,
+        "max_connections" => true,
+        "innodb_log_file_size" => false,        // needs restart
+        "innodb_buffer_pool_instances" => false, // needs restart
+        _ => return None,
+    })
+}
+
+fn human_bytes(b: u64) -> String {
+    const G: u64 = 1 << 30;
+    const M: u64 = 1 << 20;
+    if b >= G { format!("{:.1}G", b as f64 / G as f64) }
+    else if b >= M { format!("{}M", b / M) }
+    else if b >= 1024 { format!("{}K", b / 1024) }
+    else { b.to_string() }
+}
+
+/// Compute recommendations for one node from its variables + status + resources.
+fn analyze_node(vars: &HashMap<String, String>, status: &HashMap<String, String>, ram: u64, cores: u32) -> Vec<Recommendation> {
+    let mut recs = Vec::new();
+    let vs = |k: &str| vars.get(k).cloned().unwrap_or_default();
+    let vu = |k: &str| vars.get(k).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    let su = |k: &str| status.get(k).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    let mut push = |key: &str, current: String, current_display: String, recommended: String, recommended_display: String, severity: &str, why: String, dynamic: bool| {
+        recs.push(Recommendation { key: key.into(), current, current_display, recommended, recommended_display, severity: severity.into(), why, dynamic });
+    };
+
+    // innodb_buffer_pool_size ≈ 70% of RAM.
+    if ram > 0 {
+        let cur = vu("innodb_buffer_pool_size");
+        let rec = {
+            let raw = (ram as f64 * 0.70) as u64;
+            let step = 128 * (1 << 20);
+            (raw / step).max(1) * step
+        };
+        let (sev, why) = if (cur as f64) < ram as f64 * 0.5 {
+            ("improve", format!("Buffer pool is {} of {} RAM — undersized, so InnoDB keeps re-reading from disk. ~70% RAM lets the working set live in memory.", human_bytes(cur), human_bytes(ram)))
+        } else if (cur as f64) > ram as f64 * 0.85 {
+            ("warn", format!("Buffer pool is {} of only {} RAM — leaves little headroom for connections/temp tables and risks the OOM killer.", human_bytes(cur), human_bytes(ram)))
+        } else {
+            ("ok", format!("Buffer pool {} is a healthy share of {} RAM.", human_bytes(cur), human_bytes(ram)))
+        };
+        push("innodb_buffer_pool_size", cur.to_string(), human_bytes(cur), rec.to_string(), human_bytes(rec), sev, why, true);
+    }
+
+    // wsrep_slave_threads ≈ CPU cores.
+    {
+        let cur = vu("wsrep_slave_threads");
+        let rec = (cores as u64).clamp(2, 16);
+        let (sev, why) = if cur < rec {
+            ("improve", format!("Only {} apply thread(s) for {} cores — replicated writes apply mostly serially. Match it to the cores to parallelise apply.", cur.max(1), cores))
+        } else {
+            ("ok", format!("{} apply threads suits {} cores.", cur, cores))
+        };
+        push("wsrep_slave_threads", cur.to_string(), cur.to_string(), rec.to_string(), rec.to_string(), sev, why, true);
+    }
+
+    // innodb_flush_log_at_trx_commit → 2 on a cluster (only flag when it's 1).
+    if vs("innodb_flush_log_at_trx_commit") == "1" {
+        push("innodb_flush_log_at_trx_commit", "1".into(), "1".into(), "2".into(), "2".into(), "improve",
+            "On a Galera cluster durability comes from synchronous replication to the other nodes, so flushing the redo log to disk on every commit (=1) costs throughput for little gain. 2 flushes once per second.".into(), true);
+    }
+
+    // sync_binlog → 0 when the binlog is on. (log_bin may be reported ON or 1.)
+    if vs("log_bin").eq_ignore_ascii_case("ON") || vs("log_bin") == "1" {
+        let cur = vs("sync_binlog");
+        if cur != "0" {
+            push("sync_binlog", cur.clone(), cur, "0".into(), "0".into(), "improve",
+                "fsync-per-write to the binlog (=1) is redundant durability under Galera and throttles writes. 0 lets the OS flush it.".into(), true);
+        }
+    }
+
+    // query cache → off.
+    {
+        let qct = vs("query_cache_type");
+        let qcs = vu("query_cache_size");
+        let on = qcs > 0 && !qct.eq_ignore_ascii_case("OFF") && qct != "0";
+        if on {
+            push("query_cache_type", qct.clone(), qct, "0".into(), "OFF".into(), "warn",
+                "The query cache serialises writes behind a global mutex — it hurts throughput on a write-replicated cluster (and is removed in MariaDB 10.6+). Turn it off.".into(), true);
+            push("query_cache_size", qcs.to_string(), human_bytes(qcs), "0".into(), "0".into(), "warn",
+                "Free the query-cache memory once the cache is disabled.".into(), true);
+        }
+    }
+
+    // max_connections vs observed peak.
+    {
+        let cur = vu("max_connections");
+        let peak = su("Max_used_connections");
+        if cur > 0 && peak.saturating_mul(100) > cur.saturating_mul(80) {
+            let rec = ((peak as f64 * 1.5) as u64).max(cur + 50);
+            push("max_connections", cur.to_string(), cur.to_string(), rec.to_string(), rec.to_string(), "improve",
+                format!("Peak usage hit {} — over 80% of the {} limit. Raise it before clients start getting 'Too many connections'.", peak, cur), true);
+        }
+    }
+
+    // innodb_log_file_size ≈ 25% of buffer pool (restart needed).
+    {
+        let cur = vu("innodb_log_file_size");
+        let bp = vu("innodb_buffer_pool_size");
+        if bp > 0 {
+            let rec = (bp / 4).clamp(256 * (1 << 20), 4 * (1u64 << 30));
+            if cur > 0 && cur * 2 < rec {
+                push("innodb_log_file_size", cur.to_string(), human_bytes(cur), rec.to_string(), human_bytes(rec), "improve",
+                    format!("Redo log {} is small for a {} buffer pool — forces frequent checkpoint flushing under write load. (Requires a node restart.)", human_bytes(cur), human_bytes(bp)), false);
+            }
+        }
+    }
+
+    recs
+}
+
+/// Gather SHOW GLOBAL VARIABLES + STATUS for every node, concurrently.
+pub async fn analyze_sql(cluster: &GaleraCluster) -> Vec<NodeSql> {
+    let pw = dec_secret(&cluster.db_password_enc);
+    futures::future::join_all(cluster.nodes.iter().map(|n| node_vars_status(n, &cluster.db_user, &pw))).await
+}
+
+async fn node_vars_status(n: &GaleraNode, user: &str, pw: &str) -> NodeSql {
+    let params = crate::mysql_editor::ConnParams {
+        host: n.address.clone(), port: n.port, user: user.to_string(), password: pw.to_string(),
+        database: None, db_type: crate::mysql_editor::DbType::default(),
+    };
+    let mut out = NodeSql {
+        container: n.container.clone(), kind: n.kind.clone(), node_id: n.node_id.clone(),
+        reachable: false, error: String::new(), vars: HashMap::new(), status: HashMap::new(),
+    };
+    match crate::mysql_editor::execute_query(&params, "", "SHOW GLOBAL VARIABLES").await {
+        Ok(v) => {
+            out.reachable = true;
+            out.vars = wsrep_map(&v);
+            if let Ok(s) = crate::mysql_editor::execute_query(&params, "", "SHOW GLOBAL STATUS").await {
+                out.status = wsrep_map(&s);
+            }
+        }
+        Err(e) => out.error = e,
+    }
+    out
+}
+
+/// Build the full analysis: combine the SQL with each node's RAM/cores (resolved
+/// host-aware via the Sysinfo op) and compute recommendations. Sync — call from
+/// `web::block` (it uses run_op/block_on).
+pub fn build_analysis(cluster: &GaleraCluster, sqls: Vec<NodeSql>, ctx: &GaleraOpCtx) -> ClusterAnalysis {
+    let nodes = sqls.into_iter().map(|sql| {
+        if !sql.reachable {
+            return NodeAnalysis { container: sql.container, reachable: false, error: sql.error, ram_bytes: 0, cores: 0, recommendations: vec![] };
+        }
+        let host = locate_host(ctx, &sql.kind, &sql.container, &sql.node_id).unwrap_or_else(|_| sql.node_id.clone());
+        let si = run_op(ctx, &host, &sql.kind, &sql.container, NodeOp::Sysinfo).unwrap_or_default();
+        let mut parts = si.split_whitespace();
+        let ram = parts.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        let cores = parts.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(1);
+        let recs = analyze_node(&sql.vars, &sql.status, ram, cores);
+        NodeAnalysis { container: sql.container, reachable: true, error: String::new(), ram_bytes: ram, cores, recommendations: recs }
+    }).collect();
+    ClusterAnalysis { cluster_id: cluster.id.clone(), nodes }
+}
+
+/// `SET GLOBAL key = value` on every reachable node (live, dynamic settings).
+/// Concurrent. Returns (container, ok?) per node.
+pub async fn set_global_cluster(cluster: &GaleraCluster, key: &str, value: &str) -> Vec<(String, Result<(), String>)> {
+    let pw = dec_secret(&cluster.db_password_enc);
+    let user = cluster.db_user.clone();
+    futures::future::join_all(cluster.nodes.iter().map(|n| {
+        let (user, pw, key, value) = (user.clone(), pw.clone(), key.to_string(), value.to_string());
+        async move {
+            let params = crate::mysql_editor::ConnParams {
+                host: n.address.clone(), port: n.port, user, password: pw,
+                database: None, db_type: crate::mysql_editor::DbType::default(),
+            };
+            let sql = format!("SET GLOBAL {} = {}", key, value);
+            let r = crate::mysql_editor::execute_query(&params, "", &sql).await.map(|_| ());
+            (n.container.clone(), r)
+        }
+    })).await
+}
+
+/// Persist `key = value` into a managed include file inside THIS (local)
+/// container so it survives a restart. key + value are allowlist/format checked.
+pub fn write_tuning_local(kind: &str, container: &str, key: &str, value: &str) -> Result<(), String> {
+    if is_tunable(key).is_none() {
+        return Err(format!("'{}' is not a tunable setting", key));
+    }
+    if value.is_empty() || !value.chars().all(|c| c.is_ascii_digit()) {
+        return Err("value must be a non-negative integer".into());
+    }
+    safe_token(container)?;
+    // Pick the distro's conf.d include dir, drop a 99-wolfstack-tuning.cnf, and
+    // replace any prior line for this key. key/value are validated, so safe.
+    let script = format!(
+        "f=\"\"; for d in /etc/mysql/mariadb.conf.d /etc/my.cnf.d /etc/mysql/conf.d; do [ -d \"$d\" ] && f=\"$d/99-wolfstack-tuning.cnf\" && break; done; \
+         [ -z \"$f\" ] && {{ mkdir -p /etc/mysql/mariadb.conf.d; f=/etc/mysql/mariadb.conf.d/99-wolfstack-tuning.cnf; }}; \
+         grep -q '^\\[mysqld\\]' \"$f\" 2>/dev/null || printf '[mysqld]\\n' >> \"$f\"; \
+         sed -i '/^{key}[[:space:]]*=/d' \"$f\"; \
+         printf '{key} = {value}\\n' >> \"$f\"",
+        key = key, value = value);
+    cexec(kind, container, &script).map(|_| ())
+}
+
+/// Persist a setting into every node's managed include, host-aware. Sync — call
+/// from `web::block`. Returns (container, ok?) per node.
+pub fn persist_tuning_cluster(cluster: &GaleraCluster, key: &str, value: &str, ctx: &GaleraOpCtx) -> Vec<(String, Result<(), String>)> {
+    cluster.nodes.iter().map(|n| {
+        let host = locate_host(ctx, &n.kind, &n.container, &n.node_id).unwrap_or_else(|_| n.node_id.clone());
+        let r = if host.is_empty() || host == ctx.self_id {
+            write_tuning_local(&n.kind, &n.container, key, value)
+        } else {
+            persist_tuning_remote(ctx, &host, &n.kind, &n.container, key, value)
+        };
+        (n.container.clone(), r)
+    }).collect()
+}
+
+/// POST the tuning write to a peer host's local endpoint.
+fn persist_tuning_remote(ctx: &GaleraOpCtx, host: &str, kind: &str, container: &str, key: &str, value: &str) -> Result<(), String> {
+    let target = ctx.nodes.iter().find(|n| n.id == host)
+        .ok_or_else(|| format!("host '{}' is not a node in this cluster", host))?;
+    let path = format!("/api/galera/local/tuning/{}/{}", kind, container);
+    let urls = crate::api::build_node_urls(&target.address, target.port, &path);
+    let secret = ctx.cluster_secret.clone();
+    let body = serde_json::json!({ "key": key, "value": value });
+    ctx.rt.block_on(async move {
+        let mut last = format!("could not reach host '{}'", host);
+        for url in &urls {
+            match crate::api::API_HTTP_CLIENT.post(url)
+                .header("X-WolfStack-Secret", &secret)
+                .timeout(std::time::Duration::from_secs(20))
+                .json(&body)
+                .send().await
+            {
+                Ok(resp) => {
+                    let ok = resp.status().is_success();
+                    let v: serde_json::Value = resp.json().await.unwrap_or_default();
+                    if ok { return Ok(()); }
+                    last = v.get("error").and_then(|e| e.as_str()).unwrap_or("remote error").to_string();
+                }
+                Err(e) => last = e.to_string(),
+            }
+        }
+        Err(last)
+    })
 }
