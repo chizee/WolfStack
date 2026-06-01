@@ -63871,10 +63871,10 @@ function galeraMaxScaleOpen(cid) {
             <label>Release
                 <input id="gmx-release" class="form-control" value="bookworm" style="margin-top:4px;">
             </label>
-            <label>Proxy DB user
+            <label>MaxScale's own DB user <span style="color:var(--text-muted);font-weight:400;">(internal)</span>
                 <input id="gmx-user" class="form-control" value="maxscale" style="margin-top:4px;">
             </label>
-            <label>Proxy DB password
+            <label>…and its password
                 <input id="gmx-pw" type="password" class="form-control" style="margin-top:4px;" autocomplete="new-password">
             </label>
             <label>Listener port
@@ -63882,8 +63882,10 @@ function galeraMaxScaleOpen(cid) {
             </label>
         </div>
         <div style="font-size:11px;color:var(--text-muted);margin-top:10px;line-height:1.5;">
-            MaxScale only ships for Debian/Ubuntu and RHEL/Rocky bases. The proxy user is created on the cluster (for monitoring +
-            auth) — it is not your application login. Password chars: letters, digits and . _ - @ % + = ! ~
+            MaxScale only ships for Debian/Ubuntu and RHEL/Rocky bases. <b>This user/password is MaxScale's own internal account</b>
+            (it monitors the cluster + reads the user table) — <b>not</b> the login you use day-to-day. Once it's up, connect your
+            apps to the proxy with <b>root</b> (the cluster password) or your own app users — over TCP, e.g.
+            <code style="font-family:var(--font-mono,monospace);">mariadb -h PROXY_IP -P 3306 -u root -p</code>. Password chars: letters, digits and . _ - @ % + = ! ~
         </div>
         <div id="gmx-error" role="alert" style="display:none;color:var(--danger);font-size:12px;margin-top:10px;"></div>
         <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px;">

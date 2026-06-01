@@ -996,11 +996,13 @@ fn default_maxscale_user() -> String { "maxscale".into() }
 /// official one from MariaDB's MaxScale install guide
 /// (mariadb.com/docs/maxscale … installation-guide). MaxScale ships only for
 /// Debian/Ubuntu + RHEL/Rocky — Alpine/Arch have no official package, so we
-/// refuse rather than half-install something that won't run.
+/// refuse rather than half-install something that won't run. We also pull in the
+/// MariaDB client (best-effort) so the operator can test the listener from the
+/// proxy box itself.
 fn maxscale_install_cmd(distro: &str) -> Result<&'static str, String> {
     Ok(match distro_family(distro) {
-        "deb" => "export DEBIAN_FRONTEND=noninteractive; apt-get update -y && apt-get install -y curl ca-certificates && curl -LsS https://r.mariadb.com/downloads/mariadb_repo_setup | bash && apt-get update -y && apt-get install -y maxscale",
-        "rhel" => "curl -LsS https://r.mariadb.com/downloads/mariadb_repo_setup | bash && (dnf install -y maxscale || yum install -y maxscale)",
+        "deb" => "export DEBIAN_FRONTEND=noninteractive; apt-get update -y && apt-get install -y curl ca-certificates && curl -LsS https://r.mariadb.com/downloads/mariadb_repo_setup | bash && apt-get update -y && apt-get install -y maxscale && (apt-get install -y mariadb-client || true)",
+        "rhel" => "curl -LsS https://r.mariadb.com/downloads/mariadb_repo_setup | bash && (dnf install -y maxscale || yum install -y maxscale) && (dnf install -y MariaDB-client || dnf install -y mariadb || yum install -y mariadb || true)",
         other => return Err(format!(
             "MaxScale has no official package for '{}' — build the proxy on a Debian/Ubuntu or RHEL/Rocky base.", other)),
     })
@@ -1021,8 +1023,11 @@ fn maxscale_cnf(servers: &[(String, String, u16)], user: &str, password: &str, l
     s.push_str(&format!(
         "[Galera-Monitor]\ntype=monitor\nmodule=galeramon\nservers={list}\nuser={user}\npassword={pw}\n\n",
         list = list, user = user, pw = password));
+    // enable_root_user so the cluster's root@'%' account (which WolfStack already
+    // provisions for TCP management) works THROUGH the proxy — MaxScale blocks
+    // root by default. Apps still authenticate with their own backend users.
     s.push_str(&format!(
-        "[Read-Write-Service]\ntype=service\nrouter=readwritesplit\nservers={list}\nuser={user}\npassword={pw}\n\n",
+        "[Read-Write-Service]\ntype=service\nrouter=readwritesplit\nservers={list}\nuser={user}\npassword={pw}\nenable_root_user=true\n\n",
         list = list, user = user, pw = password));
     s.push_str(&format!(
         "[Read-Write-Listener]\ntype=listener\nservice=Read-Write-Service\naddress=0.0.0.0\nport={port}\n",
