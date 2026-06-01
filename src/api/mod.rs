@@ -14939,6 +14939,166 @@ fn galera_op_ctx(state: &web::Data<AppState>) -> crate::galera::GaleraOpCtx {
     }
 }
 
+// ── WolfScale cluster manager (parallels Galera) ─────────────────────
+
+fn wolfscale_op_ctx(state: &web::Data<AppState>) -> crate::wolfscale::WolfScaleOpCtx {
+    crate::wolfscale::WolfScaleOpCtx {
+        self_id: crate::agent::self_node_id(),
+        nodes: state.cluster.get_all_nodes(),
+        cluster_secret: state.cluster_secret.clone(),
+        rt: tokio::runtime::Handle::current(),
+    }
+}
+
+/// GET /api/wolfscale/clusters[?cluster=NAME] — list managed clusters (password
+/// never returned). Always stamps owner_node = this node so the UI routes ops here.
+pub async fn wolfscale_list(req: HttpRequest, state: web::Data<AppState>, query: web::Query<std::collections::HashMap<String, String>>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let self_id = crate::agent::self_node_id();
+    let mut cfg = crate::wolfscale::load_config();
+    let filter = query.get("cluster").cloned();
+    cfg.clusters.retain(|c| filter.as_ref().map(|f| &c.cluster == f).unwrap_or(true));
+    for c in cfg.clusters.iter_mut() {
+        c.db_password_enc = String::new();
+        c.owner_node = self_id.clone();
+    }
+    HttpResponse::Ok().json(cfg.clusters)
+}
+
+#[derive(serde::Deserialize)]
+pub struct WolfScaleAdoptReq {
+    pub cluster_name: String,
+    #[serde(default)] pub cluster: String,
+    #[serde(default)] pub db_user: String,
+    #[serde(default)] pub db_password: String,
+    #[serde(default)] pub cluster_port: u16,
+    #[serde(default)] pub api_port: u16,
+    #[serde(default)] pub proxy_port: u16,
+    pub nodes: Vec<WolfScaleAdoptNode>,
+}
+#[derive(serde::Deserialize)]
+pub struct WolfScaleAdoptNode {
+    #[serde(default)] pub node_id: String,
+    pub container: String,
+    #[serde(default)] pub ws_id: String,
+}
+
+/// POST /api/wolfscale/adopt — adopt picked containers into a managed cluster.
+pub async fn wolfscale_adopt(req: HttpRequest, state: web::Data<AppState>, body: web::Json<WolfScaleAdoptReq>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let b = body.into_inner();
+    let name = b.cluster_name.clone();
+    let ws_cluster = b.cluster.clone();
+    let user = b.db_user.clone();
+    let pass = b.db_password.clone();
+    let (cp, ap, pp) = (b.cluster_port, b.api_port, b.proxy_port);
+    let picks: Vec<crate::wolfscale::AdoptPick> = b.nodes.into_iter()
+        .map(|n| crate::wolfscale::AdoptPick { node_id: n.node_id, container: n.container, ws_id: n.ws_id })
+        .collect();
+    let ctx = wolfscale_op_ctx(&state);
+    match web::block(move || crate::wolfscale::adopt_cluster(&ws_cluster, &name, &user, &pass, cp, ap, pp, &picks, &ctx)).await {
+        Ok(Ok(c)) => HttpResponse::Ok().json(serde_json::json!({ "ok": true, "id": c.id })),
+        Ok(Err(e)) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e.to_string() })),
+    }
+}
+
+/// DELETE /api/wolfscale/clusters/{id} — forget a cluster (containers untouched).
+pub async fn wolfscale_delete(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    match crate::wolfscale::delete_cluster(&path.into_inner()) {
+        Ok(()) => HttpResponse::Ok().json(serde_json::json!({ "ok": true })),
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// GET /api/wolfscale/clusters/{id}/status — live status across all nodes.
+pub async fn wolfscale_status(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let id = path.into_inner();
+    match crate::wolfscale::get_cluster(&id) {
+        Some(c) => HttpResponse::Ok().json(crate::wolfscale::cluster_status(&c).await),
+        None => HttpResponse::NotFound().json(serde_json::json!({ "error": format!("cluster '{}' not found", id) })),
+    }
+}
+
+/// POST /api/wolfscale/provision — build a fresh WolfScale cluster across hosts. SSE.
+pub async fn wolfscale_provision_stream(req: HttpRequest, state: web::Data<AppState>, body: web::Json<crate::wolfscale::ProvisionRequest>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let p = body.into_inner();
+    let ctx = wolfscale_op_ctx(&state);
+    galera_stream_job(move |tx| {
+        let n = p.container_names.len();
+        let _ = tx.send(format!("Provisioning {}-node WolfScale cluster '{}'…", n, p.cluster_name));
+        match crate::wolfscale::provision_cluster(&p, &tx, &ctx) {
+            Ok(c) => { let _ = tx.send(format!("RESULT:OK:Cluster '{}' provisioned with {} node(s).", c.name, c.nodes.len())); }
+            Err(e) => { let _ = tx.send(format!("RESULT:ERR:{}", e)); }
+        }
+    })
+}
+
+/// POST /api/wolfscale/clusters/{id}/nodes/{container}/{action} — start/stop/restart.
+pub async fn wolfscale_node_action(req: HttpRequest, state: web::Data<AppState>, path: web::Path<(String, String, String)>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let (id, container, action) = path.into_inner();
+    let cluster = match crate::wolfscale::get_cluster(&id) {
+        Some(c) => c,
+        None => return HttpResponse::NotFound().json(serde_json::json!({ "error": format!("cluster '{}' not found", id) })),
+    };
+    let ctx = wolfscale_op_ctx(&state);
+    match web::block(move || crate::wolfscale::node_service(&cluster, &container, &action, &ctx)).await {
+        Ok(Ok(_)) => HttpResponse::Ok().json(serde_json::json!({ "ok": true })),
+        Ok(Err(e)) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e.to_string() })),
+    }
+}
+
+/// POST /api/wolfscale/clusters/{id}/nodes/{container}/admin/{action} — promote/demote.
+pub async fn wolfscale_node_admin(req: HttpRequest, state: web::Data<AppState>, path: web::Path<(String, String, String)>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let (id, container, action) = path.into_inner();
+    let cluster = match crate::wolfscale::get_cluster(&id) {
+        Some(c) => c,
+        None => return HttpResponse::NotFound().json(serde_json::json!({ "error": format!("cluster '{}' not found", id) })),
+    };
+    match crate::wolfscale::node_admin(&cluster, &container, &action).await {
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({ "ok": true })),
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// POST /api/wolfscale/local/setup/{container} — build one node on THIS host.
+pub async fn wolfscale_local_setup(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>, body: web::Json<crate::wolfscale::NodeSpec>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let container = path.into_inner();
+    let spec = body.into_inner();
+    // The URL names the container; the body must agree (don't let a caller build
+    // an arbitrary container by mismatching the path and the spec).
+    if spec.container != container {
+        return HttpResponse::BadRequest().json(serde_json::json!({ "error": "container in URL and body must match" }));
+    }
+    match web::block(move || crate::wolfscale::local_setup_node(&spec)).await {
+        Ok(Ok(())) => HttpResponse::Ok().json(serde_json::json!({ "ok": true })),
+        Ok(Err(e)) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e.to_string() })),
+    }
+}
+
+/// POST /api/wolfscale/local/op/{action}/{container} — run a node op on THIS host.
+pub async fn wolfscale_local_op(req: HttpRequest, state: web::Data<AppState>, path: web::Path<(String, String)>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let (action, container) = path.into_inner();
+    let op = match crate::wolfscale::NodeOp::from_str(&action) {
+        Some(o) => o,
+        None => return HttpResponse::BadRequest().json(serde_json::json!({ "error": format!("unknown op '{}'", action) })),
+    };
+    match web::block(move || crate::wolfscale::local_node_op(&container, op)).await {
+        Ok(Ok(output)) => HttpResponse::Ok().json(serde_json::json!({ "ok": true, "output": output })),
+        Ok(Err(e)) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e.to_string() })),
+    }
+}
+
 /// POST /api/galera/clusters/{id}/recover — evidence-based recovery: stop all
 /// nodes, bootstrap the most-advanced (highest grastate seqno), rejoin the rest.
 /// Refuses to act when no node reports a known position. SSE progress.
@@ -32885,6 +33045,16 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/galera/local/build/{container}", web::post().to(galera_local_build))
         .route("/api/galera/local/launch/{container}", web::post().to(galera_local_launch))
         .route("/api/galera/local/{kind}/{op}/{container}", web::post().to(galera_local_node_op))
+        // WolfScale cluster manager
+        .route("/api/wolfscale/clusters", web::get().to(wolfscale_list))
+        .route("/api/wolfscale/adopt", web::post().to(wolfscale_adopt))
+        .route("/api/wolfscale/clusters/{id}", web::delete().to(wolfscale_delete))
+        .route("/api/wolfscale/clusters/{id}/status", web::get().to(wolfscale_status))
+        .route("/api/wolfscale/provision", web::post().to(wolfscale_provision_stream))
+        .route("/api/wolfscale/clusters/{id}/nodes/{container}/admin/{action}", web::post().to(wolfscale_node_admin))
+        .route("/api/wolfscale/clusters/{id}/nodes/{container}/{action}", web::post().to(wolfscale_node_action))
+        .route("/api/wolfscale/local/setup/{container}", web::post().to(wolfscale_local_setup))
+        .route("/api/wolfscale/local/op/{action}/{container}", web::post().to(wolfscale_local_op))
         // PBS (Proxmox Backup Server) — must be before {id} routes
         .route("/api/backups/pbs/status", web::get().to(pbs_status))
         .route("/api/backups/pbs/snapshots", web::get().to(pbs_snapshots))

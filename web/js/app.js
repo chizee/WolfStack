@@ -3354,6 +3354,9 @@ function buildServerTree(nodes) {
                 </a>
                 <a class="nav-item server-child-item galera-cluster-item" data-cluster="${escapedName}" data-view="galera-cluster" onclick="showGaleraForCluster('${escapedName}')" style="margin-left: 8px; padding: 0 10px; line-height:1.4; display:flex; align-items:center; gap:5px;">
                     <span class="icon ws-icon-clean-wrap" data-icon="database" style="font-size:15px;"></span> <span style="font-weight:600;">Galera</span>
+                </a>
+                <a class="nav-item server-child-item wolfscale-cluster-item" data-cluster="${escapedName}" data-view="wolfscale-cluster" onclick="showWolfScaleForCluster('${escapedName}')" style="margin-left: 8px; padding: 0 10px; line-height:1.4; display:flex; align-items:center; gap:5px;">
+                    <span class="icon ws-icon-clean-wrap" data-icon="zap" style="font-size:15px;"></span> <span style="font-weight:600;">WolfScale</span>
                 </a>`;
 
         // Each node within the cluster
@@ -64316,3 +64319,627 @@ window.galeraOpenConsole = galeraOpenConsole;
 window.galeraRecover = galeraRecover;
 window.galeraDelete = galeraDelete;
 window.galeraCloseModal = galeraCloseModal;
+
+// ═══════════════════════════════════════════════════════════════════════
+// WolfScale cluster manager — single-leader WAL replication. Mirrors the
+// Galera manager (cluster-scoped, cross-host, owner_node aggregation), but
+// status comes from each node's WolfScale HTTP API (leader / LSN / lag).
+// ═══════════════════════════════════════════════════════════════════════
+
+const wsState = { cluster: '', clusters: [], statuses: {}, statusErrors: {}, gen: 0, timer: null, activeJobAbort: null };
+
+function wsClusterNodes() {
+    return (Array.isArray(allNodes) ? allNodes : [])
+        .filter(n => galeraNodeCluster(n) === wsState.cluster && n.node_type !== 'proxmox');
+}
+
+// Route a WolfScale API call to a host. self_id-aware (the node-proxy resolves
+// a self_id). Local API when it's self or the host isn't in allNodes.
+function wsNodeBase(hostId, path) {
+    const node = (Array.isArray(allNodes) ? allNodes : []).find(n => n.id === hostId || n.self_id === hostId);
+    if (!hostId || !node || node.is_self) return '/api/wolfscale/' + path;
+    return `/api/nodes/${encodeURIComponent(hostId)}/proxy/wolfscale/${path}`;
+}
+function wsClusterOwner(c) {
+    return (c && c.owner_node) || (c && c.nodes && c.nodes[0] && c.nodes[0].node_id) || '';
+}
+function wsOwnerBase(clusterId, path) {
+    const c = (wsState.clusters || []).find(x => x.id === clusterId);
+    return wsNodeBase(wsClusterOwner(c), path);
+}
+
+async function showWolfScaleForCluster(clusterName) {
+    if (typeof closeSidebarMobile === 'function') closeSidebarMobile();
+    wsState.cluster = clusterName;
+    currentPage = 'wolfscale-cluster';
+    currentNodeId = null;
+    try { if (typeof updateClusterPill === 'function') updateClusterPill(); } catch (_) {}
+    document.querySelectorAll('.page-view').forEach(p => p.style.display = 'none');
+    const el = document.getElementById('page-wolfscale');
+    if (el) el.style.display = 'block';
+    await wsLoadClusters();
+    if (wsState.timer) clearInterval(wsState.timer);
+    wsState.timer = setInterval(() => {
+        if (currentPage !== 'wolfscale-cluster') { clearInterval(wsState.timer); wsState.timer = null; return; }
+        wsRefreshStatus();
+    }, 12000);
+}
+
+async function wsLoadClusters() {
+    const content = document.getElementById('wolfscale-content');
+    if (!content) return;
+    const myGen = ++wsState.gen;
+    wsState.statuses = {};
+    wsState.statusErrors = {};
+    wsRender();
+    const hosts = wsClusterNodes();
+    const targets = hosts.length ? hosts.map(h => h.id) : [''];
+    try {
+        const scope = 'clusters?cluster=' + encodeURIComponent(wsState.cluster);
+        const lists = await Promise.all(targets.map(id =>
+            fetch(wsNodeBase(id, scope)).then(r => (r.ok ? r.json() : [])).catch(() => [])
+        ));
+        if (myGen !== wsState.gen) return;
+        const byId = {};
+        lists.forEach((list, i) => {
+            const fetchHost = targets[i];
+            (Array.isArray(list) ? list : []).forEach(c => {
+                if (fetchHost) c.owner_node = fetchHost; // route ops to where we found it
+                if (!byId[c.id]) byId[c.id] = c;
+            });
+        });
+        wsState.clusters = Object.keys(byId).map(k => byId[k]);
+    } catch (e) {
+        if (myGen !== wsState.gen) return;
+        wsState.clusters = [];
+    }
+    wsRender();
+    (wsState.clusters || []).forEach(c => {
+        fetch(wsOwnerBase(c.id, 'clusters/' + encodeURIComponent(c.id) + '/status'))
+            .then(r => (r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status))))
+            .then(st => { if (myGen === wsState.gen) { wsState.statuses[c.id] = st; wsState.statusErrors[c.id] = ''; wsUpdateLive(c.id); } })
+            .catch(e => { if (myGen === wsState.gen) { wsState.statusErrors[c.id] = (e && e.message) || 'unreachable'; wsUpdateLive(c.id); } });
+    });
+}
+
+function wsRefreshStatus() {
+    if (currentPage !== 'wolfscale-cluster') return;
+    const myGen = wsState.gen;
+    (wsState.clusters || []).forEach(c => {
+        fetch(wsOwnerBase(c.id, 'clusters/' + encodeURIComponent(c.id) + '/status'))
+            .then(r => (r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status))))
+            .then(st => { if (wsState.gen === myGen && currentPage === 'wolfscale-cluster') { wsState.statuses[c.id] = st; wsState.statusErrors[c.id] = ''; wsUpdateLive(c.id); } })
+            .catch(e => { if (wsState.gen === myGen && currentPage === 'wolfscale-cluster') { wsState.statusErrors[c.id] = (e && e.message) || 'unreachable'; wsUpdateLive(c.id); } });
+    });
+}
+
+function wsLeaderBadge(st, statusErr) {
+    if (!st && statusErr) return `<span title="${escapeAttr(statusErr)}" style="display:inline-block;padding:2px 9px;border-radius:4px;font-size:11px;font-weight:600;background:#6b728022;color:#9ca3af;">status unavailable</span>`;
+    if (!st) return `<span style="display:inline-block;padding:2px 9px;border-radius:4px;font-size:11px;font-weight:600;background:#6b728022;color:#9ca3af;">checking…</span>`;
+    if (st.healthy) return `<span style="display:inline-block;padding:2px 9px;border-radius:4px;font-size:11px;font-weight:600;background:#22c55e22;color:#22c55e;">● healthy · leader ${escapeHtml(st.leader || '?')}</span>`;
+    if (st.summary && st.summary.indexOf('Split') === 0) return `<span style="display:inline-block;padding:2px 9px;border-radius:4px;font-size:11px;font-weight:700;background:#ef444422;color:#ef4444;">⚠ ${escapeHtml(st.summary)}</span>`;
+    return `<span style="display:inline-block;padding:2px 9px;border-radius:4px;font-size:11px;font-weight:600;background:#f59e0b22;color:#f59e0b;">degraded</span>`;
+}
+function wsSummaryHtml(st, statusErr) {
+    return st ? escapeHtml(st.summary || '')
+        : (statusErr ? `<span style="color:var(--danger);">Couldn't reach the owning host for status: ${escapeHtml(statusErr)}</span>`
+                     : 'Querying node status…');
+}
+function wsNodeRoleBadge(ns) {
+    if (!ns) return `<span style="color:var(--text-muted);">—</span>`;
+    if (!ns.reachable) return `<span title="${escapeAttr(ns.error || 'unreachable')}" style="display:inline-block;padding:1px 7px;border-radius:3px;font-size:10px;font-weight:600;background:#6b728022;color:#9ca3af;">unreachable</span>`;
+    const leader = ns.is_leader;
+    const c = leader ? '#22c55e' : '#3b82f6';
+    return `<span style="display:inline-block;padding:1px 7px;border-radius:3px;font-size:10px;font-weight:600;background:${c}22;color:${c};">${leader ? 'leader' : 'follower'}</span>`;
+}
+
+function wsRender() {
+    const content = document.getElementById('wolfscale-content');
+    if (!content) return;
+    let html = '';
+    if (!wsState.clusters || !wsState.clusters.length) {
+        html = `<div class="card"><div class="card-body" style="text-align:center;padding:36px;color:var(--text-muted);">
+            <div style="font-size:13px;">No WolfScale clusters in <b>${escapeHtml(wsState.cluster)}</b> yet.</div>
+            <div style="margin-top:14px;display:flex;gap:8px;justify-content:center;">
+                <button class="btn btn-primary btn-sm" onclick="wsCreateOpen()">+ New cluster</button>
+                <button class="btn btn-sm" onclick="wsAdoptOpen()">Adopt existing</button>
+            </div>
+        </div></div>`;
+    } else {
+        html = wsState.clusters.map(wsClusterCardHtml).join('');
+    }
+    content.innerHTML = html;
+    wsBindDelegation();
+}
+
+function wsClusterCardHtml(c) {
+    const st = wsState.statuses[c.id];
+    const statusErr = wsState.statusErrors[c.id];
+    const badge = wsLeaderBadge(st, statusErr);
+    const summary = wsSummaryHtml(st, statusErr);
+    const byC = {};
+    if (st && Array.isArray(st.nodes)) st.nodes.forEach(ns => { byC[ns.container] = ns; });
+
+    const rows = (c.nodes || []).map(n => {
+        const ns = byC[n.container];
+        const cid = escapeAttr(c.id), cont = escapeAttr(n.container);
+        const hostLabel = n.node_id ? galeraHostName(n.node_id) : '—';
+        const act = (label, action) =>
+            `<button class="btn btn-sm" title="${label} WolfScale on ${escapeAttr(n.container)}" data-ws-act="node" data-cid="${cid}" data-cont="${cont}" data-action="${action}" style="padding:2px 8px;font-size:11px;">${label}</button>`;
+        return `<tr style="border-top:1px solid var(--border);">
+            <td style="padding:6px 8px;font-family:var(--font-mono,monospace);font-size:12px;">${escapeHtml(n.container)}</td>
+            <td style="padding:6px 8px;font-family:var(--font-mono,monospace);font-size:12px;color:var(--text-muted);">${escapeHtml(n.address)}</td>
+            <td style="padding:6px 8px;font-size:12px;color:var(--text-muted);">${escapeHtml(hostLabel)}</td>
+            <td id="wsr-${c.id}-${n.container}" style="padding:6px 8px;">${wsNodeRoleBadge(ns)}</td>
+            <td id="wsl-${c.id}-${n.container}" style="padding:6px 8px;font-size:12px;font-family:var(--font-mono,monospace);">${escapeHtml(ns && ns.reachable ? String(ns.last_applied_lsn) : '—')}</td>
+            <td id="wsg-${c.id}-${n.container}" style="padding:6px 8px;font-size:12px;text-align:center;">${escapeHtml(ns && ns.reachable ? (ns.lag > 0 ? '+' + ns.lag : '0') : '—')}</td>
+            <td style="padding:6px 8px;text-align:right;white-space:nowrap;">
+                <button class="btn btn-sm" title="Open a terminal on ${cont}" data-ws-act="console" data-cont="${cont}" data-host="${escapeAttr(n.node_id || '')}" style="padding:2px 8px;font-size:11px;border-color:var(--accent,#3b82f6);color:var(--accent,#60a5fa);"><span class="ws-icon-clean-wrap" data-icon="terminal"></span> Console</button>
+                <button class="btn btn-sm" title="Make ${cont} the leader" data-ws-act="admin" data-cid="${cid}" data-cont="${cont}" data-action="promote" style="padding:2px 8px;font-size:11px;">Promote</button>
+                ${act('Start', 'start')}
+                ${act('Stop', 'stop')}
+                ${act('Restart', 'restart')}
+            </td>
+        </tr>`;
+    }).join('');
+
+    const proxyLine = (c.nodes && c.nodes.length)
+        ? `<div style="font-size:11px;color:var(--text-muted);margin-top:10px;">Apps connect to any node's MySQL proxy — e.g. <b style="font-family:var(--font-mono,monospace);color:var(--text-primary);">${escapeHtml(c.nodes[0].address)}:${escapeHtml(String(c.proxy_port || 8007))}</b> (writes route to the leader, reads spread across followers).</div>`
+        : '';
+
+    return `<div class="card" style="margin-bottom:16px;">
+        <div class="card-body">
+            <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
+                <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+                    <h3 style="margin:0;font-size:16px;">${escapeHtml(c.name)}</h3>
+                    <span id="wsbadge-${c.id}">${badge}</span>
+                    <span style="font-size:11px;color:var(--text-muted);">${(c.nodes || []).length} node${(c.nodes || []).length === 1 ? '' : 's'} · ${c.provisioned ? 'provisioned' : 'adopted'}</span>
+                </div>
+                <div style="display:flex;gap:6px;flex-wrap:wrap;">
+                    <button class="btn btn-sm" data-ws-act="refresh" title="Refresh status">↻</button>
+                    <button class="btn btn-sm" data-ws-act="forget" data-cid="${escapeAttr(c.id)}" title="Forget this cluster (does not destroy containers)" style="border-color:var(--danger);color:var(--danger);">Forget</button>
+                </div>
+            </div>
+            <div id="wssum-${c.id}" style="font-size:12px;color:var(--text-muted);margin-top:6px;">${summary}</div>
+            <div style="overflow-x:auto;margin-top:10px;">
+                <table style="width:100%;border-collapse:collapse;font-size:13px;">
+                    <thead><tr style="text-align:left;color:var(--text-muted);font-size:11px;text-transform:uppercase;letter-spacing:.4px;">
+                        <th style="padding:4px 8px;">Container</th>
+                        <th style="padding:4px 8px;">Address</th>
+                        <th style="padding:4px 8px;">Host</th>
+                        <th style="padding:4px 8px;">Role</th>
+                        <th style="padding:4px 8px;">LSN</th>
+                        <th style="padding:4px 8px;text-align:center;">Lag</th>
+                        <th style="padding:4px 8px;text-align:right;">Lifecycle</th>
+                    </tr></thead>
+                    <tbody>${rows || `<tr><td colspan="7" style="padding:10px;color:var(--text-muted);">No nodes registered.</td></tr>`}</tbody>
+                </table>
+            </div>
+            ${proxyLine}
+        </div>
+    </div>`;
+}
+
+function wsUpdateLive(cid) {
+    const c = (wsState.clusters || []).find(x => x.id === cid);
+    if (!c) return;
+    const st = wsState.statuses[cid];
+    const statusErr = wsState.statusErrors[cid];
+    const set = (id, html) => { const el = document.getElementById(id); if (el) el.innerHTML = html; };
+    set('wsbadge-' + cid, wsLeaderBadge(st, statusErr));
+    set('wssum-' + cid, wsSummaryHtml(st, statusErr));
+    const byC = {};
+    if (st && Array.isArray(st.nodes)) st.nodes.forEach(ns => { byC[ns.container] = ns; });
+    (c.nodes || []).forEach(n => {
+        const ns = byC[n.container];
+        set('wsr-' + cid + '-' + n.container, wsNodeRoleBadge(ns));
+        set('wsl-' + cid + '-' + n.container, escapeHtml(ns && ns.reachable ? String(ns.last_applied_lsn) : '—'));
+        set('wsg-' + cid + '-' + n.container, escapeHtml(ns && ns.reachable ? (ns.lag > 0 ? '+' + ns.lag : '0') : '—'));
+    });
+}
+
+function wsBindDelegation() {
+    const content = document.getElementById('wolfscale-content');
+    if (!content || content.dataset.wsBound) return;
+    content.dataset.wsBound = '1';
+    content.addEventListener('click', ev => {
+        const btn = ev.target.closest('[data-ws-act]');
+        if (!btn) return;
+        const act = btn.getAttribute('data-ws-act');
+        const cid = btn.getAttribute('data-cid') || '';
+        if (act === 'node') wsNodeAction(cid, btn.getAttribute('data-cont') || '', btn.getAttribute('data-action') || '');
+        else if (act === 'admin') wsNodeAdmin(cid, btn.getAttribute('data-cont') || '', btn.getAttribute('data-action') || '');
+        else if (act === 'forget') wsDelete(cid);
+        else if (act === 'refresh') wsLoadClusters();
+        else if (act === 'console') wsOpenConsole(btn.getAttribute('data-cont') || '', btn.getAttribute('data-host') || '');
+    });
+}
+
+function wsOpenConsole(container, host) {
+    if (!container) return;
+    let url = '/console.html?type=lxc&name=' + encodeURIComponent(container);
+    const node = (Array.isArray(allNodes) ? allNodes : []).find(n => n.id === host || n.self_id === host);
+    if (host && node && !node.is_self) url += '&node_id=' + encodeURIComponent(host);
+    window.open(url, 'ws_console_' + container.replace(/[^a-zA-Z0-9_.-]/g, '_'), 'width=980,height=620,menubar=no,toolbar=no');
+}
+
+async function wsNodeAction(clusterId, container, action) {
+    if (action === 'stop' || action === 'restart') {
+        const ok = await showConfirm(`${action === 'stop' ? 'Stop' : 'Restart'} WolfScale on “${container}”?`, `${action[0].toUpperCase() + action.slice(1)} node`);
+        if (!ok) return;
+    }
+    try {
+        const r = await fetch(wsOwnerBase(clusterId, 'clusters/' + encodeURIComponent(clusterId) + '/nodes/' + encodeURIComponent(container) + '/' + encodeURIComponent(action)), { method: 'POST' });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok || d.error) throw new Error(d.error || ('HTTP ' + r.status));
+        showToast(`${container}: ${action} ok`, 'success');
+        setTimeout(wsLoadClusters, 1200);
+    } catch (e) {
+        showToast(`${action} failed: ${(e && e.message) || e}`, 'error', 0);
+    }
+}
+
+async function wsNodeAdmin(clusterId, container, action) {
+    if (action !== 'promote' && action !== 'demote') return;
+    const msg = action === 'demote'
+        ? `Demote “${container}”?\n\nThis asks WolfScale to step this node down as leader.`
+        : `Promote “${container}” to leader?\n\nWolfScale is single-leader; this hands write leadership to this node. Note: failover still favours the lowest node id, so a promote may not stick after a restart.`;
+    const ok = await showConfirm(msg, action === 'demote' ? 'Demote node' : 'Promote node');
+    if (!ok) return;
+    try {
+        const r = await fetch(wsOwnerBase(clusterId, 'clusters/' + encodeURIComponent(clusterId) + '/nodes/' + encodeURIComponent(container) + '/admin/' + encodeURIComponent(action)), { method: 'POST' });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok || d.error) throw new Error(d.error || ('HTTP ' + r.status));
+        showToast(`${container}: ${action} ok`, 'success');
+        setTimeout(wsLoadClusters, 1000);
+    } catch (e) {
+        showToast(`${action} failed: ${(e && e.message) || e}`, 'error', 0);
+    }
+}
+
+async function wsDelete(clusterId) {
+    const c = (wsState.clusters || []).find(x => x.id === clusterId);
+    const name = c ? c.name : clusterId;
+    const ok = await showConfirm(`Forget cluster “${name}”?\n\nThis only removes it from WolfStack — the containers and their data are left untouched.`, 'Forget cluster');
+    if (!ok) return;
+    try {
+        const r = await fetch(wsOwnerBase(clusterId, 'clusters/' + encodeURIComponent(clusterId)), { method: 'DELETE' });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok || d.error) throw new Error(d.error || ('HTTP ' + r.status));
+        showToast('Cluster forgotten', 'success');
+        wsLoadClusters();
+    } catch (e) {
+        showToast('Forget failed: ' + ((e && e.message) || e), 'error', 0);
+    }
+}
+
+// ── Create wizard ────────────────────────────────────────────────────
+
+function wsCreateHostOptions(selected) {
+    return wsClusterNodes().map(n => {
+        const val = n.self_id || n.id;
+        const sel = (selected && selected === val) ? ' selected' : '';
+        return `<option value="${escapeAttr(val)}"${sel}>${escapeHtml(n.hostname || n.id)}${n.is_self ? ' (this host)' : ''}</option>`;
+    }).join('') || `<option value="">no hosts in this cluster</option>`;
+}
+function wsPrimaryHost() {
+    const hosts = wsClusterNodes();
+    const self = hosts.find(h => h.is_self);
+    return self ? (self.self_id || self.id) : (hosts[0] ? (hosts[0].self_id || hosts[0].id) : '');
+}
+
+let _wsRow = 0;
+function wsCreateAddRow(name) {
+    const w = document.getElementById('ws-rows'); if (!w) return;
+    const idx = _wsRow++;
+    const home = (document.getElementById('ws-host') || {}).value || '';
+    w.insertAdjacentHTML('beforeend', `<div class="ws-node-row" data-idx="${idx}" style="display:flex;gap:8px;margin-bottom:6px;align-items:center;">
+        <input class="form-control ws-cname" value="${escapeAttr(name || '')}" placeholder="container name" style="font-size:12px;flex:1;">
+        <select class="form-control ws-chost" title="Host this node runs on" style="font-size:12px;flex:1;">${wsCreateHostOptions(home)}</select>
+        <button class="btn btn-sm" onclick="wsCreateRemoveRow(${idx})" title="Remove" style="padding:4px 10px;">×</button>
+    </div>`);
+}
+function wsCreateRemoveRow(idx) { const r = document.querySelector(`.ws-node-row[data-idx="${idx}"]`); if (r) r.remove(); }
+function wsCreateDistroChanged() {
+    const d = (document.getElementById('ws-distro') || {}).value;
+    const rel = { debian: 'bookworm', ubuntu: 'noble', rocky: '9' }[d] || '';
+    const el = document.getElementById('ws-release'); if (el) el.value = rel;
+}
+
+function wsCreateOpen() {
+    _wsRow = 0;
+    const html = `
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;font-size:13px;">
+            <label style="grid-column:1/-1;">Cluster name
+                <input id="ws-name" class="form-control" placeholder="my-wolfscale" style="margin-top:4px;">
+            </label>
+            <label>Home host <span style="color:var(--text-muted);font-weight:400;font-size:11px;">(stores + orchestrates)</span>
+                <select id="ws-host" class="form-control" style="margin-top:4px;">${wsCreateHostOptions(wsPrimaryHost())}</select>
+            </label>
+            <label>Distribution
+                <select id="ws-distro" class="form-control" style="margin-top:4px;" onchange="wsCreateDistroChanged()">
+                    <option value="debian">Debian</option>
+                    <option value="ubuntu">Ubuntu</option>
+                    <option value="rocky">Rocky / RHEL</option>
+                </select>
+            </label>
+            <label>Release
+                <input id="ws-release" class="form-control" value="bookworm" style="margin-top:4px;">
+            </label>
+            <label>Root / replication DB password
+                <input id="ws-pw" type="password" class="form-control" style="margin-top:4px;" autocomplete="new-password">
+            </label>
+        </div>
+        <div style="margin-top:12px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+                <span style="font-size:12px;color:var(--text-muted);">Nodes — name each and pick its host</span>
+                <button class="btn btn-sm" onclick="wsCreateAddRow()" style="padding:2px 10px;">+ Add node</button>
+            </div>
+            <div id="ws-rows"></div>
+        </div>
+        <div style="font-size:11px;color:var(--text-muted);margin-top:10px;line-height:1.5;">
+            A fresh cluster starts with empty, identical MariaDB on every node, fronted by WolfScale — apps then write through the
+            proxy and changes replicate leader→follower. Builds LXC containers; if a prebuilt WolfScale binary isn't staged it
+            compiles from source per node (slow). Password chars: letters, digits and . _ - @ % + = ! ~
+        </div>
+        <div role="note" style="font-size:11px;color:#f59e0b;margin-top:8px;line-height:1.5;">
+            ⚠ WolfScale's cluster port has no shared secret — any host that reaches it with this cluster name can join and may take
+            write leadership. The nodes bind it on their WolfNet IP; keep them isolated on the WolfNet overlay (or a private VLAN).
+        </div>
+        <div id="ws-error" role="alert" style="display:none;color:var(--danger);font-size:12px;margin-top:10px;"></div>
+        <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px;">
+            <button class="btn btn-sm" onclick="wsCloseModal()">Cancel</button>
+            <button class="btn btn-primary btn-sm" onclick="wsCreateSubmit()">Build cluster</button>
+        </div>`;
+    wsOpenModal('New WolfScale cluster in ' + wsState.cluster, html, 580);
+    wsCreateAddRow('wolfscale-1');
+    wsCreateAddRow('wolfscale-2');
+    wsCreateAddRow('wolfscale-3');
+}
+
+function wsCreateSubmit() {
+    const name = (document.getElementById('ws-name').value || '').trim();
+    const host = document.getElementById('ws-host').value;
+    const distro = document.getElementById('ws-distro').value;
+    const release = (document.getElementById('ws-release').value || '').trim();
+    const pw = document.getElementById('ws-pw').value || '';
+    const err = document.getElementById('ws-error');
+    const fail = m => { if (err) { err.textContent = m; err.style.display = 'block'; } };
+    const nameOk = /^[A-Za-z0-9._-]+$/;
+    const pwOk = /^[A-Za-z0-9._@%+=!~-]{1,128}$/;
+    const names = [], chosts = [];
+    document.querySelectorAll('.ws-node-row').forEach(row => {
+        const nm = (row.querySelector('.ws-cname')?.value || '').trim();
+        if (!nm) return;
+        names.push(nm);
+        chosts.push((row.querySelector('.ws-chost')?.value || '').trim());
+    });
+    if (!name) return fail('Cluster name is required.');
+    if (!nameOk.test(name)) return fail('Cluster name may only contain letters, digits, - _ .');
+    if (!host) return fail('Pick a home host.');
+    if (names.length < 1 || names.length > 9) return fail('A cluster needs between 1 and 9 nodes.');
+    for (const n of names) if (!nameOk.test(n)) return fail(`Container name "${n}" may only contain letters, digits, - _ .`);
+    if (new Set(names).size !== names.length) return fail('Container names must be unique.');
+    if (chosts.some(h => !h)) return fail('Every node needs a host.');
+    if (!release) return fail('Release is required.');
+    if (!pwOk.test(pw)) return fail('Password must be 1–128 chars from letters, digits and . _ - @ % + = ! ~');
+    const body = {
+        cluster_name: name, cluster: wsState.cluster, container_names: names, container_hosts: chosts,
+        distribution: distro, release: release, db_password: pw, node_id: host,
+    };
+    wsCloseModal();
+    const spread = new Set(chosts).size;
+    wsStreamJob('Building “' + name + '”' + (spread > 1 ? ' across ' + spread + ' hosts' : ''), wsNodeBase(host, 'provision'), body);
+}
+
+// ── Adopt ────────────────────────────────────────────────────────────
+
+let _wsAdoptInv = [];
+function wsAdoptOpen() {
+    _wsAdoptInv = [];
+    const html = `
+        <div style="font-size:13px;display:grid;gap:10px;">
+            <label>Cluster name (WolfScale cluster_name)
+                <input id="wsa-name" class="form-control" placeholder="my-wolfscale" style="margin-top:4px;">
+            </label>
+            <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;">
+                <label>Cluster port <input id="wsa-cport" type="number" class="form-control" value="7654" style="margin-top:4px;"></label>
+                <label>API port <input id="wsa-aport" type="number" class="form-control" value="8080" style="margin-top:4px;"></label>
+                <label>Proxy port <input id="wsa-pport" type="number" class="form-control" value="8007" style="margin-top:4px;"></label>
+            </div>
+            <div>
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+                    <span style="font-size:12px;color:var(--text-muted);">Pick the WolfScale containers to adopt</span>
+                    <button class="btn btn-sm" onclick="wsAdoptLoadInventory()" style="padding:2px 10px;">↻ Refresh</button>
+                </div>
+                <div id="wsa-picker" style="max-height:38vh;overflow:auto;border:1px solid var(--border);border-radius:8px;padding:8px;">
+                    <div style="color:var(--text-muted);font-size:12px;padding:10px;">Loading containers…</div>
+                </div>
+            </div>
+        </div>
+        <div style="font-size:11px;color:var(--text-muted);margin-top:10px;line-height:1.5;">
+            WolfStack resolves each container's WolfNet address on its host. Status is read from each node's WolfScale API on the API port above.
+        </div>
+        <div id="wsa-error" role="alert" style="display:none;color:var(--danger);font-size:12px;margin-top:10px;"></div>
+        <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px;">
+            <button class="btn btn-sm" onclick="wsCloseModal()">Cancel</button>
+            <button class="btn btn-primary btn-sm" onclick="wsAdoptSubmit()">Adopt selected</button>
+        </div>`;
+    wsOpenModal('Adopt into a WolfScale cluster — ' + wsState.cluster, html, 640);
+    wsAdoptLoadInventory();
+}
+
+async function wsAdoptLoadInventory() {
+    const picker = document.getElementById('wsa-picker');
+    if (picker) picker.innerHTML = `<div style="color:var(--text-muted);font-size:12px;padding:10px;">Loading containers…</div>`;
+    const hosts = wsClusterNodes();
+    try {
+        const results = await Promise.all(hosts.map(h =>
+            fetch('/api/control-panel/inventory/node/' + encodeURIComponent(h.id))
+                .then(r => (r.ok ? r.json() : { items: [] })).catch(() => ({ items: [] }))
+        ));
+        const inv = [];
+        results.forEach(d => (d.items || []).forEach(it => { if (it.kind === 'lxc') inv.push(it); }));
+        _wsAdoptInv = inv;
+        wsAdoptRenderPicker();
+    } catch (e) {
+        if (picker) picker.innerHTML = `<div role="alert" style="color:var(--danger);font-size:12px;padding:10px;">Couldn't load containers: ${escapeHtml((e && e.message) || String(e))}</div>`;
+    }
+}
+
+function wsAdoptRenderPicker() {
+    const picker = document.getElementById('wsa-picker');
+    if (!picker) return;
+    if (!_wsAdoptInv.length) {
+        picker.innerHTML = `<div style="color:var(--text-muted);font-size:12px;padding:10px;">No LXC containers found in this cluster.</div>`;
+        return;
+    }
+    const byHost = {};
+    _wsAdoptInv.forEach((it, i) => { (byHost[it.node_id] = byHost[it.node_id] || []).push({ it, i }); });
+    let html = '';
+    Object.keys(byHost).forEach(hostId => {
+        html += `<div style="font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:.4px;margin:6px 0 4px;">${escapeHtml(galeraHostName(hostId))}</div>`;
+        byHost[hostId].forEach(({ it, i }) => {
+            const running = (it.status || '').toLowerCase() === 'running';
+            html += `<label style="display:flex;align-items:center;gap:8px;padding:5px 6px;border-radius:6px;cursor:pointer;font-size:12px;">
+                <input type="checkbox" class="wsa-pick" data-idx="${i}">
+                <span style="font-family:var(--font-mono,monospace);">${escapeHtml(it.name)}</span>
+                <span style="margin-left:auto;font-size:10px;color:${running ? '#22c55e' : 'var(--text-muted)'};">${escapeHtml(it.status || '')}</span>
+            </label>`;
+        });
+    });
+    picker.innerHTML = html;
+}
+
+async function wsAdoptSubmit() {
+    const err = document.getElementById('wsa-error');
+    const fail = m => { if (err) { err.textContent = m; err.style.display = 'block'; } };
+    const name = (document.getElementById('wsa-name').value || '').trim();
+    const cport = parseInt(document.getElementById('wsa-cport').value, 10) || 7654;
+    const aport = parseInt(document.getElementById('wsa-aport').value, 10) || 8080;
+    const pport = parseInt(document.getElementById('wsa-pport').value, 10) || 8007;
+    const nameOk = /^[A-Za-z0-9._-]+$/;
+    if (!nameOk.test(name)) return fail('Cluster name may only contain letters, digits, - _ .');
+    const stableHostId = (hid) => {
+        const n = (Array.isArray(allNodes) ? allNodes : []).find(x => x.id === hid || x.self_id === hid);
+        return (n && n.self_id) ? n.self_id : hid;
+    };
+    const nodes = [];
+    document.querySelectorAll('.wsa-pick:checked').forEach(cb => {
+        const it = _wsAdoptInv[parseInt(cb.getAttribute('data-idx'), 10)];
+        if (it) nodes.push({ node_id: stableHostId(it.node_id), container: it.name, ws_id: it.name });
+    });
+    if (!nodes.length) return fail('Tick at least one container.');
+    const payload = { cluster_name: name, cluster: wsState.cluster, cluster_port: cport, api_port: aport, proxy_port: pport, nodes };
+    try {
+        const r = await fetch(wsNodeBase(wsPrimaryHost(), 'adopt'), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok || d.error) throw new Error(d.error || ('HTTP ' + r.status));
+        showToast('Cluster adopted', 'success');
+        wsCloseModal();
+        wsLoadClusters();
+    } catch (e) {
+        fail((e && e.message) || String(e));
+    }
+}
+
+// ── Modal + SSE job (mirrors the Galera helpers, WolfScale-scoped) ────
+
+function wsCloseModal() {
+    const o = document.getElementById('ws-modal-overlay');
+    if (o) o.remove();
+    document.removeEventListener('keydown', wsModalEsc);
+    if (wsState.activeJobAbort) { try { wsState.activeJobAbort.abort(); } catch (_) {} wsState.activeJobAbort = null; }
+}
+function wsModalEsc(e) { if (e.key === 'Escape') wsCloseModal(); }
+function wsOpenModal(title, innerHtml, widthPx) {
+    wsCloseModal();
+    const overlay = document.createElement('div');
+    overlay.id = 'ws-modal-overlay';
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);z-index:100000;display:flex;align-items:flex-start;justify-content:center;padding:5vh 16px;overflow-y:auto;';
+    overlay.onclick = e => { if (e.target === overlay) wsCloseModal(); };
+    const modal = document.createElement('div');
+    modal.style.cssText = `background:var(--bg-card,#1e2028);border:1px solid var(--border-color,#2d2f3a);border-radius:12px;padding:22px 24px;max-width:${widthPx || 560}px;width:100%;box-shadow:0 20px 60px rgba(0,0,0,0.5);color:var(--text-primary,#e4e4e7);font-family:inherit;`;
+    modal.innerHTML = `<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
+            <div style="font-size:15px;font-weight:600;color:var(--accent-light,#60a5fa);">${escapeHtml(title)}</div>
+            <button onclick="wsCloseModal()" style="background:none;border:none;color:var(--text-muted);font-size:20px;cursor:pointer;line-height:1;">×</button>
+        </div>${innerHtml}`;
+    overlay.appendChild(modal);
+    (document.fullscreenElement || document.body).appendChild(overlay);
+    document.addEventListener('keydown', wsModalEsc);
+    return modal;
+}
+
+async function wsStreamJob(title, url, body) {
+    const modal = wsOpenModal(title, `
+        <pre id="ws-job-log" role="log" aria-live="polite" style="background:var(--bg-input,#0d0f14);border:1px solid var(--border);border-radius:8px;padding:12px;font-size:12px;line-height:1.5;max-height:50vh;overflow:auto;white-space:pre-wrap;word-break:break-word;margin:0;">Starting…</pre>
+        <div id="ws-job-result" style="margin-top:12px;font-size:13px;"></div>
+        <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:14px;">
+            <button id="ws-job-close" class="btn btn-sm" onclick="wsCloseModal()" disabled>Close</button>
+        </div>`, 640);
+    const log = modal.querySelector('#ws-job-log');
+    const resultEl = modal.querySelector('#ws-job-result');
+    const closeBtn = modal.querySelector('#ws-job-close');
+    const append = line => {
+        if (!log) return;
+        if (log.textContent === 'Starting…') log.textContent = '';
+        log.textContent += (log.textContent ? '\n' : '') + line;
+        log.scrollTop = log.scrollHeight;
+    };
+    const ctrl = new AbortController();
+    wsState.activeJobAbort = ctrl;
+    let ok = null, finalMsg = '', aborted = false;
+    try {
+        const resp = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: ctrl.signal });
+        if (!resp.ok && (resp.headers.get('content-type') || '').includes('application/json')) {
+            const d = await resp.json();
+            throw new Error(d.error || ('HTTP ' + resp.status));
+        }
+        if (!resp.body) throw new Error('HTTP ' + resp.status + ' (no response body)');
+        const reader = resp.body.getReader();
+        const dec = new TextDecoder();
+        let buf = '';
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buf += dec.decode(value, { stream: true });
+            const lines = buf.split('\n'); buf = lines.pop();
+            for (const line of lines) {
+                if (!line.startsWith('data: ')) continue;
+                const msg = line.slice(6);
+                if (msg.startsWith('RESULT:OK:')) { ok = true; finalMsg = msg.slice(10); }
+                else if (msg.startsWith('RESULT:ERR:')) { ok = false; finalMsg = msg.slice(11); }
+                else append(msg);
+            }
+        }
+    } catch (e) {
+        if (ctrl.signal.aborted) { aborted = true; }
+        else { ok = false; finalMsg = (e && e.message) || String(e); }
+    }
+    if (wsState.activeJobAbort === ctrl) wsState.activeJobAbort = null;
+    if (!aborted && resultEl) {
+        if (ok === true) {
+            resultEl.innerHTML = `<div style="color:var(--success);">✅ ${escapeHtml(finalMsg || 'Done')}</div>`;
+            showToast('WolfScale: ' + (finalMsg || 'done'), 'success');
+        } else {
+            resultEl.innerHTML = `<div role="alert" style="color:var(--danger);">❌ ${escapeHtml(finalMsg || 'Failed')}</div>`;
+            showToast('WolfScale job failed', 'error', 0);
+        }
+    }
+    if (closeBtn) closeBtn.disabled = false;
+    wsLoadClusters();
+}
+
+window.showWolfScaleForCluster = showWolfScaleForCluster;
+window.wsLoadClusters = wsLoadClusters;
+window.wsCreateOpen = wsCreateOpen;
+window.wsCreateAddRow = wsCreateAddRow;
+window.wsCreateRemoveRow = wsCreateRemoveRow;
+window.wsCreateDistroChanged = wsCreateDistroChanged;
+window.wsCreateSubmit = wsCreateSubmit;
+window.wsAdoptOpen = wsAdoptOpen;
+window.wsAdoptLoadInventory = wsAdoptLoadInventory;
+window.wsAdoptSubmit = wsAdoptSubmit;
+window.wsCloseModal = wsCloseModal;

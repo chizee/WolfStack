@@ -24,6 +24,7 @@ mod storage;
 mod networking;
 mod backup;
 mod galera;
+mod wolfscale;
 mod vms;
 mod proxmox;
 mod xo;
