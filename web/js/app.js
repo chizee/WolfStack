@@ -23019,6 +23019,9 @@ async function cloneLxcContainer(name) {
             <div style="display:flex;flex-direction:column;gap:12px;">
                 <div><label style="font-size:13px;color:var(--text-muted,#aaa);">New Name</label>
                     <input id="clone-new-name" type="text" value="${name}-clone" style="width:100%;padding:8px 12px;background:var(--bg-primary,#111);border:1px solid var(--border,#444);border-radius:6px;color:var(--text,#fff);margin-top:4px;"></div>
+                <div id="clone-vmid-row" style="display:none;"><label style="font-size:13px;color:var(--text-muted,#aaa);">New VMID</label>
+                    <input id="clone-vmid" type="number" min="100" placeholder="leave blank for the next free id" style="width:100%;padding:8px 12px;background:var(--bg-primary,#111);border:1px solid var(--border,#444);border-radius:6px;color:var(--text,#fff);margin-top:4px;">
+                    <span style="font-size:11px;color:var(--text-muted,#666);margin-top:2px;display:block;">Exact copy, created stopped — change its IP / WolfNet address before starting it alongside the original.</span></div>
                 <div><label style="font-size:13px;color:var(--text-muted,#aaa);">Target Node</label>
                     <select id="clone-target-node" style="width:100%;padding:8px 12px;background:var(--bg-primary,#111);border:1px solid var(--border,#444);border-radius:6px;color:var(--text,#fff);margin-top:4px;">
                         <option value="">This node (local clone)</option>
@@ -23051,6 +23054,16 @@ async function cloneLxcContainer(name) {
                     const free = formatBytes(s.available_bytes);
                     sel.insertAdjacentHTML('beforeend', `<option value="${s.id}">${s.id} (${s.storage_type}, ${free} free)</option>`);
                 });
+                // Proxmox: let the operator choose the new VMID. Only for a
+                // local (same-node) clone — a remote clone goes through
+                // export/import and assigns its own id on the target.
+                const vmidRow = document.getElementById('clone-vmid-row');
+                const tgtSel = document.getElementById('clone-target-node');
+                if (vmidRow && tgtSel) {
+                    const syncVmidRow = () => { vmidRow.style.display = tgtSel.value ? 'none' : 'block'; };
+                    syncVmidRow();
+                    tgtSel.addEventListener('change', syncVmidRow);
+                }
             } else if (storageData.paths) {
                 storageData.paths.forEach(p => {
                     sel.insertAdjacentHTML('beforeend', `<option value="${p.path}">${p.path} (${formatBytes(p.free_bytes)} free)</option>`);
@@ -23064,7 +23077,14 @@ async function doCloneLxc(name) {
     const newName = document.getElementById('clone-new-name').value.trim();
     const targetNode = document.getElementById('clone-target-node').value;
     const storage = document.getElementById('clone-storage').value.trim();
+    // Proxmox local clone only — the field is hidden otherwise.
+    const vmidRaw = document.getElementById('clone-vmid')?.value.trim() || '';
+    const vmidRowVisible = document.getElementById('clone-vmid-row')?.style.display !== 'none';
     if (!newName) { showToast('Enter a name for the clone', 'error'); return; }
+    if (vmidRowVisible && vmidRaw && (!/^\d+$/.test(vmidRaw) || parseInt(vmidRaw, 10) < 100)) {
+        showToast('VMID must be a number ≥ 100 (or blank for the next free id)', 'error');
+        return;
+    }
 
     document.getElementById('lxc-clone-modal')?.remove();
 
@@ -23092,6 +23112,7 @@ async function doCloneLxc(name) {
         const body = { new_name: newName };
         if (targetNode) body.target_node = targetNode;
         if (storage) body.storage = storage;
+        if (vmidRowVisible && vmidRaw) body.vmid = parseInt(vmidRaw, 10);
 
         const resp = await fetch(apiUrl(`/api/containers/lxc/${name}/clone`), {
             method: 'POST',

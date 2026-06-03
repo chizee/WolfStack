@@ -8892,6 +8892,8 @@ pub struct CloneRequest {
     pub storage: Option<String>, // target storage (Proxmox ID or path)
     pub target_node: Option<String>, // clone to a different node in the cluster
     pub wolfnet_ip: Option<String>,  // pre-allocated wolfnet IP (avoids cross-node conflicts)
+    #[serde(default)]
+    pub vmid: Option<u32>,       // Proxmox local clone — operator-chosen new VMID
 }
 
 #[derive(Deserialize)]
@@ -9073,22 +9075,34 @@ pub async fn lxc_clone(
         return lxc_remote_clone(&state, &name, &body.new_name, target_node_id, body.storage.as_deref(), body.wolfnet_ip.as_deref(), None, None).await;
     }
 
-    // Local clone — lxc-copy requires container to be stopped
+    // Local clone — a full clone requires the source stopped; restart it after.
+    let was_running = containers::lxc_is_running(&name);
     let _ = containers::lxc_stop(&name);
     let storage = body.storage.as_deref();
     let result = if body.snapshot.unwrap_or(false) {
-        containers::lxc_clone_snapshot(&name, &body.new_name)
+        containers::lxc_clone_snapshot(&name, &body.new_name, body.vmid)
     } else {
-        containers::lxc_clone_local(&name, &body.new_name, storage)
+        containers::lxc_clone_local(&name, &body.new_name, storage, body.vmid)
     };
-    let _ = containers::lxc_start(&name); // restart template
+    // Restore the source to the state we found it in (don't leave a
+    // previously-stopped template running just because we cloned it).
+    if was_running { let _ = containers::lxc_start(&name); }
     match result {
         Ok(msg) => {
-            // Remove duplicated wolfnet IP marker and allocate fresh one
-            let _ = std::fs::remove_dir_all(format!("{}/{}/.wolfnet", containers::lxc_base_dir(&body.new_name), body.new_name));
-            let _ = containers::lxc_start(&body.new_name);
-            if let Some(ip) = containers::next_available_wolfnet_ip() {
-                let _ = containers::lxc_attach_wolfnet(&body.new_name, &ip);
+            // The clone is created STOPPED and is NEVER auto-started — the
+            // operator reviews/changes its identity (IP, hostname, WolfNet
+            // address) and starts it when ready.
+            //
+            // Standalone clones already got a fresh MAC/IP from
+            // lxc_clone_fixup_ip; give the copy a fresh WolfNet IP too so it
+            // can't collide with the source. Proxmox clones are deliberately
+            // left exactly as-is (same config + WolfNet IP) per operator
+            // request — nothing is reseated here.
+            if !containers::is_proxmox() {
+                let _ = std::fs::remove_dir_all(format!("{}/{}/.wolfnet", containers::lxc_base_dir(&body.new_name), body.new_name));
+                if let Some(ip) = containers::next_available_wolfnet_ip() {
+                    let _ = containers::lxc_attach_wolfnet(&body.new_name, &ip);
+                }
             }
             HttpResponse::Ok().json(serde_json::json!({ "message": msg }))
         },
@@ -9163,8 +9177,14 @@ async fn lxc_remote_clone(
         None => return HttpResponse::NotFound().json(serde_json::json!({"error": "Target node not found"})),
     };
     if node.is_self {
-        // Local clone, not remote
-        match containers::lxc_clone_local(source, new_name, storage) {
+        // Target resolved to this node — a local clone. A full clone needs the
+        // source stopped (pct clone --full / lxc-copy both require it), so stop
+        // it first and restore it to the state we found it in afterwards.
+        let was_running = containers::lxc_is_running(source);
+        let _ = containers::lxc_stop(source);
+        let res = containers::lxc_clone_local(source, new_name, storage, None);
+        if was_running { let _ = containers::lxc_start(source); }
+        match res {
             Ok(msg) => return HttpResponse::Ok().json(serde_json::json!({"message": msg})),
             Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({"error": e})),
         }
