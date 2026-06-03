@@ -9851,6 +9851,50 @@ region = us-east-1"></textarea>
     </div>
 </div>
 
+<!-- Login-time support nag: shown once per login to operators who have dismissed
+     the welcome modal and are NOT supporting WolfStack (no licence, no paying
+     Patreon pledge, no GitHub Sponsor self-attest). Freely dismissible — never
+     blocks the dashboard. Reuses the .welcome-modal styles. See
+     maybeShowLoginPrompt() / showSupportNag() in app.js. -->
+<div id="support-nag" class="welcome-modal" role="dialog" aria-modal="true" aria-labelledby="support-nag-title" style="display:none;">
+    <div class="welcome-backdrop" onclick="closeSupportNag()"></div>
+    <div class="welcome-card" role="document">
+        <button type="button" class="welcome-x" id="support-nag-close-btn" onclick="closeSupportNag()" aria-label="Close support dialog">&times;</button>
+        <div class="welcome-hero">
+            <span class="welcome-action-ico welcome-ico-heart" aria-hidden="true" style="margin:0 auto 10px;width:48px;height:48px;font-size:24px;">&#9829;</span>
+            <h2 id="support-nag-title">Help keep WolfStack free</h2>
+            <p class="welcome-sub">WolfStack is built by a tiny independent team &mdash; no VC money, no ads, no telemetry, and every feature ships free to everyone. If it's useful to you, please consider chipping in to keep it that way.</p>
+        </div>
+        <div class="welcome-actions">
+            <a class="welcome-action welcome-action-primary" href="https://github.com/sponsors/wolfsoftwaresystemsltd" target="_blank" rel="noopener noreferrer">
+                <span class="welcome-action-ico welcome-ico-heart">&#9829;</span>
+                <span class="welcome-action-txt">
+                    <strong>Become a GitHub Sponsor</strong>
+                    <span>Recurring support from a few dollars a month &mdash; cancel anytime.</span>
+                </span>
+                <span class="welcome-action-arrow">&#8599;</span>
+            </a>
+            <a class="welcome-action" href="https://wolfstack.org/enterprise.php" target="_blank" rel="noopener noreferrer">
+                <span class="welcome-action-ico" style="background:rgba(59,130,246,0.14);color:#60a5fa;">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>
+                </span>
+                <span class="welcome-action-txt">
+                    <strong>Buy a licence plan</strong>
+                    <span>Homelab to Enterprise &mdash; dedicated support, and every licence funds development.</span>
+                </span>
+                <span class="welcome-action-arrow">&#8599;</span>
+            </a>
+        </div>
+        <div class="welcome-foot">
+            <label class="welcome-dontshow-lbl">
+                <input type="checkbox" id="nag-supporting"> I'm supporting already
+            </label>
+            <button type="button" class="welcome-getstarted" onclick="closeSupportNag()">Maybe later</button>
+        </div>
+        <p class="nag-once-note">We're asking for your support &mdash; this appears just once each time you sign in. Already a GitHub or Patreon supporter? Tick <strong>&ldquo;I'm supporting already&rdquo;</strong> and we'll stop asking for good &mdash; we can't auto-verify those, so it's on the honour system.</p>
+    </div>
+</div>
+
 </body>
 
 </html>

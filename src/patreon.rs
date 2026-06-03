@@ -61,6 +61,14 @@ impl PatreonTier {
         matches!(self, PatreonTier::Advanced | PatreonTier::Platinum | PatreonTier::Enterprise)
     }
 
+    /// Whether this tier reflects an actual paid pledge — excludes `None`
+    /// (not linked) and `Free` (follows on Patreon but pledges nothing).
+    /// Used by the login-time support nag to exempt anyone who is in fact
+    /// paying us, even at a tier below beta access.
+    pub fn is_paying(&self) -> bool {
+        matches!(self, PatreonTier::Basic | PatreonTier::Advanced | PatreonTier::Platinum | PatreonTier::Enterprise)
+    }
+
     /// Determine tier from pledge amount in cents.
     pub fn from_cents(cents: i64) -> Self {
         if cents >= 9500 {
@@ -365,5 +373,18 @@ mod tests {
         assert!(PatreonTier::Advanced.has_beta_access());
         assert!(PatreonTier::Platinum.has_beta_access());
         assert!(PatreonTier::Enterprise.has_beta_access());
+    }
+
+    #[test]
+    fn test_is_paying() {
+        // The support nag must NOT fire for anyone actually paying. The
+        // critical boundary is Free (follows, pledges nothing) vs Basic
+        // (first paid tier).
+        assert!(!PatreonTier::None.is_paying());
+        assert!(!PatreonTier::Free.is_paying());
+        assert!(PatreonTier::Basic.is_paying());
+        assert!(PatreonTier::Advanced.is_paying());
+        assert!(PatreonTier::Platinum.is_paying());
+        assert!(PatreonTier::Enterprise.is_paying());
     }
 }
