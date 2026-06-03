@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v24.16.0: LXC clone on Proxmox — exact copy, operator-chosen VMID, never auto-start** _(2026-06-03 — [`33c6bae`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/33c6bae4c3355a74365bab15ba69fb058ea39cb5))_
 - **v24.15.3: fix the tamper-baseline reseed command — https + authenticate** _(2026-06-03 — [`0d23cce`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/0d23cceeefc0143e09a966420da2d3dcd1f8b60e))_
 - **v24.15.2: clamav/logrotate self-heal runs periodically, not just at startup** _(2026-06-03 — [`0952e85`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/0952e85cdb2a8f104a0bcc3137c0d66544de09cb))_
 - **v24.15.1: fix installer/KB — status pages listen on :8550, not :8555** _(2026-06-03 — [`cd68573`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/cd68573172546cb5afbdb3c27a3a6a6819865d2b))_
