@@ -7855,12 +7855,20 @@ pub fn pct_create_api(name: &str, distribution: &str, release: &str, architectur
 // ─── Clone, Export, Import ───
 
 /// Clone an LXC container on the same node
-pub fn lxc_clone_local(source: &str, new_name: &str, storage: Option<&str>) -> Result<String, String> {
+pub fn lxc_clone_local(source: &str, new_name: &str, storage: Option<&str>, vmid: Option<u32>) -> Result<String, String> {
 
 
 
     if is_proxmox() {
-        let new_vmid = pct_next_vmid()?;
+        // Honour an operator-chosen VMID; fall back to the cluster's next free
+        // id only when none was supplied. pct clone rejects a VMID that's
+        // already taken (cluster-wide via pmxcfs), so we let it be the
+        // authority on uniqueness and just bound the low end here.
+        let new_vmid = match vmid {
+            Some(v) if v >= 100 => v,
+            Some(v) => return Err(format!("Invalid VMID {} — Proxmox VMIDs must be 100 or higher", v)),
+            None => pct_next_vmid()?,
+        };
         let mut args = vec![
             "clone".to_string(),
             source.to_string(),          // source VMID
@@ -7880,9 +7888,18 @@ pub fn lxc_clone_local(source: &str, new_name: &str, storage: Option<&str>) -> R
             .map_err(|e| format!("Failed to run pct clone: {}", e))?;
 
         if output.status.success() {
-
-            lxc_clone_fixup_ip(new_name);
-            Ok(format!("Container '{}' cloned to '{}' (VMID {})", source, new_name, new_vmid))
+            // Clone everything as-is: `pct clone --full` already made an exact
+            // copy of the config + rootfs. We deliberately do NOT run
+            // lxc_clone_fixup_ip (which reseats MAC/IP for standalone clones) —
+            // the operator asked for a faithful duplicate. Carry the source's
+            // WolfNet IP across too so the copy is truly identical; the operator
+            // changes the new container's network identity before starting it
+            // alongside the original, and the start-time WolfNet conflict check
+            // refuses a duplicate if they forget.
+            if let Some(ip) = lxc_get_wolfnet_ip(source) {
+                lxc_set_wolfnet_marker(&new_vmid.to_string(), &ip);
+            }
+            Ok(format!("Container '{}' cloned to '{}' (VMID {}). Created stopped — review its IP / WolfNet identity before starting it alongside the original.", source, new_name, new_vmid))
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -9420,7 +9437,7 @@ pub fn lxc_clone(container: &str, new_name: &str) -> Result<String, String> {
 
 
     if is_proxmox() {
-        return lxc_clone_local(container, new_name, None);
+        return lxc_clone_local(container, new_name, None, None);
     }
 
     let output = Command::new("lxc-copy")
@@ -9441,12 +9458,16 @@ pub fn lxc_clone(container: &str, new_name: &str) -> Result<String, String> {
 
 /// Clone an LXC container as a snapshot (faster, copy-on-write)
 /// On Proxmox, uses linked clone (not full)
-pub fn lxc_clone_snapshot(container: &str, new_name: &str) -> Result<String, String> {
+pub fn lxc_clone_snapshot(container: &str, new_name: &str, vmid: Option<u32>) -> Result<String, String> {
 
 
     if is_proxmox() {
         // Proxmox linked clone (--full 0)
-        let new_vmid = pct_next_vmid()?;
+        let new_vmid = match vmid {
+            Some(v) if v >= 100 => v,
+            Some(v) => return Err(format!("Invalid VMID {} — Proxmox VMIDs must be 100 or higher", v)),
+            None => pct_next_vmid()?,
+        };
         let vmid_str = new_vmid.to_string();
         let args = vec![
             "clone", container, &vmid_str,
@@ -9457,8 +9478,13 @@ pub fn lxc_clone_snapshot(container: &str, new_name: &str) -> Result<String, Str
             .map_err(|e| format!("pct clone failed: {}", e))?;
 
         if output.status.success() {
-            lxc_clone_fixup_ip(new_name);
-            return Ok(format!("Container '{}' linked-cloned to '{}' (VMID {})", container, new_name, new_vmid));
+            // As-is copy (same rationale as lxc_clone_local): don't reseat
+            // networking on Proxmox, just carry the source's WolfNet IP to the
+            // new VMID so the linked clone is a faithful duplicate.
+            if let Some(ip) = lxc_get_wolfnet_ip(container) {
+                lxc_set_wolfnet_marker(&new_vmid.to_string(), &ip);
+            }
+            return Ok(format!("Container '{}' linked-cloned to '{}' (VMID {}). Created stopped — review its IP / WolfNet identity before starting it alongside the original.", container, new_name, new_vmid));
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(format!("Linked clone failed: {}", stderr.trim()));
