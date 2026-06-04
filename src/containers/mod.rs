@@ -7587,6 +7587,38 @@ pub fn pvesm_resolve_path(storage_id: &str) -> Option<String> {
     None
 }
 
+/// Reverse of [`pvesm_resolve_path`]: given a filesystem path, return the PVE
+/// storage ID whose `path` matches it. Needed because some UI storage pickers
+/// hand back a storage's filesystem path (e.g. the App Store install modal,
+/// which sends `s.path || s.id`), but `pct` addresses storage by ID. Returns
+/// `None` for a path that isn't a PVE dir storage (e.g. a WolfStack mount),
+/// so callers can fall back to the default storage.
+pub fn pvesm_resolve_id(path: &str) -> Option<String> {
+    let path = path.trim_end_matches('/');
+    if path.is_empty() { return None; }
+    // The default 'local' dir storage lives at /var/lib/vz.
+    if path == "/var/lib/vz" { return Some("local".to_string()); }
+    if let Ok(cfg) = std::fs::read_to_string("/etc/pve/storage.cfg") {
+        let mut current_id: Option<String> = None;
+        for line in cfg.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') { continue; }
+            // Section header "type: id" sits flush-left; properties are indented.
+            if trimmed.contains(':') && !line.starts_with('\t') && !line.starts_with(' ') {
+                let parts: Vec<&str> = trimmed.splitn(2, ':').collect();
+                current_id = parts.get(1).map(|s| s.trim().to_string());
+            } else if let Some(val) = trimmed.strip_prefix("path ") {
+                // PVE writes properties as "path <value>" (space-delimited);
+                // requiring the space avoids matching keys like "pathname".
+                if val.trim().trim_end_matches('/') == path {
+                    return current_id.clone();
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Get next available VMID from Proxmox
 fn pct_next_vmid() -> Result<u32, String> {
     let output = Command::new("pvesh").args(["get", "/cluster/nextid"])
@@ -7739,7 +7771,7 @@ pub fn pct_create_api(name: &str, distribution: &str, release: &str, architectur
               storage_id: Option<&str>, template_storage_id: Option<&str>,
               root_password: Option<&str>,
               memory_mb: Option<u32>, cpu_cores: Option<u32>,
-              wolfnet_ip: Option<&str>) -> Result<String, String> {
+              wolfnet_ip: Option<&str>) -> Result<(u32, String), String> {
     let vmid = pct_next_vmid()?;
     let storage = storage_id.unwrap_or("local-lvm");
 
@@ -7843,7 +7875,7 @@ pub fn pct_create_api(name: &str, distribution: &str, release: &str, architectur
             }
         }
 
-        Ok(format!("Container '{}' created (VMID {}, {} {} {}, storage: {})", name, vmid, distribution, release, architecture, storage))
+        Ok((vmid, format!("Container '{}' created (VMID {}, {} {} {}, storage: {})", name, vmid, distribution, release, architecture, storage)))
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -8349,6 +8381,172 @@ pub fn lxc_export_cleanup(archive_path: &str) {
 
 }
 
+/// List native `lxc-create` containers on a Proxmox host that PVE doesn't
+/// know about — the footprint of the pre-fix App Store installer, which
+/// created LXC containers with native tooling instead of `pct`. Such a
+/// container lives at `/var/lib/lxc/<name>/` with its own `config` file but
+/// has no `/etc/pve/lxc/<name>.conf`, so it's invisible both in the Proxmox
+/// UI and in WolfStack's `pct list`-based container view.
+///
+/// Returns an empty list on non-Proxmox hosts, where native containers are
+/// the norm rather than orphans.
+pub fn list_native_lxc_orphans() -> Vec<String> {
+    if !is_proxmox() { return Vec::new(); }
+
+    let mut orphans = Vec::new();
+    let entries = match std::fs::read_dir(LXC_DEFAULT_PATH) {
+        Ok(e) => e,
+        Err(_) => return orphans,
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let name = entry.file_name().to_string_lossy().to_string();
+        // Skip dot dirs (our own adopted-backup staging never lives here, but
+        // be defensive) and anything without a native LXC config file.
+        if name.starts_with('.') { continue; }
+        let config_path = format!("{}/{}/config", LXC_DEFAULT_PATH, name);
+        if !std::path::Path::new(&config_path).is_file() { continue; }
+
+        // PVE-managed containers carry a /etc/pve/lxc/<vmid>.conf — and a
+        // running CT also has a generated /var/lib/lxc/<vmid>/config. Either
+        // way, presence of that PVE conf means it is NOT an orphan.
+        let pve_conf = format!("/etc/pve/lxc/{}.conf", name);
+        if std::path::Path::new(&pve_conf).is_file() { continue; }
+
+        orphans.push(name);
+    }
+    orphans
+}
+
+/// Adopt a single native `lxc-create` orphan into Proxmox so it becomes a
+/// first-class PVE container (visible in the Proxmox UI and WolfStack's
+/// container view). The orphan's root filesystem is tarred and handed to
+/// `pct create` as an OS template — the same mechanism [`lxc_import`] uses
+/// for a plain rootfs archive — which lets PVE lay it down on a real storage
+/// with a fresh VMID and config. Any WolfNet IP marker is re-attached to the
+/// new container.
+///
+/// Non-destructive: the original native directory is moved aside to
+/// `/var/lib/wolfstack/adopted-backup/<name>` (not deleted) once the PVE
+/// container is confirmed created, so a bad adoption stays recoverable.
+///
+/// Returns the new VMID as a string.
+pub fn pct_adopt_native_orphan(name: &str) -> Result<String, String> {
+    if !is_proxmox() {
+        return Err("Orphan adoption only applies on Proxmox hosts".to_string());
+    }
+
+    let container_dir = format!("{}/{}", LXC_DEFAULT_PATH, name);
+    let rootfs_dir = format!("{}/rootfs", container_dir);
+    if !std::path::Path::new(&rootfs_dir).is_dir() {
+        return Err(format!("Native container '{}' has no rootfs at {}", name, rootfs_dir));
+    }
+
+    let backup_root = "/var/lib/wolfstack/adopted-backup";
+    let backup_dir = format!("{}/{}", backup_root, name);
+    // Crash-recovery marker. Written into the native dir the instant `pct
+    // create` succeeds (before the move-aside), recording the new VMID, so a
+    // re-run after a crash can finish idempotently — WITHOUT guessing by
+    // hostname (which could collide with an unrelated PVE container).
+    let adopted_marker = format!("{}/.wolfstack-adopted-vmid", container_dir);
+
+    // Idempotency / crash-safety: if a prior adoption already created the PVE
+    // container but died before moving the native dir aside, the marker tells
+    // us the exact VMID. Confirm that container still exists, then just finish
+    // the move — never create a duplicate.
+    if let Ok(recorded) = std::fs::read_to_string(&adopted_marker) {
+        let recorded = recorded.trim().to_string();
+        let pve_conf = format!("/etc/pve/lxc/{}.conf", recorded);
+        if !recorded.is_empty() && std::path::Path::new(&pve_conf).is_file() {
+            let _ = std::fs::create_dir_all(backup_root);
+            if std::fs::rename(&container_dir, &backup_dir).is_err() {
+                let _ = Command::new("mv").args([container_dir.as_str(), backup_dir.as_str()]).output();
+            }
+            return Ok(recorded);
+        }
+        // Stale marker (the recorded container is gone) — adopt afresh.
+        let _ = std::fs::remove_file(&adopted_marker);
+    }
+
+    // The rootfs must be quiescent to tar it consistently — stop it if the
+    // orphan happens to be running natively (the buggy installer left them
+    // stopped, but an operator may have started one).
+    let _ = Command::new("lxc-stop").args(["-n", name]).output();
+
+    // Tar the rootfs (excluding virtual filesystems), mirroring the standalone
+    // export path. Staged under /var/lib/wolfstack rather than /tmp so a large
+    // rootfs doesn't risk overflowing a small tmpfs.
+    let stage_dir = "/var/lib/wolfstack/adopt";
+    std::fs::create_dir_all(stage_dir)
+        .map_err(|e| format!("Failed to create adopt staging dir: {}", e))?;
+    let archive_path = format!("{}/{}.tar.gz", stage_dir, name);
+    let tar_out = Command::new("tar")
+        .args(["czf", &archive_path,
+               "--exclude=./proc/*", "--exclude=./sys/*", "--exclude=./dev/*",
+               "-C", &rootfs_dir, "."])
+        .output()
+        .map_err(|e| format!("tar of orphan '{}' failed: {}", name, e))?;
+    if !tar_out.status.success() {
+        let _ = std::fs::remove_file(&archive_path);
+        let stderr = String::from_utf8_lossy(&tar_out.stderr);
+        return Err(format!("tar of orphan '{}' failed: {}", name, stderr.trim()));
+    }
+
+    // Hand the rootfs tarball to `pct create` via the shared import path.
+    let outcome = match lxc_import(&archive_path, name, None, None) {
+        Ok(o) => o,
+        Err(e) => {
+            let _ = std::fs::remove_file(&archive_path);
+            return Err(format!("pct create for orphan '{}' failed: {}", name, e));
+        }
+    };
+    let _ = std::fs::remove_file(&archive_path);
+
+    let vmid = outcome.start_id.clone();
+
+    // Record the adopted VMID immediately so a crash before the move-aside is
+    // recoverable on the next run (see the marker check at the top).
+    let _ = std::fs::write(&adopted_marker, &vmid);
+
+    // Re-attach WolfNet if the orphan carried an IP marker.
+    let marker = format!("{}/.wolfnet/ip", container_dir);
+    if let Ok(ip) = std::fs::read_to_string(&marker) {
+        let ip = ip.trim().to_string();
+        if !ip.is_empty() {
+            ensure_lxc_bridge();
+            let _ = Command::new("pct")
+                .args(["set", &vmid, "--net1", "name=wn0,bridge=lxcbr0"])
+                .output();
+            if let Err(e) = lxc_attach_wolfnet(&vmid, &ip) {
+                warn!("Adopted orphan '{}' (VMID {}): WolfNet re-attach warning: {}", name, vmid, e);
+            }
+        }
+    }
+
+    // Confirm PVE now owns it before moving the native copy aside.
+    let pve_conf = format!("/etc/pve/lxc/{}.conf", vmid);
+    if !std::path::Path::new(&pve_conf).is_file() {
+        return Err(format!(
+            "Adopted orphan '{}' but PVE config {} is missing — leaving the native copy in place",
+            name, pve_conf
+        ));
+    }
+
+    // Move the native directory aside (recoverable) rather than deleting it.
+    std::fs::create_dir_all(backup_root)
+        .map_err(|e| format!("Failed to create adopt-backup dir: {}", e))?;
+    if let Err(e) = std::fs::rename(&container_dir, &backup_dir) {
+        // Cross-filesystem rename fails with EXDEV — fall back to `mv`.
+        let mv = Command::new("mv").args([container_dir.as_str(), backup_dir.as_str()]).output();
+        if mv.map(|o| !o.status.success()).unwrap_or(true) {
+            warn!("Adopted orphan '{}' to VMID {} but could not move native dir aside ({}); \
+                   remove {} manually once verified", name, vmid, e, container_dir);
+        }
+    }
+
+    invalidate_count_caches();
+    Ok(vmid)
+}
+
 /// Create an LXC container from a download template
 /// On Proxmox nodes, automatically uses `pct create` instead of `lxc-create`
 pub fn lxc_create(name: &str, distribution: &str, release: &str, architecture: &str,
@@ -8361,7 +8559,7 @@ pub fn lxc_create(name: &str, distribution: &str, release: &str, architecture: &
         let result = pct_create_api(name, distribution, release, architecture,
             storage_path, template_cache_path, None, None, None, None);
         if result.is_ok() { invalidate_count_caches(); }
-        return result;
+        return result.map(|(_vmid, msg)| msg);
     }
 
     // Standalone: use native lxc-create

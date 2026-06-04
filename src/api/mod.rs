@@ -6138,7 +6138,7 @@ pub async fn lxc_create(
             storage, template_storage, password, memory_mb, cpu_cores,
             wolfnet_ip.as_deref(),
         ) {
-            Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
+            Ok((_vmid, msg)) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
             Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
         };
     }

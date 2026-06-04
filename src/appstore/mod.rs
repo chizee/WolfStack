@@ -1928,6 +1928,58 @@ fn merge_pending_installs(installed: &mut Vec<InstalledApp>) {
     }
 }
 
+/// Startup reconciliation: adopt any native `lxc-create` LXC containers the
+/// pre-fix App Store installer left orphaned on a Proxmox host into PVE, so
+/// the set of containers WolfStack tracks matches what Proxmox shows.
+///
+/// Before the fix, installing an LXC app on a Proxmox host ran `lxc-create`
+/// instead of `pct create`, producing a container PVE never registered —
+/// invisible in the Proxmox UI and in WolfStack's own container view. This
+/// pass tars each such orphan's rootfs and re-creates it through `pct` so it
+/// becomes a first-class PVE container, then re-points the matching
+/// Installed-Apps record at the new VMID.
+///
+/// Safe to call on every startup: a no-op off Proxmox and when there are no
+/// orphans, and adoption is idempotent (an already-adopted container is
+/// skipped because PVE then owns its hostname).
+pub fn reconcile_orphaned_lxc() {
+    if !crate::containers::is_proxmox() { return; }
+
+    let orphans = crate::containers::list_native_lxc_orphans();
+    if orphans.is_empty() { return; }
+
+    tracing::info!(
+        "Found {} native LXC container(s) not registered with Proxmox — adopting into PVE so they appear in the Proxmox UI",
+        orphans.len()
+    );
+
+    let mut installed = load_installed();
+    let mut registry_changed = false;
+
+    for name in &orphans {
+        match crate::containers::pct_adopt_native_orphan(name) {
+            Ok(vmid) => {
+                tracing::info!("Adopted orphaned LXC container '{}' into Proxmox as VMID {}", name, vmid);
+                // Re-point any matching Installed-Apps record at the VMID so
+                // WolfStack's own view stays consistent with Proxmox.
+                for entry in installed.iter_mut() {
+                    if entry.target == "lxc" && entry.container_name.as_deref() == Some(name.as_str()) {
+                        entry.container_name = Some(vmid.clone());
+                        registry_changed = true;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Could not adopt orphaned LXC container '{}' into Proxmox: {}", name, e);
+            }
+        }
+    }
+
+    if registry_changed {
+        save_installed(&installed);
+    }
+}
+
 // ─── Live terminal install: script generation ───
 
 /// Remap a Docker volume spec to use a custom storage path.
@@ -2090,6 +2142,12 @@ pub fn prepare_install(
     let mut script = String::from("#!/bin/bash\nset -e\nexport DEBIAN_FRONTEND=noninteractive\n\n");
 
     let mut sidecar_names: Vec<String> = Vec::new();
+
+    // Identifier recorded for this install. Defaults to the human name the
+    // operator chose; the Proxmox LXC branch overrides it with the assigned
+    // VMID, because on a PVE host every subsequent container action (start,
+    // stop, console, uninstall) addresses the container by VMID, not hostname.
+    let mut register_container_name = container_name.to_string();
 
     match target {
         "docker" => {
@@ -2381,76 +2439,178 @@ pub fn prepare_install(
             let lxc = app.lxc.as_ref()
                 .ok_or("This app doesn't support LXC installation")?;
 
-            let wolfnet_ip = crate::containers::next_available_wolfnet_ip();
+            if crate::containers::is_proxmox() {
+                // ── Proxmox host ──
+                // A native `lxc-create` container is invisible to PVE (it has
+                // no /etc/pve/lxc/<vmid>.conf and no VMID), so it never shows
+                // in the Proxmox UI and WolfStack's own `pct list`-based view
+                // can't see it either. Create the container through the SAME
+                // `pct` path the Containers page uses, then have the generated
+                // script only start it, run the app's setup commands via
+                // `pct exec`, and stop it. The create happens here (inside
+                // web::block on the API side) rather than in the script so the
+                // container is a first-class PVE container from birth.
+                let wolfnet_ip = crate::containers::next_available_wolfnet_ip();
 
-            script.push_str(&format!(
-                "echo -e '\\033[1;36m━━━ Installing {} via LXC ━━━\\033[0m'\n\n",
-                app.name
-            ));
+                // Parse optional memory/CPU exactly like the direct LXC-create
+                // endpoint ("512m"/"2g"/"1024" -> MB; integer cores).
+                let memory_mb = memory_limit.and_then(|m| {
+                    let m = m.trim().to_lowercase();
+                    if m.ends_with('g') { m.trim_end_matches('g').parse::<u32>().ok().map(|v| v * 1024) }
+                    else if m.ends_with('m') { m.trim_end_matches('m').parse::<u32>().ok() }
+                    else { m.parse::<u32>().ok() }
+                });
+                let cpu_cores = cpu_limit.and_then(|c| c.trim().parse::<u32>().ok());
 
-            // Create container
-            script.push_str(&format!(
-                "echo -e '\\033[1;33m▸ Creating LXC container: {}\\033[0m'\n",
-                container_name
-            ));
-            let lxc_path_flag = storage_path.map(|sp| format!(" -P {}", shell_escape(sp))).unwrap_or_default();
-            script.push_str(&format!(
-                "lxc-create -t download -n {}{} -- -d {} -r {} -a {}\n\n",
-                shell_escape(container_name),
-                lxc_path_flag,
-                shell_escape(&lxc.distribution),
-                shell_escape(&lxc.release),
-                shell_escape(&lxc.architecture),
-            ));
+                // The install modal's storage picker sends `s.path || s.id`,
+                // so a dir-type storage arrives as a filesystem path — but
+                // `pct create --storage` wants a storage ID. Map a path back to
+                // its PVE storage ID; an ID passes straight through; anything
+                // unmappable (e.g. a WolfStack mount) falls back to the default.
+                let pct_storage: Option<String> = match storage_path {
+                    Some(sp) if !sp.is_empty() => {
+                        if sp.starts_with('/') {
+                            crate::containers::pvesm_resolve_id(sp)
+                        } else {
+                            Some(sp.to_string())
+                        }
+                    }
+                    _ => None,
+                };
 
-            // Write WolfNet IP
-            if let Some(ref ip) = wolfnet_ip {
-                let base = crate::containers::lxc_base_dir(container_name);
+                // Create now. pct_create_api downloads the template on first
+                // use, attaches the WolfNet NIC + marker, and returns the VMID.
+                let (vmid, create_msg) = crate::containers::pct_create_api(
+                    container_name, &lxc.distribution, &lxc.release, &lxc.architecture,
+                    pct_storage.as_deref(), None, None, memory_mb, cpu_cores, wolfnet_ip.as_deref(),
+                )?;
+
+                // Record the install against the VMID — that's how every later
+                // action will find this container on a PVE host.
+                register_container_name = vmid.to_string();
+
                 script.push_str(&format!(
-                    "mkdir -p {}/{}/.wolfnet\n",
-                    shell_escape(&base), shell_escape(container_name)
+                    "echo -e '\\033[1;36m━━━ Installing {} via LXC (Proxmox VMID {}) ━━━\\033[0m'\n\n",
+                    app.name, vmid
                 ));
                 script.push_str(&format!(
-                    "echo {} > {}/{}/.wolfnet/ip\n\n",
-                    shell_escape(ip), shell_escape(&base), shell_escape(container_name)
+                    "echo -e '\\033[0;32m  {}\\033[0m'\n\n",
+                    create_msg.replace('\'', "'\\''")
                 ));
-            }
 
-            // Start container
-            script.push_str(&format!(
-                "echo -e '\\033[1;33m▸ Starting container...\\033[0m'\n"
-            ));
-            script.push_str(&format!("lxc-start -n {}\n", shell_escape(container_name)));
-            script.push_str("echo 'Waiting for container to boot...'\nsleep 3\n\n");
+                // Start so setup commands can run inside the container. The
+                // container already exists in PVE (created above), so these
+                // steps are best-effort + visible rather than fatal: under the
+                // script's `set -e`, a non-zero `pct start`/`pct exec` would
+                // otherwise abort before the install-registration block at the
+                // bottom runs, leaving a container PVE shows but WolfStack
+                // can't track or uninstall.
+                script.push_str("echo -e '\\033[1;33m▸ Starting container...\\033[0m'\n");
+                script.push_str(&format!(
+                    "pct start {} || echo -e '\\033[0;31m  ⚠ Failed to start container — it exists in Proxmox but setup may be incomplete\\033[0m'\n",
+                    vmid
+                ));
+                script.push_str("echo 'Waiting for container to boot...'\nsleep 3\n\n");
 
-            // Setup commands
-            let commands = substitute_inputs(&lxc.setup_commands, user_inputs);
-            if !commands.is_empty() {
-                script.push_str("echo -e '\\033[1;33m▸ Running setup commands...\\033[0m'\n");
-                for cmd in &commands {
+                let commands = substitute_inputs(&lxc.setup_commands, user_inputs);
+                if !commands.is_empty() {
+                    script.push_str("echo -e '\\033[1;33m▸ Running setup commands...\\033[0m'\n");
+                    for cmd in &commands {
+                        script.push_str(&format!(
+                            "echo -e '\\033[0;90m  $ {}\\033[0m'\n",
+                            cmd.replace('\'', "'\\''")
+                        ));
+                        script.push_str(&format!(
+                            "pct exec {} -- sh -c {} || echo -e '\\033[0;31m  ⚠ setup command failed (continuing)\\033[0m'\n",
+                            vmid, shell_escape(cmd)
+                        ));
+                    }
+                    script.push('\n');
+                }
+
+                // Stop — configured but not running, matching the native path.
+                script.push_str("echo -e '\\033[1;33m▸ Stopping container...\\033[0m'\n");
+                script.push_str(&format!("pct stop {} 2>/dev/null || true\n\n", vmid));
+
+                if let Some(ref ip) = wolfnet_ip {
                     script.push_str(&format!(
-                        "echo -e '\\033[0;90m  $ {}\\033[0m'\n",
-                        cmd.replace('\'', "'\\''")
-                    ));
-                    script.push_str(&format!(
-                        "lxc-attach -n {} -- sh -c {}\n",
-                        shell_escape(container_name), shell_escape(cmd)
+                        "echo -e '\\033[0;36m  WolfNet IP: {}\\033[0m'\n",
+                        ip
                     ));
                 }
-                script.push('\n');
-            }
+            } else {
+                // ── Standalone host (no Proxmox) — native LXC tooling ──
+                let wolfnet_ip = crate::containers::next_available_wolfnet_ip();
 
-            // Stop container
-            script.push_str(&format!(
-                "echo -e '\\033[1;33m▸ Stopping container...\\033[0m'\n"
-            ));
-            script.push_str(&format!("lxc-stop -n {} 2>/dev/null || true\n\n", shell_escape(container_name)));
-
-            if let Some(ref ip) = wolfnet_ip {
                 script.push_str(&format!(
-                    "echo -e '\\033[0;36m  WolfNet IP: {}\\033[0m'\n",
-                    ip
+                    "echo -e '\\033[1;36m━━━ Installing {} via LXC ━━━\\033[0m'\n\n",
+                    app.name
                 ));
+
+                // Create container
+                script.push_str(&format!(
+                    "echo -e '\\033[1;33m▸ Creating LXC container: {}\\033[0m'\n",
+                    container_name
+                ));
+                let lxc_path_flag = storage_path.map(|sp| format!(" -P {}", shell_escape(sp))).unwrap_or_default();
+                script.push_str(&format!(
+                    "lxc-create -t download -n {}{} -- -d {} -r {} -a {}\n\n",
+                    shell_escape(container_name),
+                    lxc_path_flag,
+                    shell_escape(&lxc.distribution),
+                    shell_escape(&lxc.release),
+                    shell_escape(&lxc.architecture),
+                ));
+
+                // Write WolfNet IP
+                if let Some(ref ip) = wolfnet_ip {
+                    let base = crate::containers::lxc_base_dir(container_name);
+                    script.push_str(&format!(
+                        "mkdir -p {}/{}/.wolfnet\n",
+                        shell_escape(&base), shell_escape(container_name)
+                    ));
+                    script.push_str(&format!(
+                        "echo {} > {}/{}/.wolfnet/ip\n\n",
+                        shell_escape(ip), shell_escape(&base), shell_escape(container_name)
+                    ));
+                }
+
+                // Start container
+                script.push_str(
+                    "echo -e '\\033[1;33m▸ Starting container...\\033[0m'\n"
+                );
+                script.push_str(&format!("lxc-start -n {}\n", shell_escape(container_name)));
+                script.push_str("echo 'Waiting for container to boot...'\nsleep 3\n\n");
+
+                // Setup commands
+                let commands = substitute_inputs(&lxc.setup_commands, user_inputs);
+                if !commands.is_empty() {
+                    script.push_str("echo -e '\\033[1;33m▸ Running setup commands...\\033[0m'\n");
+                    for cmd in &commands {
+                        script.push_str(&format!(
+                            "echo -e '\\033[0;90m  $ {}\\033[0m'\n",
+                            cmd.replace('\'', "'\\''")
+                        ));
+                        script.push_str(&format!(
+                            "lxc-attach -n {} -- sh -c {}\n",
+                            shell_escape(container_name), shell_escape(cmd)
+                        ));
+                    }
+                    script.push('\n');
+                }
+
+                // Stop container
+                script.push_str(
+                    "echo -e '\\033[1;33m▸ Stopping container...\\033[0m'\n"
+                );
+                script.push_str(&format!("lxc-stop -n {} 2>/dev/null || true\n\n", shell_escape(container_name)));
+
+                if let Some(ref ip) = wolfnet_ip {
+                    script.push_str(&format!(
+                        "echo -e '\\033[0;36m  WolfNet IP: {}\\033[0m'\n",
+                        ip
+                    ));
+                }
             }
         }
         "bare" => {
@@ -2505,7 +2665,7 @@ pub fn prepare_install(
         app_id: app_id.to_string(),
         app_name: app.name.clone(),
         target: target.to_string(),
-        container_name: Some(container_name.to_string()),
+        container_name: Some(register_container_name.clone()),
         installed_at: chrono_timestamp(),
         sidecar_names,
         deployment_type: "docker-run".to_string(),

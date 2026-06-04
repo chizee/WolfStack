@@ -1276,6 +1276,14 @@ async fn main() -> std::io::Result<()> {
             }
         });
 
+        // One-shot at startup: adopt any native `lxc-create` LXC containers
+        // the pre-fix App Store installer left orphaned into PVE, so the
+        // containers WolfStack tracks match what Proxmox shows. The function
+        // self-guards (no-op off Proxmox / when there are none) and is
+        // idempotent; it tars + re-creates rootfs, so it runs on the blocking
+        // pool rather than the async runtime.
+        let _ = tokio::task::spawn_blocking(crate::appstore::reconcile_orphaned_lxc);
+
         // Antivirus scheduler — every 5 minutes, check whether the
         // configured schedule_hours interval has elapsed since the
         // last completed scan; if so, fire a background scan thread.

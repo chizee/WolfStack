@@ -34338,6 +34338,11 @@ async function executeAppStoreInstall() {
 
     closeAppStoreInstallModal();
 
+    // Immediate feedback: preparing the install can take a moment — on a
+    // Proxmox host an LXC app downloads its container template at this step
+    // (via pct) before the live terminal opens.
+    showToast(`Preparing ${appName} install…`, 'info', 4000);
+
     try {
         // Call prepare-install to generate the install script
         let prepareUrl;
