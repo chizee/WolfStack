@@ -6138,7 +6138,7 @@ pub async fn lxc_create(
             storage, template_storage, password, memory_mb, cpu_cores,
             wolfnet_ip.as_deref(),
         ) {
-            Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
+            Ok((_vmid, msg)) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
             Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
         };
     }
@@ -28185,6 +28185,51 @@ fn beta_access_granted(patreon_tier: &crate::patreon::PatreonTier)
     beta_access_granted_full(patreon_tier, false)
 }
 
+/// Whether this installation supports WolfStack by ANY means — a paid
+/// licence, a paying Patreon pledge (Basic+), or the GitHub Sponsor
+/// self-attest flag. Deliberately broader than `beta_access_granted_full`:
+/// the login-time support nag must exempt EVERYONE who gives us money,
+/// including Patreon Basic backers who don't earn beta access. Nagging a
+/// paying customer is a self-own.
+///
+/// Returns (is_supporter, reason) so the frontend can tailor copy if it wants.
+fn is_supporter(
+    patreon_tier: &crate::patreon::PatreonTier,
+    github_sponsor: bool,
+) -> (bool, &'static str) {
+    if crate::compat::platform_ready() {
+        return (true, "licence");
+    }
+    if patreon_tier.is_paying() {
+        return (true, "patreon");
+    }
+    if github_sponsor {
+        return (true, "github_sponsor");
+    }
+    (false, "none")
+}
+
+/// GET /api/supporter/status — drives the login-time support nag. Reports
+/// whether this install supports WolfStack by any means (licence, paying
+/// Patreon pledge, or GitHub Sponsor self-attest) so the frontend can decide
+/// whether to show the nag. Operator session required.
+async fn supporter_status(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) {
+        return resp;
+    }
+    // Copy the two inputs out and drop the guard BEFORE the (sync) licence
+    // check — never hold the RwLock guard longer than the read needs.
+    let (tier, github_sponsor) = {
+        let config = state.patreon.config.read().unwrap();
+        (config.tier.clone(), config.github_sponsor)
+    };
+    let (granted, reason) = is_supporter(&tier, github_sponsor);
+    HttpResponse::Ok().json(serde_json::json!({
+        "is_supporter": granted,
+        "reason": reason,
+    }))
+}
+
 /// POST /api/patreon/disconnect — unlink Patreon account
 async fn patreon_disconnect(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) {
@@ -33885,6 +33930,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         // are independent grants); the persisted state happens to
         // share patreon.json for historical reasons.
         .route("/api/sponsor/github", web::post().to(set_github_sponsor))
+        .route("/api/supporter/status", web::get().to(supporter_status))
         .route("/api/patreon/disconnect", web::post().to(patreon_disconnect))
         // Icon Packs
         .route("/api/icon-packs", web::get().to(icon_packs_list))

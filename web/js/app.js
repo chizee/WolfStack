@@ -34338,6 +34338,11 @@ async function executeAppStoreInstall() {
 
     closeAppStoreInstallModal();
 
+    // Immediate feedback: preparing the install can take a moment — on a
+    // Proxmox host an LXC app downloads its container template at this step
+    // (via pct) before the live terminal opens.
+    showToast(`Preparing ${appName} install…`, 'info', 4000);
+
     try {
         // Call prepare-install to generate the install script
         let prepareUrl;
@@ -52072,24 +52077,106 @@ function dismissLearnBanner() {
     if (el) el.style.display = 'none';
 }
 
-// ── Login welcome modal ──────────────────────────────────────────────
-// Shown once per login: login.html sets a per-login sessionStorage flag on a
-// genuine sign-in (password or passkey), which we consume here on first show
-// — so it does NOT reappear on refresh or in-app navigation within the same
-// session, only on the next login. Ticking "Don't show again" sets a
-// permanent localStorage flag that suppresses it for good. Promotes the
-// Getting Started course, the Discord community, and sponsorship.
+// ── Login-time prompt coordinator ────────────────────────────────────
+// Runs once per fresh login: login.html sets a per-login sessionStorage flag
+// on a genuine sign-in (password or passkey), which we consume here on first
+// show — so neither prompt reappears on refresh or in-app navigation within
+// the same session, only on the next login.
+//
+// Two prompts, never stacked:
+//   • Welcome modal — shown while the operator hasn't ticked "Don't show
+//     again" (permanent localStorage flag). Promotes the Getting Started
+//     course, Discord, and sponsorship.
+//   • Support nag — once the welcome is dismissed for good, non-supporters
+//     (no licence, no paying Patreon pledge, no GitHub Sponsor self-attest)
+//     get a focused, freely-dismissible ask to sponsor or buy a licence.
+//     Supporters see nothing further. Fail-safe: on ANY error we treat the
+//     user as a supporter, so we never nag someone who might be paying.
 const WELCOME_DISMISS_KEY = 'wolfstack_welcome_dismissed';
 const WELCOME_FRESH_KEY = 'wolfstack_fresh_login';
+// Set when the operator ticks "I'm supporting already" — a permanent,
+// offline-proof local guarantee that the support nag never shows again in
+// this browser, complementing the server-side self-attest.
+const NAG_DECLARED_KEY = 'wolfstack_support_declared';
 
-function maybeShowWelcomeModal() {
-    let permanent = false, fresh = false;
-    try { permanent = localStorage.getItem(WELCOME_DISMISS_KEY) === '1'; } catch (_) {}
+async function maybeShowLoginPrompt() {
+    let fresh = false;
     try { fresh = sessionStorage.getItem(WELCOME_FRESH_KEY) === '1'; } catch (_) {}
-    if (permanent || !fresh) return;
-    // Consume the per-login flag so the modal shows once per login only.
+    if (!fresh) return;                              // refresh / in-app nav, not a login
+    // Consume the per-login flag so a prompt shows once per login only.
     try { sessionStorage.removeItem(WELCOME_FRESH_KEY); } catch (_) {}
-    showWelcomeModal();
+
+    let permanent = false;
+    try { permanent = localStorage.getItem(WELCOME_DISMISS_KEY) === '1'; } catch (_) {}
+    // Welcome still active → it shows (and already carries a sponsor ask); don't
+    // pile the nag on top.
+    if (!permanent) { showWelcomeModal(); return; }
+
+    // Welcome dismissed → focused support nag for non-supporters only.
+    // First honour a prior self-declaration ("I'm supporting already") without
+    // a round-trip — this never reappears once they've ticked the box.
+    let declared = false;
+    try { declared = localStorage.getItem(NAG_DECLARED_KEY) === '1'; } catch (_) {}
+    if (declared) return;
+
+    let supporter = true; // fail SAFE: never nag on error / unknown / older binary
+    try {
+        const r = await fetch('/api/supporter/status');
+        if (r.ok) {
+            const d = await r.json();
+            supporter = (d && d.is_supporter !== false);
+        }
+    } catch (_) { supporter = true; }
+    if (!supporter) showSupportNag();
+}
+
+// ── Support nag (non-supporters, once per login) ─────────────────────
+function showSupportNag() {
+    const el = document.getElementById('support-nag');
+    if (!el) return;
+    el.style.display = 'flex';
+    requestAnimationFrame(() => el.classList.add('open'));
+    document.addEventListener('keydown', supportNagEscHandler);
+    const close = document.getElementById('support-nag-close-btn');
+    if (close) { try { close.focus(); } catch (_) {} }
+}
+
+function supportNagEscHandler(e) { if (e.key === 'Escape') closeSupportNag(); }
+
+function closeSupportNag() {
+    const el = document.getElementById('support-nag');
+    if (!el) return;
+    // "I'm supporting already" → cancel permanently. Record locally for an
+    // instant, offline-proof guarantee, AND tell the server (honour-system
+    // self-attest) so it persists across browsers and counts everywhere.
+    const cb = document.getElementById('nag-supporting');
+    if (cb && cb.checked) {
+        try { localStorage.setItem(NAG_DECLARED_KEY, '1'); } catch (_) {}
+        nagDeclareSupport();
+    }
+    el.classList.remove('open');
+    document.removeEventListener('keydown', supportNagEscHandler);
+    setTimeout(() => { el.style.display = 'none'; }, 200);
+}
+
+// Tell the server this install supports WolfStack (honour-system; GitHub's
+// API can't be queried to verify the org's sponsors) so the declaration
+// persists across browsers and the operator counts as a supporter everywhere.
+// Best-effort: NAG_DECLARED_KEY already stops the nag in this browser, so a
+// failure here only means it didn't sync off-device.
+async function nagDeclareSupport() {
+    try {
+        const r = await fetch('/api/sponsor/github', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled: true })
+        });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        if (typeof showToast === 'function') showToast('Thanks for supporting WolfStack — we won’t ask again.', 'success');
+    } catch (_) {
+        // Warning toasts must not auto-dismiss — duration 0 keeps it until dismissed.
+        if (typeof showToast === 'function') showToast('Noted on this device — couldn’t sync to the server, so it may reappear on other browsers.', 'warning', 0);
+    }
 }
 
 function showWelcomeModal() {
@@ -52124,7 +52211,7 @@ function welcomeStartCourse() {
     openLearnDrawer();
 }
 
-document.addEventListener('DOMContentLoaded', maybeShowWelcomeModal);
+document.addEventListener('DOMContentLoaded', maybeShowLoginPrompt);
 
 // Build (possibly nested) list HTML from a contiguous run of markdown list
 // lines starting at `start`. Nesting is by leading indentation, so a numbered

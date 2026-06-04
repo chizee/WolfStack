@@ -4218,3 +4218,8 @@ body.learn-drawer-open #task-log-footer { right: var(--learn-drawer-w) !importan
     .welcome-getstarted { width: 100%; }
     .welcome-dontshow-lbl { justify-content: center; }
 }
+
+/* Support nag — reuses .welcome-modal / .welcome-card / .welcome-action /
+   .welcome-foot / .welcome-dontshow-lbl. The note is the only unique bit. */
+.nag-once-note { margin: 12px 0 0; font-size: 12px; color: var(--text-muted); line-height: 1.45; text-align: center; }
+.nag-once-note strong { color: var(--text-secondary); }
