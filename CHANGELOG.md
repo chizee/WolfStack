@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v24.23.3: fix WolfKube localhost:8080 (empty/missing kubeconfig) + self-heal; fix lock-screen logout** _(2026-06-05 — [`dc8829b`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/dc8829ba4257d05565e3e7dfca9f15aa6fa6ad38))_
 - **v24.23.2: fix idle-lock PIN rejected as invalid when a remote node is open** _(2026-06-05 — [`5ac4139`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/5ac41399c834fb4ec425da88df79c2caa40f61cd))_
 - **v24.23.1: fix K8s 'Import Cluster' reporting 'Please fill in all fields' on a filled form** _(2026-06-05 — [`919de64`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/919de64c99672233cddf62037c957e0f988bd34a))_
 - **v24.23.0: PIN lock screen uses the user's background image; setup.sh auto-upgrades WolfProxy** _(2026-06-05 — [`c582090`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/c58209024bb12487c4405a03c8d00a1d544e3137))_
