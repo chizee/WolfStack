@@ -282,13 +282,57 @@ pub fn remove_cluster(id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The canonical location the import handler writes a pasted kubeconfig to
+/// (api::k8s_create_cluster). Used to recover a cluster whose stored path was
+/// lost or points at a now-missing file.
+fn canonical_kubeconfig_path(id: &str) -> String {
+    format!("/etc/wolfstack/kubernetes/{}.yaml", id)
+}
+
+/// Repair a cluster whose `kubeconfig_path` is blank or points at a file that
+/// no longer exists, by falling back to the canonical import location. Returns
+/// true if it changed the path. Without this, such a cluster silently runs
+/// kubectl with no config and hits kubectl's `localhost:8080` default — the
+/// cluster shows the right API IP but every action "can't reach localhost:8080"
+/// (HoXsan 2026-06-05). Self-healing means an already-broken cluster fixes
+/// itself the next time it's loaded, as long as the kubeconfig file is still on
+/// disk; if it isn't, the kubectl() guard returns a clear "re-import" error.
+fn heal_cluster_kubeconfig(cluster: &mut K8sCluster) -> bool {
+    let current_ok = !cluster.kubeconfig_path.trim().is_empty()
+        && Path::new(&cluster.kubeconfig_path).is_file();
+    if current_ok {
+        return false;
+    }
+    let canonical = canonical_kubeconfig_path(&cluster.id);
+    if canonical != cluster.kubeconfig_path && Path::new(&canonical).is_file() {
+        cluster.kubeconfig_path = canonical;
+        return true;
+    }
+    false
+}
+
 pub fn get_cluster(id: &str) -> Option<K8sCluster> {
-    let config = load_config();
-    config.clusters.into_iter().find(|c| c.id == id)
+    let mut config = load_config();
+    let idx = config.clusters.iter().position(|c| c.id == id)?;
+    if heal_cluster_kubeconfig(&mut config.clusters[idx]) {
+        let healed = config.clusters[idx].clone();
+        let _ = save_config(&config);
+        info!("WolfKube: recovered kubeconfig path for cluster '{}' → {}", healed.id, healed.kubeconfig_path);
+        return Some(healed);
+    }
+    Some(config.clusters[idx].clone())
 }
 
 pub fn list_clusters() -> Vec<K8sCluster> {
-    load_config().clusters
+    let mut config = load_config();
+    let mut changed = false;
+    for c in &mut config.clusters {
+        if heal_cluster_kubeconfig(c) { changed = true; }
+    }
+    if changed {
+        let _ = save_config(&config);
+    }
+    config.clusters
 }
 
 // ═══════════════════════════════════════════════
@@ -329,6 +373,23 @@ fn find_kubectl() -> (&'static str, &'static [&'static str]) {
 }
 
 pub fn kubectl(kubeconfig: &str, args: &[&str]) -> Result<String, String> {
+    // A blank or missing kubeconfig makes kubectl silently fall back to its
+    // built-in default endpoint (http://localhost:8080), which then surfaces as
+    // a baffling "connection to the server localhost:8080 was refused" — even
+    // though the cluster shows the right API IP in the UI. That's never what we
+    // want; fail with a clear, actionable error instead (HoXsan 2026-06-05).
+    if kubeconfig.trim().is_empty() {
+        return Err("No kubeconfig is configured for this cluster on this node. \
+                    Re-import the cluster (paste its kubeconfig) so kubectl has a \
+                    config to use — otherwise it falls back to its localhost:8080 \
+                    default and can't reach your cluster.".to_string());
+    }
+    if !std::path::Path::new(kubeconfig).is_file() {
+        return Err(format!(
+            "Kubeconfig '{}' was not found on this node. If the cluster was \
+             imported on a different node, run the action from that node, or \
+             re-import the cluster here.", kubeconfig));
+    }
     let (binary, prefix_args) = find_kubectl();
     let mut cmd = Command::new(binary);
     cmd.args(prefix_args);

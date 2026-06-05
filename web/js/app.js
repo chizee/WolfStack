@@ -36207,7 +36207,12 @@ function lockInterfaceNow() {
 async function lockScreenLogout() {
     try { localStorage.removeItem(LOCK_FLAG_KEY); } catch (_) {}
     _ifaceLocked = false;
-    try { await fetch(apiUrl('/api/auth/logout'), { method: 'POST' }); } catch (_) {}
+    // BARE path, never apiUrl() — we must destroy the session on the node the
+    // user is actually logged into. apiUrl() would rewrite to a remote node's
+    // proxy while a remote node view is open, logging THAT node out while the
+    // local session stays alive — so login.html, seeing a still-valid local
+    // session, bounced the user straight back into the app instead of out.
+    try { await fetch('/api/auth/logout', { method: 'POST' }); } catch (_) {}
     window.location.href = '/login.html';
 }
 
