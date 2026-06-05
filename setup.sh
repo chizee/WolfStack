@@ -1394,6 +1394,38 @@ EOF
 fi
 
 
+# ─── Upgrade WolfProxy if installed and outdated ─────────────────────────────
+# WolfProxy is an optional companion (the reverse proxy) installed separately,
+# but when WolfStack updates we pull any newer WolfProxy too so unit/binary
+# fixes reach existing installs without a separate step — notably the
+# orphan-reaping ExecStartPre that resolves the "ports 80/443 in use" loop.
+# WolfProxy's own setup.sh downloads the latest prebuilt binary AND rewrites the
+# systemd unit, so re-running it upgrades both. Best-effort — never block the
+# WolfStack install on it, and never trigger an upgrade when the version probe
+# is inconclusive (empty WP_LATEST).
+echo ""
+echo "Checking WolfProxy (reverse proxy)..."
+if command -v wolfproxy >/dev/null 2>&1 || [ -f /etc/systemd/system/wolfproxy.service ]; then
+    WP_INSTALLED="$(wolfproxy --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")"
+    WP_LATEST="$(curl -fsSL https://api.github.com/repos/wolfsoftwaresystemsltd/wolfproxy/releases/latest 2>/dev/null \
+        | grep -oE '"tag_name"[^"]*"v?[0-9]+\.[0-9]+\.[0-9]+"' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")"
+    if [ -n "$WP_LATEST" ] && [ "$WP_INSTALLED" != "$WP_LATEST" ]; then
+        echo "  WolfProxy ${WP_INSTALLED:-unknown} → ${WP_LATEST} available — upgrading..."
+        if curl -fsSL https://raw.githubusercontent.com/wolfsoftwaresystemsltd/wolfproxy/main/setup.sh | bash; then
+            echo "  ✓ WolfProxy upgraded to ${WP_LATEST}"
+        else
+            echo "  ⚠ WolfProxy upgrade failed — re-run manually: curl -fsSL https://raw.githubusercontent.com/wolfsoftwaresystemsltd/wolfproxy/main/setup.sh | sudo bash"
+        fi
+    elif [ -n "$WP_INSTALLED" ]; then
+        echo "  ✓ WolfProxy up to date (${WP_INSTALLED})"
+    else
+        echo "  ✓ WolfProxy present"
+    fi
+else
+    echo "  WolfProxy not installed — skipping (install it from the WolfStack Configurator if you want a reverse proxy)."
+fi
+
+
 # ─── Install Rust if not present ────────────────────────────────────────────
 CARGO_BIN="${CARGO_HOME:-$REAL_HOME/.cargo}/bin/cargo"
 

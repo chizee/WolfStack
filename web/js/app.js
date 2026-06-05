@@ -36159,6 +36159,20 @@ function lockInterface() {
     _ifaceLocked = true;
     try { localStorage.setItem(LOCK_FLAG_KEY, '1'); } catch (_) {}
     const ov = ensureLockOverlay();
+    // Use the user's dashboard background image (the same data-URL the
+    // datacenter view uses) as the lock backdrop if they've set one, with a
+    // dark scrim over it so the PIN card stays readable. Otherwise fall back to
+    // the plain frosted dark. Applied at lock time so a freshly-set image is
+    // picked up without rebuilding the overlay.
+    if (typeof dcBgImage === 'string' && dcBgImage) {
+        ov.style.background = `linear-gradient(rgba(6,8,14,0.74), rgba(6,8,14,0.74)), url(${dcBgImage}) center / cover no-repeat`;
+        ov.style.backdropFilter = 'none';
+        ov.style.webkitBackdropFilter = 'none';
+    } else {
+        ov.style.background = 'rgba(6,8,14,0.92)';
+        ov.style.backdropFilter = 'blur(10px)';
+        ov.style.webkitBackdropFilter = 'blur(10px)';
+    }
     ov.style.display = 'flex';
     const err = document.getElementById('iface-lock-error');
     if (err) err.textContent = '';
