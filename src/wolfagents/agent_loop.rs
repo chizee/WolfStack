@@ -560,19 +560,25 @@ fn build_gemini_function_decls(agent: &Agent) -> Vec<serde_json::Value> {
 /// This function walks the schema and rewrites the few forms we actually
 /// emit. New schema shapes added later may need extensions here.
 fn normalise_schema_for_gemini(mut v: serde_json::Value) -> serde_json::Value {
-    // Gemini rejects multi-type unions in `type`. Narrow every array
-    // form to a single string: `["string", "null"]` → `"string"` +
-    // `nullable: true`, and `["string", "array", "null"]` → pick the
-    // first non-null (loses the union flexibility but the model can
-    // still pass values Gemini will accept). Done iteratively so the
-    // same code handles 2- and 3+ element unions.
+    // Gemini rejects multi-type unions in `type`. Narrow every array form to a
+    // single type. Prefer "array" when the union allows it AND an `items`
+    // schema is present, so the array+items pair stays valid — Gemini accepts
+    // `items` only on ARRAY types. Otherwise take the first non-null type.
+    // `["string","null"]` → "string" + nullable; `["string","array","null"]`
+    // with items → "array" + nullable.
     if let Some(t) = v.get("type").cloned() {
         if let Some(arr) = t.as_array() {
             let non_null: Vec<&serde_json::Value> = arr.iter()
                 .filter(|x| x.as_str() != Some("null")).collect();
             let has_null = arr.iter().any(|x| x.as_str() == Some("null"));
             if !non_null.is_empty() {
-                v["type"] = non_null[0].clone();
+                let prefer_array = v.get("items").is_some()
+                    && non_null.iter().any(|x| x.as_str() == Some("array"));
+                v["type"] = if prefer_array {
+                    serde_json::Value::String("array".to_string())
+                } else {
+                    non_null[0].clone()
+                };
                 if has_null { v["nullable"] = serde_json::Value::Bool(true); }
             } else if has_null {
                 // Pure `["null"]` — fall back to string+nullable so the
@@ -581,6 +587,14 @@ fn normalise_schema_for_gemini(mut v: serde_json::Value) -> serde_json::Value {
                 v["nullable"] = serde_json::Value::Bool(true);
             }
         }
+    }
+    // Gemini accepts `items` ONLY on ARRAY types. A non-array schema carrying a
+    // stray `items` — e.g. the SendEmail `to` union narrowed to "string" while
+    // keeping its items — fails with
+    // "properties[to].items: field predicate failed: $type == Type.ARRAY"
+    // (Tor 2026-06-05). Drop `items` unless the (now single) type is array.
+    if v.get("type").and_then(|t| t.as_str()) != Some("array") {
+        if let Some(obj) = v.as_object_mut() { obj.remove("items"); }
     }
     // Recurse into `properties`.
     if let Some(props) = v.get_mut("properties").and_then(|p| p.as_object_mut()) {
@@ -1169,5 +1183,56 @@ fn input_schema_for(tool: ToolId) -> serde_json::Value {
                 }
             }
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // Tor 2026-06-05: the SendEmail `to` union (`["string","array","null"]`
+    // with `items`) was narrowed to "string" while keeping `items`, so Gemini
+    // rejected it with "properties[to].items: ... $type == Type.ARRAY".
+    #[test]
+    fn gemini_union_with_items_becomes_array() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "to": {
+                    "type": ["string", "array", "null"],
+                    "items": { "type": "string" }
+                }
+            }
+        });
+        let out = normalise_schema_for_gemini(schema);
+        let to = &out["properties"]["to"];
+        assert_eq!(to["type"], json!("array"), "items present → type must be array");
+        assert!(to.get("items").is_some(), "array must keep its items");
+        assert_eq!(to["items"]["type"], json!("string"));
+        assert_eq!(to["nullable"], json!(true));
+    }
+
+    #[test]
+    fn gemini_nullable_string_union_has_no_items() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "name": { "type": ["string", "null"] } }
+        });
+        let out = normalise_schema_for_gemini(schema);
+        let name = &out["properties"]["name"];
+        assert_eq!(name["type"], json!("string"));
+        assert_eq!(name["nullable"], json!(true));
+        assert!(name.get("items").is_none());
+    }
+
+    // A stray `items` on a plain (single-type) non-array property must be
+    // dropped too, not just on narrowed unions.
+    #[test]
+    fn gemini_strips_stray_items_on_non_array() {
+        let schema = json!({ "type": "string", "items": { "type": "string" } });
+        let out = normalise_schema_for_gemini(schema);
+        assert_eq!(out["type"], json!("string"));
+        assert!(out.get("items").is_none());
     }
 }
