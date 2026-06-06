@@ -3891,7 +3891,15 @@ pub async fn cluster_control_plane_receive(
     body: web::Json<crate::agent::ControlPlaneBundle>,
 ) -> HttpResponse {
     if let Err(e) = require_cluster_auth(&req, &state) { return e; }
-    let detail = crate::agent::apply_control_plane_bundle(&state.cluster, &body);
+    // The sender advertises its bind address (often 0.0.0.0) for itself; learn
+    // its REAL address from the connection source IP so the hub "main" is
+    // reachable from every other node (regression: secondaries saw all nodes
+    // except main). Use the raw TCP peer address, NOT X-Forwarded-For — this is
+    // a direct, cluster-secret-authed node→node call; trusting a client header
+    // for the source IP would let a peer spoof another node's address. Inter-
+    // node traffic is not reverse-proxied.
+    let sender_addr = req.peer_addr().map(|a| a.ip().to_string());
+    let detail = crate::agent::apply_control_plane_bundle(&state.cluster, &body, sender_addr);
     HttpResponse::Ok().json(serde_json::json!({ "applied": true, "detail": detail }))
 }
 
@@ -28764,6 +28772,20 @@ fn compose_project_dir(name: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(compose_root_dir()).join(name)
 }
 
+/// Find the compose file in a stack directory, honouring Docker Compose's own
+/// filename precedence: compose.yaml > compose.yml > docker-compose.yaml >
+/// docker-compose.yml. Returns the existing file, or `docker-compose.yml` (our
+/// canonical name for newly-created stacks) when none is present yet — so
+/// imported stacks that use any of the standard names are picked up and edited
+/// in place rather than ignored or duplicated.
+fn compose_file_in(dir: &std::path::Path) -> std::path::PathBuf {
+    for name in ["compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"] {
+        let p = dir.join(name);
+        if p.exists() { return p; }
+    }
+    dir.join("docker-compose.yml")
+}
+
 /// Validate compose stack name — alphanumeric, dash, underscore only
 fn is_safe_compose_name(name: &str) -> bool {
     !name.is_empty()
@@ -28802,7 +28824,7 @@ async fn compose_list_stacks(
             let path = entry.path();
             if !path.is_dir() { continue; }
             let name = entry.file_name().to_string_lossy().to_string();
-            let compose_file = path.join("docker-compose.yml");
+            let compose_file = compose_file_in(&path);
             let env_file = path.join(".env");
             if !compose_file.exists() { continue; }
 
@@ -28904,7 +28926,7 @@ async fn compose_delete_stack(
     }
 
     // Run docker compose down first
-    let compose_file = dir.join("docker-compose.yml");
+    let compose_file = compose_file_in(&dir);
     match Command::new("docker")
         .args(["compose", "-f", &compose_file.to_string_lossy(), "down", "--remove-orphans"])
         .current_dir(&dir)
@@ -28936,7 +28958,7 @@ async fn compose_read_yaml(
 
     let name = path.into_inner();
     if let Err(e) = require_safe_compose_name(&name) { return e; }
-    let file = compose_project_dir(&name).join("docker-compose.yml");
+    let file = compose_file_in(&compose_project_dir(&name));
     match std::fs::read_to_string(&file) {
         Ok(content) => HttpResponse::Ok().json(serde_json::json!({ "content": content })),
         Err(e) => HttpResponse::NotFound().json(serde_json::json!({ "error": format!("{}", e) })),
@@ -28954,7 +28976,7 @@ async fn compose_write_yaml(
 
     let name = path.into_inner();
     if let Err(e) = require_safe_compose_name(&name) { return e; }
-    let file = compose_project_dir(&name).join("docker-compose.yml");
+    let file = compose_file_in(&compose_project_dir(&name));
     match std::fs::write(&file, &body.content) {
         Ok(_) => HttpResponse::Ok().json(serde_json::json!({ "message": "Saved" })),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("{}", e) })),
@@ -29005,7 +29027,7 @@ async fn compose_up(
     let name = path.into_inner();
     if let Err(e) = require_safe_compose_name(&name) { return e; }
     let dir = compose_project_dir(&name);
-    let compose_file = dir.join("docker-compose.yml");
+    let compose_file = compose_file_in(&dir);
     if !compose_file.exists() {
         return HttpResponse::NotFound().json(serde_json::json!({ "error": "Stack not found" }));
     }
@@ -29040,7 +29062,7 @@ async fn compose_down(
     let name = path.into_inner();
     if let Err(e) = require_safe_compose_name(&name) { return e; }
     let dir = compose_project_dir(&name);
-    let compose_file = dir.join("docker-compose.yml");
+    let compose_file = compose_file_in(&dir);
     if !compose_file.exists() {
         return HttpResponse::NotFound().json(serde_json::json!({ "error": "Stack not found" }));
     }
@@ -29074,7 +29096,7 @@ async fn compose_pull(
     let name = path.into_inner();
     if let Err(e) = require_safe_compose_name(&name) { return e; }
     let dir = compose_project_dir(&name);
-    let compose_file = dir.join("docker-compose.yml");
+    let compose_file = compose_file_in(&dir);
     if !compose_file.exists() {
         return HttpResponse::NotFound().json(serde_json::json!({ "error": "Stack not found" }));
     }
@@ -29108,7 +29130,7 @@ async fn compose_restart(
     let name = path.into_inner();
     if let Err(e) = require_safe_compose_name(&name) { return e; }
     let dir = compose_project_dir(&name);
-    let compose_file = dir.join("docker-compose.yml");
+    let compose_file = compose_file_in(&dir);
     if !compose_file.exists() {
         return HttpResponse::NotFound().json(serde_json::json!({ "error": "Stack not found" }));
     }
@@ -29143,7 +29165,7 @@ async fn compose_logs(
     let name = path.into_inner();
     if let Err(e) = require_safe_compose_name(&name) { return e; }
     let dir = compose_project_dir(&name);
-    let compose_file = dir.join("docker-compose.yml");
+    let compose_file = compose_file_in(&dir);
     if !compose_file.exists() {
         return HttpResponse::NotFound().json(serde_json::json!({ "error": "Stack not found" }));
     }
@@ -29191,7 +29213,7 @@ async fn compose_validate(
     let name = path.into_inner();
     if let Err(e) = require_safe_compose_name(&name) { return e; }
     let dir = compose_project_dir(&name);
-    let compose_file = dir.join("docker-compose.yml");
+    let compose_file = compose_file_in(&dir);
     if !compose_file.exists() {
         return HttpResponse::NotFound().json(serde_json::json!({ "error": "Stack not found" }));
     }
@@ -31861,6 +31883,228 @@ fn is_valid_hostname(s: &str) -> bool {
     bytes.iter().all(|&b| alnum(b) || b == b'-')
 }
 
+// ─── TrueNAS integration ────────────────────────────────────────────
+// Multi-instance external NAS appliances. Mirrors the XO handlers: API keys
+// stay encrypted in the store and are never returned to the browser; the store
+// is loaded per-request (admin-only, low-frequency UI actions).
+
+#[derive(serde::Deserialize)]
+pub struct TrueNasRegisterRequest {
+    pub label: String,
+    #[serde(default)] pub cluster: Option<String>,
+    pub api_url: String,
+    pub api_key: String,
+    #[serde(default)] pub pool_name: String,
+    #[serde(default = "tn_default_insecure")] pub insecure_tls: bool,
+    #[serde(default = "tn_default_ttl")] pub cache_ttl_secs: u64,
+}
+fn tn_default_insecure() -> bool { true }
+fn tn_default_ttl() -> u64 { 300 }
+
+#[derive(serde::Deserialize)]
+pub struct TrueNasUpdateRequest {
+    pub label: String,
+    #[serde(default)] pub cluster: Option<String>,
+    pub api_url: String,
+    #[serde(default)] pub pool_name: String,
+    #[serde(default = "tn_default_insecure")] pub insecure_tls: bool,
+    #[serde(default = "tn_default_ttl")] pub cache_ttl_secs: u64,
+    /// Blank/absent = keep the stored key.
+    #[serde(default)] pub api_key: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct TrueNasSnapshotCreateRequest {
+    pub dataset: String,
+    pub name: String,
+    #[serde(default)] pub recursive: bool,
+}
+
+/// GET /api/truenas/instances — registered TrueNAS servers (keys redacted).
+pub async fn truenas_list(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let list = crate::truenas::TrueNasStore::load().list();
+    let safe: Vec<serde_json::Value> = list.iter().map(|i| i.redacted()).collect();
+    HttpResponse::Ok().json(safe)
+}
+
+/// POST /api/truenas/instances — register a server (test-connection before persist).
+pub async fn truenas_register(
+    req: HttpRequest, state: web::Data<AppState>, body: web::Json<TrueNasRegisterRequest>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let r = body.into_inner();
+    if r.label.trim().is_empty() || r.api_url.trim().is_empty() || r.api_key.trim().is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "label, api_url and api_key are all required"}));
+    }
+    if let Err(e) = validate_outbound_url(&r.api_url) {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": e}));
+    }
+    let mut inst = crate::truenas::TrueNasInstance {
+        id: String::new(),
+        label: r.label.trim().to_string(),
+        cluster: r.cluster.filter(|c| !c.trim().is_empty()),
+        api_url: r.api_url.trim().trim_end_matches('/').to_string(),
+        api_key_enc: crate::truenas::obfuscate_key(r.api_key.trim()),
+        pool_name: r.pool_name.trim().to_string(),
+        insecure_tls: r.insecure_tls,
+        cache_ttl_secs: r.cache_ttl_secs,
+        last_seen: String::new(),
+        status: String::new(),
+    };
+    // Verify the key/URL work before storing — bad creds never persist.
+    let client = crate::truenas::TrueNasClient::for_instance(&inst);
+    match client.test_connection().await {
+        Ok(_) => { inst.status = "ok".into(); inst.last_seen = chrono::Utc::now().to_rfc3339(); }
+        Err(e) => return HttpResponse::BadGateway().json(serde_json::json!({"error": format!("Couldn't reach the TrueNAS API: {}", e)})),
+    }
+    let mut store = crate::truenas::TrueNasStore::load();
+    match store.add(inst) {
+        Ok(id) => HttpResponse::Created().json(serde_json::json!({"id": id, "status": "ok"})),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e})),
+    }
+}
+
+/// PUT /api/truenas/instances/{id} — edit a server (blank api_key keeps the stored one).
+pub async fn truenas_update(
+    req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>, body: web::Json<TrueNasUpdateRequest>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let r = body.into_inner();
+    if let Err(e) = validate_outbound_url(&r.api_url) {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": e}));
+    }
+    let mut store = crate::truenas::TrueNasStore::load();
+    match store.update(&id, r.label.trim().to_string(),
+        r.cluster.filter(|c| !c.trim().is_empty()),
+        r.api_url.trim().trim_end_matches('/').to_string(),
+        r.pool_name.trim().to_string(), r.insecure_tls, r.cache_ttl_secs, r.api_key)
+    {
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"status": "updated"})),
+        Err(e) => HttpResponse::NotFound().json(serde_json::json!({"error": e})),
+    }
+}
+
+/// DELETE /api/truenas/instances/{id} — unregister a server.
+pub async fn truenas_delete(
+    req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    match crate::truenas::TrueNasStore::load().remove(&id) {
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"status": "removed"})),
+        Err(e) => HttpResponse::NotFound().json(serde_json::json!({"error": e})),
+    }
+}
+
+/// Look up an instance or return a 404 response.
+fn truenas_get(id: &str) -> Result<crate::truenas::TrueNasInstance, HttpResponse> {
+    crate::truenas::TrueNasStore::load().get(id)
+        .ok_or_else(|| HttpResponse::NotFound().json(serde_json::json!({"error": "TrueNAS instance not found"})))
+}
+
+/// POST /api/truenas/instances/{id}/test — re-probe; updates cached status.
+pub async fn truenas_test(
+    req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let inst = match truenas_get(&id) { Ok(i) => i, Err(r) => return r };
+    let client = crate::truenas::TrueNasClient::for_instance(&inst);
+    match client.test_connection().await {
+        Ok(version) => {
+            crate::truenas::TrueNasStore::load().update_status(&id, "ok");
+            HttpResponse::Ok().json(serde_json::json!({"status": "ok", "version": version}))
+        }
+        Err(e) => {
+            let status = if e.contains("401") || e.contains("403") || e.to_ascii_lowercase().contains("key")
+                { "auth_failed" } else { "unreachable" };
+            crate::truenas::TrueNasStore::load().update_status(&id, status);
+            HttpResponse::BadGateway().json(serde_json::json!({"status": status, "error": e}))
+        }
+    }
+}
+
+/// GET /api/truenas/instances/{id}/overview — pool + datasets + disks.
+pub async fn truenas_overview(
+    req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let inst = match truenas_get(&id) { Ok(i) => i, Err(r) => return r };
+    let client = crate::truenas::TrueNasClient::for_instance(&inst);
+    match client.overview(&inst.pool_name).await {
+        Ok(ov) => HttpResponse::Ok().json(ov),
+        Err(e) => HttpResponse::BadGateway().json(serde_json::json!({"error": e})),
+    }
+}
+
+/// GET /api/truenas/instances/{id}/nfs — NFS exports.
+pub async fn truenas_nfs(
+    req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let inst = match truenas_get(&id) { Ok(i) => i, Err(r) => return r };
+    let client = crate::truenas::TrueNasClient::for_instance(&inst);
+    match client.nfs_exports().await {
+        Ok(x) => HttpResponse::Ok().json(serde_json::json!({"exports": x})),
+        Err(e) => HttpResponse::BadGateway().json(serde_json::json!({"error": e})),
+    }
+}
+
+/// GET /api/truenas/instances/{id}/snapshots — ZFS snapshots.
+pub async fn truenas_snapshots(
+    req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let inst = match truenas_get(&id) { Ok(i) => i, Err(r) => return r };
+    let client = crate::truenas::TrueNasClient::for_instance(&inst);
+    match client.snapshots().await {
+        Ok(x) => HttpResponse::Ok().json(serde_json::json!({"snapshots": x})),
+        Err(e) => HttpResponse::BadGateway().json(serde_json::json!({"error": e})),
+    }
+}
+
+/// POST /api/truenas/instances/{id}/snapshots — create a ZFS snapshot.
+pub async fn truenas_snapshot_create(
+    req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>, body: web::Json<TrueNasSnapshotCreateRequest>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let r = body.into_inner();
+    if r.dataset.trim().is_empty() || r.name.trim().is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "dataset and name are required"}));
+    }
+    let inst = match truenas_get(&id) { Ok(i) => i, Err(resp) => return resp };
+    let client = crate::truenas::TrueNasClient::for_instance(&inst);
+    match client.create_snapshot(r.dataset.trim(), r.name.trim(), r.recursive).await {
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"status": "created"})),
+        Err(e) => HttpResponse::BadGateway().json(serde_json::json!({"error": e})),
+    }
+}
+
+/// DELETE /api/truenas/instances/{id}/snapshots?snap=<full-id> — delete a snapshot.
+pub async fn truenas_snapshot_delete(
+    req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>,
+    query: web::Query<std::collections::HashMap<String, String>>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let snap = query.get("snap").map(|s| s.trim().to_string()).unwrap_or_default();
+    if snap.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "snap (snapshot id) is required"}));
+    }
+    let inst = match truenas_get(&id) { Ok(i) => i, Err(resp) => return resp };
+    let client = crate::truenas::TrueNasClient::for_instance(&inst);
+    match client.delete_snapshot(&snap).await {
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"status": "deleted"})),
+        Err(e) => HttpResponse::BadGateway().json(serde_json::json!({"error": e})),
+    }
+}
+
 /// Validate that a URL is HTTP(S) and resolves to a host that's
 /// not loopback / link-local / metadata. Used as the SSRF gate
 /// on every operator-supplied URL we make outbound calls to
@@ -34219,6 +34463,17 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         // Xen Orchestra / XCP-ng integration (P1: read-only).
         // Mirrors the proxmox surface — operator registers an XO
         // instance with a token, WolfStack drives it via REST.
+        // TrueNAS integration (multi-instance external NAS appliances)
+        .route("/api/truenas/instances", web::get().to(truenas_list))
+        .route("/api/truenas/instances", web::post().to(truenas_register))
+        .route("/api/truenas/instances/{id}", web::put().to(truenas_update))
+        .route("/api/truenas/instances/{id}", web::delete().to(truenas_delete))
+        .route("/api/truenas/instances/{id}/test", web::post().to(truenas_test))
+        .route("/api/truenas/instances/{id}/overview", web::get().to(truenas_overview))
+        .route("/api/truenas/instances/{id}/nfs", web::get().to(truenas_nfs))
+        .route("/api/truenas/instances/{id}/snapshots", web::get().to(truenas_snapshots))
+        .route("/api/truenas/instances/{id}/snapshots", web::post().to(truenas_snapshot_create))
+        .route("/api/truenas/instances/{id}/snapshots", web::delete().to(truenas_snapshot_delete))
         .route("/api/xo/pools", web::get().to(xo_pools_list))
         .route("/api/xo/pools", web::post().to(xo_pools_register))
         .route("/api/xo/pools/{id}", web::delete().to(xo_pools_delete))

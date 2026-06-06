@@ -128,6 +128,24 @@ fn is_private_address(addr: &str) -> bool {
     }
 }
 
+/// An address peers can actually CONNECT to. A node advertises its own address
+/// as the bind address (`cli.bind`, usually the wildcard `0.0.0.0`), which is
+/// unreachable from anywhere else — so a self-entry carrying `0.0.0.0` must
+/// never be added or used to overwrite a real address. Peers learn a node's
+/// real address from the source IP of its inbound pushes instead (GitHub: the
+/// hub "main" was missing from every other node because its self-entry's
+/// 0.0.0.0 failed is_private_address).
+pub fn is_usable_addr(addr: &str) -> bool {
+    let a = addr.trim();
+    !a.is_empty()
+        && a != "0.0.0.0"
+        && a != "::"
+        && a != "[::]"
+        && a != "0.0.0.0/0"
+        && !a.starts_with("0.0.0.0:")
+        && !a.starts_with("[::]:")
+}
+
 /// Track consecutive poll failures per node — only mark offline after 2+ failures
 static POLL_FAIL_COUNTS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, u32>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
@@ -624,6 +642,10 @@ impl ClusterState {
         let current = self.get_all_nodes();
         for m in members {
             if m.node_type != "wolfstack" { continue; }
+            // Skip a self-entry carrying the wildcard bind address (0.0.0.0):
+            // it's unreachable, and the sender's REAL address is repaired into
+            // the bundle from the connection source IP before we get here.
+            if !is_usable_addr(&m.address) { continue; }
             // Never seed ourselves as a peer.
             if m.id == self.self_id { continue; }
             if m.self_id.as_deref() == Some(self.self_id.as_str()) { continue; }
@@ -1117,11 +1139,27 @@ pub fn build_control_plane_bundle(cluster: &ClusterState) -> ControlPlaneBundle 
 }
 
 /// Apply a received control-plane bundle: merge tombstones, converge
-/// membership, then last-write-wins the users/auth blobs. Returns a one-line
-/// summary for logging.
-pub fn apply_control_plane_bundle(cluster: &ClusterState, bundle: &ControlPlaneBundle) -> String {
+/// membership, then last-write-wins the users/auth blobs. `sender_addr` is the
+/// source IP of the inbound connection — used to repair the sender's own
+/// member entry, which carries its (unreachable) bind address (0.0.0.0). This
+/// is how every other node learns the hub "main"'s real, reachable address.
+/// Returns a one-line summary for logging.
+pub fn apply_control_plane_bundle(cluster: &ClusterState, bundle: &ControlPlaneBundle, sender_addr: Option<String>) -> String {
     cluster.merge_tombstones(&bundle.deleted_ids);
-    cluster.merge_member_refs(&bundle.members);
+    let mut members = bundle.members.clone();
+    if let Some(addr) = sender_addr.filter(|a| is_usable_addr(a)) {
+        // Repair the sender's self-entry (id/self_id == from_id) when it
+        // advertised an unusable address — the connection source IP is how it
+        // actually reached us, so it's reachable back on the LAN.
+        for m in members.iter_mut() {
+            let is_sender = m.id == bundle.from_id
+                || m.self_id.as_deref() == Some(bundle.from_id.as_str());
+            if is_sender && !is_usable_addr(&m.address) {
+                m.address = addr.clone();
+            }
+        }
+    }
+    cluster.merge_member_refs(&members);
     let (users_updated, auth_updated) = crate::auth::users::control_plane_apply(
         &bundle.users_json,
         bundle.users_version,
@@ -1419,8 +1457,11 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
                                 let existing_by_id = current_nodes.iter().find(|n| n.id == known.id);
 
                                 if let Some(existing) = existing_by_id {
-                                    // Node already known — update its settings to mirror the source
-                                    if existing.address != known.address
+                                    // Node already known — update its settings to mirror the source.
+                                    // A wildcard (0.0.0.0) gossiped address doesn't count as a
+                                    // change — it's preserved below — so don't let it trigger a
+                                    // spurious write on its own.
+                                    if (is_usable_addr(&known.address) && existing.address != known.address)
                                         || existing.hostname != known.hostname
                                         || existing.port != known.port
                                         || existing.pve_token != known.pve_token
@@ -1432,7 +1473,14 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
                                         cluster.update_node_settings(
                                             &known.id,
                                             Some(known.hostname.clone()),
-                                            Some(known.address.clone()),
+                                            // Never overwrite a real, reachable address with a
+                                            // peer's unusable self-entry (0.0.0.0 bind address) —
+                                            // that's what dropped the hub "main" from other nodes.
+                                            if is_usable_addr(&known.address) {
+                                                Some(known.address.clone())
+                                            } else {
+                                                Some(existing.address.clone())
+                                            },
                                             Some(known.port),
                                             known.pve_token.clone(),
                                             if known.pve_fingerprint.is_some() || existing.pve_fingerprint.is_some() {
@@ -1732,5 +1780,40 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod convergence_tests {
+    use super::*;
+
+    #[test]
+    fn unusable_addresses_are_rejected() {
+        // The wildcard bind address a node advertises for itself must never be
+        // treated as reachable — this was why the hub "main" vanished from
+        // every other node.
+        assert!(!is_usable_addr("0.0.0.0"));
+        assert!(!is_usable_addr("0.0.0.0:8553"));
+        assert!(!is_usable_addr("::"));
+        assert!(!is_usable_addr("[::]"));
+        assert!(!is_usable_addr(""));
+        assert!(!is_usable_addr("   "));
+    }
+
+    #[test]
+    fn real_addresses_are_usable() {
+        assert!(is_usable_addr("192.168.5.10"));
+        assert!(is_usable_addr("10.2.0.153"));
+        assert!(is_usable_addr("nas.lan"));
+    }
+
+    #[test]
+    fn private_guard_allows_lan_and_hostnames_but_not_public() {
+        assert!(is_private_address("192.168.5.10"));
+        assert!(is_private_address("10.0.0.1"));
+        assert!(is_private_address("127.0.0.1"));
+        assert!(is_private_address("nas.lan"));       // hostname → treated local
+        assert!(!is_private_address("8.8.8.8"));      // public → not auto-added
+        assert!(!is_private_address("0.0.0.0"));       // wildcard → not private
     }
 }

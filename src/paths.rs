@@ -61,6 +61,8 @@ pub struct FileLocations {
     pub node_id_file: String,
     #[serde(default = "default_xo_pools_config")]
     pub xo_pools_config: String,
+    #[serde(default = "default_truenas_config")]
+    pub truenas_config: String,
 
     // ── Alerting ──────────────────────────────────
     #[serde(default = "default_alerts_config")]
@@ -190,6 +192,7 @@ fn default_self_cluster_config() -> String { "/etc/wolfstack/self_cluster.json".
 fn default_self_site_config() -> String { "/etc/wolfstack/self_site.json".into() }
 fn default_node_id_file() -> String { "/etc/wolfstack/node_id".into() }
 fn default_xo_pools_config() -> String { "/etc/wolfstack/xo_pools.json".into() }
+fn default_truenas_config() -> String { "/etc/wolfstack/truenas.json".into() }
 
 fn default_alerts_config() -> String { "/etc/wolfstack/alerts.json".into() }
 
