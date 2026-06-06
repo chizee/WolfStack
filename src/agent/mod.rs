@@ -146,17 +146,6 @@ pub fn is_usable_addr(addr: &str) -> bool {
         && !a.starts_with("[::]:")
 }
 
-/// Two cluster tags are compatible for membership convergence when either side
-/// is unset/empty, or they match. Two DIFFERENT non-empty names never match —
-/// separate named clusters must NOT be merged. (The v24.27 storm was a
-/// cross-cluster + multi-homed-duplicate merge that exploded every node's poll
-/// list; this is the guard that was missing.)
-fn cluster_matches(a: &str, b: Option<&str>) -> bool {
-    let a = a.trim();
-    let b = b.unwrap_or("").trim();
-    a.is_empty() || b.is_empty() || a.eq_ignore_ascii_case(b)
-}
-
 /// Track consecutive poll failures per node — only mark offline after 2+ failures
 static POLL_FAIL_COUNTS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, u32>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
@@ -291,13 +280,14 @@ impl ClusterState {
         // Purge unverified wolfstack nodes (except self)
         state.purge_unverified();
         // Heal a list bloated by a pre-fix build: collapse duplicate records
-        // (multi-homed dup explosion) and drop foreign-cluster peers. This is
-        // what self-recovers a node hit by the v24.27 convergence storm on its
-        // first restart after upgrading.
-        let pruned = state.prune_duplicate_and_foreign_nodes();
+        // (the multi-homed self_id explosion). This self-recovers a node hit by
+        // the v24.27 convergence storm on its first restart after upgrading.
+        // NOTE: peers are NEVER dropped for belonging to another named cluster —
+        // control-plane replication shows the whole multi-cluster fleet.
+        let pruned = state.prune_duplicate_nodes();
         if pruned > 0 {
             tracing::warn!(
-                "cluster: pruned {} duplicate/foreign node record(s) from membership at startup",
+                "cluster: collapsed {} duplicate node record(s) in membership at startup",
                 pruned
             );
         }
@@ -502,28 +492,6 @@ impl ClusterState {
             .unwrap_or_else(|| "WolfStack".to_string())
     }
 
-    /// The self node's cluster name for membership SCOPING decisions, or `None`
-    /// when it genuinely can't be determined yet.
-    ///
-    /// Unlike `get_self_cluster_name`, this NEVER substitutes the "WolfStack"
-    /// display default: an unknown self-cluster must be treated as PERMISSIVE
-    /// (match anything) — never restrictive — so scoping can't accidentally
-    /// exclude or prune legitimate same-cluster peers. It reads the live
-    /// self-entry first, then the on-disk persisted name, which is available
-    /// even before `update_self()` has populated the self-entry (e.g. the
-    /// startup prune in `ClusterState::new`, which is exactly where assuming
-    /// "WolfStack" would have wiped a named cluster's whole peer list).
-    fn self_cluster_for_scope(&self) -> Option<String> {
-        let from_map = {
-            let nodes = self.nodes.read().unwrap();
-            nodes.get(&self.self_id).and_then(|n| n.cluster_name.clone())
-        };
-        from_map
-            .filter(|s| !s.trim().is_empty())
-            .or_else(Self::load_self_cluster_name)
-            .filter(|s| !s.trim().is_empty())
-    }
-
     /// Add a server by address — persists to disk (join_verified=true because only called after token validation)
     pub fn add_server(&self, address: String, port: u16, cluster_name: Option<String>) -> String {
         let id = self.add_server_full(address, port, "wolfstack".to_string(), None, None, None, None, cluster_name);
@@ -683,7 +651,6 @@ impl ClusterState {
         let self_hostname = hostname::get()
             .map(|h| h.to_string_lossy().to_string())
             .unwrap_or_default();
-        let self_cluster = self.self_cluster_for_scope().unwrap_or_default();
         let current = self.get_all_nodes();
         // Dedup WITHIN this single bundle too: a sender that hasn't been pruned
         // yet can advertise the same physical node under two record ids sharing
@@ -714,11 +681,6 @@ impl ClusterState {
             if m_self_id == self.self_id.as_str() { continue; }
             if m.hostname == self_hostname && m.port == self.port { continue; }
             if m.address == self.self_address && m.port == self.port { continue; }
-            // Cluster scope: NEVER merge a node that belongs to a different
-            // named cluster. Each node manages only its own cluster's members;
-            // merging foreign clusters is what made N (and the poll fan-out)
-            // grow without bound across separate fleets.
-            if !cluster_matches(&self_cluster, m.cluster_name.as_deref()) { continue; }
             // Already seeded earlier in THIS same bundle (under another record
             // id sharing this self_id)? Skip — the snapshot below can't see it.
             if added_self_ids.contains(m_self_id) { continue; }
@@ -755,29 +717,23 @@ impl ClusterState {
 
     /// One-shot cleanup of a node list that a pre-fix build may have bloated:
     /// collapse duplicate records (same global `self_id`, or same address+port)
-    /// down to a single best entry, and drop any peer that belongs to a
-    /// DIFFERENT named cluster. This is what heals an already-exploded list on
-    /// the first restart after upgrading past the v24.27 storm — the operator
-    /// does not have to hand-edit `nodes.json`.
+    /// down to a single best entry. This heals a list exploded by the v24.27
+    /// multi-homed convergence storm on the first restart after upgrading — the
+    /// operator does not have to hand-edit `nodes.json`.
     ///
-    /// Conservative: `is_self` is always kept; an untagged peer (no
-    /// `cluster_name`) is never pruned as "foreign" (it may simply not have been
-    /// tagged yet); and when OUR OWN cluster name can't be determined the
-    /// foreign-cluster removal is skipped entirely (permissive) so we can't wipe
-    /// a named cluster's peers. The keeper for each duplicate group is the most
-    /// trustworthy record (self > verified > online > usable-address). Returns
-    /// the number of entries removed. Saves to disk only if something changed.
-    pub fn prune_duplicate_and_foreign_nodes(&self) -> usize {
-        // Resolve our own cluster from the live self-entry OR disk — NOT the
-        // "WolfStack" display default. This runs at startup BEFORE update_self,
-        // so `get_self_cluster_name()` would always answer "WolfStack" and prune
-        // every peer of a differently-named cluster as foreign. `None` here ⇒
-        // unknown ⇒ skip foreign removal entirely.
-        let self_cluster = self.self_cluster_for_scope();
+    /// Cluster-agnostic by design: control-plane replication shows the WHOLE
+    /// fleet across clusters (`cluster_name` is a display grouping, NEVER a
+    /// membership boundary), so a peer is never dropped for belonging to a
+    /// different named cluster — that mistake (v24.29.1) deleted whole federated
+    /// clusters down to a single node. `is_self` is always kept; the keeper for
+    /// each duplicate group is the most trustworthy record
+    /// (self > verified > online > usable-address). Returns the number of
+    /// entries removed. Saves to disk only if something changed.
+    pub fn prune_duplicate_nodes(&self) -> usize {
         let mut nodes = self.nodes.write().unwrap();
         let before = nodes.len();
         let entries: Vec<Node> = nodes.values().cloned().collect();
-        let remove = Self::plan_prune(entries, self_cluster.as_deref());
+        let remove = Self::plan_prune(entries);
         for id in &remove {
             nodes.remove(id);
         }
@@ -789,12 +745,12 @@ impl ClusterState {
         removed
     }
 
-    /// Pure decision core of `prune_duplicate_and_foreign_nodes`: given the node
-    /// records and the resolved self-cluster (`None` ⇒ unknown ⇒ permissive,
-    /// foreign removal skipped), return the ids to remove. Split out so the
-    /// data-loss-sensitive logic is unit-testable without disk or a live
-    /// `ClusterState`.
-    fn plan_prune(mut entries: Vec<Node>, self_cluster: Option<&str>) -> Vec<String> {
+    /// Pure decision core of `prune_duplicate_nodes`: given the node records,
+    /// return the ids of duplicate records to remove (same global `self_id`, or
+    /// same address+port). Cluster membership is never a reason to remove a peer.
+    /// Split out so the data-loss-sensitive logic is unit-testable without disk
+    /// or a live `ClusterState`.
+    fn plan_prune(mut entries: Vec<Node>) -> Vec<String> {
         // Choose keepers deterministically: sort so the best record of each
         // duplicate group is visited first and therefore retained.
         entries.sort_by_key(|n| {
@@ -807,21 +763,11 @@ impl ClusterState {
             )
         });
 
-        // Unknown self-cluster ⇒ permissive: an empty string makes
-        // `cluster_matches` match everything, so nothing is dropped as foreign.
-        let self_c = self_cluster.unwrap_or("");
         let mut seen_self_ids: HashSet<String> = HashSet::new();
         let mut seen_addrs: HashSet<String> = HashSet::new();
         let mut remove: Vec<String> = Vec::new();
         for n in &entries {
             if n.is_self {
-                continue;
-            }
-            // Foreign-cluster WolfStack peers should never be in our list.
-            if n.node_type == "wolfstack"
-                && !cluster_matches(self_c, n.cluster_name.as_deref())
-            {
-                remove.push(n.id.clone());
                 continue;
             }
             let sid = n.self_id.as_deref().filter(|s| !s.is_empty());
@@ -1287,14 +1233,13 @@ pub struct ControlPlaneBundle {
 pub fn build_control_plane_bundle(cluster: &ClusterState) -> ControlPlaneBundle {
     let (users_json, users_version, auth_json, auth_version) =
         crate::auth::users::control_plane_snapshot();
-    let self_cluster = cluster.self_cluster_for_scope().unwrap_or_default();
     let self_id = cluster.self_id.clone();
-    // Only advertise OUR OWN cluster's members. Shipping the whole list (which
-    // could contain peers from other clusters this node had erroneously merged)
-    // is how a cross-cluster merge propagated fleet-wide. Untagged peers are
-    // still included — they may simply not be tagged yet.
+    // Advertise the WHOLE fleet — control-plane replication is "log into any
+    // node, see every cluster". `cluster_name` is a display grouping, not a
+    // membership boundary; filtering it here is what severed federated clusters
+    // (v24.29.1). The receiver dedups by stable self_id, so multi-homed records
+    // can't pile up regardless of how many peers we advertise.
     let members = cluster.get_all_nodes().into_iter()
-        .filter(|n| cluster_matches(&self_cluster, n.cluster_name.as_deref()))
         .map(|mut n| {
             n.metrics = None;
             n.components = Vec::new();
@@ -1363,15 +1308,14 @@ pub async fn sweep_replicate_control_plane(cluster: Arc<ClusterState>, cluster_s
     if std::env::var("WOLFSTACK_DISABLE_CP_SYNC").map(|v| v != "0" && !v.is_empty()).unwrap_or(false) {
         return;
     }
-    let self_cluster = cluster.self_cluster_for_scope().unwrap_or_default();
+    // Replicate to every online WolfStack peer across the whole fleet. The CPU
+    // storm was unbounded GROWTH of nodes.json (the same multi-homed node
+    // re-added under each address forever), now fixed by self_id dedup — NOT the
+    // count of distinct peers we push to, which is bounded by the real fleet.
     let peers: Vec<(String, u16)> = {
         let nodes = cluster.nodes.read().unwrap();
         nodes.values()
             .filter(|n| !n.is_self && n.node_type == "wolfstack" && n.online)
-            // Cluster scope: only replicate to peers in OUR cluster. Pushing the
-            // bundle to every WolfStack node the list had accumulated (across
-            // clusters) is the fan-out that pegged the CPU.
-            .filter(|n| cluster_matches(&self_cluster, n.cluster_name.as_deref()))
             .map(|n| (n.address.clone(), n.port))
             .collect()
     };
@@ -1687,9 +1631,18 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
                                         );
                                     }
                                 } else {
-                                    // Check by address+port or hostname+port to prevent ghost duplicates
+                                    // Dedup STRICTLY by the stable global self_id first
+                                    // (mirrors merge_member_refs). A multi-homed node is
+                                    // gossiped under its LAN IP, its WolfNet 10.x IP and
+                                    // the v24.27 source-IP-repair variant — three different
+                                    // addresses, ONE self_id. Keying only on address/hostname
+                                    // (as before) let each variant be admitted as a fresh
+                                    // record on successive polls, re-bloating nodes.json
+                                    // between restarts — the same vector as the v24.27 storm.
+                                    let known_sid = known.self_id.as_deref().filter(|s| !s.is_empty());
                                     let already_known = current_nodes.iter().any(|n| {
-                                        (n.address == known.address && n.port == known.port && n.pve_node_name == known.pve_node_name)
+                                        (known_sid.is_some() && n.self_id.as_deref() == known_sid)
+                                        || (n.address == known.address && n.port == known.port && n.pve_node_name == known.pve_node_name)
                                         || (n.hostname == known.hostname && n.port == known.port && n.node_type == known.node_type)
                                     });
                                     if !already_known {
@@ -2009,24 +1962,6 @@ mod convergence_tests {
         assert!(!is_private_address("0.0.0.0"));       // wildcard → not private
     }
 
-    #[test]
-    fn cluster_scope_never_merges_distinct_named_clusters() {
-        // The guard that was missing in the v24.27 storm: two DIFFERENT named
-        // clusters must never be treated as compatible for convergence.
-        assert!(!cluster_matches("alpha", Some("beta")));
-        assert!(!cluster_matches("HomeLab", Some("prod")));
-        // Same name (case-insensitive) matches.
-        assert!(cluster_matches("alpha", Some("alpha")));
-        assert!(cluster_matches("HomeLab", Some("homelab")));
-        // Either side unset/empty is permissive — an untagged peer may simply
-        // not have propagated its tag yet, so we don't exclude it.
-        assert!(cluster_matches("", Some("alpha")));
-        assert!(cluster_matches("alpha", None));
-        assert!(cluster_matches("alpha", Some("")));
-        assert!(cluster_matches("alpha", Some("   ")));
-        assert!(cluster_matches("", None));
-    }
-
     // Build a Node with only the fields the prune logic reads; the rest take
     // their serde defaults.
     fn mk(
@@ -2057,30 +1992,20 @@ mod convergence_tests {
     }
 
     #[test]
-    fn prune_drops_foreign_cluster_peers_but_keeps_same_and_untagged() {
+    fn prune_keeps_peers_from_other_clusters() {
+        // Control-plane replication shows the WHOLE fleet across clusters —
+        // `cluster_name` is a display grouping, never a membership boundary.
+        // Peers in OTHER named clusters (and untagged peers) must be KEPT; the
+        // v24.29.1 regression pruned them and deleted ~5 federated clusters
+        // down to a single node.
         let nodes = vec![
             mk("self", "10.0.0.1", None, Some("HomeLab"), true, true, true),
             mk("a", "10.0.0.2", Some("ws-a"), Some("HomeLab"), false, true, true),
             mk("b", "10.0.0.3", Some("ws-b"), Some("Production"), false, true, true),
             mk("c", "10.0.0.4", Some("ws-c"), None, false, true, true),
         ];
-        let remove = ClusterState::plan_prune(nodes, Some("HomeLab"));
-        assert_eq!(remove.len(), 1);
-        assert!(remove.contains(&"b".to_string())); // only the foreign-cluster peer
-    }
-
-    #[test]
-    fn prune_with_unknown_self_cluster_never_wipes_peers() {
-        // C1 regression guard: at startup self may not be resolvable yet. An
-        // unknown self-cluster MUST be permissive — never drop peers as foreign,
-        // or a named cluster loses its whole membership on first boot.
-        let nodes = vec![
-            mk("self", "10.0.0.1", None, None, true, true, true),
-            mk("a", "10.0.0.2", Some("ws-a"), Some("HomeLab"), false, true, true),
-            mk("b", "10.0.0.3", Some("ws-b"), Some("Production"), false, true, true),
-        ];
-        let remove = ClusterState::plan_prune(nodes, None);
-        assert!(remove.is_empty());
+        let remove = ClusterState::plan_prune(nodes);
+        assert!(remove.is_empty(), "no peer may be pruned for cluster membership");
     }
 
     #[test]
@@ -2093,7 +2018,7 @@ mod convergence_tests {
             mk("a-wg", "10.10.10.5", Some("ws-a"), Some("HomeLab"), false, false, false),
             mk("a-src", "172.16.0.5", Some("ws-a"), Some("HomeLab"), false, false, false),
         ];
-        let remove = ClusterState::plan_prune(nodes, Some("HomeLab"));
+        let remove = ClusterState::plan_prune(nodes);
         assert_eq!(remove.len(), 2);
         assert!(!remove.contains(&"a-lan".to_string())); // verified+online keeper survives
     }
@@ -2105,7 +2030,7 @@ mod convergence_tests {
             mk("x1", "192.168.1.9", None, Some("HomeLab"), false, true, true),
             mk("x2", "192.168.1.9", None, Some("HomeLab"), false, false, false),
         ];
-        let remove = ClusterState::plan_prune(nodes, Some("HomeLab"));
+        let remove = ClusterState::plan_prune(nodes);
         assert_eq!(remove.len(), 1);
         assert!(remove.contains(&"x2".to_string()));
     }
