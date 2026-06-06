@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v24.25.0: top-bar global search + default auth mode = Both** _(2026-06-06 — [`a6b59f9`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/a6b59f9369066b379332375a34656c6e89460c80))_
 - **v24.24.0: control-plane replication — log into any node, see the same fleet + users** _(2026-06-06 — [`230f596`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/230f5964a8aaeae58ac676a72f110237807444a0))_
 - **v24.23.8: cross-platform LXC restore (Proxmox vzdump <-> native WolfStack)** _(2026-06-06 — [`16695e0`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/16695e0541091f45cbbce9f7ceaab8c1bc05082b))_
 - **v24.23.7: PBS restore lets you pick the target Proxmox storage** _(2026-06-06 — [`642d5dd`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/642d5dd3bb7e0ba2b23579cecbb78c6ad3a224ac))_

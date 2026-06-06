@@ -31,6 +31,13 @@ pub struct FileLocations {
     #[serde(default = "default_backup_local_dir")]
     pub backup_local_dir: String,
 
+    // Where standalone Docker Compose stacks live (the Compose page). Point it
+    // at an existing compose root and every `<name>/docker-compose.yml` under
+    // it shows up as a managed stack — that's the "import existing compose
+    // files" path. Default unchanged so existing stacks keep working.
+    #[serde(default = "default_compose_dir")]
+    pub compose_dir: String,
+
     // ── Storage ───────────────────────────────────
     #[serde(default = "default_storage_config")]
     pub storage_config: String,
@@ -170,6 +177,7 @@ fn default_backup_config() -> String { "/etc/wolfstack/backups.json".into() }
 fn default_backup_staging_dir() -> String { "/tmp/wolfstack-backups".into() }
 fn default_backup_received_dir() -> String { "/var/lib/wolfstack/backups/received".into() }
 fn default_backup_local_dir() -> String { "/var/lib/wolfstack/backups".into() }
+fn default_compose_dir() -> String { "/etc/wolfstack/compose".into() }
 
 fn default_storage_config() -> String { "/etc/wolfstack/storage.json".into() }
 fn default_storage_mount_base() -> String { "/mnt/wolfstack".into() }
