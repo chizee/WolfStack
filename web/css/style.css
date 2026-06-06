@@ -2305,6 +2305,38 @@ body.sidebar-collapsed #task-log-footer {
     gap: 12px;
 }
 
+/* Top-bar global search */
+#global-search-input:focus {
+    border-color: var(--accent-primary);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-primary) 25%, transparent);
+}
+.gs-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 10px;
+    border-radius: 7px;
+    cursor: pointer;
+}
+.gs-row:hover, .gs-row.gs-active {
+    background: var(--bg-tertiary);
+}
+.gs-badge {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 2px 7px;
+    border-radius: 5px;
+    flex-shrink: 0;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+.gs-name { font-weight: 600; font-size: 13px; color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.gs-meta { font-size: 11px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.gs-empty { padding: 14px; text-align: center; color: var(--text-muted); font-size: 13px; }
+@media (max-width: 640px) {
+    #global-search-input { width: 150px; }
+}
+
 .page-content {
     padding: 8px 16px 16px;
 }

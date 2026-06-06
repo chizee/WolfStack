@@ -28673,7 +28673,7 @@ function nodeApiUrl(nodeId, path) {
     if (!node) return path;
     if (node.is_self) return path;
     const cleanPath = path.replace(/^\/api\//, '');
-    return `/api/nodes/${nodeId}/proxy/${cleanPath}`;
+    return `/api/nodes/${encodeURIComponent(nodeId)}/proxy/${cleanPath}`;
 }
 
 function getClusterNodes(clusterName) {
@@ -28686,6 +28686,123 @@ function getClusterNodes(clusterName) {
 function getAllWolfStackNodes() {
     return allNodes.filter(n => n.node_type !== 'proxmox');
 }
+
+// ═══════════════════════════════════════════════════
+// Top-bar global search (VMs / containers / networking, cluster-wide)
+// ═══════════════════════════════════════════════════
+// Debounced; fans the query out to /api/search on every online WolfStack node
+// (local + proxied to peers, same pattern as the cluster Backups page) and
+// aggregates. Click or Enter jumps straight to the resource on its node.
+
+let _globalSearchTimer = null;
+let _globalSearchSeq = 0;
+window._gsResults = [];
+
+function globalSearchInput(e) {
+    const q = (e.target.value || '').trim();
+    clearTimeout(_globalSearchTimer);
+    if (q.length < 2) { hideGlobalSearchResults(); return; }
+    _globalSearchTimer = setTimeout(() => runGlobalSearch(q), 220);
+}
+
+async function runGlobalSearch(q) {
+    const seq = ++_globalSearchSeq;
+    const box = document.getElementById('global-search-results');
+    if (!box) return;
+    box.style.display = 'block';
+    document.getElementById('global-search-input')?.setAttribute('aria-expanded', 'true');
+    box.innerHTML = '<div class="gs-empty">Searching…</div>';
+
+    // Every online WolfStack node (include self even if not flagged online).
+    const nodes = (typeof allNodes !== 'undefined' ? allNodes : [])
+        .filter(n => n.node_type !== 'proxmox' && (n.online || n.is_self));
+
+    const fetches = nodes.map(async (node) => {
+        try {
+            const r = await fetch(nodeApiUrl(node.id, '/api/search?q=' + encodeURIComponent(q)),
+                { signal: AbortSignal.timeout(4000) });
+            if (!r.ok) return [];
+            const d = await r.json();
+            return (Array.isArray(d.results) ? d.results : []).map(x => ({ ...x, node }));
+        } catch (_) { return []; }
+    });
+
+    const all = (await Promise.all(fetches)).flat();
+    if (seq !== _globalSearchSeq) return; // a newer keystroke superseded this run
+    renderGlobalSearchResults(all, q);
+}
+
+function renderGlobalSearchResults(results, q) {
+    const box = document.getElementById('global-search-results');
+    if (!box) return;
+    if (!results.length) {
+        box.innerHTML = '<div class="gs-empty">No matches for "' + escapeHtml(q) + '"</div>';
+        return;
+    }
+    // Name-prefix matches first, then keep server order.
+    const ql = q.toLowerCase();
+    results.sort((a, b) => {
+        const ap = (a.name || '').toLowerCase().startsWith(ql) ? 0 : 1;
+        const bp = (b.name || '').toLowerCase().startsWith(ql) ? 0 : 1;
+        return ap - bp;
+    });
+    window._gsResults = results.slice(0, 40);
+    // Closed colour map keyed by the server-supplied `kind`; an unknown/forged
+    // kind falls back to neutral grey, so it can't inject into the style attr.
+    const colour = { docker: '#3b82f6', lxc: '#a855f7', vm: '#f59e0b', network: '#14b8a6' };
+    box.innerHTML = window._gsResults.map((r, i) => {
+        const c = colour[r.kind] || '#6b7280';
+        const nodeName = escapeHtml(r.node?.hostname || r.node?.id || '');
+        const cluster = r.node?.cluster_name ? ' · ' + escapeHtml(r.node.cluster_name) : '';
+        const detail = r.detail ? escapeHtml(r.detail) + ' · ' : '';
+        return `<div class="gs-row" role="option" data-idx="${i}" onclick="gsGo(${i})">
+            <span class="gs-badge" style="background:${c}22;color:${c};">${escapeHtml(r.label || r.kind || '')}</span>
+            <div style="min-width:0; flex:1;">
+                <div class="gs-name">${escapeHtml(r.name || '')}</div>
+                <div class="gs-meta">${detail}${nodeName}${cluster}</div>
+            </div>
+        </div>`;
+    }).join('');
+}
+
+function hideGlobalSearchResults() {
+    const box = document.getElementById('global-search-results');
+    if (box) { box.style.display = 'none'; box.innerHTML = ''; }
+    document.getElementById('global-search-input')?.setAttribute('aria-expanded', 'false');
+}
+
+// Navigate to a result by index and reset the box.
+function gsGo(i) {
+    const r = (window._gsResults || [])[i];
+    if (!r || !r.node) return;
+    hideGlobalSearchResults();
+    const input = document.getElementById('global-search-input');
+    if (input) input.value = '';
+    if (typeof selectServerView === 'function') selectServerView(r.node.id, r.view || 'overview');
+}
+window.gsGo = gsGo;
+
+// Keyboard: ↑/↓ move the highlight, Enter activates, Esc closes.
+function globalSearchKey(e) {
+    const box = document.getElementById('global-search-results');
+    if (e.key === 'Escape') { hideGlobalSearchResults(); e.target.blur(); return; }
+    if (!box || box.style.display === 'none') return;
+    const rows = Array.from(box.querySelectorAll('.gs-row'));
+    if (!rows.length) return;
+    let idx = rows.findIndex(r => r.classList.contains('gs-active'));
+    if (e.key === 'ArrowDown') { e.preventDefault(); idx = idx < 0 ? 0 : Math.min(rows.length - 1, idx + 1); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); idx = idx < 0 ? rows.length - 1 : Math.max(0, idx - 1); }
+    else if (e.key === 'Enter') { e.preventDefault(); gsGo(idx < 0 ? 0 : idx); return; }
+    else return;
+    rows.forEach(r => r.classList.remove('gs-active'));
+    if (idx >= 0) { rows[idx].classList.add('gs-active'); rows[idx].scrollIntoView({ block: 'nearest' }); }
+}
+
+// Close the results when clicking anywhere outside the search box (registered once).
+document.addEventListener('click', (e) => {
+    const wrap = document.querySelector('.global-search-wrap');
+    if (wrap && !wrap.contains(e.target)) hideGlobalSearchResults();
+});
 
 function showClusterBackupsPage(clusterName) {
     closeSidebarMobile();

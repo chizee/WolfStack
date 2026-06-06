@@ -5961,6 +5961,97 @@ pub async fn docker_list(req: HttpRequest, state: web::Data<AppState>) -> HttpRe
     HttpResponse::Ok().json(containers)
 }
 
+/// GET /api/search?q=<term> — local resource search powering the top-bar global
+/// search. Matches Docker + LXC containers, VMs, and network interfaces/VLANs
+/// on THIS node by name (+ id / IP / MAC where useful). Returns a small capped
+/// payload tagged with the `view` to navigate to; the frontend calls this on
+/// the local node and proxies it to every online peer, then aggregates — so a
+/// single box searches the whole cluster. Reads cached container lists, so it's
+/// cheap to fan out.
+pub async fn global_search(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    query: web::Query<std::collections::HashMap<String, String>>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let q = query.get("q").map(|s| s.trim().to_lowercase()).unwrap_or_default();
+    if q.len() < 2 {
+        // Avoid fanning out a whole-fleet search on a single keystroke.
+        return HttpResponse::Ok().json(serde_json::json!({ "results": [] }));
+    }
+
+    // Every lookup below shells out (`ip` for interfaces) or reads a
+    // cache/lock, so run the whole gather on the blocking pool — a search
+    // fan-out must never park an actix async worker thread.
+    let state = state.clone();
+    let results: Vec<serde_json::Value> = web::block(move || {
+        const PER_KIND: usize = 8;
+        let mut results: Vec<serde_json::Value> = Vec::new();
+
+        // Docker containers → Docker view
+        for c in containers::docker_list_all_cached().into_iter()
+            .filter(|c| c.name.to_lowercase().contains(&q) || c.id.to_lowercase().contains(&q))
+            .take(PER_KIND)
+        {
+            results.push(serde_json::json!({
+                "kind": "docker", "label": "Docker", "name": c.name,
+                "detail": c.image, "state": c.state, "view": "containers",
+            }));
+        }
+
+        // LXC containers → LXC view
+        for c in containers::lxc_list_all_cached().into_iter()
+            .filter(|c| c.name.to_lowercase().contains(&q)
+                || c.id.to_lowercase().contains(&q)
+                || c.ip_address.to_lowercase().contains(&q))
+            .take(PER_KIND)
+        {
+            results.push(serde_json::json!({
+                "kind": "lxc", "label": "LXC", "name": c.name,
+                "detail": c.ip_address, "state": c.state, "view": "lxc",
+            }));
+        }
+
+        // VMs → Proxmox combined view on PVE hosts, native VM view otherwise
+        let vm_view = if containers::is_proxmox() { "pve-resources" } else { "vms" };
+        let vms = state.vms.lock().unwrap().list_vms();
+        for vm in vms.into_iter()
+            .filter(|v| v.name.to_lowercase().contains(&q))
+            .take(PER_KIND)
+        {
+            results.push(serde_json::json!({
+                "kind": "vm", "label": "VM", "name": vm.name,
+                "detail": format!("{} vCPU · {} MB", vm.cpus, vm.memory_mb),
+                "view": vm_view,
+            }));
+        }
+
+        // Network interfaces / VLANs → Networking view
+        for nic in networking::list_interfaces().into_iter()
+            .filter(|n| n.name.to_lowercase().contains(&q)
+                || n.mac.to_lowercase().contains(&q)
+                || n.addresses.iter().any(|a| a.address.to_lowercase().contains(&q)))
+            .take(PER_KIND)
+        {
+            let detail = if nic.is_vlan {
+                format!("VLAN {}{}",
+                    nic.vlan_id.map(|v| v.to_string()).unwrap_or_default(),
+                    nic.parent.as_ref().map(|p| format!(" on {}", p)).unwrap_or_default())
+            } else {
+                nic.addresses.first().map(|a| a.address.clone()).unwrap_or_else(|| nic.mac.clone())
+            };
+            results.push(serde_json::json!({
+                "kind": "network", "label": "Network", "name": nic.name,
+                "detail": detail, "state": nic.state, "view": "networking",
+            }));
+        }
+
+        results
+    }).await.unwrap_or_default();
+
+    HttpResponse::Ok().json(serde_json::json!({ "results": results }))
+}
+
 /// GET /api/containers/cluster — list every Docker + LXC container
 /// across this node and every reachable cluster peer. Same fan-out
 /// pattern as /api/gateways/cluster and /api/array/cluster. Each
@@ -33378,6 +33469,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         // reachable peer). Registered before parameterised routes so
         // it isn't swallowed by `/{runtime}/{id}/...`.
         .route("/api/containers/cluster", web::get().to(containers_cluster))
+        .route("/api/search", web::get().to(global_search))
         // Docker
         .route("/api/containers/docker", web::get().to(docker_list))
         .route("/api/containers/docker/search", web::get().to(docker_search))
