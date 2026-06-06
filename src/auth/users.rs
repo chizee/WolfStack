@@ -36,7 +36,12 @@ fn now_ms() -> u64 {
 /// Controls which authentication backends are active
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthConfig {
-    /// "linux" = system users only (default), "wolfstack" = WolfStack users only, "both" = either works
+    /// "linux" = system users only, "wolfstack" = WolfStack users only,
+    /// "both" = either works (default). "both" is the default because it's
+    /// non-breaking — with no WolfStack users it behaves exactly like "linux"
+    /// (system logins only), but the moment an operator creates a WolfStack
+    /// user it works on every node of every cluster (replicated) with zero
+    /// extra setup.
     #[serde(default = "default_auth_mode")]
     pub auth_mode: String,
     /// Whether to require 2FA for WolfStack users that have it enabled
@@ -49,7 +54,7 @@ pub struct AuthConfig {
     pub version: u64,
 }
 
-fn default_auth_mode() -> String { "linux".into() }
+fn default_auth_mode() -> String { "both".into() }
 fn default_true() -> bool { true }
 
 impl Default for AuthConfig {

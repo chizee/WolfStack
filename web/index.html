@@ -287,6 +287,17 @@
                 <h2 id="page-title">Dashboard</h2>
             </div>
             <div class="top-bar-actions" style="display:flex; align-items:center; gap:12px;">
+                <div class="global-search-wrap" style="position:relative;">
+                    <input id="global-search-input" type="text" role="combobox"
+                        placeholder="Search VMs, containers, networking…" autocomplete="off" spellcheck="false"
+                        aria-label="Search the cluster for VMs, containers and networking"
+                        aria-autocomplete="list" aria-expanded="false" aria-controls="global-search-results"
+                        oninput="globalSearchInput(event)" onkeydown="globalSearchKey(event)"
+                        onfocus="if(this.value.trim().length>=2 && document.getElementById('global-search-results').style.display==='none')globalSearchInput(event)"
+                        style="width:260px; max-width:36vw; padding:7px 12px 7px 12px; border-radius:8px; border:1px solid var(--border); background:var(--bg-secondary); color:var(--text-primary); font-size:13px; outline:none;">
+                    <div id="global-search-results" role="listbox" aria-label="Search results"
+                        style="display:none; position:absolute; top:calc(100% + 6px); left:0; width:400px; max-width:84vw; max-height:64vh; overflow-y:auto; background:var(--bg-primary); border:1px solid var(--border); border-radius:10px; box-shadow:0 12px 40px rgba(0,0,0,0.45); z-index:10050; padding:6px;"></div>
+                </div>
                 <button id="learn-help-btn" onclick="learnContextHelp()" title="Help for this page — opens the matching lesson"
                     style="display:flex; align-items:center; justify-content:center; width:32px; height:32px; border-radius:6px; background:rgba(255,255,255,0.06); color:var(--text-muted); border:none; cursor:pointer; font-size:14px; transition:all 0.2s;"
                     onmouseover="this.style.background='rgba(255,255,255,0.15)';this.style.color='#fff'"
