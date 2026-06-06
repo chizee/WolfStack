@@ -69,6 +69,24 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
+# ─── Helper: stop, disable and remove a systemd unit ────────────────────────
+remove_service() {
+    local svc="$1"
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+        systemctl stop "$svc" 2>/dev/null || true
+        echo "✓ ${svc} service stopped"
+    fi
+    if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+        systemctl disable "$svc" 2>/dev/null || true
+        echo "✓ ${svc} service disabled"
+    fi
+    if [ -f "/etc/systemd/system/${svc}.service" ]; then
+        rm -f "/etc/systemd/system/${svc}.service"
+        systemctl daemon-reload
+        echo "✓ ${svc} systemd unit removed"
+    fi
+}
+
 # ─── Confirm ─────────────────────────────────────────────────────────────────
 if [ "$FORCE" != true ]; then
     echo "This will remove WolfStack from your system."
@@ -180,6 +198,19 @@ else
     echo "  Web UI directory not found"
 fi
 
+# ─── Remove WolfUSB companion service ───────────────────────────────────────
+# WolfStack's setup.sh installs wolfusb alongside it; remove it here so it
+# doesn't linger as an active unit after WolfStack is gone (GitHub #17).
+remove_service wolfusb
+if [ -f "/usr/local/bin/wolfusb" ]; then
+    rm -f /usr/local/bin/wolfusb
+    echo "✓ Removed /usr/local/bin/wolfusb"
+fi
+if [ "$PURGE" = true ] && [ -d "/etc/wolfusb" ]; then
+    rm -rf /etc/wolfusb
+    echo "✓ Removed /etc/wolfusb/"
+fi
+
 # ─── Remove firewall rules ──────────────────────────────────────────────────
 # Read port from config if it exists
 WS_PORT=$(grep "port" /etc/wolfstack/config.toml 2>/dev/null | head -1 | awk '{print $3}' || echo "8553")
@@ -231,6 +262,51 @@ else
     echo ""
     echo "  ℹ  Config preserved at /etc/wolfstack/"
     echo "     To remove all data, re-run with: sudo bash uninstall.sh --purge"
+fi
+
+# ─── Always neutralise WolfNet's live networking (GitHub #17) ───────────────
+# WolfNet is WolfStack's overlay — with WolfStack removed it has no manager,
+# and a live wolfnet0 plus its routes/iptables rule can break LAN connectivity
+# (the issue reporter lost LAN SSH + _netdev mounts to a surviving overlay).
+# So even on a DEFAULT uninstall we stop + disable the service and tear the
+# interface down. The binary, config and systemd unit are only deleted with
+# --wolfnet (so a reinstall keeps its keys); this block just guarantees nothing
+# live survives to break the network after WolfStack is gone.
+if systemctl list-unit-files 2>/dev/null | grep -q '^wolfnet\.service' \
+   || systemctl is-active --quiet wolfnet 2>/dev/null \
+   || ip link show wolfnet0 &>/dev/null; then
+    echo ""
+    echo "Neutralising WolfNet overlay networking..."
+
+    systemctl stop wolfnet 2>/dev/null || true
+    systemctl disable wolfnet 2>/dev/null || true
+    echo "✓ WolfNet service stopped and disabled"
+
+    # Remove the Tailscale-loop iptables rule WolfNet adds on startup
+    # (OUTPUT -p udp --dport 41641 -d <wolfnet-subnet> -j DROP). Best effort:
+    # derive the subnet from config.toml; the kernel stores the rule against
+    # the masked network address.
+    if [ -f /etc/wolfnet/config.toml ]; then
+        WN_ADDR=$(grep -E '^[[:space:]]*address[[:space:]]*=' /etc/wolfnet/config.toml | head -1 | sed -E 's/.*=[[:space:]]*"?([0-9.]+)"?.*/\1/')
+        WN_PREFIX=$(grep -E '^[[:space:]]*subnet[[:space:]]*=' /etc/wolfnet/config.toml | head -1 | sed -E 's/.*=[[:space:]]*([0-9]+).*/\1/')
+        WN_PREFIX=${WN_PREFIX:-24}
+        if [ -n "$WN_ADDR" ]; then
+            WN_NET="$(echo "$WN_ADDR" | cut -d. -f1-3).0/${WN_PREFIX}"
+            removed_rule=false
+            while iptables -C OUTPUT -p udp --dport 41641 -d "$WN_NET" -j DROP 2>/dev/null; do
+                iptables -D OUTPUT -p udp --dport 41641 -d "$WN_NET" -j DROP 2>/dev/null || break
+                removed_rule=true
+            done
+            [ "$removed_rule" = true ] && echo "✓ Removed WolfNet's Tailscale-loop iptables rule"
+        fi
+    fi
+
+    # Tear down the interface so its IP/routes can't conflict with the LAN.
+    if ip link show wolfnet0 &>/dev/null; then
+        ip link set wolfnet0 down 2>/dev/null || true
+        ip link delete wolfnet0 2>/dev/null || true
+        echo "✓ Brought down and removed wolfnet0"
+    fi
 fi
 
 # ─── Remove WolfNet (optional) ──────────────────────────────────────────────
@@ -303,24 +379,6 @@ if [ "$REMOVE_WOLFNET" = true ]; then
         echo "     To remove all data, re-run with: sudo bash uninstall.sh --purge --wolfnet"
     fi
 fi
-
-# ─── Helper: stop, disable and remove a systemd unit ────────────────────────
-remove_service() {
-    local svc="$1"
-    if systemctl is-active --quiet "$svc" 2>/dev/null; then
-        systemctl stop "$svc" 2>/dev/null || true
-        echo "✓ ${svc} service stopped"
-    fi
-    if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
-        systemctl disable "$svc" 2>/dev/null || true
-        echo "✓ ${svc} service disabled"
-    fi
-    if [ -f "/etc/systemd/system/${svc}.service" ]; then
-        rm -f "/etc/systemd/system/${svc}.service"
-        systemctl daemon-reload
-        echo "✓ ${svc} systemd unit removed"
-    fi
-}
 
 # ─── Remove WolfProxy (optional) ────────────────────────────────────────────
 if [ "$REMOVE_WOLFPROXY" = true ]; then
@@ -424,6 +482,40 @@ if [ "$REMOVE_WOLFSCALE" = true ]; then
     fi
 fi
 
+# ─── Tailscale subnet-route advisory (GitHub #17) ───────────────────────────
+# WolfStack does NOT change Tailscale's --accept-routes. But if it's on AND a
+# peer advertises a subnet that overlaps your LAN, Tailscale's policy table
+# (table 52) hijacks LAN return traffic — silently breaking LAN SSH and
+# _netdev mounts via asymmetric routing. It's a non-obvious failure, so flag
+# it on the way out. We OFFER to disable it but never change it silently —
+# it's your Tailscale policy, not ours.
+if command -v tailscale &>/dev/null; then
+    TS_TABLE52=$(ip route show table 52 2>/dev/null || true)
+    if [ -n "$TS_TABLE52" ]; then
+        echo ""
+        echo "  ⚠  Tailscale is accepting subnet routes (policy table 52 is populated):"
+        echo "$TS_TABLE52" | sed 's/^/        /'
+        echo ""
+        echo "     If any route above overlaps your LAN, it can break LAN SSH and network"
+        echo "     mounts by sending reply traffic out tailscale0 (asymmetric routing)."
+        echo "     WolfStack did not enable this — but it's worth checking now WolfNet is gone."
+        echo "     Manual fix:  sudo tailscale set --accept-routes=false"
+        if [ "$FORCE" != true ]; then
+            echo -n "     Disable Tailscale --accept-routes now? [y/N]: "
+            read TS_ANS < /dev/tty
+            if [ "$TS_ANS" = "y" ] || [ "$TS_ANS" = "Y" ]; then
+                if tailscale set --accept-routes=false 2>/dev/null; then
+                    echo "     ✓ Disabled Tailscale --accept-routes"
+                else
+                    echo "     ⚠ Could not change it — run: sudo tailscale set --accept-routes=false"
+                fi
+            else
+                echo "     Left unchanged."
+            fi
+        fi
+    fi
+fi
+
 # ─── Done ────────────────────────────────────────────────────────────────────
 echo ""
 echo "  🐺 Uninstall Complete!"
@@ -432,7 +524,8 @@ if [ "$PURGE" != true ]; then
     echo "  Config files preserved — reinstall with setup.sh to restore."
 fi
 if [ "$REMOVE_WOLFNET"   != true ] && command -v wolfnet   &>/dev/null; then
-    echo "  WolfNet was NOT removed. Remove with:   sudo bash uninstall.sh --wolfnet"
+    echo "  WolfNet overlay was stopped & disabled and wolfnet0 torn down; its"
+    echo "  binary/config were kept. Remove fully:  sudo bash uninstall.sh --wolfnet --purge"
 fi
 if [ "$REMOVE_WOLFPROXY" != true ] && systemctl cat wolfproxy &>/dev/null; then
     echo "  WolfProxy was NOT removed. Remove with: sudo bash uninstall.sh --wolfproxy"
