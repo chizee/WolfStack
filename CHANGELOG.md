@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v24.26.1: uninstaller no longer leaves WolfNet active / breaks LAN (GitHub #17)** _(2026-06-06 — [`5d5bada`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/5d5bada8830ac73e28aea8d3434fe969ac54cdd5))_
 - **v24.26.0: configurable Compose directory + import existing compose files** _(2026-06-06 — [`cb9455d`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/cb9455d89a903a3328493f4509c3d570f4fca3f5))_
 - **v24.25.0: top-bar global search + default auth mode = Both** _(2026-06-06 — [`a6b59f9`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/a6b59f9369066b379332375a34656c6e89460c80))_
 - **v24.24.0: control-plane replication — log into any node, see the same fleet + users** _(2026-06-06 — [`230f596`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/230f5964a8aaeae58ac676a72f110237807444a0))_

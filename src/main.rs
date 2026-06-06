@@ -28,6 +28,7 @@ mod wolfscale;
 mod vms;
 mod proxmox;
 mod xo;
+mod truenas;
 mod pools;
 mod mysql_editor;
 mod appstore;
