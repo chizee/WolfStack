@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v24.29.0: File Locations fleet sync + fix broken delete confirmations** _(2026-06-06 — [`a24ad53`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/a24ad53af6e01681957481ddf0a058aabf4d7fa4))_
 - **v24.28.0: TrueNAS Storage UI (completes the multi-instance TrueNAS integration)** _(2026-06-06 — [`a3d7d6f`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/a3d7d6f2322134e0ebf31bef2e90f550b07b6c9c))_
 - **v24.27.0: fix hub "main" missing from other nodes; compose multi-filename; TrueNAS backend** _(2026-06-06 — [`3066343`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/3066343e4c915cb3afe27826cd56a04bde7cf597))_
 - **v24.26.1: uninstaller no longer leaves WolfNet active / breaks LAN (GitHub #17)** _(2026-06-06 — [`5d5bada`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/5d5bada8830ac73e28aea8d3434fe969ac54cdd5))_
