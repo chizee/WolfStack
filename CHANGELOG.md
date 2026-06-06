@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v24.28.0: TrueNAS Storage UI (completes the multi-instance TrueNAS integration)** _(2026-06-06 — [`a3d7d6f`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/a3d7d6f2322134e0ebf31bef2e90f550b07b6c9c))_
 - **v24.27.0: fix hub "main" missing from other nodes; compose multi-filename; TrueNAS backend** _(2026-06-06 — [`3066343`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/3066343e4c915cb3afe27826cd56a04bde7cf597))_
 - **v24.26.1: uninstaller no longer leaves WolfNet active / breaks LAN (GitHub #17)** _(2026-06-06 — [`5d5bada`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/5d5bada8830ac73e28aea8d3434fe969ac54cdd5))_
 - **v24.26.0: configurable Compose directory + import existing compose files** _(2026-06-06 — [`cb9455d`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/cb9455d89a903a3328493f4509c3d570f4fca3f5))_
