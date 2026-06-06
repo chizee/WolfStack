@@ -28716,7 +28716,13 @@ async fn icon_packs_preview(req: HttpRequest, state: web::Data<AppState>, path: 
 // Docker Compose Management
 // ═══════════════════════════════════════════════════════════════════
 
-const COMPOSE_DIR: &str = "/etc/wolfstack/compose";
+/// Operator-configurable root for standalone Docker Compose stacks
+/// (Settings → File Locations → "Compose Directory"). Defaults to
+/// /etc/wolfstack/compose; pointing it at an existing compose root makes every
+/// `<name>/docker-compose.yml` under it appear as a managed stack.
+fn compose_root_dir() -> String {
+    crate::paths::get().compose_dir
+}
 const SECRETS_FILE: &str = "/etc/wolfstack/secrets.json";
 
 #[derive(Deserialize)]
@@ -28755,7 +28761,7 @@ struct SecretRequest {
 }
 
 fn compose_project_dir(name: &str) -> std::path::PathBuf {
-    std::path::PathBuf::from(COMPOSE_DIR).join(name)
+    std::path::PathBuf::from(compose_root_dir()).join(name)
 }
 
 /// Validate compose stack name — alphanumeric, dash, underscore only
@@ -28784,7 +28790,8 @@ async fn compose_list_stacks(
 ) -> HttpResponse {
     if let Err(e) = require_auth(&req, &state) { return e; }
 
-    let dir = std::path::Path::new(COMPOSE_DIR);
+    let compose_root = compose_root_dir();
+    let dir = std::path::Path::new(&compose_root);
     if !dir.exists() {
         return HttpResponse::Ok().json(serde_json::json!({ "stacks": [] }));
     }

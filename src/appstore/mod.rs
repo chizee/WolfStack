@@ -678,10 +678,12 @@ fn yaml_double_quoted(s: &str) -> String {
     out
 }
 
-const APPSTORE_COMPOSE_DIR: &str = "/etc/wolfstack/compose";
-
 fn appstore_compose_dir(stack: &str) -> std::path::PathBuf {
-    std::path::PathBuf::from(APPSTORE_COMPOSE_DIR).join(stack)
+    // Same configurable root the standalone Compose page uses (Settings → File
+    // Locations → "Compose Directory"), so appstore stacks and operator stacks
+    // never diverge — appstore-* stacks stay visible on the Compose page even
+    // when the directory is moved off the default.
+    std::path::PathBuf::from(crate::paths::get().compose_dir).join(stack)
 }
 
 fn appstore_compose_file(stack: &str) -> std::path::PathBuf {

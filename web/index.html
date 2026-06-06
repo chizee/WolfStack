@@ -4780,9 +4780,16 @@
                     <button class="modal-close" onclick="closeComposeEditor()">&times;</button>
                 </div>
                 <div class="modal-body" style="padding:0;">
-                    <div style="display:flex; border-bottom:1px solid var(--border);">
+                    <div style="display:flex; border-bottom:1px solid var(--border); align-items:center;">
                         <button id="compose-tab-yaml" class="btn btn-sm" onclick="switchComposeTab('yaml')" style="border-radius:0; border-bottom:2px solid var(--primary-color, #3b82f6); font-weight:600;">docker-compose.yml</button>
                         <button id="compose-tab-env" class="btn btn-sm" onclick="switchComposeTab('env')" style="border-radius:0; opacity:0.6;">.env</button>
+                        <div style="margin-left:auto; padding:0 8px;">
+                            <button class="btn btn-sm" onclick="document.getElementById('compose-import-file').click()"
+                                title="Load an existing docker-compose.yml from your computer into the editor" style="font-size:12px;">
+                                <span class="ws-icon-clean-wrap" data-icon="folder"></span> Import .yml
+                            </button>
+                            <input type="file" id="compose-import-file" accept=".yml,.yaml" style="display:none;" onchange="composeImportFile(event)">
+                        </div>
                     </div>
                     <div id="compose-tab-yaml-content">
                         <div class="code-editor-wrap" style="display:flex; height:60vh; background:var(--bg-primary); position:relative;">

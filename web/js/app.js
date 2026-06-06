@@ -38153,6 +38153,7 @@ const _pathFields = [
     { key: 'statuspage_config', label: 'Status Page Config', group: 'Monitoring' },
     { key: 'statuspage_uptime', label: 'Status Page Uptime Data', group: 'Monitoring' },
     { key: 'ai_config', label: 'AI Config', group: 'Monitoring' },
+    { key: 'compose_dir', label: 'Compose Directory', group: 'Orchestration' },
     { key: 'wolfrun_dir', label: 'WolfRun Directory', group: 'Orchestration' },
     { key: 'wolfrun_services', label: 'WolfRun Services Config', group: 'Orchestration' },
     { key: 'wolfrun_failover_events', label: 'WolfRun Failover Events', group: 'Orchestration' },
@@ -50993,6 +50994,39 @@ async function loadComposeStacks() {
         showToast('Failed to load compose stacks: ' + e.message, 'error');
     }
 }
+
+// Import an existing docker-compose file from the operator's computer straight
+// into the editor (so they don't have to copy-paste). Suggests a stack name
+// from the filename when creating a new stack.
+function composeImportFile(e) {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+        const ed = document.getElementById('compose-yaml-editor');
+        if (ed) {
+            ed.value = String(reader.result || '');
+            if (typeof attachLineNumberGutter === 'function') attachLineNumberGutter('compose-yaml-editor');
+            ed.dispatchEvent(new Event('input'));
+        }
+        if (typeof switchComposeTab === 'function') switchComposeTab('yaml');
+        // Only present when creating a new stack; suggest a name from the file.
+        const nameInput = document.getElementById('compose-create-name');
+        if (nameInput && !nameInput.value.trim()) {
+            const base = file.name
+                .replace(/\.(ya?ml|txt)$/i, '')
+                .replace(/^docker-compose$/i, '')
+                .replace(/[^a-zA-Z0-9_-]/g, '-')
+                .replace(/^-+|-+$/g, '');
+            if (base) nameInput.value = base;
+        }
+        showToast('Loaded ' + file.name + ' — review it, name the stack, then Save', 'info');
+    };
+    reader.onerror = () => showToast('Could not read that file', 'error', 0);
+    reader.readAsText(file);
+    e.target.value = ''; // allow re-importing the same file
+}
+window.composeImportFile = composeImportFile;
 
 function showComposeCreate() {
     composeEditingStack = null;
