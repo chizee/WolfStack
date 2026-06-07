@@ -8,6 +8,9 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v24.30.2: run WolfRouter's gateway ARP announce off-thread (no apply/config-receive latency)** _(2026-06-07 — [`8c353e4`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/8c353e41611021b4829ea765c1327ec16b4313bf))_
+- **v24.30.1: WolfRouter PPPoE WAN status fix + gratuitous ARP on LAN apply; pin passthrough-bridge MAC** _(2026-06-07 — [`046dbe2`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/046dbe237a53cc22f5ac42dd2982769a699bbe75))_
+- **v24.30.0: daily automatic config backups + Settings UI to list/restore/download them** _(2026-06-07 — [`79d52e2`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/79d52e2ed007281de52b70f1650ea48f80de0639))_
 - **v24.29.3: fix config restore (nodes import) so a fleet can be recovered from a backup** _(2026-06-06 — [`8c89a0a`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/8c89a0a26fc199a2fef38d5afc519c6f1d01704d))_
 - **v24.29.2: fix v24.29.1 regression that pruned federated clusters to one node** _(2026-06-06 — [`f71c864`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/f71c864de62755960fc59a6e949bac667f13713d))_
 - **v24.29.1: fix v24.27 control-plane convergence storm (100% CPU / connection flood)** _(2026-06-06 — [`8b3fe25`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/8b3fe25fa6500b125c848f515e5e1af646b57ff0))_
@@ -38,10 +41,12 @@ release._
 - **v24.16.0: LXC clone on Proxmox — exact copy, operator-chosen VMID, never auto-start** _(2026-06-03 — [`33c6bae`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/33c6bae4c3355a74365bab15ba69fb058ea39cb5))_
 - **v24.15.3: fix the tamper-baseline reseed command — https + authenticate** _(2026-06-03 — [`0d23cce`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/0d23cceeefc0143e09a966420da2d3dcd1f8b60e))_
 - **v24.15.2: clamav/logrotate self-heal runs periodically, not just at startup** _(2026-06-03 — [`0952e85`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/0952e85cdb2a8f104a0bcc3137c0d66544de09cb))_
+- **v24.15.2: clamav/logrotate self-heal runs periodically, not just at startup** _(2026-06-03 — [`deda441`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/deda441aa85d746298ed70898c2d5a92faa6e4d0))_
 - **v24.15.1: fix installer/KB — status pages listen on :8550, not :8555** _(2026-06-03 — [`cd68573`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/cd68573172546cb5afbdb3c27a3a6a6819865d2b))_
 - **v24.15.0: WolfNet lifecycle — advertise running workloads, refuse a start on an active IP clash** _(2026-06-02 — [`a8538f4`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/a8538f420a9f2a7e56c2a03ed8663a9e74e0ddd0))_
 - **v24.14.1: LXC migrate preserves identity — keep IP/MAC/WolfNet as-is** _(2026-06-02 — [`e2422c7`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/e2422c75dabbe66d31e7220eeec71088dfad1386))_
 - **v24.14.0: LXC intra-cluster migrate is a true move — bootable destination + live progress** _(2026-06-02 — [`ad5f88f`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/ad5f88fe0d2045b792414db2cb13ead04aa1af76))_
+- **v24.14.0: LXC intra-cluster migrate is a true move — bootable destination + live progress** _(2026-06-02 — [`c46e10f`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/c46e10f8c11cf687024759bad3476d8fe70c15a4))_
 - **v24.13.1: fix cross-host adopt — probe-locate instead of trusting the picked id** _(2026-06-01 — [`dda1cf6`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/dda1cf6434c355a418d5e5fea69547926a48f3a7))_
 - **v24.13.0: WolfScale cluster builder** _(2026-06-01 — [`042c455`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/042c4558eaa288dd0ca12a9f8ec7b28ac717df8f))_
 - **v24.12.14: cross-host Galera create + fix cross-host adopt** _(2026-06-01 — [`099f5fb`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/099f5fbe1ca82340804d8baa8e7ac82b7f3b54b8))_
