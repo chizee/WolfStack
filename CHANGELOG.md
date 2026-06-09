@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v24.34.2: cluster names are case-insensitive — fixes the minio/Minio split + rename revert** _(2026-06-09 — [`6bdd0ee`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/6bdd0ee681182841f690e7315aff8aa6a5a2106e))_
 - **v24.34.1: fleet UI — repaint the node tree on display-name change** _(2026-06-09 — [`7464060`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/746406083f86f834497c9b567034494e7c418702))_
 - **v24.34.0: Fleet management — node display names + reliable cluster moves (renames/moves no longer revert)** _(2026-06-09 — [`590b1c3`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/590b1c3a4b9174ffbdce20859eed617bd422fba1))_
 - **v24.33.0: VM Settings now persist + apply on libvirt & Proxmox (NIC/ISO/disk-bus/BIOS) + running-VM note** _(2026-06-09 — [`b3d5c2b`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/b3d5c2b93c472c385ed24c8d0a4e609fe0e8be3b))_
