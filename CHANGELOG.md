@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v24.33.0: VM Settings now persist + apply on libvirt & Proxmox (NIC/ISO/disk-bus/BIOS) + running-VM note** _(2026-06-09 — [`b3d5c2b`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/b3d5c2b93c472c385ed24c8d0a4e609fe0e8be3b))_
 - **v24.32.1: don't auto-block the host's own container/workload subnets (klasSponsor)** _(2026-06-08 — [`5b84a65`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/5b84a658577739e341da1b40705b3a6420c8f3ba))_
 - **v24.32.0: cluster-node firewall/fail2ban auto-whitelist + red banner; any-size dashboard background** _(2026-06-08 — [`8f419ef`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/8f419ef32019711a6388587bdbb849ea2af66c6b))_
 - **v24.31.1: WolfDisk dashboard config-write creates /etc/wolfdisk first (B1)** _(2026-06-08 — [`1e3f626`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/1e3f626d0d633acf404f6193260feffde81e45b6))_
