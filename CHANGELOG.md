@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v24.37.8: NFS shares publish at host:/exports/<name>** _(2026-06-10 — [`b242f27`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/b242f276d7ebd7c26fca8fa4ad56e030b21bc53e))_
 - **v24.37.7: WolfNet IP conflict check is cluster-scoped, not fleet-wide** _(2026-06-10 — [`81c318c`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/81c318ca87fc6ccd3b7122a9a7dee2c63d941ce3))_
 - **v24.37.6: stop spurious connection-lost banner on Docker view toggle** _(2026-06-10 — [`883bb23`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/883bb23775a0d51fd340304de596a1cbb43af387))_
 - **v24.37.5: NFS shares get a unique per-share fsid + export-options field** _(2026-06-10 — [`aa755b5`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/aa755b514644240669098f98f9aed2a8315f8665))_
