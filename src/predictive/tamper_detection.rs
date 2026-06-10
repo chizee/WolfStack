@@ -319,6 +319,30 @@ fn remediate_blocking(
         }
         let ft = finding_type_for_path(&tp.path);
         if suppressed(&ft) { continue; }
+
+        // /etc/passwd: auto-reseed when the only change is known-safe
+        // service users being ADDED (e.g. clamav installed by apt).
+        // Blindly restoring the baseline deletes those users, breaking
+        // logrotate / freshclam and causing a persistent fight between
+        // the tamper detector and self_heal_clamav_logrotate().
+        // piranhaSponsor 2026-06-10.
+        if tp.path == PASSWD && passwd_drift_is_safe_addition(&tp.path) {
+            tracing::info!(
+                "tamper_detection: /etc/passwd drift is only safe service-user additions — reseeding baseline"
+            );
+            let _ = baselines::reseed(&tp.path, "auto:safe-service-users",
+                "only known-safe service accounts added (e.g. clamav)");
+            facts.remediations.push(RemediationOutcome {
+                action: format!("auto-reseed {} baseline", tp.path),
+                ok: true,
+                detail: format!(
+                    "only known-safe service accounts were added to {}; baseline reseeded to accept them",
+                    tp.path
+                ),
+            });
+            continue;
+        }
+
         let outcome = restore_from_baseline(&tp.path);
         facts.remediations.push(outcome);
     }
@@ -663,6 +687,111 @@ fn remediation_evidence_for(rem: &RemediationOutcome) -> Evidence {
         }),
         links: Vec::new(),
     }
+}
+
+/// Determine whether the /etc/passwd drift is ONLY safe service-user
+/// additions — i.e. every baseline line is still present unchanged, and
+/// every NEW line belongs to a known-safe service account with a no-login
+/// shell. If so, the tamper detector should reseed the baseline rather
+/// than restoring (which would delete the user and break the service that
+/// created it — e.g. clamav/logrotate cycle reported by piranhaSponsor).
+///
+/// Rationale: the whole point of /etc/passwd tamper detection is catching
+/// backdoor accounts with shell access. Service accounts with
+/// /usr/sbin/nologin or /bin/false are not interactive — they can't be
+/// used for SSH persistence — and they're routinely created by apt/dnf
+/// package installations. Restoring the baseline to delete them causes
+/// real operational breakage (logrotate failures, freshclam inability to
+/// drop privileges).
+fn passwd_drift_is_safe_addition(path: &str) -> bool {
+    // Load the baseline content snapshot.
+    let content_path = baselines::baselines_dir()
+        .join(format!("{}.content", baselines::slug_for(path)));
+    let baseline_bytes = match std::fs::read(&content_path) {
+        Ok(b) => b,
+        Err(_) => return false, // no content snapshot → can't compare → not safe
+    };
+    let baseline_text = String::from_utf8_lossy(&baseline_bytes);
+    let current_text = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    let baseline_lines: HashSet<&str> = baseline_text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    let current_lines: HashSet<&str> = current_text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+
+    // Any baseline line removed or modified → real tampering.
+    for bl in &baseline_lines {
+        if !current_lines.contains(bl) {
+            return false;
+        }
+    }
+
+    // Every NEW line must be a known-safe service account.
+    let added: Vec<&&str> = current_lines.difference(&baseline_lines).collect();
+    if added.is_empty() {
+        return false; // no additions but still drifted → something else changed
+    }
+
+    for line in &added {
+        if !is_safe_service_user_line(line) {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Check whether a /etc/passwd line represents a safe, non-interactive
+/// service account. Criteria:
+///   1. The username is in our known-safe list, OR
+///   2. The shell is a no-login shell AND the UID is in the system range
+///      (typically < 1000 on Linux, assigned by adduser --system).
+fn is_safe_service_user_line(line: &str) -> bool {
+    let fields: Vec<&str> = line.split(':').collect();
+    if fields.len() < 7 { return false; }
+    let username = fields[0];
+    let uid: u32 = match fields[2].parse() { Ok(u) => u, Err(_) => return false };
+    let shell = fields[6];
+
+    // Known-safe service accounts that WolfStack or its dependencies install.
+    const KNOWN_SAFE: &[&str] = &[
+        "clamav", "freshclam", "_clamav",        // ClamAV
+        "clamupdate", "clamscan",                  // ClamAV on RHEL/Fedora
+        "vscan",                                   // ClamAV on SUSE
+        "lxd", "_lxd",                             // LXD
+        "docker",                                  // Docker (rare but possible)
+        "systemd-coredump", "systemd-oom",         // systemd services
+        "systemd-timesync", "systemd-resolve",
+        "systemd-network",
+        "_apt", "apt-cacher-ng",                   // APT
+        "sshd",                                    // OpenSSH
+        "mosquitto",                               // MQTT broker
+        "redis", "postgres", "mysql", "mongodb",   // databases
+        "prometheus", "grafana", "node_exporter",  // monitoring
+        "wireguard",                               // VPN
+        "tcpdump", "tss",                          // system utilities
+    ];
+
+    // Check 1: known username.
+    if KNOWN_SAFE.iter().any(|s| s.eq_ignore_ascii_case(username)) {
+        return true;
+    }
+
+    // Check 2: system-range UID + no-login shell.
+    let no_login_shells: &[&str] = &[
+        "/usr/sbin/nologin",
+        "/sbin/nologin",
+        "/bin/false",
+        "/usr/bin/false",
+        "/bin/nologin",
+        "/dev/null",
+    ];
+    uid < 1000 && no_login_shells.iter().any(|s| *s == shell)
 }
 
 #[cfg(test)]
