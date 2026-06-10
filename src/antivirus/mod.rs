@@ -901,6 +901,24 @@ pub fn install_tools(state: &AntivirusState) -> InstallResult {
             &["rkhunter", "--propupd", "--nocolors", "--skip-keypress"], &[]);
     }
 
+    // The package install may have created system users (clamav,
+    // freshclam, etc.). Reseed the /etc/passwd baseline NOW so the
+    // tamper detector doesn't restore the pre-install snapshot and
+    // delete them on the next 5-minute tick (piranhaSponsor 2026-06-10).
+    if std::path::Path::new("/etc/passwd").exists() {
+        match crate::predictive::baselines::reseed(
+            "/etc/passwd",
+            "auto:antivirus-install",
+            "reseeded after antivirus package install added service users",
+        ) {
+            Ok(_) => state.push_install_line(
+                "==> Reseeded /etc/passwd baseline (new service users are now accepted)".into()),
+            Err(e) => state.push_install_line(
+                format!("==> WARNING: could not reseed /etc/passwd baseline: {} — \
+                         the tamper detector may flag the new users", e)),
+        }
+    }
+
     state.push_install_line("==> Install complete.".into());
     finalize_install(state, true, None);
 
