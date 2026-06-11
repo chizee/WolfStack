@@ -487,9 +487,23 @@ impl TrueNasStore {
             .unwrap_or_else(|| std::path::Path::new("/etc/wolfstack"));
         let _ = std::fs::create_dir_all(parent);
         let tmp = format!("{}.tmp", self.path);
+        // The file holds encrypted API keys — the TEMP file must already be
+        // 0600 at creation, not chmodded after the rename (that left a
+        // umask-mode window; code review 2026-06-11, found via the Unraid
+        // mirror of this store).
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true).create(true).truncate(true).mode(0o600)
+                .open(&tmp).map_err(|e| format!("write: {}", e))?;
+            f.write_all(s.as_bytes()).map_err(|e| format!("write: {}", e))?;
+        }
+        #[cfg(not(unix))]
         std::fs::write(&tmp, &s).map_err(|e| format!("write: {}", e))?;
         std::fs::rename(&tmp, &self.path).map_err(|e| format!("rename: {}", e))?;
-        // File holds encrypted API keys — keep it 0600.
+        // Re-assert on the final path in case it pre-existed with looser perms.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

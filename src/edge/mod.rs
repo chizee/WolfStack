@@ -184,16 +184,6 @@ pub enum TargetRuntime {
     // v23.4+: KubernetesIngress { cluster, namespace, ingress_class }
 }
 
-impl TargetRuntime {
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Host         => "host",
-            Self::Docker { .. }=> "docker",
-            Self::Lxc { .. }   => "lxc",
-        }
-    }
-}
-
 // ─── Cloud-provider credentials store ──────────────────────────────────
 //
 // Sister to the existing DnsProviderStore (DNS API keys for ACME

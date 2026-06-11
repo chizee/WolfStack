@@ -67,6 +67,8 @@ pub struct FileLocations {
     pub xo_pools_config: String,
     #[serde(default = "default_truenas_config")]
     pub truenas_config: String,
+    #[serde(default = "default_unraid_config")]
+    pub unraid_config: String,
 
     // ── Alerting ──────────────────────────────────
     #[serde(default = "default_alerts_config")]
@@ -199,6 +201,7 @@ fn default_pending_identity_config() -> String { "/etc/wolfstack/pending_identit
 fn default_node_id_file() -> String { "/etc/wolfstack/node_id".into() }
 fn default_xo_pools_config() -> String { "/etc/wolfstack/xo_pools.json".into() }
 fn default_truenas_config() -> String { "/etc/wolfstack/truenas.json".into() }
+fn default_unraid_config() -> String { "/etc/wolfstack/unraid.json".into() }
 
 fn default_alerts_config() -> String { "/etc/wolfstack/alerts.json".into() }
 

@@ -251,7 +251,7 @@ pub(super) fn cloudflare_creds_from_dns_provider(
             id
         ));
     }
-    Ok(cloudflare::CloudflareCreds { account_id: String::new(), api_token: token })
+    Ok(cloudflare::CloudflareCreds { api_token: token })
 }
 
 async fn reconcile_cloudflare(
