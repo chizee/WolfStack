@@ -180,6 +180,21 @@ else
     echo "  No systemd service file found"
 fi
 
+# Storage auto-mount signalling units (written by the binary at startup so
+# fstab entries can order on wolfstack-mounts.target). Warn loudly if any
+# fstab line still references the target — removing the units would make
+# that mount wait out its timeout at every boot.
+if [ -f "/etc/systemd/system/wolfstack-mounts.target" ] || [ -f "/etc/systemd/system/wolfstack-mounts-wait.service" ]; then
+    if grep -q "wolfstack-mounts.target" /etc/fstab 2>/dev/null; then
+        echo "⚠ /etc/fstab still references wolfstack-mounts.target — remove that"
+        echo "  x-systemd.requires entry or the mount will stall at every boot."
+    fi
+    systemctl stop wolfstack-mounts.target wolfstack-mounts-wait.service 2>/dev/null || true
+    rm -f /etc/systemd/system/wolfstack-mounts.target /etc/systemd/system/wolfstack-mounts-wait.service
+    systemctl daemon-reload
+    echo "✓ WolfStack mounts-target units removed"
+fi
+
 # ─── Remove binary ──────────────────────────────────────────────────────────
 if [ -f "/usr/local/bin/wolfstack" ]; then
     rm -f /usr/local/bin/wolfstack

@@ -9341,6 +9341,16 @@ pveum aclmod / -token 'root@pam!wolfstack' -role WolfStackMonitor</code></pre>
                                 <input type="checkbox" id="mount-auto" checked> <span class="ws-icon-clean-wrap" data-icon="lightning"></span> Auto-mount on boot
                             </label>
                         </div>
+                        <div style="grid-column: 1 / -1;">
+                            <small style="color:var(--text-muted); font-size:11px;">
+                                Auto-mounted shares have no systemd mount units. To make an fstab mount (e.g. a
+                                mergerfs pool over these) wait for them, add
+                                <code>nofail,_netdev,x-systemd.requires=wolfstack-mounts.target</code> to its fstab
+                                options — the target activates once WolfStack has finished attempting all
+                                auto-mounts. <strong>nofail is required</strong>: without it systemd hits an
+                                ordering cycle at boot and drops the mount (or worse) from the boot transaction.
+                            </small>
+                        </div>
                     </div>
                 </div>
                 <div class="modal-footer">
