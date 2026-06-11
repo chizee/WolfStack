@@ -3415,6 +3415,9 @@ function buildServerTree(nodes) {
                 <a class="nav-item server-child-item truenas-cluster-item" data-cluster="${escapedName}" data-view="truenas" onclick="showTrueNasForCluster('${escapedName}')" style="margin-left: 8px; padding: 0 10px; line-height:1.4; display:flex; align-items:center; gap:5px;">
                     <span class="icon ws-icon-clean-wrap" data-icon="database" style="font-size:15px;"></span> <span style="font-weight:600;">Storage</span>
                 </a>
+                <a class="nav-item server-child-item unraid-cluster-item" data-cluster="${escapedName}" data-view="unraid" onclick="showUnraidForCluster('${escapedName}')" style="margin-left: 8px; padding: 0 10px; line-height:1.4; display:flex; align-items:center; gap:5px;">
+                    <span class="icon ws-icon-clean-wrap" data-icon="database" style="font-size:15px;"></span> <span style="font-weight:600;">Unraid</span>
+                </a>
 
                 <a class="nav-item server-child-item k8s-cluster-item" data-cluster="${escapedName}" data-view="kubernetes" onclick="showK8sClusterPage('${escapedName}')" style="margin-left: 8px; padding: 0 10px; line-height:1.4; display:flex; align-items:center; gap:5px;">
                     <span class="icon ws-icon-clean-wrap" data-icon="package" style="font-size:15px;"></span> <span style="font-weight:600;">WolfKube</span>
@@ -29694,6 +29697,323 @@ async function truenasDeleteSnapshot(id, snap) {
     } catch (e) { showToast('Delete failed: ' + e.message, 'error', 0); }
 }
 window.showTrueNasForCluster = showTrueNasForCluster;
+
+// ─── Unraid (per-cluster, mirrors the TrueNAS section above) ────────
+// All element/modal IDs are ur-* — never bare names (modal-ID-collision
+// pitfall). Read-only P1: array/disks/shares/parity overview, Docker, VMs.
+
+let unraidCurrentCluster = '';
+window._urInstances = [];
+window._urCurrentId = null;
+window._urTab = 'overview';
+
+function urFetch(path, opts) { return fetch(apiUrl(path), opts); }
+function urHttpUrl(u) { return /^https?:\/\//i.test(u || '') ? u : ''; }
+
+function showUnraidForCluster(clusterName) {
+    closeSidebarMobile();
+    unraidCurrentCluster = clusterName;
+    currentPage = 'unraid';
+    currentNodeId = null;
+    currentComponent = null;
+    document.querySelectorAll('.page-view').forEach(p => p.style.display = 'none');
+    const el = document.getElementById('page-unraid');
+    if (el) el.style.display = 'block';
+    document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+    const item = document.querySelector(`.unraid-cluster-item[data-cluster="${CSS.escape(clusterName)}"]`);
+    if (item) item.classList.add('active');
+    const t = document.getElementById('page-title');
+    if (t) t.textContent = `Unraid — ${clusterName}`;
+    loadUnraidInstances();
+}
+
+async function loadUnraidInstances() {
+    const body = document.getElementById('unraid-body');
+    if (!body) return;
+    try {
+        const r = await urFetch('/api/unraid/instances');
+        const all = r.ok ? await r.json() : [];
+        window._urInstances = (Array.isArray(all) ? all : []).filter(i =>
+            !i.cluster || i.cluster === unraidCurrentCluster);
+    } catch (_) {
+        window._urInstances = [];
+    }
+    if (!window._urInstances.some(i => i.id === window._urCurrentId)) {
+        window._urCurrentId = window._urInstances[0]?.id || null;
+    }
+    if (!window._urCurrentId) window._urTab = 'settings'; // nothing yet → land on add
+    unraidRender();
+}
+
+function urCurrent() { return window._urInstances.find(i => i.id === window._urCurrentId) || null; }
+
+function unraidRender() {
+    const body = document.getElementById('unraid-body');
+    if (!body) return;
+    const inst = urCurrent();
+    const tabs = [
+        ['overview', 'Overview'], ['docker', 'Docker'], ['vms', 'VMs'],
+        ['parity', 'Parity History'], ['settings', 'Settings'],
+    ];
+    const opts = window._urInstances.map(i =>
+        `<option value="${escapeHtml(i.id)}" ${i.id === window._urCurrentId ? 'selected' : ''}>${escapeHtml(i.label)}${i.status && i.status !== 'ok' ? ' (' + escapeHtml(i.status) + ')' : ''}</option>`).join('');
+    const selector = window._urInstances.length
+        ? `<select onchange="unraidSelectInstance(this.value)" style="padding:6px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg-secondary);color:var(--text-primary);font-size:13px;">${opts}</select>`
+        : '';
+    const safeUrl = urHttpUrl(inst?.api_url);
+    const openLink = (inst && safeUrl) ? `<a href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener" style="color:var(--accent-primary);text-decoration:underline;">Open Unraid</a>` : '';
+    body.innerHTML = `
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:8px;">
+            <div>
+                <h1 style="margin:0;font-size:26px;font-weight:700;">Unraid</h1>
+                <div style="font-size:13px;color:var(--text-muted);margin-top:2px;">
+                    ${inst ? escapeHtml(inst.label) + ' · ' + openLink : 'No Unraid servers for this cluster yet'}
+                </div>
+            </div>
+            <div style="display:flex;gap:8px;align-items:center;">
+                ${selector}
+                <button class="btn btn-sm" onclick="loadUnraidInstances()" title="Refresh"><span class="ws-icon-clean-wrap" data-icon="refresh"></span></button>
+            </div>
+        </div>
+        <div style="display:flex;gap:4px;border-bottom:1px solid var(--border);margin:10px 0 16px;">
+            ${tabs.map(([k, label]) => `<button onclick="unraidTab('${k}')" style="background:none;border:none;padding:8px 14px;font-size:13px;cursor:pointer;color:${window._urTab === k ? 'var(--text-primary)' : 'var(--text-muted)'};border-bottom:2px solid ${window._urTab === k ? 'var(--accent-primary)' : 'transparent'};font-weight:${window._urTab === k ? '600' : '400'};">${label}</button>`).join('')}
+        </div>
+        <div id="unraid-tab-content"><div style="color:var(--text-muted);padding:20px;">Loading…</div></div>`;
+    unraidLoadTab();
+}
+
+function unraidSelectInstance(id) { window._urCurrentId = id; unraidRender(); }
+function unraidTab(tab) { window._urTab = tab; unraidRender(); }
+
+function unraidLoadTab() {
+    const c = document.getElementById('unraid-tab-content');
+    if (!c) return;
+    const inst = urCurrent();
+    if (window._urTab === 'settings') { unraidRenderSettings(c); return; }
+    if (!inst) { c.innerHTML = `<div class="card"><div class="card-body" style="text-align:center;padding:30px;color:var(--text-muted);">No Unraid server selected. <button class="btn btn-sm btn-primary" onclick="unraidServerModal()" style="margin-left:8px;">+ Add server</button></div></div>`; return; }
+    if (window._urTab === 'overview') unraidLoadOverview(inst.id);
+    else if (window._urTab === 'docker') unraidLoadDocker(inst.id);
+    else if (window._urTab === 'vms') unraidLoadVms(inst.id);
+    else if (window._urTab === 'parity') unraidLoadParity(inst.id);
+}
+
+function unraidError(msg) {
+    return `<div class="card"><div class="card-body" role="alert" style="color:var(--danger-color,#ef4444);">${escapeHtml(msg || 'Request failed')}</div></div>`;
+}
+
+function urDiskKindBadge(kind) {
+    const colors = { parity: '#8b5cf6', data: '#3b82f6', cache: '#f59e0b', boot: '#6b7280' };
+    return `<span class="badge" style="background:${colors[kind] || '#6b7280'};color:#fff;font-size:10px;">${escapeHtml(kind)}</span>`;
+}
+
+async function unraidLoadOverview(id) {
+    const c = document.getElementById('unraid-tab-content');
+    if (!c) return;
+    try {
+        const r = await urFetch(`/api/unraid/instances/${encodeURIComponent(id)}/overview`);
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) { c.innerHTML = unraidError(d.error); return; }
+        const a = d.array || {};
+        const started = (a.state || '').toUpperCase() === 'STARTED';
+        const pct = a.total_bytes > 0 ? Math.round(a.used_bytes / a.total_bytes * 100) : 0;
+        const info = d.info || {};
+        const parity = d.parity || {};
+        const parityLine = parity.running
+            ? `Parity check ${parity.correcting ? '(correcting)' : '(read-check)'}: ${parity.progress || 0}%${parity.paused ? ' — paused' : ''}${parity.errors ? ` · <span style="color:#ef4444;">${parity.errors} errors</span>` : ''}`
+            : (parity.status ? `Last parity status: ${escapeHtml(parity.status)}${parity.errors ? ` · <span style="color:#ef4444;">${parity.errors} errors</span>` : ''}` : '');
+        const arrayCard = `
+            <div class="card" style="margin-bottom:16px;"><div class="card-body">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+                    <div style="font-size:18px;font-weight:700;display:flex;align-items:center;gap:8px;"><span class="server-dot ${started ? 'online' : 'offline'}"></span>${escapeHtml(info.hostname || 'Array')}</div>
+                    <div style="font-weight:700;color:${started ? '#22c55e' : '#ef4444'};">${escapeHtml((a.state || 'UNKNOWN').toUpperCase())}</div>
+                </div>
+                <div style="display:flex;gap:32px;margin-bottom:10px;">
+                    <div><div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;">Used</div><div style="font-size:22px;font-weight:700;">${formatBytes(a.used_bytes || 0)}</div></div>
+                    <div><div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;">Free</div><div style="font-size:22px;font-weight:700;">${formatBytes(a.free_bytes || 0)}</div></div>
+                    <div><div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;">Total</div><div style="font-size:22px;font-weight:700;">${formatBytes(a.total_bytes || 0)}</div></div>
+                </div>
+                <div style="font-size:11px;color:var(--text-muted);margin-bottom:4px;">${pct}% used${parityLine ? ' · ' + parityLine : ''}</div>
+                <div style="height:8px;border-radius:4px;background:var(--bg-tertiary);overflow:hidden;"><div style="height:100%;width:${pct}%;background:${pct > 90 ? '#ef4444' : pct > 75 ? '#f59e0b' : '#22c55e'};"></div></div>
+                <div style="font-size:11px;color:var(--text-muted);margin-top:10px;">
+                    ${escapeHtml(info.distro || '')} ${escapeHtml(info.release || '')}${info.unraid_version ? ' · Unraid ' + escapeHtml(info.unraid_version) : ''}${info.cpu_brand ? ' · ' + escapeHtml(info.cpu_brand) + ' (' + (info.cpu_cores || 0) + 'c/' + (info.cpu_threads || 0) + 't)' : ''}
+                </div>
+            </div></div>`;
+        const disks = (d.disks || []).map(dk => {
+            const ok = (dk.status || '').toUpperCase() === 'DISK_OK';
+            const fsLine = dk.fs_size_bytes > 0 ? `${formatBytes(dk.fs_size_bytes - dk.fs_free_bytes)} / ${formatBytes(dk.fs_size_bytes)} ${escapeHtml(dk.fs_type || '')}` : '';
+            return `<div style="display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-bottom:1px solid var(--border);">
+                <span style="display:flex;align-items:center;gap:8px;"><span class="server-dot ${ok ? 'online' : 'offline'}"></span><strong>${escapeHtml(dk.name)}</strong> ${urDiskKindBadge(dk.kind)} <span style="color:var(--text-muted);font-size:12px;">${escapeHtml(dk.device || '')} · ${formatBytes(dk.size_bytes)}${dk.rotational === false ? ' · SSD' : ''}</span></span>
+                <span style="color:var(--text-muted);font-size:12px;">${fsLine}${dk.temp != null ? ` · ${dk.temp}°C` : ''}${dk.num_errors ? ` · <span style="color:#ef4444;">${dk.num_errors} errors</span>` : ''}</span>
+            </div>`;
+        }).join('') || '<div style="padding:12px;color:var(--text-muted);">No disks reported (array stopped?).</div>';
+        const shares = (d.shares || []).map(s => `
+            <div style="display:flex;justify-content:space-between;padding:8px 12px;border-bottom:1px solid var(--border);">
+                <span><strong>${escapeHtml(s.name)}</strong>${s.comment ? ` <span style="color:var(--text-muted);font-size:12px;">${escapeHtml(s.comment)}</span>` : ''}${s.luks_status && s.luks_status !== 'none' ? ' <span class="badge" style="background:#8b5cf6;color:#fff;font-size:10px;">LUKS</span>' : ''}</span>
+                <span style="color:var(--text-muted);font-size:12px;">${formatBytes(s.used_bytes)} used · ${formatBytes(s.free_bytes)} free${s.cache ? ` · cache: ${escapeHtml(s.cache)}` : ''}</span>
+            </div>`).join('') || '<div style="padding:12px;color:var(--text-muted);">No user shares.</div>';
+        c.innerHTML = `${arrayCard}
+            <div style="font-size:12px;color:var(--text-muted);text-transform:uppercase;margin:6px 0;">Disks</div>
+            <div class="card" style="margin-bottom:16px;"><div class="card-body" style="padding:0;">${disks}</div></div>
+            <div style="font-size:12px;color:var(--text-muted);text-transform:uppercase;margin:6px 0;">User Shares</div>
+            <div class="card"><div class="card-body" style="padding:0;">${shares}</div></div>`;
+    } catch (e) { c.innerHTML = unraidError(e.message); }
+}
+
+async function unraidLoadDocker(id) {
+    const c = document.getElementById('unraid-tab-content');
+    if (!c) return;
+    try {
+        const r = await urFetch(`/api/unraid/instances/${encodeURIComponent(id)}/docker`);
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) { c.innerHTML = unraidError(d.error); return; }
+        const list = d.containers || [];
+        if (!list.length) { c.innerHTML = `<div class="card"><div class="card-body" style="color:var(--text-muted);">No Docker containers.</div></div>`; return; }
+        const running = list.filter(x => (x.state || '').toLowerCase() === 'running').length;
+        c.innerHTML = `<div style="font-size:12px;color:var(--text-muted);margin-bottom:8px;">${running} running / ${list.length} total (read-only — manage them in the Unraid UI)</div>
+            <div class="card"><div class="card-body" style="padding:0;">${list.map(x => `
+                <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-bottom:1px solid var(--border);">
+                    <span style="display:flex;align-items:center;gap:8px;"><span class="server-dot ${(x.state || '').toLowerCase() === 'running' ? 'online' : 'offline'}"></span><strong>${escapeHtml(x.name)}</strong> <span style="color:var(--text-muted);font-size:12px;">${escapeHtml(x.image)}</span></span>
+                    <span style="color:var(--text-muted);font-size:12px;">${escapeHtml(x.status || x.state || '')}${x.auto_start ? ' · autostart' : ''}</span>
+                </div>`).join('')}</div></div>`;
+    } catch (e) { c.innerHTML = unraidError(e.message); }
+}
+
+async function unraidLoadVms(id) {
+    const c = document.getElementById('unraid-tab-content');
+    if (!c) return;
+    try {
+        const r = await urFetch(`/api/unraid/instances/${encodeURIComponent(id)}/vms`);
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) { c.innerHTML = unraidError(d.error); return; }
+        const list = d.vms || [];
+        if (!list.length) { c.innerHTML = `<div class="card"><div class="card-body" style="color:var(--text-muted);">No VMs (or the VM service is disabled on this Unraid).</div></div>`; return; }
+        c.innerHTML = `<div style="font-size:12px;color:var(--text-muted);margin-bottom:8px;">${list.length} VM${list.length !== 1 ? 's' : ''} (read-only — manage them in the Unraid UI)</div>
+            <div class="card"><div class="card-body" style="padding:0;">${list.map(v => `
+                <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-bottom:1px solid var(--border);">
+                    <span style="display:flex;align-items:center;gap:8px;"><span class="server-dot ${(v.state || '').toLowerCase() === 'running' ? 'online' : 'offline'}"></span><strong>${escapeHtml(v.name)}</strong></span>
+                    <span style="color:var(--text-muted);font-size:12px;">${escapeHtml(v.state || '')}</span>
+                </div>`).join('')}</div></div>`;
+    } catch (e) { c.innerHTML = unraidError(e.message); }
+}
+
+async function unraidLoadParity(id) {
+    const c = document.getElementById('unraid-tab-content');
+    if (!c) return;
+    try {
+        const r = await urFetch(`/api/unraid/instances/${encodeURIComponent(id)}/parity-history`);
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) { c.innerHTML = unraidError(d.error); return; }
+        const runs = d.runs || [];
+        if (!runs.length) { c.innerHTML = `<div class="card"><div class="card-body" style="color:var(--text-muted);">No parity-check history.</div></div>`; return; }
+        const fmtDur = (s) => s >= 3600 ? `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m` : `${Math.floor(s / 60)}m`;
+        c.innerHTML = `<div class="card"><div class="card-body" style="padding:0;">${runs.map(x => `
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-bottom:1px solid var(--border);">
+                <span><strong>${escapeHtml(x.date || '')}</strong> <span style="color:var(--text-muted);font-size:12px;">${escapeHtml(x.status || '')}</span></span>
+                <span style="color:${x.errors ? '#ef4444' : 'var(--text-muted)'};font-size:12px;">${x.duration ? fmtDur(x.duration) + ' · ' : ''}${escapeHtml(x.speed || '')}${x.errors ? ` · ${x.errors} errors` : ' · 0 errors'}</span>
+            </div>`).join('')}</div></div>`;
+    } catch (e) { c.innerHTML = unraidError(e.message); }
+}
+
+function unraidRenderSettings(c) {
+    const rows = window._urInstances.map(i => `
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-bottom:1px solid var(--border);">
+            <div><strong>${escapeHtml(i.label)}</strong> <span style="color:var(--text-muted);font-size:12px;">${escapeHtml(i.api_url)}${i.cluster ? ' · ' + escapeHtml(i.cluster) : ' · all clusters'}</span>
+                <div style="font-size:11px;color:var(--text-muted);">TLS: ${i.insecure_tls ? 'insecure' : 'verified'} · ${i.status ? escapeHtml(i.status) : 'untested'}</div></div>
+            <div style="display:flex;gap:6px;">
+                <button class="btn btn-sm" onclick="unraidTest('${tnArg(i.id)}')" style="font-size:11px;">Test</button>
+                <button class="btn btn-sm" onclick="unraidServerModal('${tnArg(i.id)}')" style="font-size:11px;">Edit</button>
+                <button class="btn btn-sm" onclick="unraidDelete('${tnArg(i.id)}')" style="font-size:11px;color:var(--danger-color,#ef4444);">Remove</button>
+            </div>
+        </div>`).join('') || '<div style="padding:14px;color:var(--text-muted);">No Unraid servers registered yet.</div>';
+    c.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+            <div style="font-size:12px;color:var(--text-muted);">Unraid servers (API keys are encrypted at rest and never shown). Create a key in Unraid under Settings → Management Access → API Keys with read access to array, disks, shares, Docker, VMs and system info (WolfStack never writes). Use the LAN IP/hostname, not a myunraid.net URL. Needs Unraid 7.2+, or 6.12+ with the Unraid Connect plugin.</div>
+            <button class="btn btn-sm btn-primary" onclick="unraidServerModal()" style="font-size:12px;">+ Add server</button>
+        </div>
+        <div class="card"><div class="card-body" style="padding:0;">${rows}</div></div>`;
+}
+
+// ── Add/edit server modal ──
+function unraidServerModal(id) {
+    const inst = id ? window._urInstances.find(i => i.id === id) : null;
+    const stale = document.getElementById('ur-modal'); if (stale) stale.remove();
+    const bd = document.createElement('div');
+    bd.id = 'ur-modal';
+    bd.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:10001;display:flex;align-items:center;justify-content:center;';
+    const f = (label, idAttr, val, ph, type) => `<label style="display:block;margin-bottom:10px;"><span style="display:block;font-size:12px;color:var(--text-muted);margin-bottom:3px;">${label}</span><input id="${idAttr}" type="${type || 'text'}" value="${escapeHtml(val || '')}" placeholder="${escapeHtml(ph || '')}" style="width:100%;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg-primary);color:var(--text-primary);"></label>`;
+    bd.innerHTML = `<div role="dialog" aria-modal="true" aria-labelledby="ur-modal-title" style="background:var(--bg-primary);border:1px solid var(--border);border-radius:12px;padding:20px;width:480px;max-width:92vw;max-height:88vh;overflow-y:auto;">
+        <h3 id="ur-modal-title" style="margin:0 0 14px;font-size:16px;">${inst ? 'Edit' : 'Add'} Unraid server</h3>
+        ${f('Label', 'ur-f-label', inst?.label, 'tower')}
+        ${f('Server URL (LAN IP/hostname, not myunraid.net)', 'ur-f-url', inst?.api_url, 'https://10.2.0.40')}
+        ${f('API key' + (inst ? ' (leave blank to keep current)' : ''), 'ur-f-key', '', inst ? '••••••••' : 'paste the Unraid API key', 'password')}
+        ${f('Cluster tag (blank = all clusters)', 'ur-f-cluster', inst?.cluster || unraidCurrentCluster, unraidCurrentCluster)}
+        <label style="display:flex;align-items:center;gap:8px;margin:10px 0;font-size:13px;cursor:pointer;"><input id="ur-f-insecure" type="checkbox" ${inst ? (inst.insecure_tls ? 'checked' : '') : 'checked'}> Accept self-signed TLS</label>
+        ${f('Cache TTL (seconds)', 'ur-f-ttl', String(inst?.cache_ttl_secs || 300), '300')}
+        <div id="ur-modal-err" role="alert" style="display:none;color:var(--danger-color,#ef4444);font-size:12px;margin-bottom:8px;"></div>
+        <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:8px;">
+            <button class="btn btn-sm" onclick="document.getElementById('ur-modal').remove()">Cancel</button>
+            <button class="btn btn-sm btn-primary" id="ur-modal-save" onclick="unraidSaveServer('${tnArg(id || '')}')">${inst ? 'Save' : 'Add & test'}</button>
+        </div>
+    </div>`;
+    bd.onclick = (e) => { if (e.target === bd) bd.remove(); };
+    document.body.appendChild(bd);
+    document.getElementById('ur-f-label')?.focus();
+}
+
+async function unraidSaveServer(id) {
+    const err = document.getElementById('ur-modal-err');
+    const btn = document.getElementById('ur-modal-save');
+    const val = (x) => (document.getElementById(x)?.value || '').trim();
+    const payload = {
+        label: val('ur-f-label'),
+        api_url: val('ur-f-url'),
+        api_key: val('ur-f-key'),
+        cluster: val('ur-f-cluster') || null,
+        insecure_tls: document.getElementById('ur-f-insecure')?.checked || false,
+        cache_ttl_secs: parseInt(val('ur-f-ttl'), 10) || 300,
+    };
+    if (!payload.label || !payload.api_url || (!id && !payload.api_key)) {
+        if (err) { err.style.display = 'block'; err.textContent = 'Label, server URL and API key are required.'; }
+        return;
+    }
+    if (btn) { btn.disabled = true; btn.textContent = id ? 'Saving…' : 'Testing…'; }
+    try {
+        const r = await urFetch(id ? `/api/unraid/instances/${encodeURIComponent(id)}` : '/api/unraid/instances', {
+            method: id ? 'PUT' : 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) { if (err) { err.style.display = 'block'; err.textContent = d.error || 'Save failed'; } if (btn) { btn.disabled = false; btn.textContent = id ? 'Save' : 'Add & test'; } return; }
+        document.getElementById('ur-modal')?.remove();
+        showToast(id ? 'Unraid server updated' : 'Unraid server added', 'success');
+        if (!id && d.id) window._urCurrentId = d.id;
+        window._urTab = 'overview';
+        loadUnraidInstances();
+    } catch (e) {
+        if (err) { err.style.display = 'block'; err.textContent = e.message; }
+        if (btn) { btn.disabled = false; btn.textContent = id ? 'Save' : 'Add & test'; }
+    }
+}
+
+async function unraidTest(id) {
+    showToast('Testing Unraid connection…', 'info');
+    try {
+        const r = await urFetch(`/api/unraid/instances/${encodeURIComponent(id)}/test`, { method: 'POST' });
+        const d = await r.json().catch(() => ({}));
+        if (r.ok) showToast('Unraid reachable' + (d.hostname ? ' (' + d.hostname + ')' : ''), 'success');
+        else showToast('Unraid test failed: ' + (d.error || d.status || 'error'), 'error', 0);
+        loadUnraidInstances(); // refresh the status badge after a definitive result
+    } catch (e) { showToast('Unraid test failed: ' + e.message, 'error', 0); }
+}
+
+async function unraidDelete(id) {
+    const label = window._urInstances.find(i => i.id === id)?.label || id;
+    if (!(await wolfConfirm(`Remove Unraid server "${label}"? This only unregisters it from WolfStack; the server itself is untouched.`, 'Remove Unraid server', { okText: 'Remove', danger: true }))) return;
+    try {
+        const r = await urFetch(`/api/unraid/instances/${encodeURIComponent(id)}`, { method: 'DELETE' });
+        if (r.ok) { showToast('Unraid server removed', 'success'); if (window._urCurrentId === id) window._urCurrentId = null; loadUnraidInstances(); }
+        else { const d = await r.json().catch(() => ({})); showToast('Remove failed: ' + (d.error || 'error'), 'error', 0); }
+    } catch (e) { showToast('Remove failed: ' + e.message, 'error', 0); }
+}
+window.showUnraidForCluster = showUnraidForCluster;
 
 function showClusterBackupsPage(clusterName) {
     closeSidebarMobile();

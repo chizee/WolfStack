@@ -20,10 +20,11 @@ use std::time::Duration;
 
 const API_BASE: &str = "https://api.cloudflare.com/client/v4";
 
+/// The stored credential JSON is `{"account_id": "...", "api_token": "..."}`
+/// (one shape shared with the tunnel client, which needs the account id).
+/// This DNS client only uses the token — serde ignores the extra key.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CloudflareCreds {
-    #[serde(default)]
-    pub account_id: String,
     pub api_token: String,
 }
 
@@ -286,10 +287,11 @@ mod tests {
 
     #[test]
     fn creds_parse_required_fields() {
+        // The stored shape carries account_id (the tunnel client uses it);
+        // this DNS client only needs the token and must tolerate the extra key.
         let v = serde_json::json!({"account_id": "abc", "api_token": "tok"});
         let c = CloudflareCreds::from_value(&v).unwrap();
         assert_eq!(c.api_token, "tok");
-        assert_eq!(c.account_id, "abc");
     }
 
     #[test]
@@ -299,10 +301,9 @@ mod tests {
     }
 
     #[test]
-    fn creds_account_id_optional() {
+    fn creds_token_alone_is_enough() {
         let v = serde_json::json!({"api_token": "tok"});
-        let c = CloudflareCreds::from_value(&v).unwrap();
-        assert!(c.account_id.is_empty());
+        assert!(CloudflareCreds::from_value(&v).is_ok());
     }
 
     #[test]

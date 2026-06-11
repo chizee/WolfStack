@@ -29,6 +29,7 @@ mod vms;
 mod proxmox;
 mod xo;
 mod truenas;
+mod unraid;
 mod pools;
 mod mysql_editor;
 mod appstore;

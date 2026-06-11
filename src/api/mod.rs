@@ -32558,7 +32558,9 @@ pub async fn truenas_update(
         r.pool_name.trim().to_string(), r.insecure_tls, r.cache_ttl_secs, r.api_key)
     {
         Ok(_) => HttpResponse::Ok().json(serde_json::json!({"status": "updated"})),
-        Err(e) => HttpResponse::NotFound().json(serde_json::json!({"error": e})),
+        // Same 400-vs-404 split as the Unraid handler (code review 2026-06-11).
+        Err(e) if e.contains("not found") => HttpResponse::NotFound().json(serde_json::json!({"error": e})),
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({"error": e})),
     }
 }
 
@@ -32677,6 +32679,192 @@ pub async fn truenas_snapshot_delete(
     let client = crate::truenas::TrueNasClient::for_instance(&inst);
     match client.delete_snapshot(&snap).await {
         Ok(_) => HttpResponse::Ok().json(serde_json::json!({"status": "deleted"})),
+        Err(e) => HttpResponse::BadGateway().json(serde_json::json!({"error": e})),
+    }
+}
+
+// ─── Unraid integration ────────────────────────────────────────────
+// Multi-instance Unraid servers over the official GraphQL API. Mirrors the
+// TrueNAS handlers exactly: API keys stay encrypted in the store and are
+// never returned to the browser; the store is loaded per-request
+// (admin-only, low-frequency UI actions). Read-only in P1: array, disks,
+// shares, parity, docker, vms.
+
+#[derive(serde::Deserialize)]
+pub struct UnraidRegisterRequest {
+    pub label: String,
+    #[serde(default)] pub cluster: Option<String>,
+    pub api_url: String,
+    pub api_key: String,
+    #[serde(default = "tn_default_insecure")] pub insecure_tls: bool,
+    #[serde(default = "tn_default_ttl")] pub cache_ttl_secs: u64,
+}
+
+#[derive(serde::Deserialize)]
+pub struct UnraidUpdateRequest {
+    pub label: String,
+    #[serde(default)] pub cluster: Option<String>,
+    pub api_url: String,
+    #[serde(default = "tn_default_insecure")] pub insecure_tls: bool,
+    #[serde(default = "tn_default_ttl")] pub cache_ttl_secs: u64,
+    /// Blank/absent = keep the stored key.
+    #[serde(default)] pub api_key: Option<String>,
+}
+
+/// GET /api/unraid/instances — registered Unraid servers (keys redacted).
+pub async fn unraid_list(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let list = crate::unraid::UnraidStore::load().list();
+    let safe: Vec<serde_json::Value> = list.iter().map(|i| i.redacted()).collect();
+    HttpResponse::Ok().json(safe)
+}
+
+/// POST /api/unraid/instances — register a server (test-connection before persist).
+pub async fn unraid_register(
+    req: HttpRequest, state: web::Data<AppState>, body: web::Json<UnraidRegisterRequest>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let r = body.into_inner();
+    if r.label.trim().is_empty() || r.api_url.trim().is_empty() || r.api_key.trim().is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "label, server URL and API key are all required"}));
+    }
+    if let Err(e) = validate_outbound_url(&r.api_url) {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": e}));
+    }
+    let mut inst = crate::unraid::UnraidInstance {
+        id: String::new(),
+        label: r.label.trim().to_string(),
+        cluster: r.cluster.filter(|c| !c.trim().is_empty()),
+        api_url: r.api_url.trim().trim_end_matches('/').to_string(),
+        api_key_enc: crate::unraid::obfuscate_key(r.api_key.trim()),
+        insecure_tls: r.insecure_tls,
+        cache_ttl_secs: r.cache_ttl_secs,
+        last_seen: String::new(),
+        status: String::new(),
+    };
+    // Verify the key/URL work before storing — bad creds never persist.
+    match crate::unraid::test_connection(&inst).await {
+        Ok(_) => { inst.status = "ok".into(); inst.last_seen = chrono::Utc::now().to_rfc3339(); }
+        Err(e) => return HttpResponse::BadGateway().json(serde_json::json!({"error": format!("Couldn't reach the Unraid API: {}", e)})),
+    }
+    let mut store = crate::unraid::UnraidStore::load();
+    match store.add(inst) {
+        Ok(id) => HttpResponse::Created().json(serde_json::json!({"id": id, "status": "ok"})),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e})),
+    }
+}
+
+/// PUT /api/unraid/instances/{id} — edit a server (blank api_key keeps the stored one).
+pub async fn unraid_update(
+    req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>, body: web::Json<UnraidUpdateRequest>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let r = body.into_inner();
+    if let Err(e) = validate_outbound_url(&r.api_url) {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": e}));
+    }
+    let mut store = crate::unraid::UnraidStore::load();
+    match store.update(&id, r.label.trim().to_string(),
+        r.cluster.filter(|c| !c.trim().is_empty()),
+        r.api_url.trim().trim_end_matches('/').to_string(),
+        r.insecure_tls, r.cache_ttl_secs, r.api_key)
+    {
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"status": "updated"})),
+        // "not found" = missing instance (404); everything else is a
+        // validation failure (400) — they were all 404 before, which
+        // misclassified blank-label edits (code review 2026-06-11).
+        Err(e) if e.contains("not found") => HttpResponse::NotFound().json(serde_json::json!({"error": e})),
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({"error": e})),
+    }
+}
+
+/// DELETE /api/unraid/instances/{id} — unregister a server.
+pub async fn unraid_delete(
+    req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    match crate::unraid::UnraidStore::load().remove(&id) {
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"status": "removed"})),
+        Err(e) => HttpResponse::NotFound().json(serde_json::json!({"error": e})),
+    }
+}
+
+/// Look up an instance or return a 404 response.
+fn unraid_get(id: &str) -> Result<crate::unraid::UnraidInstance, HttpResponse> {
+    crate::unraid::UnraidStore::load().get(id)
+        .ok_or_else(|| HttpResponse::NotFound().json(serde_json::json!({"error": "Unraid instance not found"})))
+}
+
+/// POST /api/unraid/instances/{id}/test — re-probe; updates cached status.
+pub async fn unraid_test(
+    req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let inst = match unraid_get(&id) { Ok(i) => i, Err(r) => return r };
+    match crate::unraid::test_connection(&inst).await {
+        Ok(hostname) => {
+            crate::unraid::UnraidStore::load().update_status(&id, "ok");
+            HttpResponse::Ok().json(serde_json::json!({"status": "ok", "hostname": hostname}))
+        }
+        Err(e) => {
+            let status = if e.starts_with("unauthorized:") { "auth_failed" } else { "unreachable" };
+            crate::unraid::UnraidStore::load().update_status(&id, status);
+            HttpResponse::BadGateway().json(serde_json::json!({"status": status, "error": e}))
+        }
+    }
+}
+
+/// GET /api/unraid/instances/{id}/overview — array + disks + shares + parity + system info.
+pub async fn unraid_overview(
+    req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let inst = match unraid_get(&id) { Ok(i) => i, Err(r) => return r };
+    match crate::unraid::fetch_overview(&inst).await {
+        Ok(ov) => HttpResponse::Ok().json(ov),
+        Err(e) => HttpResponse::BadGateway().json(serde_json::json!({"error": e})),
+    }
+}
+
+/// GET /api/unraid/instances/{id}/docker — Docker containers (read-only).
+pub async fn unraid_docker(
+    req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let inst = match unraid_get(&id) { Ok(i) => i, Err(r) => return r };
+    match crate::unraid::fetch_docker(&inst).await {
+        Ok(x) => HttpResponse::Ok().json(serde_json::json!({"containers": x})),
+        Err(e) => HttpResponse::BadGateway().json(serde_json::json!({"error": e})),
+    }
+}
+
+/// GET /api/unraid/instances/{id}/vms — VMs (read-only).
+pub async fn unraid_vms(
+    req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let inst = match unraid_get(&id) { Ok(i) => i, Err(r) => return r };
+    match crate::unraid::fetch_vms(&inst).await {
+        Ok(x) => HttpResponse::Ok().json(serde_json::json!({"vms": x})),
+        Err(e) => HttpResponse::BadGateway().json(serde_json::json!({"error": e})),
+    }
+}
+
+/// GET /api/unraid/instances/{id}/parity-history — past parity checks.
+pub async fn unraid_parity_history(
+    req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let id = path.into_inner();
+    let inst = match unraid_get(&id) { Ok(i) => i, Err(r) => return r };
+    match crate::unraid::fetch_parity_history(&inst).await {
+        Ok(x) => HttpResponse::Ok().json(serde_json::json!({"runs": x})),
         Err(e) => HttpResponse::BadGateway().json(serde_json::json!({"error": e})),
     }
 }
@@ -35059,6 +35247,15 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/truenas/instances/{id}/snapshots", web::get().to(truenas_snapshots))
         .route("/api/truenas/instances/{id}/snapshots", web::post().to(truenas_snapshot_create))
         .route("/api/truenas/instances/{id}/snapshots", web::delete().to(truenas_snapshot_delete))
+        .route("/api/unraid/instances", web::get().to(unraid_list))
+        .route("/api/unraid/instances", web::post().to(unraid_register))
+        .route("/api/unraid/instances/{id}", web::put().to(unraid_update))
+        .route("/api/unraid/instances/{id}", web::delete().to(unraid_delete))
+        .route("/api/unraid/instances/{id}/test", web::post().to(unraid_test))
+        .route("/api/unraid/instances/{id}/overview", web::get().to(unraid_overview))
+        .route("/api/unraid/instances/{id}/docker", web::get().to(unraid_docker))
+        .route("/api/unraid/instances/{id}/vms", web::get().to(unraid_vms))
+        .route("/api/unraid/instances/{id}/parity-history", web::get().to(unraid_parity_history))
         .route("/api/xo/pools", web::get().to(xo_pools_list))
         .route("/api/xo/pools", web::post().to(xo_pools_register))
         .route("/api/xo/pools/{id}", web::delete().to(xo_pools_delete))
