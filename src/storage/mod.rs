@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use tracing::{warn, error};
+use tracing::{warn, error, info};
 use chrono::Utc;
 
 fn config_path() -> String { crate::paths::get().storage_config }
@@ -1186,27 +1186,128 @@ fn rclone_section_to_mount(
 
 // ─── Auto-mount on boot ───
 
-/// Mount all entries that have auto_mount: true — called at startup
+// ─── systemd ordering for WebUI auto-mounts ─────────────────────────────────
+// WolfStack mounts its WebUI storage entries itself (raw `mount` from a
+// startup thread), so systemd has no .mount units to order against — an
+// fstab line like a mergerfs pool over WebUI CIFS branches could never use
+// `x-systemd.requires=mnt-….mount` and raced WolfStack at every boot
+// (community report 2026-06-10: 2-3 successes in 100 reboots). The fix is
+// the standard systemd signalling pattern:
+//   • wolfstack-mounts-wait.service — oneshot that polls for the per-boot
+//     flag file below (in /run, a tmpfs, so a stale flag from the previous
+//     boot is impossible).
+//   • wolfstack-mounts.target — Requires/After the wait service.
+//   • WolfStack touches the flag once every auto_mount entry has been
+//     ATTEMPTED (settled — success or failure; "all succeeded" can't be the
+//     contract or one unreachable NAS would wedge boot ordering forever).
+// Operators order with `nofail,_netdev,x-systemd.requires=wolfstack-mounts.target`
+// on their fstab line. `nofail` is MANDATORY, not advisory: without it the
+// fstab generator orders the mount Before=local-fs.target, while this chain
+// forces it after wolfstack.service (after basic.target, after
+// local-fs.target) — an ordering cycle systemd breaks by dropping a job from
+// the boot transaction. With nofail, systemd documents the mount is neither
+// required by nor ordered before local-fs.target, so no cycle. A bare target
+// WolfStack merely `systemctl start`s would NOT work either: a target with
+// no blocking dependency activates instantly when an fstab Requires= pulls
+// it in at boot.
+const MOUNTS_READY_FLAG: &str = "/run/wolfstack/mounts-ready";
+const MOUNTS_WAIT_UNIT_PATH: &str = "/etc/systemd/system/wolfstack-mounts-wait.service";
+const MOUNTS_TARGET_PATH: &str = "/etc/systemd/system/wolfstack-mounts.target";
+
+const MOUNTS_WAIT_UNIT: &str = "\
+[Unit]
+Description=Wait for WolfStack WebUI storage auto-mounts to settle
+Documentation=https://wolfstack.org
+After=wolfstack.service
+Wants=wolfstack.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# WolfStack touches this flag once every auto-mount entry has been attempted
+# (success or failure). /run is per-boot tmpfs - no stale flag across boots.
+ExecStart=/bin/sh -c 'until [ -e /run/wolfstack/mounts-ready ]; do sleep 1; done'
+TimeoutStartSec=300
+";
+
+const MOUNTS_TARGET_UNIT: &str = "\
+[Unit]
+Description=WolfStack WebUI storage auto-mounts settled
+Documentation=https://wolfstack.org
+Requires=wolfstack-mounts-wait.service
+After=wolfstack-mounts-wait.service
+";
+
+/// Write the two units when missing or outdated (content-compared, so a
+/// binary upgrade that changes them self-heals without setup.sh). Only
+/// daemon-reloads when something actually changed.
+fn ensure_mounts_target_units() {
+    // Canonical "is systemd PID 1" check — on non-systemd hosts (containers,
+    // dev runs) there is nothing to order and the unit writes would just log
+    // errors every boot.
+    if !std::path::Path::new("/run/systemd/system").exists() {
+        return;
+    }
+    let mut changed = false;
+    for (path, body) in [
+        (MOUNTS_WAIT_UNIT_PATH, MOUNTS_WAIT_UNIT),
+        (MOUNTS_TARGET_PATH, MOUNTS_TARGET_UNIT),
+    ] {
+        if std::fs::read_to_string(path).ok().as_deref() == Some(body) {
+            continue;
+        }
+        match std::fs::write(path, body) {
+            Ok(()) => changed = true,
+            Err(e) => error!("storage: could not write {}: {}", path, e),
+        }
+    }
+    if changed {
+        let _ = Command::new("systemctl").arg("daemon-reload").output();
+    }
+}
+
+/// Mount all entries that have auto_mount: true — called at startup.
+/// Mounts run in parallel; a supervisor thread joins them and then signals
+/// wolfstack-mounts.target (see the block comment above) so fstab entries
+/// ordered on the target are released. Signals even with zero auto-mounts —
+/// a node without any must not leave dependants waiting for the timeout.
+/// Non-blocking for the caller: the startup task sequence (LXC autostart
+/// etc.) must not stall behind a slow CIFS mount.
 pub fn auto_mount_all() {
+    ensure_mounts_target_units();
+
     let config = load_config();
     let auto_mounts: Vec<_> = config.mounts.iter()
         .filter(|m| m.auto_mount && m.enabled)
         .map(|m| (m.id.clone(), m.name.clone()))
         .collect();
-    
-    if auto_mounts.is_empty() {
-        return;
-    }
-    
 
-    for (id, name) in auto_mounts {
-        std::thread::spawn(move || {
-            match mount_storage(&id) {
-                Ok(_msg) => {}
-                Err(e) => error!("  ✗ Failed to auto-mount {}: {}", name, e),
-            }
-        });
-    }
+    std::thread::spawn(move || {
+        let handles: Vec<std::thread::JoinHandle<()>> = auto_mounts
+            .into_iter()
+            .map(|(id, name)| std::thread::spawn(move || {
+                match mount_storage(&id) {
+                    Ok(_msg) => {}
+                    Err(e) => error!("  ✗ Failed to auto-mount {}: {}", name, e),
+                }
+            }))
+            .collect();
+        let total = handles.len();
+        for h in handles {
+            let _ = h.join();
+        }
+        let _ = std::fs::create_dir_all("/run/wolfstack");
+        if let Err(e) = std::fs::write(
+            MOUNTS_READY_FLAG,
+            format!("settled {} auto-mount(s)\n", total),
+        ) {
+            error!("storage: could not write {}: {}", MOUNTS_READY_FLAG, e);
+        }
+        // Belt-and-braces: also activate the target directly so units that
+        // only use After= (without Requires= pulling the chain) see it too.
+        let _ = Command::new("systemctl").args(["start", "wolfstack-mounts.target"]).output();
+        info!("storage: {} auto-mount(s) settled — wolfstack-mounts.target signalled", total);
+    });
 }
 
 // ─── Container Mount Integration ───
@@ -2256,4 +2357,33 @@ fn get_mountpoint(device: &str) -> Option<String> {
         .ok()?;
     let mp = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if mp.is_empty() { None } else { Some(mp) }
+}
+
+#[cfg(test)]
+mod mounts_target_tests {
+    use super::*;
+
+    /// The three pieces of the signalling chain reference each other by
+    /// literal name/path — this pins them together so an edit to one can't
+    /// silently break the ordering contract.
+    #[test]
+    fn signalling_chain_is_consistent() {
+        // The wait service polls exactly the flag the supervisor writes.
+        assert!(MOUNTS_WAIT_UNIT.contains(MOUNTS_READY_FLAG),
+            "wait unit must poll {}", MOUNTS_READY_FLAG);
+        // The target gates on the wait service (Requires AND After) — a
+        // bare target would activate instantly when fstab Requires= it.
+        assert!(MOUNTS_TARGET_UNIT.contains("Requires=wolfstack-mounts-wait.service"));
+        assert!(MOUNTS_TARGET_UNIT.contains("After=wolfstack-mounts-wait.service"));
+        // Unit paths match the names units reference.
+        assert!(MOUNTS_WAIT_UNIT_PATH.ends_with("/wolfstack-mounts-wait.service"));
+        assert!(MOUNTS_TARGET_PATH.ends_with("/wolfstack-mounts.target"));
+        // The wait service must order after wolfstack itself, and survive
+        // ExecStart exit so the target stays up (oneshot + RemainAfterExit).
+        assert!(MOUNTS_WAIT_UNIT.contains("After=wolfstack.service"));
+        assert!(MOUNTS_WAIT_UNIT.contains("RemainAfterExit=yes"));
+        // A bounded wait — an absent/broken wolfstack must not hang boot
+        // ordering forever (dependants should also use nofail).
+        assert!(MOUNTS_WAIT_UNIT.contains("TimeoutStartSec="));
+    }
 }
