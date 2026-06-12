@@ -212,6 +212,14 @@ pub struct DnsServerConfig {
     /// DNS server.
     #[serde(default)]
     pub local_records: Vec<LocalDnsRecord>,
+    /// Wildcard local domains: a domain and EVERY subdomain under it resolve
+    /// to one IP. Rendered as dnsmasq `address=/<domain>/<ip>`, which answers
+    /// `domain` itself and `*.domain` authoritatively. The home-lab pattern:
+    /// point `*.ai.home` at the reverse proxy so every app subdomain resolves
+    /// without a per-host record (community request, 2026-06-12). Empty by
+    /// default, so existing LANs are unchanged.
+    #[serde(default)]
+    pub wildcard_domains: Vec<WildcardDomain>,
     /// Enable DNS cache. dnsmasq caches by default; this toggle lets an
     /// admin disable it for debugging.
     #[serde(default = "default_true")]
@@ -246,6 +254,7 @@ impl Default for DnsServerConfig {
             external_server: None,
             forwarders: vec!["1.1.1.1".into(), "9.9.9.9".into()],
             local_records: vec![],
+            wildcard_domains: vec![],
             cache_enabled: true,
             block_ads: false,
             query_log: false,
@@ -257,6 +266,17 @@ impl Default for DnsServerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalDnsRecord {
     pub hostname: String,
+    pub ip: String,
+}
+
+/// A wildcard local domain: `domain` and every subdomain resolve to `ip`.
+/// Rendered as dnsmasq `address=/<domain>/<ip>`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WildcardDomain {
+    /// Bare domain, no leading dot or `*.` — e.g. `ai.home`. dnsmasq's
+    /// `address=/ai.home/...` already covers `ai.home` and all subdomains.
+    pub domain: String,
+    /// Target IP (IPv4 or IPv6) the domain and its subdomains resolve to.
     pub ip: String,
 }
 

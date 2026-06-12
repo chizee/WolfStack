@@ -35,6 +35,40 @@ fn ensure_dirs() -> Result<(), String> {
     Ok(())
 }
 
+/// Render the dnsmasq `address=/<domain>/<ip>` lines for a LAN's wildcard
+/// local domains. Each entry resolves the domain AND every subdomain to one
+/// IP — e.g. `address=/ai.home/192.168.10.2` answers ai.home, app.ai.home,
+/// a.b.ai.home … all with that IP (the home-lab "*.ai.home → reverse proxy"
+/// pattern). A leading `*.` or `.` the operator may have typed is stripped;
+/// dnsmasq wants the bare domain. An entry that normalises to an empty domain
+/// is skipped so we never emit a malformed `address=//ip` line (which would
+/// make dnsmasq reject the whole config and take the LAN's DNS+DHCP down).
+/// Pure (no I/O) so it can be unit-tested; empty input renders an empty
+/// string, leaving existing LANs' configs byte-identical.
+fn render_wildcard_lines(domains: &[WildcardDomain]) -> String {
+    let mut out = String::new();
+    for wc in domains {
+        let domain = wc.domain.trim().trim_start_matches("*.").trim_start_matches('.');
+        let ip = wc.ip.trim();
+        // Self-protecting: skip anything that can't form a valid
+        // `address=/<domain>/<ip>` line, so even an un-validated config (the
+        // API validator is the normal gate, but a config can be hand-edited
+        // on disk or imported) can never emit a directive that makes dnsmasq
+        // reject the whole file and take the LAN's DNS+DHCP down. A `/`, `#`
+        // or whitespace would break the directive's structure; a non-IP value
+        // would be rejected by dnsmasq for that line.
+        if domain.is_empty()
+            || domain.contains('/') || domain.contains('#')
+            || domain.chars().any(|c| c.is_whitespace())
+            || ip.parse::<std::net::IpAddr>().is_err()
+        {
+            continue;
+        }
+        out.push_str(&format!("address=/{}/{}\n", domain, ip));
+    }
+    out
+}
+
 /// Write the dnsmasq config for one LAN using an explicit bind interface.
 /// `bind_iface` may differ from `lan.interface` when apply-time self-heal
 /// resolves a mismatch (router_ip is on a different iface than configured).
@@ -155,6 +189,8 @@ pub fn render_config_for_iface(lan: &LanSegment, bind_iface: &str) -> Result<Str
                 // address= gives an A record; host-record= gives A + PTR.
                 cfg.push_str(&format!("host-record={},{}\n", rec.hostname, rec.ip));
             }
+            // Wildcard local domains — see render_wildcard_lines.
+            cfg.push_str(&render_wildcard_lines(&lan.dns.wildcard_domains));
             // Ad-blocking: use a shared hosts file if available. The file is
             // maintained separately (phase 4 feature) — for now it's optional.
             if lan.dns.block_ads && Path::new(ADBLOCK_HOSTS).exists() {
@@ -828,6 +864,64 @@ pub fn stop_all_for_node(config: &RouterConfig, self_node_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wc(domain: &str, ip: &str) -> WildcardDomain {
+        WildcardDomain { domain: domain.into(), ip: ip.into() }
+    }
+
+    #[test]
+    fn wildcard_domains_render_as_address_directive() {
+        let out = render_wildcard_lines(&[
+            wc("ai.home", "192.168.10.2"),
+            wc("*.lab.lan", "192.168.10.3"),   // leading *. stripped
+            wc(".svc.home", "192.168.10.4"),   // leading . stripped
+            wc("  pad.home  ", " 192.168.10.5 "), // trimmed
+        ]);
+        assert!(out.contains("address=/ai.home/192.168.10.2\n"),
+            "wildcard domain must render as dnsmasq address=/domain/ip; got:\n{out}");
+        assert!(out.contains("address=/lab.lan/192.168.10.3\n"),
+            "a leading *. must be stripped to the bare domain");
+        assert!(out.contains("address=/svc.home/192.168.10.4\n"),
+            "a leading . must be stripped to the bare domain");
+        assert!(out.contains("address=/pad.home/192.168.10.5\n"),
+            "domain and ip must be trimmed");
+    }
+
+    #[test]
+    fn empty_wildcard_domains_render_nothing() {
+        // GOLDEN RULE: a LAN with no wildcard_domains renders an empty string,
+        // so its dnsmasq config is byte-for-byte the pre-feature behaviour —
+        // an upgrade changes no existing LAN's config.
+        assert_eq!(render_wildcard_lines(&[]), "");
+        assert!(!render_wildcard_lines(&[]).contains("address=/"));
+    }
+
+    #[test]
+    fn blank_wildcard_domain_is_skipped_not_malformed() {
+        // A domain that normalises to empty must be skipped, never rendered as
+        // `address=//ip` — that would make dnsmasq reject the whole config and
+        // take the LAN's DNS+DHCP down. Validation also rejects these; the
+        // renderer guards defensively.
+        let out = render_wildcard_lines(&[wc("*.", "10.0.0.1"), wc("", "10.0.0.2"), wc(".", "10.0.0.3")]);
+        assert_eq!(out, "", "blank domains must produce no lines at all; got:\n{out}");
+        assert!(!out.contains("address=//"));
+    }
+
+    #[test]
+    fn structurally_unsafe_wildcard_entries_are_skipped() {
+        // Defense-in-depth: even if a bad entry reaches the renderer (config
+        // hand-edited on disk, bypassing the API validator), it must be
+        // dropped rather than emit a directive dnsmasq would choke on.
+        let out = render_wildcard_lines(&[
+            wc("ok.home", "10.0.0.1"),          // valid — kept
+            wc("bad/slash.home", "10.0.0.2"),   // slash breaks address=/.../
+            wc("has#hash.home", "10.0.0.3"),    // # breaks the directive
+            wc("has space.home", "10.0.0.4"),   // whitespace
+            wc("noip.home", "not-an-ip"),       // invalid IP
+        ]);
+        assert_eq!(out, "address=/ok.home/10.0.0.1\n",
+            "only the valid entry may survive; got:\n{out}");
+    }
 
     #[test]
     fn netmask_conversion() {
