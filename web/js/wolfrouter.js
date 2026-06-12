@@ -1777,7 +1777,7 @@
             interface: '', zone: { kind: 'lan', id: 0 },
             subnet_cidr: seeded.cidr, router_ip: seeded.router_ip,
             dhcp: { enabled: true, pool_start: seeded.pool_start, pool_end: seeded.pool_end, lease_time: '12h', reservations: [], extra_options: [] },
-            dns: { forwarders: ['1.1.1.1', '9.9.9.9'], local_records: [], cache_enabled: true, block_ads: false },
+            dns: { forwarders: ['1.1.1.1', '9.9.9.9'], local_records: [], wildcard_domains: [], cache_enabled: true, block_ads: false },
             description: '',
         };
 
@@ -1889,6 +1889,13 @@
                                 Tags every forwarded query with the real LAN client's IP so upstream resolvers like <strong>AdGuard Home</strong>, <strong>Pi-hole</strong>, or <strong>NextDNS</strong> can attribute traffic to individual clients instead of seeing them all come from this router. Particularly useful for AdGuard running in a Docker bridge container, which otherwise sees every query as coming from <code>172.17.0.1</code>. The upstream must have ECS enabled too (AdGuard: Settings → DNS server → "Enable EDNS Client Subnet"). Leave off if you'd rather not leak client subnets to the upstream.
                             </span>
                         </div>
+                        <div style="grid-column:1/-1; display:flex; flex-direction:column; gap:4px;">
+                            <label for="wr-l-wildcards" style="font-weight:500;">Wildcard local domains</label>
+                            <textarea id="wr-l-wildcards" class="form-control" rows="2" placeholder="ai.home  192.168.10.2" style="font-family:monospace; font-size:12px;"></textarea>
+                            <span style="font-size:11px; color:var(--text-muted); line-height:1.5;">
+                                One <code>domain&nbsp;&nbsp;ip</code> per line. The domain <em>and every subdomain under it</em> resolve to that IP — e.g. <code>ai.home&nbsp;&nbsp;192.168.10.2</code> points <code>ai.home</code>, <code>sonarr.ai.home</code> and anything <code>*.ai.home</code> straight at your reverse proxy, with no per-host record. Ideal for an internal domain you can't (and don't want to) register publicly. Served authoritatively on this LAN.
+                            </span>
+                        </div>
                     </div>
                 </div>
                 <div id="wr-l-status" style="padding:0 20px; font-size:12px;"></div>
@@ -1942,6 +1949,8 @@
         if (modeRadio) modeRadio.checked = true;
         document.getElementById('wr-l-dns-ext').value = l.dns.external_server || '';
         document.getElementById('wr-l-dns-port').value = l.dns.listen_port || 53;
+        const wcEl = document.getElementById('wr-l-wildcards');
+        if (wcEl) wcEl.value = (l.dns.wildcard_domains || []).map(w => `${w.domain}  ${w.ip}`).join('\n');
         // Advanced toggle defaults on when the stored config diverges
         // from the simple case (non-53 port, or external_server set in
         // WolfRouter mode) — otherwise the operator would open the
@@ -2156,6 +2165,17 @@
             external_server: extServerRaw || null,
             forwarders: document.getElementById('wr-l-fwd').value.split(',').map(s => s.trim()).filter(Boolean),
             local_records: lan.dns?.local_records || [],
+            // Wildcard domains: one "domain ip" per line (also accept = or → as
+            // the separator). Strip a leading *. the user might type. Keep any
+            // line that has a domain so a missing/blank IP gets a clear backend
+            // error rather than vanishing silently.
+            wildcard_domains: (document.getElementById('wr-l-wildcards')?.value || '').split('\n')
+                .map(line => line.trim()).filter(Boolean)
+                .map(line => {
+                    const parts = line.replace(/[=→]/g, ' ').split(/\s+/).filter(Boolean);
+                    return { domain: (parts[0] || '').replace(/^\*\./, ''), ip: parts[1] || '' };
+                })
+                .filter(w => w.domain),
             cache_enabled: true,
             block_ads: document.getElementById('wr-l-ads').checked,
             forward_client_subnet: document.getElementById('wr-l-ecs').checked,
@@ -6413,7 +6433,7 @@
                 subnet_cidr: cidr, router_ip: routerIp,
                 dhcp: { enabled: true, pool_start: poolStart, pool_end: poolEnd,
                         lease_time: '12h', reservations: [], extra_options: [] },
-                dns: { forwarders, local_records: [],
+                dns: { forwarders, local_records: [], wildcard_domains: [],
                        cache_enabled: true, block_ads: false },
                 description: 'Created by Quick Setup',
             };

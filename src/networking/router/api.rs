@@ -655,6 +655,23 @@ fn validate_segment(seg: &LanSegment) -> Result<(), String> {
         check(&format!("local_records[{}].hostname", i), &rec.hostname)?;
         check(&format!("local_records[{}].ip", i), &rec.ip)?;
     }
+    for (i, wc) in seg.dns.wildcard_domains.iter().enumerate() {
+        check(&format!("wildcard_domains[{}].domain", i), &wc.domain)?;
+        check(&format!("wildcard_domains[{}].ip", i), &wc.ip)?;
+        // Normalise the way the renderer will, then validate. dnsmasq's
+        // `address=/<domain>/<ip>` breaks if the domain carries a slash or
+        // whitespace, and a bad IP would make dnsmasq reject the whole config.
+        let domain = wc.domain.trim().trim_start_matches("*.").trim_start_matches('.');
+        if domain.is_empty() {
+            return Err(format!("wildcard_domains[{}]: domain is empty (e.g. ai.home)", i));
+        }
+        if domain.contains('/') || domain.contains('#') || domain.chars().any(|c| c.is_whitespace()) {
+            return Err(format!("wildcard_domains[{}]: domain '{}' must be a bare domain like ai.home (no slashes, '#', or spaces)", i, wc.domain));
+        }
+        if wc.ip.trim().parse::<std::net::IpAddr>().is_err() {
+            return Err(format!("wildcard_domains[{}]: '{}' is not a valid IP address", i, wc.ip));
+        }
+    }
     // DNS mode / port / external_server sanity. The renderer falls back
     // to router_ip for DHCP option 6 when external_server is missing,
     // so "mode=External, no external_server" would silently advertise
