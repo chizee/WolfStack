@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v24.38.6: stop spamming the journal — log state changes, not heartbeats** _(2026-06-12 — [`1ea9d54`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/1ea9d54c3d981efcbff2a3aa2acb2ac8da8dcaa1))_
 - **v24.38.5: readable muted text on every theme + installer URL fixes** _(2026-06-12 — [`8f47ee9`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/8f47ee94b4f501bfb671cad0143c2e47af87bcd3))_
 - **v24.38.4: cluster Storage is ONE page, strictly ONE cluster + cluster Shares view** _(2026-06-11 — [`8877764`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/8877764d183d9d693a4b2ed4e12b8bca3fb61262))_
 - **v24.38.3: fleet screen — moves no longer revert, renames carry every resource** _(2026-06-11 — [`394a18b`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/394a18bfd47ea0995658e09a0d3bb4251a6b7606))_
