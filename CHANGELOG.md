@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v24.43.0: auto-refresh package index for the vulnerability scanner** _(2026-06-13 — [`73f9c01`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/73f9c01c42602f2ba581ed3bf4a624ef6c361724))_
 - **v24.42.0: WolfProxy/Nginx configurator — cluster node selector** _(2026-06-13 — [`e843cdb`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/e843cdb97126e7903af771df4e35824580ff739e))_
 - **v24.41.0: Fleet Logs — Enterprise cluster log aggregation, retention & search** _(2026-06-13 — [`8a854df`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/8a854df8b93f68527287cc1a08a456c4f0e48495))_
 - **v24.40.1: VNC desktop install recovers from interrupted dpkg state** _(2026-06-13 — [`aff31f4`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/aff31f4a1086e1d1bf8ee26cff434662babec200))_
