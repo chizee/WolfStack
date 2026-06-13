@@ -258,6 +258,8 @@ pub struct AppState {
     pub wireguard_bridges: Arc<std::sync::RwLock<std::collections::HashMap<String, crate::networking::WireGuardBridge>>>,
     /// Patreon integration state
     pub patreon: Arc<crate::patreon::PatreonState>,
+    /// Fleet Logs (loghub) — cluster log aggregation/retention state.
+    pub loghub: Arc<crate::loghub::LogHubState>,
     /// Migration task progress tracker
     pub migration_tasks: Arc<std::sync::RwLock<std::collections::HashMap<String, MigrationTask>>>,
     /// Alert log — recent alerts surfaced to the frontend task log
@@ -34611,6 +34613,384 @@ pub async fn cluster_bootstrap_add(
     }))
 }
 
+// ════════════════════════════════════════════════════════════════════════
+//  Fleet Logs (loghub) — cluster log aggregation, retention & search.
+//  Enterprise-gated user surface; ingest is inter-node (cluster secret).
+// ════════════════════════════════════════════════════════════════════════
+
+/// True when this install is entitled to the Fleet Logs feature: a commercial
+/// licence, or the Enterprise Patreon tier. Mirrors how the rest of the app
+/// reads tier off `PatreonState` and licence off `compat`.
+fn fleet_logs_entitled(state: &web::Data<AppState>) -> bool {
+    if crate::compat::platform_ready() {
+        return true;
+    }
+    let tier = { state.patreon.config.read().unwrap().tier.clone() };
+    matches!(tier, crate::patreon::PatreonTier::Enterprise)
+}
+
+/// 402-style refusal body for unentitled callers. Endpoints stay discoverable
+/// (so the UI can show a locked state) but return no data.
+fn fleet_logs_locked() -> HttpResponse {
+    HttpResponse::PaymentRequired().json(serde_json::json!({
+        "error": "Fleet Logs is an Enterprise feature.",
+        "entitled": false,
+        "upgrade": "https://wolfstack.org/enterprise.php",
+    }))
+}
+
+/// GET /api/logs/entitlement — lets the UI show the locked/unlocked state.
+/// Auth required; no tier gate (it reports the gate).
+async fn logs_entitlement(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) {
+        return resp;
+    }
+    let tier = { state.patreon.config.read().unwrap().tier.clone() };
+    HttpResponse::Ok().json(serde_json::json!({
+        "entitled": fleet_logs_entitled(&state),
+        "tier": serde_json::to_value(&tier).unwrap_or(serde_json::Value::Null),
+        "licensed": crate::compat::platform_ready(),
+    }))
+}
+
+/// POST /api/logs/ingest — shipper → hub batch ingest. Inter-node only: the
+/// shared cluster secret is mandatory; a browser session is NOT accepted here.
+async fn logs_ingest(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<Vec<crate::loghub::LogEvent>>,
+) -> HttpResponse {
+    let provided = req
+        .headers()
+        .get("X-WolfStack-Secret")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !crate::auth::validate_inter_node_secret(provided, &state.cluster_secret) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "invalid cluster secret"}));
+    }
+    // Only the designated hub stores logs. A non-hub node must never write
+    // ingest payloads — that would create orphaned, un-retained, unsearchable
+    // segments. The shipper only POSTs to the hub, so this is defence in depth
+    // against a momentary config disagreement (it'll retry once converged).
+    if !state.loghub.is_hub() {
+        return HttpResponse::NotFound()
+            .json(serde_json::json!({"error": "this node is not the log hub"}));
+    }
+    // Refuse while the janitor has paused ingest for low disk. 507 tells the
+    // shipper to keep spooling rather than drop.
+    if state.loghub.ingest_blocked.load(std::sync::atomic::Ordering::SeqCst) {
+        return HttpResponse::InsufficientStorage()
+            .json(serde_json::json!({"error": "ingest paused: low disk on hub"}));
+    }
+    let events = body.into_inner();
+    let root = state.loghub.store_root();
+    let loghub = state.loghub.clone();
+    let written = web::block(move || crate::loghub::store::append_events(&root, &events))
+        .await;
+    match written {
+        Ok(Ok(n)) => {
+            loghub.ingested.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            HttpResponse::Ok().json(serde_json::json!({"stored": n}))
+        }
+        _ => HttpResponse::InternalServerError().json(serde_json::json!({"error": "write failed"})),
+    }
+}
+
+/// GET /api/logs/search — query THIS node's local store. Enterprise-gated.
+async fn logs_search(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    q: web::Query<std::collections::HashMap<String, String>>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) {
+        return resp;
+    }
+    if !fleet_logs_entitled(&state) {
+        return fleet_logs_locked();
+    }
+    let root = state.loghub.store_root();
+    let query = serde_qs_from_map(&q).unwrap_or_default();
+    match web::block(move || crate::loghub::query::search(&root, &query)).await {
+        Ok(result) => HttpResponse::Ok().json(result),
+        Err(_) => HttpResponse::InternalServerError().json(serde_json::json!({"error": "search failed"})),
+    }
+}
+
+/// Where the cluster's log hub lives relative to this node.
+enum HubRoute {
+    /// This node IS the hub — serve from the local store.
+    Local,
+    /// The hub is a remote cluster node.
+    Remote(Box<crate::agent::Node>),
+    /// No hub configured (or it's not in the cluster membership).
+    NoHub,
+}
+
+fn logs_hub_route(state: &web::Data<AppState>) -> HubRoute {
+    let hub_id = { state.loghub.config.read().unwrap().hub_node_id.clone() };
+    let hub_id = match hub_id {
+        Some(h) => h,
+        None => return HubRoute::NoHub,
+    };
+    if hub_id == state.loghub.node_id {
+        return HubRoute::Local;
+    }
+    match state.cluster.get_all_nodes().into_iter().find(|n| n.id == hub_id) {
+        Some(n) => HubRoute::Remote(Box::new(n)),
+        None => HubRoute::NoHub,
+    }
+}
+
+/// GET a JSON path from a remote node over the inter-node secret. Tries the
+/// HTTPS-first URL chain; `None` if every attempt fails.
+async fn proxy_get_json(node: &crate::agent::Node, secret: &str, path: &str) -> Option<serde_json::Value> {
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .ok()?;
+    for url in build_node_urls(&node.address, node.port, path) {
+        if let Ok(r) = client.get(&url).header("X-WolfStack-Secret", secret).send().await {
+            if r.status().is_success() {
+                if let Ok(v) = r.json::<serde_json::Value>().await {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// GET /api/logs/cluster/search — query the cluster's hub. If this node is the
+/// hub, searches locally; otherwise proxies to the hub over the inter-node
+/// secret. Enterprise-gated. The UI always calls this variant so it never has
+/// to know where the hub is.
+async fn logs_cluster_search(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    q: web::Query<std::collections::HashMap<String, String>>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) {
+        return resp;
+    }
+    if !fleet_logs_entitled(&state) {
+        return fleet_logs_locked();
+    }
+    match logs_hub_route(&state) {
+        HubRoute::Local => {
+            let parsed = serde_qs_from_map(&q).unwrap_or_default();
+            let root = state.loghub.store_root();
+            match web::block(move || crate::loghub::query::search(&root, &parsed)).await {
+                Ok(result) => HttpResponse::Ok().json(result),
+                Err(_) => HttpResponse::InternalServerError()
+                    .json(serde_json::json!({"error": "search failed"})),
+            }
+        }
+        HubRoute::Remote(node) => {
+            let qs: String = q
+                .iter()
+                .map(|(k, v)| format!("{}={}", urlencoding_encode(k), urlencoding_encode(v)))
+                .collect::<Vec<_>>()
+                .join("&");
+            let path = format!("/api/logs/search?{qs}");
+            match proxy_get_json(&node, &state.cluster_secret, &path).await {
+                Some(v) => HttpResponse::Ok().json(v),
+                None => HttpResponse::BadGateway()
+                    .json(serde_json::json!({"error": "could not reach log hub"})),
+            }
+        }
+        HubRoute::NoHub => HttpResponse::Ok().json(serde_json::json!({
+            "events": [], "scanned": 0, "truncated": false, "note": "no hub configured",
+        })),
+    }
+}
+
+/// GET /api/logs/cluster/stats — store stats from the cluster's hub (local or
+/// proxied). Enterprise-gated.
+async fn logs_cluster_stats(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) {
+        return resp;
+    }
+    if !fleet_logs_entitled(&state) {
+        return fleet_logs_locked();
+    }
+    match logs_hub_route(&state) {
+        HubRoute::Local => logs_stats(req, state).await,
+        HubRoute::Remote(node) => {
+            match proxy_get_json(&node, &state.cluster_secret, "/api/logs/stats").await {
+                Some(v) => HttpResponse::Ok().json(v),
+                None => HttpResponse::BadGateway()
+                    .json(serde_json::json!({"error": "could not reach log hub"})),
+            }
+        }
+        HubRoute::NoHub => HttpResponse::Ok().json(serde_json::json!({
+            "stats": null, "is_hub": false, "note": "no hub configured",
+        })),
+    }
+}
+
+/// GET /api/logs/stats — store size/segment/disk stats from the hub.
+async fn logs_stats(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) {
+        return resp;
+    }
+    if !fleet_logs_entitled(&state) {
+        return fleet_logs_locked();
+    }
+    let root = state.loghub.store_root();
+    let loghub = state.loghub.clone();
+    let stats = web::block(move || crate::loghub::store::compute_stats(&root)).await;
+    match stats {
+        Ok(mut s) => {
+            s.ingest_blocked = loghub.ingest_blocked.load(std::sync::atomic::Ordering::SeqCst);
+            HttpResponse::Ok().json(serde_json::json!({
+                "stats": s,
+                "is_hub": loghub.is_hub(),
+                "ingested": loghub.ingested.load(std::sync::atomic::Ordering::Relaxed),
+                "dropped": loghub.dropped.load(std::sync::atomic::Ordering::Relaxed),
+            }))
+        }
+        Err(_) => HttpResponse::InternalServerError().json(serde_json::json!({"error": "stats failed"})),
+    }
+}
+
+/// GET /api/logs/config — current Fleet Logs config. Auth required; not
+/// gated so the UI can render settings (and the locked state) for any operator.
+async fn logs_config_get(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) {
+        return resp;
+    }
+    let cfg = { state.loghub.config.read().unwrap().clone() };
+    HttpResponse::Ok().json(serde_json::json!({
+        "config": cfg,
+        "self_node_id": state.loghub.node_id,
+        "entitled": fleet_logs_entitled(&state),
+    }))
+}
+
+/// PUT /api/logs/config — update Fleet Logs config. Enterprise-gated. Persists
+/// locally, updates in-memory state, and (best-effort) fans the new config out
+/// to every cluster node so the whole fleet agrees on the hub + settings.
+async fn logs_config_put(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<crate::loghub::LogHubConfig>,
+    q: web::Query<std::collections::HashMap<String, String>>,
+) -> HttpResponse {
+    // Inter-node config push authenticates with the cluster secret; an
+    // operator authenticates with a session. The secret only waives the
+    // *session* requirement (it IS an authenticated peer) — it does NOT waive
+    // entitlement. Entitlement is enforced on BOTH paths so a node that isn't
+    // licensed for Fleet Logs can't be enabled via the fan-out path either.
+    let is_internal = req
+        .headers()
+        .get("X-WolfStack-Secret")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| crate::auth::validate_inter_node_secret(s, &state.cluster_secret))
+        .unwrap_or(false);
+    if !is_internal {
+        if let Err(resp) = require_auth(&req, &state) {
+            return resp;
+        }
+    }
+    if !fleet_logs_entitled(&state) {
+        return fleet_logs_locked();
+    }
+
+    let new_cfg = body.into_inner();
+    if let Err(e) = new_cfg.save() {
+        return HttpResponse::InternalServerError().json(serde_json::json!({"error": e}));
+    }
+    {
+        let mut guard = state.loghub.config.write().unwrap();
+        *guard = new_cfg.clone();
+    }
+
+    // Fan out to the rest of the cluster unless this is itself an internal push
+    // (avoid an infinite ripple) or the caller opted out with ?fleet=false.
+    let fleet = q.get("fleet").map(|v| v != "false").unwrap_or(true);
+    if !is_internal && fleet {
+        let nodes = state.cluster.get_all_nodes();
+        let secret = state.cluster_secret.clone();
+        let self_id = state.loghub.node_id.clone();
+        let payload = new_cfg.clone();
+        // Spawn so the operator's PUT returns promptly; best-effort delivery.
+        tokio::spawn(async move {
+            let client = match reqwest::Client::builder()
+                .danger_accept_invalid_certs(true)
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+            {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            for n in nodes {
+                if n.id == self_id || n.node_type != "wolfstack" {
+                    continue;
+                }
+                for url in build_node_urls(&n.address, n.port, "/api/logs/config?fleet=false") {
+                    if let Ok(r) = client
+                        .request(reqwest::Method::PUT, &url)
+                        .header("X-WolfStack-Secret", &secret)
+                        .json(&payload)
+                        .send()
+                        .await
+                    {
+                        if r.status().is_success() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    HttpResponse::Ok().json(serde_json::json!({"ok": true, "config": new_cfg}))
+}
+
+/// Minimal percent-encoder for query passthrough (alnum + `-._~` pass).
+fn urlencoding_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Build a `SearchQuery` from a raw query-string map (used on the hub-local
+/// path of the cluster search, where we have the map already).
+fn serde_qs_from_map(
+    q: &std::collections::HashMap<String, String>,
+) -> Option<crate::loghub::query::SearchQuery> {
+    let get_i64 = |k: &str| q.get(k).and_then(|v| v.parse::<i64>().ok());
+    let get_str = |k: &str| q.get(k).filter(|v| !v.is_empty()).cloned();
+    let source = q.get("source").and_then(|s| {
+        serde_json::from_value(serde_json::Value::String(s.clone())).ok()
+    });
+    let level = q.get("level").and_then(|s| {
+        serde_json::from_value(serde_json::Value::String(s.clone())).ok()
+    });
+    Some(crate::loghub::query::SearchQuery {
+        from: get_i64("from"),
+        to: get_i64("to"),
+        node: get_str("node"),
+        source,
+        unit: get_str("unit"),
+        level,
+        q: get_str("q"),
+        limit: q
+            .get("limit")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1000)
+            .clamp(1, 10_000),
+    })
+}
+
 /// Configure all API routes
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg
@@ -34625,6 +35005,22 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         // is the first consumer, more groups (VMs, WolfNet) added later.
         .route("/api/system/deps/check",   web::get().to(system_deps_check))
         .route("/api/system/deps/install", web::post().to(system_deps_install))
+        // Fleet Logs (loghub) — cluster log aggregation / retention / search.
+        .route("/api/logs/entitlement",    web::get().to(logs_entitlement))
+        // Ingest carries log batches: lift the 2 MB Json default to 64 MB so
+        // real batches aren't rejected, but cap it so a hostile cluster-secret
+        // holder can't push a multi-GB body and OOM the hub.
+        .service(
+            web::resource("/api/logs/ingest")
+                .app_data(web::JsonConfig::default().limit(64 * 1024 * 1024))
+                .route(web::post().to(logs_ingest)),
+        )
+        .route("/api/logs/search",         web::get().to(logs_search))
+        .route("/api/logs/cluster/search", web::get().to(logs_cluster_search))
+        .route("/api/logs/cluster/stats",  web::get().to(logs_cluster_stats))
+        .route("/api/logs/stats",          web::get().to(logs_stats))
+        .route("/api/logs/config",         web::get().to(logs_config_get))
+        .route("/api/logs/config",         web::put().to(logs_config_put))
         // Auth (no auth required)
         .route("/api/auth/login", web::post().to(login))
         .route("/api/auth/logout", web::post().to(logout))

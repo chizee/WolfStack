@@ -5423,7 +5423,7 @@ dependencies = [
 
 [[package]]
 name = "wolfstack"
-version = "24.40.1"
+version = "24.41.0"
 dependencies = [
  "actix-files",
  "actix-multipart",
@@ -5473,6 +5473,7 @@ dependencies = [
  "webauthn-rs",
  "webpki-roots 0.26.11",
  "yescrypt",
+ "zstd",
 ]
 
 [[package]]

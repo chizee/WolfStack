@@ -7262,6 +7262,22 @@ dns_cloudflare_api_token = your_token_here"
             </div>
         </div>
 
+        <!-- ═══ Fleet Logs (loghub) ═══ -->
+        <div id="page-fleet-logs" class="page-view" style="display:none;">
+            <div style="display:flex;gap:4px;border-bottom:1px solid var(--border-color,#333);margin-bottom:16px;">
+                <button id="flog-tab-search" class="flog-tab" onclick="fleetLogsSwitch('search')"
+                        style="background:none;border:none;border-bottom:2px solid transparent;color:var(--text-muted);padding:10px 16px;font-size:13px;font-weight:600;cursor:pointer;">Search</button>
+                <button id="flog-tab-stats" class="flog-tab" onclick="fleetLogsSwitch('stats')"
+                        style="background:none;border:none;border-bottom:2px solid transparent;color:var(--text-muted);padding:10px 16px;font-size:13px;font-weight:600;cursor:pointer;">Storage</button>
+                <button id="flog-tab-settings" class="flog-tab" onclick="fleetLogsSwitch('settings')"
+                        style="background:none;border:none;border-bottom:2px solid transparent;color:var(--text-muted);padding:10px 16px;font-size:13px;font-weight:600;cursor:pointer;">Settings</button>
+            </div>
+            <div id="flog-locked" style="display:none;"></div>
+            <div id="flog-search-body"></div>
+            <div id="flog-stats-body" style="display:none;"></div>
+            <div id="flog-settings-body" style="display:none;"></div>
+        </div>
+
         <!-- ═══ Storage Manager ═══ -->
         <div id="page-storage" class="page-view" style="display:none;">
             <!-- Cross-link to the cluster-wide mdadm / NoNRAID array

@@ -175,6 +175,14 @@ pub struct FileLocations {
     pub sql_connections_config: String,
     #[serde(default = "default_sql_audit_log")]
     pub sql_audit_log: String,
+
+    // ── Fleet Logs (loghub) ───────────────────────
+    // Bulk log-segment store lives under the data dir, NOT /etc — it grows
+    // and is not config. Config (enable/hub/retention) is a small JSON file.
+    #[serde(default = "default_loghub_dir")]
+    pub loghub_dir: String,
+    #[serde(default = "default_loghub_config")]
+    pub loghub_config: String,
 }
 
 // ── Default value functions ──────────────────────────
@@ -255,6 +263,9 @@ fn default_ports_config() -> String { "/etc/wolfstack/ports.json".into() }
 
 fn default_sql_connections_config() -> String { "/etc/wolfstack/sql-connections.json".into() }
 fn default_sql_audit_log() -> String { "/var/log/wolfstack/sql-audit.log".into() }
+
+fn default_loghub_dir() -> String { "/var/lib/wolfstack/loghub".into() }
+fn default_loghub_config() -> String { "/etc/wolfstack/loghub.json".into() }
 
 impl Default for FileLocations {
     fn default() -> Self {

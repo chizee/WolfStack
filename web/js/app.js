@@ -1998,6 +1998,7 @@ function configuratorApiUrl(path) {
 // ─── Page Navigation ───
 function selectView(page) {
     closeSidebarMobile();
+    if (typeof fleetLogsStopTail === 'function') fleetLogsStopTail();
     // Close the embedded inbox terminal when leaving the inbox so the
     // WebSocket and xterm don't stay live in a hidden pane.
     if (currentPage === 'inbox' && page !== 'inbox' && typeof predTermClose === 'function') {
@@ -2015,7 +2016,7 @@ function selectView(page) {
     document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
     document.querySelector(`.nav-item[data-page="${page}"]`)?.classList.add('active');
 
-    const titles = { datacenter: 'Datacenter', learn: 'Getting Started', settings: 'Settings', docs: 'Help & Documentation', appstore: 'App Store', issues: 'Issues', inbox: 'Predictive Inbox', 'global-wolfnet': 'Global View', kubernetes: 'WolfKube', topology: '3D Server Room', wolfflow: 'WolfFlow', wolfagents: 'WolfAgents', 'cluster-browser': 'Cluster Browser', databases: 'Databases', 'control-panel': 'Control Panel', array: 'Storage Array', xopools: 'XO Pools', tenants: 'Tenants', 'fleet-security': 'Fleet Security', 'fleet-manage': 'Fleet', 'dashboard-sync': 'Dashboard Sync' };
+    const titles = { datacenter: 'Datacenter', learn: 'Getting Started', settings: 'Settings', docs: 'Help & Documentation', appstore: 'App Store', issues: 'Issues', inbox: 'Predictive Inbox', 'global-wolfnet': 'Global View', kubernetes: 'WolfKube', topology: '3D Server Room', wolfflow: 'WolfFlow', wolfagents: 'WolfAgents', 'cluster-browser': 'Cluster Browser', databases: 'Databases', 'control-panel': 'Control Panel', array: 'Storage Array', xopools: 'XO Pools', tenants: 'Tenants', 'fleet-security': 'Fleet Security', 'fleet-manage': 'Fleet', 'fleet-logs': 'Fleet Logs', 'dashboard-sync': 'Dashboard Sync' };
     document.getElementById('page-title').textContent = titles[page] || page;
 
     if (page === 'datacenter') {
@@ -2077,6 +2078,8 @@ function selectView(page) {
         renderFleetManage();
     } else if (page === 'dashboard-sync') {
         dashboardSyncLoad();
+    } else if (page === 'fleet-logs') {
+        fleetLogsInit();
     } else if (page === 'learn') {
         learnInit();
     }
@@ -2090,6 +2093,7 @@ function selectView(page) {
 
 function selectServerView(nodeId, view) {
     closeSidebarMobile();
+    if (typeof fleetLogsStopTail === 'function') fleetLogsStopTail();
     // Close the embedded inbox terminal when leaving the inbox.
     if (currentPage === 'inbox' && view !== 'inbox' && typeof predTermClose === 'function') {
         try { predTermClose(); } catch (_) {}
@@ -29558,6 +29562,342 @@ function tnHttpUrl(u) { return /^https?:\/\//i.test(u || '') ? u : ''; }
 // The sidebar's per-cluster "Storage" entry opens page-cluster-storage,
 // which hosts every integration (TrueNAS, Unraid, future Synology/…) as
 // tabs over their own body divs. Remembers the last tab within the session.
+// ════════════════════════════════════════════════════════════════════════
+//  Fleet Logs (loghub) — fleet-wide log aggregation, retention & search.
+//  Opened from the Apps & Tools drawer (a global view, not per-cluster: one
+//  hub stores the whole fleet's logs, tagged by node). selectView('fleet-logs')
+//  shows page-fleet-logs and sets the title; this just (re)loads the content.
+//  Data is served by the hub node — the backend proxies /api/logs/cluster/*.
+//  Enterprise-gated.
+// ════════════════════════════════════════════════════════════════════════
+
+function fleetLogsInit() {
+    fleetLogsStopTail();
+    fleetLogsCheckEntitlement();
+}
+window.fleetLogsInit = fleetLogsInit;
+
+async function fleetLogsCheckEntitlement() {
+    const lock = document.getElementById('flog-locked');
+    const tabs = document.querySelectorAll('.flog-tab');
+    let ent = { entitled: false, tier: 'none' };
+    try {
+        const r = await fetch('/api/logs/entitlement');
+        if (r.ok) ent = await r.json();
+    } catch (_) {}
+    if (!ent.entitled) {
+        tabs.forEach(b => b.style.display = 'none');
+        ['flog-search-body', 'flog-stats-body', 'flog-settings-body'].forEach(id => {
+            const e = document.getElementById(id); if (e) e.style.display = 'none';
+        });
+        if (lock) {
+            lock.style.display = 'block';
+            lock.innerHTML = `
+                <div style="max-width:560px;margin:48px auto;text-align:center;padding:32px;border:1px solid var(--border-color,#333);border-radius:12px;">
+                    <div style="font-size:28px;margin-bottom:8px;">🔒</div>
+                    <h2 style="margin:0 0 8px;color:var(--text-primary,#fff);">Fleet Logs is an Enterprise feature</h2>
+                    <p style="color:var(--text-muted);line-height:1.5;margin:0 0 18px;">
+                        Aggregate, retain and search every server's logs from one place — with
+                        zero collectors to babysit. Your current tier is
+                        <strong>${escapeHtml(String(ent.tier || 'none'))}</strong>.
+                    </p>
+                    <a href="https://wolfstack.org/enterprise.php" target="_blank" rel="noopener noreferrer"
+                       class="btn btn-primary" style="text-decoration:none;">See Enterprise →</a>
+                </div>`;
+        }
+        return;
+    }
+    if (lock) lock.style.display = 'none';
+    tabs.forEach(b => b.style.display = '');
+    fleetLogsSwitch(window._flogTab || 'search');
+}
+
+function fleetLogsSwitch(tab) {
+    window._flogTab = tab;
+    if (tab !== 'search') fleetLogsStopTail();
+    const map = { search: 'flog-tab-search', stats: 'flog-tab-stats', settings: 'flog-tab-settings' };
+    for (const [name, id] of Object.entries(map)) {
+        const btn = document.getElementById(id);
+        if (!btn) continue;
+        const on = name === tab;
+        btn.style.borderBottomColor = on ? 'var(--primary-color,#3b82f6)' : 'transparent';
+        btn.style.color = on ? 'var(--text-primary,#fff)' : 'var(--text-muted)';
+    }
+    const bodies = { search: 'flog-search-body', stats: 'flog-stats-body', settings: 'flog-settings-body' };
+    for (const [name, id] of Object.entries(bodies)) {
+        const e = document.getElementById(id); if (e) e.style.display = name === tab ? '' : 'none';
+    }
+    if (tab === 'search') fleetLogsRenderSearch();
+    else if (tab === 'stats') fleetLogsLoadStats();
+    else if (tab === 'settings') fleetLogsLoadSettings();
+}
+window.fleetLogsSwitch = fleetLogsSwitch;
+
+function flogBytes(n) {
+    n = Number(n) || 0;
+    const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let i = 0;
+    while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+    return `${n.toFixed(i ? 1 : 0)} ${u[i]}`;
+}
+
+function flogLevelColor(level) {
+    switch (level) {
+        case 'emerg': case 'alert': case 'crit': case 'error': return '#ef4444';
+        case 'warning': return '#f59e0b';
+        case 'notice': return '#3b82f6';
+        case 'debug': return 'var(--text-muted)';
+        default: return 'var(--text-secondary,#aaa)';
+    }
+}
+
+function fleetLogsRenderSearch() {
+    const body = document.getElementById('flog-search-body');
+    if (!body) return;
+    // Build the node options from known cluster nodes.
+    const nodeOpts = (Array.isArray(allNodes) ? allNodes : [])
+        .filter(n => (n.node_type || 'wolfstack') === 'wolfstack')
+        .map(n => `<option value="${escapeHtml(n.id)}">${escapeHtml(n.hostname || n.id)}</option>`)
+        .join('');
+    body.innerHTML = `
+        <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end;margin-bottom:14px;">
+            <div style="flex:1;min-width:200px;">
+                <label style="display:block;font-size:11px;color:var(--text-muted);margin-bottom:3px;">Search text</label>
+                <input id="flog-q" type="text" placeholder="message contains…" onkeydown="if(event.key==='Enter')fleetLogsDoSearch()"
+                       style="width:100%;padding:7px 10px;border:1px solid var(--border-color,#333);border-radius:6px;background:var(--input-bg,#1a1a1a);color:var(--text-primary,#fff);">
+            </div>
+            <div>
+                <label style="display:block;font-size:11px;color:var(--text-muted);margin-bottom:3px;">Node</label>
+                <select id="flog-node" style="padding:7px 10px;border:1px solid var(--border-color,#333);border-radius:6px;background:var(--input-bg,#1a1a1a);color:var(--text-primary,#fff);">
+                    <option value="">All nodes</option>${nodeOpts}
+                </select>
+            </div>
+            <div>
+                <label style="display:block;font-size:11px;color:var(--text-muted);margin-bottom:3px;">Source</label>
+                <select id="flog-source" style="padding:7px 10px;border:1px solid var(--border-color,#333);border-radius:6px;background:var(--input-bg,#1a1a1a);color:var(--text-primary,#fff);">
+                    <option value="">All</option><option value="journald">journald</option>
+                    <option value="docker">Docker</option><option value="lxc">LXC</option>
+                </select>
+            </div>
+            <div>
+                <label style="display:block;font-size:11px;color:var(--text-muted);margin-bottom:3px;">Severity</label>
+                <select id="flog-level" style="padding:7px 10px;border:1px solid var(--border-color,#333);border-radius:6px;background:var(--input-bg,#1a1a1a);color:var(--text-primary,#fff);">
+                    <option value="">All</option><option value="error">Errors+</option>
+                    <option value="warning">Warnings+</option><option value="notice">Notice+</option>
+                </select>
+            </div>
+            <div>
+                <label style="display:block;font-size:11px;color:var(--text-muted);margin-bottom:3px;">Window</label>
+                <select id="flog-window" style="padding:7px 10px;border:1px solid var(--border-color,#333);border-radius:6px;background:var(--input-bg,#1a1a1a);color:var(--text-primary,#fff);">
+                    <option value="900">Last 15m</option><option value="3600" selected>Last 1h</option>
+                    <option value="21600">Last 6h</option><option value="86400">Last 24h</option>
+                    <option value="604800">Last 7d</option><option value="0">All time</option>
+                </select>
+            </div>
+            <button class="btn btn-primary" onclick="fleetLogsDoSearch()">Search</button>
+            <button id="flog-tail-btn" class="btn" onclick="fleetLogsToggleTail()">▶ Live tail</button>
+        </div>
+        <div id="flog-results-meta" style="font-size:12px;color:var(--text-muted);margin-bottom:6px;"></div>
+        <div id="flog-results" role="log" aria-live="polite"
+             style="font-family:var(--mono,monospace);font-size:12px;line-height:1.5;max-height:62vh;overflow:auto;border:1px solid var(--border-color,#333);border-radius:8px;background:var(--input-bg,#0d0d0d);"></div>`;
+    fleetLogsDoSearch();
+}
+
+async function fleetLogsDoSearch() {
+    const results = document.getElementById('flog-results');
+    const meta = document.getElementById('flog-results-meta');
+    if (!results) return;
+    const q = (document.getElementById('flog-q')?.value || '').trim();
+    const node = document.getElementById('flog-node')?.value || '';
+    const source = document.getElementById('flog-source')?.value || '';
+    const level = document.getElementById('flog-level')?.value || '';
+    const win = parseInt(document.getElementById('flog-window')?.value || '3600', 10);
+    const params = new URLSearchParams();
+    if (q) params.set('q', q);
+    if (node) params.set('node', node);
+    if (source) params.set('source', source);
+    if (level) params.set('level', level);
+    if (win > 0) params.set('from', String(Date.now() - win * 1000));
+    params.set('limit', '500');
+    try {
+        const r = await fetch('/api/logs/cluster/search?' + params.toString());
+        if (!r.ok) {
+            const e = await r.json().catch(() => ({}));
+            results.innerHTML = `<div style="padding:24px;color:#ef4444;">${escapeHtml(e.error || ('Search failed (' + r.status + ')'))}</div>`;
+            if (meta) meta.textContent = '';
+            return;
+        }
+        const data = await r.json();
+        const events = data.events || [];
+        if (meta) {
+            let m = `${events.length} line${events.length === 1 ? '' : 's'}`;
+            if (data.scanned) m += ` · scanned ${data.scanned.toLocaleString()}`;
+            if (data.truncated) m += ` · ⚠ results capped — narrow the window or filters`;
+            if (data.note) m += ` · ${escapeHtml(data.note)}`;
+            meta.textContent = m;
+        }
+        if (!events.length) {
+            results.innerHTML = `<div style="padding:24px;color:var(--text-muted);text-align:center;">No matching log lines in this window.</div>`;
+            return;
+        }
+        const nodeName = {};
+        (Array.isArray(allNodes) ? allNodes : []).forEach(n => { nodeName[n.id] = n.hostname || n.id; });
+        results.innerHTML = events.map(ev => {
+            const when = new Date(ev.ts).toLocaleString();
+            const col = flogLevelColor(ev.level);
+            return `<div style="display:flex;gap:10px;padding:3px 10px;border-bottom:1px solid rgba(255,255,255,0.04);">
+                <span style="color:var(--text-muted);white-space:nowrap;">${escapeHtml(when)}</span>
+                <span style="color:#3b82f6;white-space:nowrap;min-width:90px;">${escapeHtml(nodeName[ev.node] || ev.node)}</span>
+                <span style="color:var(--text-secondary,#aaa);white-space:nowrap;min-width:120px;overflow:hidden;text-overflow:ellipsis;max-width:180px;" title="${escapeHtml(ev.unit)}">${escapeHtml(ev.unit)}</span>
+                <span style="color:${col};white-space:nowrap;text-transform:uppercase;font-size:10px;min-width:54px;">${escapeHtml(ev.level)}</span>
+                <span style="color:var(--text-primary,#fff);white-space:pre-wrap;word-break:break-word;flex:1;">${escapeHtml(ev.msg)}</span>
+            </div>`;
+        }).join('');
+    } catch (e) {
+        results.innerHTML = `<div style="padding:24px;color:#ef4444;">Search error: ${escapeHtml(String(e))}</div>`;
+    }
+}
+window.fleetLogsDoSearch = fleetLogsDoSearch;
+
+function fleetLogsToggleTail() {
+    const btn = document.getElementById('flog-tail-btn');
+    if (window._flogTailTimer) {
+        fleetLogsStopTail();
+        if (btn) { btn.textContent = '▶ Live tail'; btn.classList.remove('btn-primary'); }
+    } else {
+        window._flogTailTimer = setInterval(fleetLogsDoSearch, 3000);
+        if (btn) { btn.textContent = '⏸ Live tail'; btn.classList.add('btn-primary'); }
+        fleetLogsDoSearch();
+    }
+}
+window.fleetLogsToggleTail = fleetLogsToggleTail;
+
+function fleetLogsStopTail() {
+    if (window._flogTailTimer) { clearInterval(window._flogTailTimer); window._flogTailTimer = null; }
+}
+
+async function fleetLogsLoadStats() {
+    const body = document.getElementById('flog-stats-body');
+    if (!body) return;
+    body.innerHTML = `<div style="color:var(--text-muted);text-align:center;padding:48px;">Loading…</div>`;
+    try {
+        const r = await fetch('/api/logs/cluster/stats');
+        const data = r.ok ? await r.json() : {};
+        const s = data.stats;
+        if (!s) {
+            body.innerHTML = `<div style="padding:24px;color:var(--text-muted);">${escapeHtml(data.note || 'No hub configured — set one in Settings.')}</div>`;
+            return;
+        }
+        const blockedBanner = s.ingest_blocked
+            ? `<div role="alert" style="background:#7f1d1d;color:#fff;padding:10px 14px;border-radius:8px;margin-bottom:14px;">⚠ Ingest is paused — the hub's disk dropped below the free-space floor. Existing logs are retained; new logs are spooling on each node and resume automatically once headroom recovers.</div>`
+            : '';
+        const droppedBanner = (data.dropped > 0)
+            ? `<div role="alert" style="background:#78350f;color:#fff;padding:8px 14px;border-radius:8px;margin-bottom:14px;">⚠ ${Number(data.dropped).toLocaleString()} event(s) were dropped from a node spool while the hub was unreachable.</div>`
+            : '';
+        const card = (label, val) => `<div style="border:1px solid var(--border-color,#333);border-radius:8px;padding:14px;min-width:150px;">
+            <div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;">${label}</div>
+            <div style="font-size:20px;font-weight:700;color:var(--text-primary,#fff);margin-top:4px;">${val}</div></div>`;
+        body.innerHTML = blockedBanner + droppedBanner + `
+            <div style="display:flex;flex-wrap:wrap;gap:12px;">
+                ${card('Stored', flogBytes(s.store_bytes))}
+                ${card('Segments', Number(s.segment_count || 0).toLocaleString())}
+                ${card('Nodes', Number(s.node_count || 0).toLocaleString())}
+                ${card('Disk free', s.free_pct != null ? s.free_pct.toFixed(1) + '%' : '—')}
+                ${card('Events ingested', Number(data.ingested || 0).toLocaleString())}
+                ${card('This node is hub', data.is_hub ? 'Yes' : 'No')}
+            </div>
+            <div style="margin-top:14px;font-size:12px;color:var(--text-muted);">
+                ${s.oldest_ts ? 'Oldest: ' + new Date(s.oldest_ts).toLocaleDateString() : 'No data yet'}
+                ${s.newest_ts ? ' · Newest: ' + new Date(s.newest_ts).toLocaleDateString() : ''}
+            </div>`;
+    } catch (e) {
+        body.innerHTML = `<div style="padding:24px;color:#ef4444;">Failed to load stats: ${escapeHtml(String(e))}</div>`;
+    }
+}
+
+async function fleetLogsLoadSettings() {
+    const body = document.getElementById('flog-settings-body');
+    if (!body) return;
+    body.innerHTML = `<div style="color:var(--text-muted);text-align:center;padding:48px;">Loading…</div>`;
+    let cfg = {}, selfId = '';
+    try {
+        const r = await fetch('/api/logs/config');
+        if (r.ok) { const d = await r.json(); cfg = d.config || {}; selfId = d.self_node_id || ''; }
+    } catch (_) {}
+    const nodeOpts = (Array.isArray(allNodes) ? allNodes : [])
+        .filter(n => (n.node_type || 'wolfstack') === 'wolfstack')
+        .map(n => `<option value="${escapeHtml(n.id)}"${n.id === cfg.hub_node_id ? ' selected' : ''}>${escapeHtml(n.hostname || n.id)}${n.id === selfId ? ' (this node)' : ''}</option>`)
+        .join('');
+    const gb = ((cfg.max_bytes || 0) / (1024 * 1024 * 1024)) || 10;
+    const chk = (id, on, label, hint) => `<label style="display:flex;align-items:center;gap:8px;margin:6px 0;color:var(--text-primary,#fff);">
+        <input type="checkbox" id="${id}"${on ? ' checked' : ''}> <span>${label}</span>
+        ${hint ? `<span style="color:var(--text-muted);font-size:11px;">${hint}</span>` : ''}</label>`;
+    const fld = (lbl, inner) => `<div style="margin-bottom:12px;"><label style="display:block;font-size:12px;color:var(--text-muted);margin-bottom:4px;">${lbl}</label>${inner}</div>`;
+    const inputStyle = 'padding:7px 10px;border:1px solid var(--border-color,#333);border-radius:6px;background:var(--input-bg,#1a1a1a);color:var(--text-primary,#fff);';
+    body.innerHTML = `
+        <div style="max-width:680px;">
+            <p style="color:var(--text-muted);font-size:12px;line-height:1.5;margin:0 0 16px;">
+                Fleet Logs settings apply to the <strong>whole fleet</strong>. One hub node stores every server's
+                logs; all other nodes ship to it. Saving pushes the config to every node automatically.
+            </p>
+            ${chk('flog-enabled', cfg.enabled, 'Enable Fleet Logs', '(off = nothing ships or stores)')}
+            ${fld('Hub node (stores the logs)', `<select id="flog-hub" style="${inputStyle}width:100%;"><option value="">— none —</option>${nodeOpts}</select>`)}
+            <div style="display:flex;gap:16px;flex-wrap:wrap;">
+                ${fld('Retention (days)', `<input id="flog-retention" type="number" min="1" value="${Number(cfg.retention_days || 14)}" style="${inputStyle}width:120px;">`)}
+                ${fld('Max store size (GB)', `<input id="flog-maxgb" type="number" min="1" step="1" value="${Math.max(1, Math.round(gb))}" style="${inputStyle}width:120px;">`)}
+                ${fld('Min disk free (%)', `<input id="flog-minfree" type="number" min="1" max="90" value="${Number(cfg.min_free_pct || 10)}" style="${inputStyle}width:120px;">`)}
+            </div>
+            <div style="margin:10px 0;">
+                <div style="font-size:12px;color:var(--text-muted);margin-bottom:4px;">Sources</div>
+                ${chk('flog-journald', cfg.ship_journald !== false, 'System logs (journald)')}
+                ${chk('flog-docker', cfg.ship_docker, 'Docker container logs')}
+                ${chk('flog-lxc', cfg.ship_lxc, 'LXC container logs')}
+            </div>
+            ${chk('flog-redact', cfg.redaction_builtin !== false, 'Redact secrets before storing', '(passwords, tokens, API keys, auth headers)')}
+            ${fld('Extra redaction patterns (one regex per line)', `<textarea id="flog-redact-extra" rows="2" style="${inputStyle}width:100%;font-family:var(--mono,monospace);">${escapeHtml((cfg.redaction_patterns || []).join('\n'))}</textarea>`)}
+            ${fld('Unit/container denylist (one per line, substring match)', `<textarea id="flog-denylist" rows="2" style="${inputStyle}width:100%;font-family:var(--mono,monospace);">${escapeHtml((cfg.unit_denylist || []).join('\n'))}</textarea>`)}
+            <button class="btn btn-primary" onclick="fleetLogsSaveSettings()">Save &amp; push to fleet</button>
+        </div>`;
+}
+
+async function fleetLogsSaveSettings() {
+    const lines = id => (document.getElementById(id)?.value || '')
+        .split('\n').map(s => s.trim()).filter(Boolean);
+    const cfg = {
+        enabled: !!document.getElementById('flog-enabled')?.checked,
+        hub_node_id: document.getElementById('flog-hub')?.value || null,
+        retention_days: parseInt(document.getElementById('flog-retention')?.value || '14', 10),
+        max_bytes: Math.max(1, parseInt(document.getElementById('flog-maxgb')?.value || '10', 10)) * 1024 * 1024 * 1024,
+        min_free_pct: parseFloat(document.getElementById('flog-minfree')?.value || '10'),
+        ship_journald: !!document.getElementById('flog-journald')?.checked,
+        ship_docker: !!document.getElementById('flog-docker')?.checked,
+        ship_lxc: !!document.getElementById('flog-lxc')?.checked,
+        redaction_builtin: !!document.getElementById('flog-redact')?.checked,
+        redaction_patterns: lines('flog-redact-extra'),
+        unit_denylist: lines('flog-denylist'),
+    };
+    if (cfg.enabled && !cfg.hub_node_id) {
+        showToast('Pick a hub node before enabling Fleet Logs.', 'error');
+        return;
+    }
+    try {
+        const r = await fetch('/api/logs/config', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(cfg),
+        });
+        if (r.ok) {
+            showToast('Fleet Logs settings saved and pushed to the fleet.', 'success');
+        } else {
+            const e = await r.json().catch(() => ({}));
+            showToast(e.error || ('Save failed (' + r.status + ')'), 'error');
+        }
+    } catch (e) {
+        showToast('Save error: ' + e, 'error');
+    }
+}
+window.fleetLogsSaveSettings = fleetLogsSaveSettings;
+
 function showClusterStorage(clusterName) {
     closeSidebarMobile();
     window._storageCluster = clusterName;
@@ -63850,6 +64190,10 @@ const APP_DRAWER_TILES = [
     {
         id: 'array', icon: '', name: 'Storage Array',
         desc: 'mdadm / NoNRAID parity arrays. Status, parity checks, drive alerts.',
+    },
+    {
+        id: 'fleet-logs', icon: '', name: 'Fleet Logs',
+        desc: 'Aggregate, retain and search every server\'s logs from one hub — journald, Docker, LXC — with zero collectors to babysit. Enterprise.',
     },
 ];
 
