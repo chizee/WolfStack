@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v24.43.2: LXC containers on Fedora/SELinux — stop writing an AppArmor key their LXC can't parse** _(2026-06-13 — [`fec3d48`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/fec3d4845bca7c3deaf14f31012dfba1c3d0129e))_
 - **v24.43.1: WolfUSB survives source reboot + first-attach reliability; calmer 2FA login** _(2026-06-13 — [`afc8d99`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/afc8d9906d8ba40bc95513514bb8df1a86de0017))_
 - **v24.43.0: auto-refresh package index for the vulnerability scanner** _(2026-06-13 — [`73f9c01`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/73f9c01c42602f2ba581ed3bf4a624ef6c361724))_
 - **v24.42.0: WolfProxy/Nginx configurator — cluster node selector** _(2026-06-13 — [`e843cdb`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/e843cdb97126e7903af771df4e35824580ff739e))_
