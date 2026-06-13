@@ -56,6 +56,7 @@ mod wolfnote;
 mod wolfusb;
 mod dashboard_sync;
 mod paths;
+mod loghub;
 mod ports;
 mod reverse_proxy;
 mod control_panel;
@@ -686,6 +687,7 @@ async fn main() -> std::io::Result<()> {
             diag_control: Arc::new(diag::Control::new()),
             wireguard_bridges: Arc::new(std::sync::RwLock::new(networking::load_wireguard_bridges())),
             patreon: Arc::new(patreon::PatreonState::new()),
+            loghub: Arc::new(loghub::LogHubState::new(node_id.clone())),
             migration_tasks: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             alert_log: Arc::new(std::sync::RwLock::new(Vec::new())),
             password_reset_tokens: Arc::new(auth::PasswordResetTokens::new()),
@@ -862,6 +864,15 @@ async fn main() -> std::io::Result<()> {
         // so SSH and Proxmox brute-force attacks trigger the same
         // kernel-block + fleet propagation as WolfStack-UI attacks.
         crate::auth::log_monitor::start_monitor(app_state.login_limiter.clone());
+        // Start the Fleet Logs shipper + janitor threads. Both idle cheaply
+        // while the feature is disabled (off by default), so this is a no-op
+        // on installs that never opt in. They re-read config each tick, so
+        // enabling/configuring at runtime takes effect without a restart.
+        crate::loghub::start(
+            app_state.loghub.clone(),
+            app_state.cluster.clone(),
+            app_state.cluster_secret.clone(),
+        );
         // Diagnostic listener — see src/diag.rs.
         crate::diag::start(
             app_state.login_limiter.clone(),
