@@ -1450,6 +1450,17 @@
                         <div style="font-size:12px; color:var(--text-muted);">No IPs are currently blocked.</div>
                     </div>
 
+                    <div style="margin:14px 0 4px; padding-top:14px; border-top:1px solid var(--border);">
+                        <label for="security-unblock-ip" style="display:block; font-size:13px; font-weight:600; color:var(--text-secondary); margin-bottom:6px;">Unblock an IP</label>
+                        <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+                            <input type="text" id="security-unblock-ip" placeholder="e.g. 203.0.113.7" autocomplete="off"
+                                onkeydown="if(event.key==='Enter'){event.preventDefault();securityManualUnblockIp();}"
+                                style="font-family:var(--font-mono); font-size:12px; padding:6px 9px; min-width:200px; border:1px solid var(--border); border-radius:6px; background:var(--bg-secondary); color:var(--text-primary);">
+                            <button class="btn btn-sm" onclick="securityManualUnblockIp()" style="font-size:12px;">Unblock</button>
+                        </div>
+                        <div style="font-size:11px; color:var(--text-muted); margin-top:6px;">Removes the kernel iptables DROP rule and clears the lockout — on this node and every peer. Use for an IP that's blocked but isn't in the list above (e.g. one you blocked manually or that was propagated from another node).</div>
+                    </div>
+
                     <h4 style="margin:18px 0 6px; font-size:13px; color:var(--text-secondary);">Recent auth attempts (last 100)</h4>
                     <div id="security-auth-log" style="max-height:300px; overflow-y:auto; border:1px solid var(--border); border-radius:6px;">
                         <div style="padding:12px; font-size:12px; color:var(--text-muted);">Loading…</div>

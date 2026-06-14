@@ -18187,8 +18187,25 @@ async function securitySaveLockoutConfig() {
     }
 }
 
+// Manual unblock: operator types an IP that isn't in the lockout list (e.g. one
+// blocked manually, by a scan trip, or propagated from a peer) and lifts it.
+// Delegates to securityUnblockIp, which confirms + unblocks fleet-wide.
+async function securityManualUnblockIp() {
+    const input = document.getElementById('security-unblock-ip');
+    const ip = (input?.value || '').trim();
+    if (!ip) { showToast('Enter an IP address to unblock', 'warning'); return; }
+    // Light sanity check — the backend ignores a malformed IP, but catch typos
+    // before we fan a no-op out to every peer.
+    if (!/^[0-9a-fA-F:.]+$/.test(ip) || !(ip.includes('.') || ip.includes(':'))) {
+        showToast(`"${ip}" doesn't look like an IP address`, 'error');
+        return;
+    }
+    const ok = await securityUnblockIp(ip);
+    if (ok && input) input.value = '';
+}
+
 async function securityUnblockIp(ip) {
-    if (!await wolfConfirm(`Unblock ${ip} on this node AND all peers? This removes the kernel iptables DROP rule fleet-wide.`, 'Unblock IP')) return;
+    if (!await wolfConfirm(`Unblock ${ip} on this node AND all peers? This removes the kernel iptables DROP rule fleet-wide.`, 'Unblock IP')) return false;
     try {
         const resp = await fetch(apiUrl('/api/security/auth-unblock'), {
             method: 'POST',
@@ -18198,18 +18215,21 @@ async function securityUnblockIp(ip) {
         const data = await resp.json();
         if (!resp.ok) {
             showToast(data.error || 'Unblock failed', 'error');
-            return;
+            return false;
         }
         showToast(`Unblocked ${ip} fleet-wide`, 'success');
         securityRefreshLockouts();
+        return true;
     } catch (e) {
         showToast(`Unblock failed: ${e.message || e}`, 'error');
+        return false;
     }
 }
 
 window.securityRefreshLockouts = securityRefreshLockouts;
 window.securitySaveLockoutConfig = securitySaveLockoutConfig;
 window.securityUnblockIp = securityUnblockIp;
+window.securityManualUnblockIp = securityManualUnblockIp;
 
 async function gandalfRefresh() {
     const cb = document.getElementById('gandalf-checkbox');
