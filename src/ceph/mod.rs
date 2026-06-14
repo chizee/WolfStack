@@ -69,6 +69,25 @@ pub struct CephClusterStatus {
     pub rbd_images: Vec<RbdImage>,
     #[serde(default)]
     pub crush_rules: Vec<CrushRule>,
+    /// Operational OSD-map flags currently set (e.g. noout, norebalance, pause).
+    /// Only the flags an operator toggles are surfaced — internal always-on
+    /// flags (sortbitwise, …) are filtered out so the maintenance view is clear.
+    #[serde(default)]
+    pub flags: Vec<String>,
+    /// Recovery/backfill progress. Non-zero only while the cluster is healing —
+    /// this is how the operator sees "is it still recovering, and how fast".
+    #[serde(default)]
+    pub degraded_objects: u64,
+    #[serde(default)]
+    pub misplaced_objects: u64,
+    #[serde(default)]
+    pub recovering_bytes_per_sec: u64,
+    /// MDS daemons (for CephFS). Empty when no filesystem is deployed.
+    #[serde(default)]
+    pub mds: Vec<CephMds>,
+    /// Whether the automatic PG balancer is currently on.
+    #[serde(default)]
+    pub balancer_on: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,6 +179,19 @@ pub struct CephFilesystem {
     pub active_mds: u32,
     #[serde(default)]
     pub standby_mds: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CephMds {
+    pub name: String,
+    /// e.g. "up:active", "up:standby", "up:standby-replay".
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub rank: i64,
+    /// Which filesystem this MDS serves (empty for a pure standby).
+    #[serde(default)]
+    pub filesystem: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -368,6 +400,12 @@ pub fn get_cluster_status() -> CephClusterStatus {
             status.available_bytes = pgmap.get("bytes_avail").and_then(|b| b.as_u64()).unwrap_or(0);
             status.objects = pgmap.get("num_objects").and_then(|n| n.as_u64()).unwrap_or(0);
 
+            // Recovery/backfill progress — present only while healing. These tell
+            // the operator the cluster is actively repairing and at what rate.
+            status.degraded_objects = pgmap.get("degraded_objects").and_then(|n| n.as_u64()).unwrap_or(0);
+            status.misplaced_objects = pgmap.get("misplaced_objects").and_then(|n| n.as_u64()).unwrap_or(0);
+            status.recovering_bytes_per_sec = pgmap.get("recovering_bytes_per_sec").and_then(|n| n.as_u64()).unwrap_or(0);
+
             if let Some(pgs_by_state) = pgmap.get("pgs_by_state").and_then(|p| p.as_array()) {
                 let parts: Vec<String> = pgs_by_state.iter().filter_map(|entry| {
                     let name = entry.get("state_name")?.as_str()?;
@@ -382,6 +420,25 @@ pub fn get_cluster_status() -> CephClusterStatus {
     // Get ceph version
     if let Ok(ver) = ceph_text(&["version"]) {
         status.ceph_version = ver;
+    }
+
+    // Operational OSD-map flags (noout, norebalance, pause, …). `ceph osd dump`
+    // returns a comma-joined "flags" string that also includes always-on
+    // internal flags (sortbitwise, recovery_deletes, …); surface only the ones
+    // an operator actually toggles so the maintenance view stays readable.
+    if let Ok(dump) = ceph_json(&["osd", "dump"])
+        && let Some(flags) = dump.get("flags").and_then(|f| f.as_str())
+    {
+        status.flags = flags.split(',')
+            .map(|f| f.trim())
+            .filter(|f| OPERATIONAL_FLAGS.contains(f))
+            .map(|f| f.to_string())
+            .collect();
+    }
+
+    // Balancer state (mgr module; may be unavailable on a degraded cluster).
+    if let Ok(bal) = ceph_json(&["balancer", "status"]) {
+        status.balancer_on = bal.get("active").and_then(|a| a.as_bool()).unwrap_or(false);
     }
 
     // Get OSD details
@@ -537,6 +594,53 @@ pub fn get_cluster_status() -> CephClusterStatus {
         }
     }
 
+    // MDS daemons (only relevant once a CephFS exists). `ceph fs dump` lists each
+    // filesystem's active MDS map (info) plus a global standbys array. We build a
+    // flat daemon list AND backfill per-fs active/standby counts so the UI can
+    // show "is my filesystem served and does it have a standby for failover".
+    if !status.filesystems.is_empty()
+        && let Ok(dump) = ceph_json(&["fs", "dump"])
+    {
+        if let Some(fss) = dump.get("filesystems").and_then(|f| f.as_array()) {
+            for fs in fss {
+                let mdsmap = match fs.get("mdsmap") { Some(m) => m, None => continue };
+                let fs_name = mdsmap.get("fs_name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                let mut active = 0u32;
+                if let Some(info) = mdsmap.get("info").and_then(|i| i.as_object()) {
+                    for (_gid, d) in info {
+                        let name = d.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                        let state = d.get("state").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                        let rank = d.get("rank").and_then(|r| r.as_i64()).unwrap_or(-1);
+                        if state.starts_with("up:active") || state.starts_with("up:replay")
+                            || state.starts_with("up:reconnect") || state.starts_with("up:rejoin")
+                            || state.starts_with("up:clientreplay") {
+                            active += 1;
+                        }
+                        status.mds.push(CephMds { name, state, rank, filesystem: fs_name.clone() });
+                    }
+                }
+                if let Some(f) = status.filesystems.iter_mut().find(|f| f.name == fs_name) {
+                    f.active_mds = active;
+                }
+            }
+        }
+        // Global standbys aren't bound to a single filesystem.
+        if let Some(standbys) = dump.get("standbys").and_then(|s| s.as_array()) {
+            for d in standbys {
+                let name = d.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                let state = d.get("state").and_then(|s| s.as_str()).unwrap_or("up:standby").to_string();
+                let rank = d.get("rank").and_then(|r| r.as_i64()).unwrap_or(-1);
+                status.mds.push(CephMds { name, state, rank, filesystem: String::new() });
+            }
+            let standby_total = standbys.len() as u32;
+            // Surface the shared standby pool against each filesystem (standbys
+            // can take over any rank), so a single-fs cluster reads correctly.
+            for f in status.filesystems.iter_mut() {
+                f.standby_mds = standby_total;
+            }
+        }
+    }
+
     status
 }
 
@@ -547,9 +651,8 @@ pub fn create_pool(name: &str, pg_num: u32, pool_type: &str, size: Option<u32>, 
     if name.is_empty() { return Err("Pool name is required".into()); }
     let pg = if pg_num == 0 { 32 } else { pg_num };
 
-    let mut args = vec!["osd", "pool", "create", name, &pg.to_string()];
     let pg_str = pg.to_string();
-    args = vec!["osd", "pool", "create", name, &pg_str];
+    let mut args = vec!["osd", "pool", "create", name, &pg_str];
 
     if pool_type == "erasure" {
         args.push("erasure");
@@ -671,6 +774,222 @@ pub fn set_osd_in(osd_id: u32, mark_in: bool) -> Result<String, String> {
     let id_str = osd_id.to_string();
     let action = if mark_in { "in" } else { "out" };
     ceph_text(&["osd", action, &id_str])
+}
+
+/// Mark an OSD down. Used to evict a hung/flapping OSD so the cluster stops
+/// waiting on it; the OSD will be marked up again automatically if its daemon
+/// is still alive and healthy, so this is a nudge, not a removal.
+pub fn mark_osd_down(osd_id: u32) -> Result<String, String> {
+    ceph_text(&["osd", "down", &osd_id.to_string()])?;
+    info!("Marked osd.{} down", osd_id);
+    Ok(format!("osd.{} marked down", osd_id))
+}
+
+/// Trigger a scrub (or deep-scrub) of every PG on an OSD. Scrub checks metadata
+/// consistency; deep-scrub also re-reads object data and is what surfaces (and,
+/// with a follow-up repair, fixes) bit-rot.
+pub fn osd_scrub(osd_id: u32, deep: bool) -> Result<String, String> {
+    let verb = if deep { "deep-scrub" } else { "scrub" };
+    ceph_text(&["osd", verb, &osd_id.to_string()])?;
+    Ok(format!("osd.{} {} scheduled", osd_id, verb))
+}
+
+// ─── Cluster Maintenance / Repair ───
+
+/// OSD-map flags an operator may toggle from the maintenance view. Whitelisted
+/// so the API can never hand an arbitrary token to `ceph osd set`, and so the
+/// status view filters `ceph osd dump`'s flag string down to the operationally
+/// meaningful ones (hiding always-on internals like sortbitwise).
+///
+/// Source: docs.ceph.com — rados/operations/health-checks (OSDMAP_FLAGS) and
+/// `ceph osd set --help` flag list.
+pub const OPERATIONAL_FLAGS: &[&str] = &[
+    "noout",        // don't mark OSDs out (maintenance — stop rebalance on a down OSD)
+    "noin",         // don't mark OSDs in automatically
+    "nodown",       // ignore OSD failure reports
+    "noup",         // don't mark OSDs up
+    "norebalance",  // don't move PGs for balancing (but recovery still runs)
+    "norecover",    // pause recovery
+    "nobackfill",   // pause backfill
+    "noscrub",      // pause scrubbing
+    "nodeep-scrub", // pause deep scrubbing
+    "pause",        // pause all client I/O (pauserd + pausewr)
+];
+
+/// Set or clear an operational cluster flag. Cluster-wide (runs against the mon
+/// via the local admin keyring).
+pub fn set_cluster_flag(flag: &str, enable: bool) -> Result<String, String> {
+    if !OPERATIONAL_FLAGS.contains(&flag) {
+        return Err(format!("Unknown or disallowed cluster flag '{}'", flag));
+    }
+    let action = if enable { "set" } else { "unset" };
+    ceph_text(&["osd", action, flag])?;
+    info!("Ceph cluster flag '{}' {}", flag, if enable { "set" } else { "unset" });
+    Ok(format!("Flag '{}' {}", flag, if enable { "set" } else { "unset" }))
+}
+
+/// Validate a placement-group id like `3.1a` — `<pool-int>.<hex-seed>`. Guards
+/// the pg subcommand against arbitrary arguments reaching the ceph CLI.
+fn is_valid_pgid(pgid: &str) -> bool {
+    match pgid.split_once('.') {
+        Some((pool, seed)) => {
+            !pool.is_empty() && pool.bytes().all(|b| b.is_ascii_digit())
+                && !seed.is_empty() && seed.bytes().all(|b| b.is_ascii_hexdigit())
+        }
+        None => false,
+    }
+}
+
+/// Scrub, deep-scrub or repair a specific placement group. `repair` is the
+/// recovery action for an `inconsistent` PG (Ceph re-reads the replicas and
+/// rewrites the bad copy from a good one).
+pub fn pg_action(pgid: &str, action: &str) -> Result<String, String> {
+    if !is_valid_pgid(pgid) {
+        return Err(format!("Invalid PG id '{}' — expected e.g. 3.1a", pgid));
+    }
+    let verb = match action {
+        "scrub" | "deep-scrub" | "repair" => action,
+        _ => return Err(format!("Unknown PG action '{}'", action)),
+    };
+    ceph_text(&["pg", verb, pgid])?;
+    info!("Ceph pg {} {} scheduled", pgid, verb);
+    Ok(format!("PG {} {} scheduled", pgid, verb))
+}
+
+/// Turn the automatic PG balancer on or off (`ceph balancer on|off`). Turning it
+/// off freezes placement during maintenance; turning it on resumes optimisation.
+pub fn set_balancer(enable: bool) -> Result<String, String> {
+    let action = if enable { "on" } else { "off" };
+    ceph_text(&["balancer", action])?;
+    info!("Ceph balancer {}", action);
+    Ok(format!("Balancer turned {}", action))
+}
+
+// ─── Daemon Control (this node) ───
+
+/// Start, stop or restart a Ceph daemon running on THIS node via systemd. Kind
+/// and action are whitelisted and the instance id is validated, so nothing
+/// arbitrary reaches systemctl. Used to recover a hung mon/mgr/osd/mds without
+/// dropping to a shell.
+pub fn daemon_control(kind: &str, id: &str, action: &str) -> Result<String, String> {
+    let kind = match kind {
+        "mon" | "mgr" | "osd" | "mds" => kind,
+        _ => return Err(format!("Unknown daemon kind '{}'", kind)),
+    };
+    let act = match action {
+        "start" | "stop" | "restart" => action,
+        _ => return Err(format!("Unknown daemon action '{}'", action)),
+    };
+    // Instance id is a hostname (mon/mgr/mds) or a numeric OSD id. Permit only
+    // characters that appear in those — never whitespace or a shell metachar.
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_') {
+        return Err(format!("Invalid daemon id '{}'", id));
+    }
+    let unit = format!("ceph-{}@{}", kind, id);
+    run_cmd("systemctl", &[act, &unit])?;
+    info!("systemctl {} {}", act, unit);
+    Ok(format!("{} {}", unit, act))
+}
+
+// ─── Monitor / Manager HA (this node) ───
+
+const MON_LIB_DIR: &str = "/var/lib/ceph/mon";
+const MGR_LIB_DIR: &str = "/var/lib/ceph/mgr";
+
+/// Promote THIS node to also run a Ceph monitor, for quorum HA. The node must
+/// already be in the cluster (bootstrapped or joined — i.e. it has ceph.conf and
+/// the admin keyring). Follows the official manual "Adding Monitors" procedure
+/// (docs.ceph.com — rados/operations/add-or-rm-mons): fetch the `mon.` keyring
+/// and the current monmap, `--mkfs` the mon store, register the new mon's
+/// address with the quorum (`ceph mon add`), then start the daemon — it syncs
+/// the updated monmap (now containing itself) and joins quorum.
+///
+/// Mirrors `bootstrap_cluster`'s manual mon setup; this is the same hand-rolled
+/// approach WolfStack already uses, not cephadm.
+pub fn add_monitor(mon_ip: &str) -> Result<String, String> {
+    // Validate the address — it's passed to `ceph mon add` and is what the new
+    // monitor binds to. (Command::args means no shell injection regardless, but
+    // a bad value should fail fast with a clear message, not a cryptic ceph error.)
+    if mon_ip.parse::<std::net::IpAddr>().is_err() {
+        return Err(format!("'{}' is not a valid IP address — give an address on the cluster's public network (no port)", mon_ip));
+    }
+    if !std::path::Path::new(CEPH_CONF_PATH).exists() {
+        return Err("This node isn't in a Ceph cluster yet — bootstrap or join one first".into());
+    }
+    if !std::path::Path::new(CEPH_ADMIN_KEYRING_PATH).exists() {
+        return Err("This node has no admin keyring — it can't add a monitor".into());
+    }
+    let hostname = hostname::get().map(|h| h.to_string_lossy().to_string()).unwrap_or_else(|_| "localhost".to_string());
+    let mon_dir = format!("{}/ceph-{}", MON_LIB_DIR, hostname);
+    if std::path::Path::new(&mon_dir).join("keyring").exists()
+        || std::path::Path::new(&mon_dir).join("store.db").exists() {
+        return Err(format!("A monitor store already exists for '{}' — this node looks like a monitor already", hostname));
+    }
+    info!("Adding a Ceph monitor on {} ({})", hostname, mon_ip);
+
+    // The `mon.` keyring grants `allow *` on every monitor — it must never be
+    // world-readable. Stage it (and the monmap) in a private 0700 dir rather
+    // than a predictable, default-umask path in /tmp. The process is long-lived
+    // so the per-pid path is stable; remove_dir_all up front cleans any remnant
+    // from a previous failed attempt (which, being 0700, was never exposed).
+    use std::os::unix::fs::DirBuilderExt;
+    let staging = format!("/tmp/wolfstack-addmon-{}", std::process::id());
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::DirBuilder::new().mode(0o700).create(&staging)
+        .map_err(|e| format!("create staging dir: {}", e))?;
+    let tmp_key = format!("{}/mon.keyring", staging);
+    let tmp_map = format!("{}/monmap", staging);
+
+    // Fetch the mon. secret and the live monmap from the running cluster (needs
+    // the admin keyring, which we verified above).
+    run_cmd("ceph", &["auth", "get", "mon.", "-o", &tmp_key])?;
+    run_cmd("ceph", &["mon", "getmap", "-o", &tmp_map])?;
+
+    std::fs::create_dir_all(&mon_dir).map_err(|e| format!("mkdir {}: {}", mon_dir, e))?;
+    // Initialise the mon store from the fetched monmap + key.
+    run_cmd("ceph-mon", &["--mkfs", "-i", &hostname, "--monmap", &tmp_map, "--keyring", &tmp_key])?;
+    let _ = Command::new("chown").args(["-R", "ceph:ceph", &mon_dir]).output();
+
+    // Register the new monitor's address with the quorum so existing mons (and,
+    // on reconnect, clients) learn it. Without this the daemon would start but
+    // the cluster wouldn't know where to reach it.
+    run_cmd("ceph", &["mon", "add", &hostname, mon_ip])?;
+
+    // Start (and enable) the new monitor; it syncs the updated monmap and joins.
+    let mon_svc = format!("ceph-mon@{}", hostname);
+    run_cmd("systemctl", &["enable", "--now", &mon_svc])?;
+
+    let _ = std::fs::remove_dir_all(&staging);
+
+    Ok(format!("Monitor started on {} ({}) and registered with the quorum. Verify it reached quorum on the cluster status before relying on it for HA.", hostname, mon_ip))
+}
+
+/// Add a Ceph manager on THIS node (a standby mgr for failover). Safe and
+/// idempotent-ish: refuses if a mgr store already exists here. Mirrors the mgr
+/// half of `bootstrap_cluster`.
+pub fn add_manager() -> Result<String, String> {
+    if !std::path::Path::new(CEPH_CONF_PATH).exists() {
+        return Err("This node isn't in a Ceph cluster yet — bootstrap or join one first".into());
+    }
+    let hostname = hostname::get().map(|h| h.to_string_lossy().to_string()).unwrap_or_else(|_| "localhost".to_string());
+    let mgr_dir = format!("{}/ceph-{}", MGR_LIB_DIR, hostname);
+    if std::path::Path::new(&mgr_dir).join("keyring").exists() {
+        return Err(format!("A manager already exists for '{}' on this node", hostname));
+    }
+    info!("Adding a Ceph manager on {}", hostname);
+
+    std::fs::create_dir_all(&mgr_dir).map_err(|e| format!("mkdir {}: {}", mgr_dir, e))?;
+    // Create the mgr's auth identity, then write its keyring.
+    let key = ceph_text(&["auth", "get-or-create", &format!("mgr.{}", hostname),
+        "mon", "allow profile mgr", "osd", "allow *", "mds", "allow *"])?;
+    let mgr_keyring = format!("{}/keyring", mgr_dir);
+    std::fs::write(&mgr_keyring, key).map_err(|e| format!("write mgr keyring: {}", e))?;
+    let _ = Command::new("chown").args(["-R", "ceph:ceph", &mgr_dir]).output();
+
+    let mgr_svc = format!("ceph-mgr@{}", hostname);
+    run_cmd("systemctl", &["enable", "--now", &mgr_svc])?;
+
+    Ok(format!("Manager started on {} (standby for failover)", hostname))
 }
 
 // ─── CephFS Management ───
@@ -1016,5 +1335,44 @@ mod join_tests {
         assert_eq!(parse_conf_value(conf, "fsid").as_deref(), Some("abc-123"));
         assert_eq!(parse_conf_value(conf, "public network").as_deref(), Some("10.0.0.0/24"));
         assert_eq!(parse_conf_value(conf, "cluster network"), None);
+    }
+
+    #[test]
+    fn pgid_validation() {
+        assert!(is_valid_pgid("3.1a"));
+        assert!(is_valid_pgid("10.ff"));
+        assert!(is_valid_pgid("0.0"));
+        assert!(!is_valid_pgid("abc"));        // no dot
+        assert!(!is_valid_pgid("3."));         // empty seed
+        assert!(!is_valid_pgid(".1a"));        // empty pool
+        assert!(!is_valid_pgid("3.xz"));       // non-hex seed
+        assert!(!is_valid_pgid("3a.1"));       // non-numeric pool
+        assert!(!is_valid_pgid("3.1a; rm -rf /")); // injection attempt
+    }
+
+    #[test]
+    fn cluster_flag_rejects_unknown() {
+        // Rejection happens before any ceph CLI call, so this is safe to unit test.
+        assert!(set_cluster_flag("bogusflag", true).is_err());
+        assert!(set_cluster_flag("noout; reboot", true).is_err());
+        // The whitelist is exactly the operational set.
+        assert!(OPERATIONAL_FLAGS.contains(&"noout"));
+        assert!(OPERATIONAL_FLAGS.contains(&"norebalance"));
+        assert!(!OPERATIONAL_FLAGS.contains(&"sortbitwise"));
+    }
+
+    #[test]
+    fn pg_action_rejects_bad_input() {
+        assert!(pg_action("not-a-pg", "scrub").is_err());     // bad pgid
+        assert!(pg_action("3.1a", "frobnicate").is_err());    // bad action
+    }
+
+    #[test]
+    fn daemon_control_rejects_bad_input() {
+        // All these fail validation before reaching systemctl.
+        assert!(daemon_control("evil", "1", "start").is_err());        // bad kind
+        assert!(daemon_control("osd", "1", "frobnicate").is_err());    // bad action
+        assert!(daemon_control("osd", "1; rm -rf /", "start").is_err()); // bad id
+        assert!(daemon_control("mon", "", "restart").is_err());        // empty id
     }
 }

@@ -16871,7 +16871,12 @@ pub async fn ceph_status(
     state: web::Data<AppState>,
 ) -> HttpResponse {
     if let Err(e) = require_auth(&req, &state) { return e; }
-    HttpResponse::Ok().json(crate::ceph::get_cluster_status())
+    // get_cluster_status shells out to ~10 ceph commands — keep it off the
+    // actix worker thread.
+    match web::block(crate::ceph::get_cluster_status).await {
+        Ok(status) => HttpResponse::Ok().json(status),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("{}", e)})),
+    }
 }
 
 /// GET /api/ceph/install-status — check what ceph components are installed
@@ -16880,7 +16885,11 @@ pub async fn ceph_install_status(
     state: web::Data<AppState>,
 ) -> HttpResponse {
     if let Err(e) = require_auth(&req, &state) { return e; }
-    HttpResponse::Ok().json(crate::ceph::get_install_status())
+    // Runs a handful of `which` probes — keep them off the actix worker thread.
+    match web::block(crate::ceph::get_install_status).await {
+        Ok(status) => HttpResponse::Ok().json(status),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("{}", e)})),
+    }
 }
 
 /// GET /api/ceph/devices — list available devices for OSD creation
@@ -17107,18 +17116,24 @@ pub async fn ceph_osd_action(
 ) -> HttpResponse {
     if let Err(e) = require_auth(&req, &state) { return e; }
     let osd_id = path.into_inner();
-    let result = match body.action.as_str() {
+    let weight = body.weight;
+    let action = body.action.clone();
+    let result = web::block(move || match action.as_str() {
         "in" => crate::ceph::set_osd_in(osd_id, true),
         "out" => crate::ceph::set_osd_in(osd_id, false),
+        "down" => crate::ceph::mark_osd_down(osd_id),
+        "scrub" => crate::ceph::osd_scrub(osd_id, false),
+        "deep-scrub" => crate::ceph::osd_scrub(osd_id, true),
         "reweight" => {
-            let w = body.weight.unwrap_or(1.0);
+            let w = weight.unwrap_or(1.0);
             crate::ceph::reweight_osd(osd_id, w)
         },
-        _ => Err(format!("Unknown action: {}", body.action)),
-    };
+        other => Err(format!("Unknown action: {}", other)),
+    }).await;
     match result {
-        Ok(msg) => HttpResponse::Ok().json(serde_json::json!({"ok": true, "message": msg})),
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"ok": false, "error": e})),
+        Ok(Ok(msg)) => HttpResponse::Ok().json(serde_json::json!({"ok": true, "message": msg})),
+        Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({"ok": false, "error": e})),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"ok": false, "error": format!("{}", e)})),
     }
 }
 
@@ -17201,6 +17216,125 @@ pub async fn ceph_delete_rbd(
     match crate::ceph::delete_rbd_image(&pool, &image) {
         Ok(msg) => HttpResponse::Ok().json(serde_json::json!({"ok": true, "message": msg})),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"ok": false, "error": e})),
+    }
+}
+
+// ─── Ceph Maintenance / Repair / HA API ───
+
+#[derive(Deserialize)]
+pub struct CephFlagRequest {
+    pub flag: String,
+    pub enable: bool,
+}
+
+/// POST /api/ceph/flags — set/clear an operational cluster flag (noout, …)
+pub async fn ceph_set_flag(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<CephFlagRequest>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let (flag, enable) = (body.flag.clone(), body.enable);
+    match web::block(move || crate::ceph::set_cluster_flag(&flag, enable)).await {
+        Ok(Ok(msg)) => HttpResponse::Ok().json(serde_json::json!({"ok": true, "message": msg})),
+        Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({"ok": false, "error": e})),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"ok": false, "error": format!("{}", e)})),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct CephPgActionRequest {
+    pub pgid: String,
+    pub action: String,
+}
+
+/// POST /api/ceph/pg-action — scrub/deep-scrub/repair a placement group
+pub async fn ceph_pg_action(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<CephPgActionRequest>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let (pgid, action) = (body.pgid.clone(), body.action.clone());
+    match web::block(move || crate::ceph::pg_action(&pgid, &action)).await {
+        Ok(Ok(msg)) => HttpResponse::Ok().json(serde_json::json!({"ok": true, "message": msg})),
+        Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({"ok": false, "error": e})),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"ok": false, "error": format!("{}", e)})),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct CephBalancerRequest {
+    pub enable: bool,
+}
+
+/// POST /api/ceph/balancer — turn the automatic PG balancer on/off
+pub async fn ceph_balancer(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<CephBalancerRequest>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let enable = body.enable;
+    match web::block(move || crate::ceph::set_balancer(enable)).await {
+        Ok(Ok(msg)) => HttpResponse::Ok().json(serde_json::json!({"ok": true, "message": msg})),
+        Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({"ok": false, "error": e})),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"ok": false, "error": format!("{}", e)})),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct CephDaemonRequest {
+    pub kind: String,
+    pub id: String,
+    pub action: String,
+}
+
+/// POST /api/ceph/daemon — start/stop/restart a ceph daemon on this node
+pub async fn ceph_daemon_control(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<CephDaemonRequest>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let (kind, id, action) = (body.kind.clone(), body.id.clone(), body.action.clone());
+    match web::block(move || crate::ceph::daemon_control(&kind, &id, &action)).await {
+        Ok(Ok(msg)) => HttpResponse::Ok().json(serde_json::json!({"ok": true, "message": msg})),
+        Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({"ok": false, "error": e})),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"ok": false, "error": format!("{}", e)})),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct CephAddMonRequest {
+    pub mon_ip: String,
+}
+
+/// POST /api/ceph/monitors — promote this node to also run a monitor (HA)
+pub async fn ceph_add_monitor(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<CephAddMonRequest>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let mon_ip = body.mon_ip.clone();
+    match web::block(move || crate::ceph::add_monitor(&mon_ip)).await {
+        Ok(Ok(msg)) => HttpResponse::Ok().json(serde_json::json!({"ok": true, "message": msg})),
+        Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({"ok": false, "error": e})),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"ok": false, "error": format!("{}", e)})),
+    }
+}
+
+/// POST /api/ceph/managers — add a manager (standby) on this node (HA)
+pub async fn ceph_add_manager(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    match web::block(crate::ceph::add_manager).await {
+        Ok(Ok(msg)) => HttpResponse::Ok().json(serde_json::json!({"ok": true, "message": msg})),
+        Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({"ok": false, "error": e})),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"ok": false, "error": format!("{}", e)})),
     }
 }
 
@@ -35394,6 +35528,12 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/ceph/rbd/{pool}", web::get().to(ceph_list_rbd))
         .route("/api/ceph/rbd", web::post().to(ceph_create_rbd))
         .route("/api/ceph/rbd/{pool}/{image}", web::delete().to(ceph_delete_rbd))
+        .route("/api/ceph/flags", web::post().to(ceph_set_flag))
+        .route("/api/ceph/pg-action", web::post().to(ceph_pg_action))
+        .route("/api/ceph/balancer", web::post().to(ceph_balancer))
+        .route("/api/ceph/daemon", web::post().to(ceph_daemon_control))
+        .route("/api/ceph/monitors", web::post().to(ceph_add_monitor))
+        .route("/api/ceph/managers", web::post().to(ceph_add_manager))
         // Filesystem browser (operator-facing path picker)
         .route("/api/fs/browse", web::get().to(fs_browse))
         // Storage Manager
