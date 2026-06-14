@@ -304,19 +304,25 @@ fn lxc_count_inner() -> u32 {
             })
             .unwrap_or(0);
     }
-    // Native LXC — count across all storage paths
-    let mut count = 0u32;
+    // Native LXC — count container directories across all storage paths. Use a
+    // directory scan (a sub-dir with a `config` file IS a container) rather than
+    // `lxc-ls`: lxc-ls is a python script that needs the python3-lxc bindings,
+    // which are absent by default on Fedora — there it returns nothing, so the
+    // menu showed 0 even though the containers exist and the list (which already
+    // dir-scans, since v24.46.0) shows them. Counting the same way keeps the
+    // menu count and the list in sync on every distro.
     let mut seen = std::collections::HashSet::new();
     for base_path in lxc_storage_paths() {
-        if let Ok(output) = Command::new("lxc-ls").args(["-P", &base_path]).output() {
-            for name in String::from_utf8_lossy(&output.stdout).split_whitespace() {
-                if !name.is_empty() && seen.insert(name.to_string()) {
-                    count += 1;
-                }
+        if let Ok(entries) = std::fs::read_dir(&base_path) {
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.is_empty() { continue; }
+                if !e.path().join("config").is_file() { continue; }
+                seen.insert(name);
             }
         }
     }
-    count
+    seen.len() as u32
 }
 
 // ─── Cached container counts ───
