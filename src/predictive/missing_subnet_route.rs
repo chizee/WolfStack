@@ -98,6 +98,15 @@ fn sample_blocking() -> MissingSubnetRouteFacts {
         if workload_subnets.is_empty() { continue; }
 
         for sub in workload_subnets {
+            // WolfStack's subnet-route feature is IPv4-only: apply_subnet_route
+            // (src/networking/router/mod.rs) validates an IPv4 gateway and
+            // installs `ip route add <cidr> via <gw>`. Flagging an IPv6 workload
+            // subnet would hand the operator a broken `ip route add <v6> via
+            // <v4>` command (iproute2: "inet6 address is expected rather than
+            // …") and a finding that can never auto-resolve, because the
+            // reconciler can't apply it. Skip v6 until first-class v6 subnet
+            // routing exists. (CodeBangZoom, 2026-06-15.)
+            if !is_ipv4_cidr(sub) { continue; }
             if subnet_already_covered(sub, &peer_ip_only, &configured) { continue; }
             missing.push(MissingRoute {
                 peer_name: peer.name.clone(),
@@ -145,6 +154,18 @@ fn subnet_already_covered(target_subnet: &str, peer_ip: &str, configured: &[(Str
         }
     }
     false
+}
+
+/// True only for a well-formed IPv4 CIDR. The subnet-route feature is
+/// IPv4-only (see the skip in `sample_blocking`), so this gates what the
+/// analyzer flags — IPv6 CIDRs (which contain `:`) and anything unparseable
+/// are excluded.
+fn is_ipv4_cidr(cidr: &str) -> bool {
+    // Require an explicit `/prefix` (split_once, not split) so a bare IP
+    // isn't mistaken for a CIDR — workload subnets are always CIDRs.
+    cidr.split_once('/')
+        .and_then(|(ip, _)| ip.parse::<Ipv4Addr>().ok())
+        .is_some()
 }
 
 fn parse_cidr(cidr: &str) -> Option<(u32, u32)> {
@@ -294,6 +315,20 @@ mod tests {
     fn subnet_already_covered_exact_match() {
         let configured = vec![("10.10.0.0/16".into(), "10.100.10.30".into())];
         assert!(subnet_already_covered("10.10.0.0/16", "10.100.10.30", &configured));
+    }
+
+    #[test]
+    fn ipv4_cidr_filter_excludes_ipv6_and_garbage() {
+        // The subnet-route feature is IPv4-only; v6 workload subnets must be
+        // skipped so the analyzer never emits a broken `ip route add <v6> via
+        // <v4>` command (CodeBangZoom, 2026-06-15).
+        assert!(is_ipv4_cidr("10.10.10.0/24"));
+        assert!(is_ipv4_cidr("192.168.1.0/24"));
+        assert!(!is_ipv4_cidr("fc42:5009:ba4b:5ab0::/64"));
+        assert!(!is_ipv4_cidr("fd00::/8"));
+        assert!(!is_ipv4_cidr("not-a-cidr"));
+        // A bare IP (no /prefix) is not a CIDR.
+        assert!(!is_ipv4_cidr("10.0.0.1"));
     }
 
     #[test]
