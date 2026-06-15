@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v24.47.2: installer auto-detects Unraid (static-binary agent install)** _(2026-06-15 — [`bf9c7bce`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/bf9c7bcee4e7f6e1542a17ea79dd15902258bd90))_
 - **v24.47.1: fix predictive "Mark applied" recursive cluster fan-out CPU storm** _(2026-06-15 — [`48c1232e`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/48c1232ed4b131cdf8dcd40bd9a2b49986d758d4))_
 - **v24.47.0: predictive "Mark applied" CPU-storm fix + AI/DB security hardening** _(2026-06-15 — [`03b74bda`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/03b74bda70e5c7b558f3d4a23b5a2b2f04a7d679))_
 - **v24.46.4: Fedora LXC — fix the container count (menu showed 0)** _(2026-06-14 — [`4ace6ff0`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/4ace6ff0a09578b6c450a11cf58604272f7af453))_
