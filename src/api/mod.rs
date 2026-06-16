@@ -19808,7 +19808,11 @@ pub async fn agent_storage_apply(
             mount.source = rewrite_loopback_nfs_source(&mount.source, sender);
         }
     }
-    match storage::create_mount(mount, true) {
+    // Idempotent upsert (NOT create_mount): a re-synced global mount that
+    // already exists on this peer must UPDATE + re-attempt the mount, not
+    // fail with "Mount point already in use" before ever creating the dir or
+    // mounting (wabil 2026-06-16).
+    match storage::apply_replicated_mount(mount) {
         Ok(m) => HttpResponse::Ok().json(serde_json::json!({
             "message": "Mount applied",
             "mount": m
@@ -19846,37 +19850,57 @@ async fn sync_mount_to_cluster(
 ) -> Result<Vec<serde_json::Value>, String> {
     let nodes = state.cluster.get_all_nodes();
     let mut results = Vec::new();
-    
+
     for node in &nodes {
-        if node.is_self { continue; }
-        let url = format!("http://{}:{}/api/agent/storage/apply", crate::netaddr::bracket_host(&node.address), node.port);
-        let client = API_HTTP_CLIENT.clone();
-        match client.post(&url)
-            .header("X-WolfStack-Secret", state.cluster_secret.clone())
-            .json(mount)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
-        {
-            Ok(resp) => {
-                let status = resp.status().as_u16();
-                let body = resp.text().await.unwrap_or_default();
-                results.push(serde_json::json!({
-                    "node": node.hostname,
-                    "status": status,
-                    "response": body
-                }));
-            }
-            Err(e) => {
-                results.push(serde_json::json!({
-                    "node": node.hostname,
-                    "status": "error",
-                    "response": e.to_string()
-                }));
+        // Only WolfStack peers run the storage agent; skip self and
+        // Proxmox-only members (they'd just 404).
+        if node.is_self || node.node_type != "wolfstack" { continue; }
+
+        // Canonical HTTPS-first URL chain. The old code posted a hardcoded
+        // `http://<addr>:<port>` — but peers serve HTTPS on that port (the
+        // plaintext second listener was removed), so the request died on the
+        // TLS handshake INSTANTLY on every modern peer. The apply was never
+        // reached: no mount, no dir, and no entry in the peer's Storage
+        // Manager (wabil 2026-06-16). build_node_urls leads with HTTPS, and
+        // API_HTTP_CLIENT already accepts the peers' self-signed certs.
+        let urls = build_node_urls(&node.address, node.port, "/api/agent/storage/apply");
+        let mut applied = false;
+        let mut last_status = serde_json::Value::from("error");
+        let mut last_response = String::from("no attempts");
+        for url in &urls {
+            match API_HTTP_CLIENT.post(url)
+                .header("X-WolfStack-Secret", &state.cluster_secret)
+                .json(mount)
+                .timeout(std::time::Duration::from_secs(20)) // apply mounts synchronously
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    if status.is_success() {
+                        results.push(serde_json::json!({
+                            "node": node.hostname, "status": status.as_u16(), "response": body
+                        }));
+                        applied = true;
+                        break;
+                    }
+                    last_status = serde_json::Value::from(status.as_u16());
+                    last_response = format!("{} -> {}", url, body.chars().take(300).collect::<String>());
+                }
+                Err(e) => {
+                    last_status = serde_json::Value::from("error");
+                    last_response = format!("{} -> transport: {}", url, e);
+                }
             }
         }
+        if !applied {
+            results.push(serde_json::json!({
+                "node": node.hostname, "status": last_status, "response": last_response
+            }));
+        }
     }
-    
+
     Ok(results)
 }
 

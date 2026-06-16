@@ -412,8 +412,70 @@ pub fn create_mount(mut mount: StorageMount, do_mount: bool) -> Result<StorageMo
             return Ok(m.clone());
         }
     }
-    
+
     Ok(mount)
+}
+
+/// Index of the existing mount a replicated `incoming` should REPLACE on a
+/// cluster apply — matched by id first (stable across the cluster), else by
+/// mount_point. Pure (no I/O) so the upsert decision is unit-testable.
+fn replicated_mount_match(mounts: &[StorageMount], incoming: &StorageMount) -> Option<usize> {
+    if !incoming.id.is_empty() {
+        if let Some(i) = mounts.iter().position(|m| m.id == incoming.id) {
+            return Some(i);
+        }
+    }
+    mounts.iter().position(|m| m.mount_point == incoming.mount_point)
+}
+
+/// Idempotently apply a mount replicated from another cluster node. Unlike
+/// `create_mount`, this UPSERTS: a matching existing entry is updated in
+/// place and the mount is RE-ATTEMPTED, instead of failing with "Mount point
+/// already in use". Without this, once a global mount's first sync left an
+/// entry on a peer, every later sync returned "already in use" instantly —
+/// never creating the dir or retrying the mount (wabil 2026-06-16).
+/// `mount_storage` is itself idempotent (already-mounted → no-op), so a
+/// working mount is never disturbed; a failed/unmounted one is retried and
+/// its real error surfaced (instead of the misleading "already in use").
+pub fn apply_replicated_mount(mut incoming: StorageMount) -> Result<StorageMount, String> {
+    if incoming.id.is_empty() {
+        incoming.id = generate_id(&incoming.name);
+    }
+    if incoming.mount_point.is_empty() {
+        incoming.mount_point = format!("{}/{}", MOUNT_BASE, incoming.id);
+    }
+    if incoming.created_at.is_empty() {
+        incoming.created_at = Utc::now().to_rfc3339();
+    }
+
+    let mut config = load_config();
+    let mount_id = match replicated_mount_match(&config.mounts, &incoming) {
+        Some(i) => {
+            // Keep the stored id stable so mount_storage finds it and a later
+            // re-sync keeps matching the same row. Preserve a live "mounted"
+            // status (mount_storage re-checks the kernel anyway).
+            let id = config.mounts[i].id.clone();
+            incoming.id = id.clone();
+            incoming.status = config.mounts[i].status.clone();
+            config.mounts[i] = incoming;
+            id
+        }
+        None => {
+            incoming.status = "unmounted".to_string();
+            let id = incoming.id.clone();
+            config.mounts.push(incoming);
+            id
+        }
+    };
+    save_config(&config)?;
+
+    // (Re-)attempt the mount. The config entry is already persisted, so even
+    // if the mount fails the row survives in error state on this peer (and
+    // shows in Storage Manager) and a later re-sync retries it.
+    mount_storage(&mount_id)?;
+
+    load_config().mounts.into_iter().find(|m| m.id == mount_id)
+        .ok_or_else(|| "mount vanished after apply".to_string())
 }
 
 /// Remove a mount entry (unmount first if needed)
@@ -2580,5 +2642,25 @@ mod mount_dropin_tests {
         assert_eq!(effective_s3_region(&s3cfg("", "https://minio.local:9000")), "");
         // Non-R2 with explicit region → that region (unchanged).
         assert_eq!(effective_s3_region(&s3cfg("us-east-2", "https://minio.local:9000")), "us-east-2");
+    }
+
+    #[test]
+    fn replicated_mount_match_prefers_id_then_mount_point() {
+        let sm = |id: &str, mp: &str| -> StorageMount {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "name": id, "type": "nfs",
+                "source": "srv:/data", "mount_point": mp, "created_at": ""
+            })).unwrap()
+        };
+        let existing = vec![sm("m1", "/mnt/a"), sm("m2", "/mnt/b")];
+        // Same id → match that row (the cluster re-sync case that used to
+        // blow up with "already in use").
+        assert_eq!(replicated_mount_match(&existing, &sm("m2", "/mnt/zzz")), Some(1));
+        // Different id but same mount_point → match by mount_point.
+        assert_eq!(replicated_mount_match(&existing, &sm("new", "/mnt/a")), Some(0));
+        // No id/mount_point match → None (a genuinely new mount).
+        assert_eq!(replicated_mount_match(&existing, &sm("new", "/mnt/c")), None);
+        // Empty incoming id never matches on id — falls through to mount_point.
+        assert_eq!(replicated_mount_match(&existing, &sm("", "/mnt/b")), Some(1));
     }
 }
