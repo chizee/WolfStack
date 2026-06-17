@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v24.49.1: auto-block uses ipset (O(1)) — fixes router ksoftirqd/throughput collapse (PapaSchlumpf)** _(2026-06-17 — [`e50ce1c0`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/e50ce1c0e91a039b3e125af320dc5db7ee874c14))_
 - **v24.49.0: cluster-secret hardening + console/scan-detector/AV/mount safety + Unraid installer survives reboot** _(2026-06-17 — [`d248b1bd`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/d248b1bd97ac60ceb16eee9717a470892ba74133))_
 - **v24.48.3: legible S3 credential failures (the Gary R2 lesson)** _(2026-06-16 — [`e9ef593e`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/e9ef593e5360c307f94fdbd157d841303e538d7d))_
 - **v24.48.2: cluster NFS sync never reached peers (wabil) + idempotent re-sync** _(2026-06-16 — [`652c792e`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/652c792eaf0495df7da8f67f7b327bcd1877b483))_
