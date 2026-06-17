@@ -1416,11 +1416,185 @@ pub fn sweep_protected_drop_rules() {
             }
         }
     }
+    // Also heal the ipsets: a source blocked before it became protected (e.g.
+    // a node that joined the cluster later) must be released there too.
+    if ipset_available() {
+        for set in [BLOCK_SET_V4, BLOCK_SET_V6] {
+            let out = match std::process::Command::new("ipset").args(["list", set]).output() {
+                Ok(o) if o.status.success() => o,
+                _ => continue,
+            };
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                // Member lines are bare addresses/CIDRs; the header block
+                // (Name:, Type:, References:, ...) won't parse as an IP.
+                let member = line.trim();
+                let ip = member.split('/').next().unwrap_or(member);
+                if ip.parse::<std::net::IpAddr>().is_ok() && is_protected_address(ip) {
+                    let _ = std::process::Command::new("ipset")
+                        .args(["del", set, member])
+                        .output();
+                    tracing::warn!("auth: healed protected {} from ipset {}", member, set);
+                }
+            }
+        }
+    }
 }
 
-/// Add a kernel DROP rule for `ip` (v4 or v6). Idempotent — uses
-/// iptables -C to check before adding. Silent when iptables is missing
-/// (the HTTP-level Forbidden fallback still applies).
+/// ipsets holding auto-blocked sources (brute-force, scan, fleet-propagated).
+/// A SINGLE `-m set --match-set` rule per chain references each, so the kernel
+/// does an O(1) hash lookup per packet regardless of how many IPs are blocked.
+/// The old design inserted one `-s <ip> -j DROP` rule per IP into INPUT *and
+/// FORWARD*; on a router/gateway the FORWARD walk ran for every forwarded
+/// packet, so a large blocklist saturated ksoftirqd and collapsed throughput
+/// (PapaSchlumpf, 2026-06-17, 200→8 Mbps). hash:net so CIDR blocks work too.
+const BLOCK_SET_V4: &str = "wolfstack_block4";
+const BLOCK_SET_V6: &str = "wolfstack_block6";
+
+/// `ipset` usable on this host? Cached after first lookup. When false we fall
+/// back to per-IP iptables rules so blocking still works (Golden Rule: never
+/// make blocking worse), just without the O(1) win.
+fn ipset_available() -> bool {
+    use std::sync::OnceLock;
+    static AVAIL: OnceLock<bool> = OnceLock::new();
+    *AVAIL.get_or_init(|| {
+        // `which` honours $PATH, but the systemd unit's PATH frequently omits
+        // /usr/sbin where ipset lives — so also probe the standard absolute
+        // locations directly, otherwise the O(1) path silently never engages
+        // on exactly the router nodes that need it most.
+        let via_which = std::process::Command::new("which")
+            .arg("ipset")
+            .output()
+            .map(|o| o.status.success() && !o.stdout.is_empty())
+            .unwrap_or(false);
+        via_which
+            || ["/usr/sbin/ipset", "/sbin/ipset", "/usr/bin/ipset", "/bin/ipset"]
+                .iter()
+                .any(|p| std::path::Path::new(p).exists())
+    })
+}
+
+/// Ensure `-m set --match-set <set> src -j DROP` exists at the top of `chain`
+/// for the given iptables variant. Idempotent (`-C` then `-I`). Returns true
+/// if the rule is present (or the binary is simply absent — e.g. no ip6tables,
+/// which is not fatal for the other family); false only if the rule genuinely
+/// could not be installed (e.g. the `set` match module is missing).
+fn ensure_match_set_rule(cmd: &str, chain: &str, set: &str) -> bool {
+    if let Ok(o) = std::process::Command::new(cmd)
+        .args(["-C", chain, "-m", "set", "--match-set", set, "src", "-j", "DROP"])
+        .output()
+    {
+        if o.status.success() {
+            return true;
+        }
+    }
+    match std::process::Command::new(cmd)
+        .args(["-I", chain, "1", "-m", "set", "--match-set", set, "src", "-j", "DROP"])
+        .output()
+    {
+        Ok(o) if o.status.success() => true,
+        Err(_) => true, // variant binary missing — don't fail the other family
+        Ok(_) => false, // present but couldn't install (xt_set missing) → fall back
+    }
+}
+
+/// Idempotently create the auto-block ipset for ONE family (v4 or v6) and its
+/// match-set DROP rules in INPUT+FORWARD. Returns true if the ipset path is
+/// usable for that family. Tracked PER FAMILY so a host missing ip6tables /
+/// xt_set for v6 still gets the O(1) ipset path for v4 (and vice versa) rather
+/// than collapsing all the way back to per-IP rules. The create/-C/-I work runs
+/// once per family per process (gated); Relaxed ordering is fine because every
+/// underlying op is idempotent (`-exist`, `-C` before `-I`), so a thread race
+/// during an attack burst at most repeats harmless setup.
+fn ensure_block_family(v6: bool) -> bool {
+    if !ipset_available() {
+        return false;
+    }
+    static V4_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static V6_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let gate = if v6 { &V6_READY } else { &V4_READY };
+    if gate.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    let (set, family, cmd) = if v6 {
+        (BLOCK_SET_V6, "inet6", "ip6tables")
+    } else {
+        (BLOCK_SET_V4, "inet", "iptables")
+    };
+    let _ = std::process::Command::new("ipset")
+        .args(["create", set, "hash:net", "family", family, "hashsize", "4096", "maxelem", "1048576", "-exist"])
+        .output();
+    let mut ok = true;
+    for chain in ["INPUT", "FORWARD"] {
+        if !ensure_match_set_rule(cmd, chain, set) {
+            ok = false;
+        }
+    }
+    if ok {
+        gate.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    ok
+}
+
+/// One-shot startup migration: lift any legacy per-IP WolfStack DROP rules out
+/// of INPUT/FORWARD into the ipset, then delete the per-IP rules. Existing
+/// installs accumulated one rule per blocked IP; on a router that per-packet
+/// walk saturated ksoftirqd. Running this on startup gives those hosts the
+/// O(1) behaviour immediately, not just for new blocks. No-op without ipset.
+/// Protected addresses are released, never migrated into the set.
+pub fn migrate_legacy_block_rules() {
+    let mut migrated = 0usize;
+    for (cmd, set, v6) in [
+        ("iptables", BLOCK_SET_V4, false),
+        ("ip6tables", BLOCK_SET_V6, true),
+    ] {
+        // Without this family's ipset we can't migrate it — leave its per-IP
+        // rules untouched so blocking still works there.
+        if !ensure_block_family(v6) {
+            continue;
+        }
+        // Collect WolfStack per-IP DROP IPs across BOTH chains, deduped, so an
+        // IP blocked in INPUT *and* FORWARD (the normal prior state) is
+        // migrated and counted exactly once.
+        let mut ips: Vec<String> = Vec::new();
+        for chain in ["INPUT", "FORWARD"] {
+            let out = match std::process::Command::new(cmd).args(["-S", chain]).output() {
+                Ok(o) if o.status.success() => o,
+                _ => continue,
+            };
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                if let Some(ip) = parse_wolfstack_drop_rule(line, chain) {
+                    if !ips.contains(&ip) {
+                        ips.push(ip);
+                    }
+                }
+            }
+        }
+        for ip in &ips {
+            if !is_protected_address(ip) {
+                let _ = std::process::Command::new("ipset")
+                    .args(["add", set, ip, "-exist"])
+                    .output();
+                migrated += 1;
+            }
+            // Remove the per-IP rule from BOTH chains either way (protected ones
+            // are healed, never migrated into the set).
+            remove_drop_rule(cmd, "INPUT", ip);
+            remove_drop_rule(cmd, "FORWARD", ip);
+        }
+    }
+    if migrated > 0 {
+        tracing::warn!(
+            "auth: migrated {} legacy per-IP kernel-block rules into ipset (O(1) match) \
+             — relieves router ksoftirqd/throughput collapse from large blocklists",
+            migrated
+        );
+    }
+}
+
+/// Block `ip` (v4 or v6) in the kernel. Prefers the ipset-backed match (O(1)
+/// per packet) and falls back to a per-IP iptables rule only where ipset is
+/// unavailable. Idempotent. Silent when the tooling is missing (the HTTP-level
+/// Forbidden fallback still applies).
 pub fn kernel_block_ip(ip: &str) {
     // to_canonical: an IPv4-mapped form (::ffff:a.b.c.d, reported by a
     // dual-stack [::] listener) is IPv4 ON THE WIRE — it must produce an
@@ -1452,34 +1626,37 @@ pub fn kernel_block_ip(ip: &str) {
         );
         return;
     }
-    let cmd = match target {
-        std::net::IpAddr::V4(_) => "iptables",
-        std::net::IpAddr::V6(_) => "ip6tables",
-    };
-    // Insert the DROP rule in BOTH the INPUT and FORWARD chains.
-    //
-    // - INPUT protects the host's own services (sshd, pveproxy on
-    //   8006, wolfstack on 8553).
-    // - FORWARD protects guests behind the host's Linux bridges /
-    //   vSwitches — VM/LXC traffic that the host is forwarding, not
-    //   consuming. Without this rule a brute-forcer who pivots from
-    //   the host management plane to a guest service can keep
-    //   attacking even after the host kicks them out.
-    //
-    // CAVEAT — FORWARD-chain rules only see bridged traffic when
-    // `br_netfilter` is loaded and `net.bridge.bridge-nf-call-iptables=1`.
-    // Proxmox enables this by default; on a vanilla Debian/Ubuntu box
-    // it may need `modprobe br_netfilter`. If the kernel module isn't
-    // present, the FORWARD rule is harmless (just inert).
-    //
-    // What this CANNOT block:
-    //   - VMs using PCI/SR-IOV passthrough — packets reach the VM
-    //     without ever touching the host kernel's netfilter
-    //   - VMs reached via a separate physical NIC that bypasses
-    //     the host's iptables (e.g. dedicated mgmt vs data NIC where
-    //     only mgmt is firewalled here)
-    // For those topologies, propagate the block to the upstream
-    // router / switch ACL or to a per-VM firewall.
+    let v6 = matches!(target, std::net::IpAddr::V6(_));
+    // Prefer the ipset-backed block (one match-set rule per chain, O(1) per
+    // packet). The match-set rules sit in BOTH INPUT and FORWARD: INPUT
+    // protects the host's own services (sshd, pveproxy:8006, wolfstack:8553);
+    // FORWARD protects guests behind the host's bridges/vSwitches (only
+    // effective with br_netfilter + net.bridge.bridge-nf-call-iptables=1,
+    // which Proxmox enables by default — inert/harmless otherwise). Neither
+    // can block traffic that bypasses host netfilter (SR-IOV/PCI passthrough,
+    // a separate unfirewalled NIC) — push those to an upstream ACL.
+    if ensure_block_family(v6) {
+        let set = if v6 { BLOCK_SET_V6 } else { BLOCK_SET_V4 };
+        match std::process::Command::new("ipset")
+            .args(["add", set, ip, "-exist"])
+            .output()
+        {
+            Ok(o) if o.status.success() => {
+                tracing::warn!("auth: kernel-blocked {} (ipset {})", ip, set);
+            }
+            Ok(o) => tracing::error!(
+                "auth: ipset add {} to {} failed: {}",
+                ip,
+                set,
+                String::from_utf8_lossy(&o.stderr).trim()
+            ),
+            Err(e) => tracing::error!("auth: could not run ipset to block {}: {}", ip, e),
+        }
+        return;
+    }
+    // Fallback: no usable ipset — per-IP rules in INPUT + FORWARD (the old
+    // O(N) path, kept so blocking still works where ipset is absent).
+    let cmd = if v6 { "ip6tables" } else { "iptables" };
     insert_drop_rule(cmd, "INPUT", ip);
     insert_drop_rule(cmd, "FORWARD", ip);
 }
@@ -1524,13 +1701,19 @@ pub fn kernel_unblock_ip(ip: &str) {
     };
     let canon = target.to_string();
     let ip = canon.as_str();
-    let cmd = match target {
-        std::net::IpAddr::V4(_) => "iptables",
-        std::net::IpAddr::V6(_) => "ip6tables",
-    };
+    let v6 = matches!(target, std::net::IpAddr::V6(_));
+    // Remove from the ipset (new path) AND any legacy per-IP rule (blocks
+    // written before the ipset migration, or on hosts without ipset).
+    if ipset_available() {
+        let set = if v6 { BLOCK_SET_V6 } else { BLOCK_SET_V4 };
+        let _ = std::process::Command::new("ipset")
+            .args(["del", set, ip])
+            .output();
+    }
+    let cmd = if v6 { "ip6tables" } else { "iptables" };
     remove_drop_rule(cmd, "INPUT", ip);
     remove_drop_rule(cmd, "FORWARD", ip);
-    tracing::info!("auth: kernel-unblocked {} (INPUT + FORWARD)", ip);
+    tracing::info!("auth: kernel-unblocked {} (ipset + INPUT/FORWARD)", ip);
 }
 
 fn remove_drop_rule(cmd: &str, chain: &str, ip: &str) {
