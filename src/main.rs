@@ -860,6 +860,11 @@ async fn main() -> std::io::Result<()> {
             crate::auth::kernel_unblock_ip(&ip);
         }
         crate::auth::sweep_protected_drop_rules();
+        // Migrate any legacy per-IP kernel-block rules into the ipset so an
+        // existing install with a large accumulated blocklist gets the O(1)
+        // match-set behaviour immediately (fixes router ksoftirqd/throughput
+        // collapse — PapaSchlumpf 2026-06-17), not just for newly-blocked IPs.
+        crate::auth::migrate_legacy_block_rules();
         // Restore kernel iptables rules for any non-expired lockouts
         // from the previous WolfStack process. Kernel rules survive a
         // service restart; this keeps our in-memory state aligned.
