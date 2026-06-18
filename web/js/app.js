@@ -40746,12 +40746,24 @@ async function loadFileLocations(nodeId) {
         if (window._pathsNodeId !== nodeId) return;
 
         // Fleet node selector — pull/edit/save a chosen node's paths.
+        // Push-target selector — choose which cluster (or the whole fleet) a
+        // per-field push lands on, so a federated operator who can admin other
+        // people's clusters can target their own (wabil 2026-06-18). Default to
+        // the cluster of the node being edited.
+        const fleetCount = nodes.length;
+        const clusters = wsScopeClusters(nodes); // sorted unique cluster_name||'WolfStack'
+        const defaultCluster = pathsCurrentClusterLabel();
         let html = `<div style="display:flex;align-items:center;gap:10px;margin-bottom:16px;flex-wrap:wrap;">
             <label style="font-size:13px;color:var(--text-secondary);font-weight:600;">Node:</label>
             <select id="paths-node-select" onchange="loadFileLocations(this.value)" style="font-size:13px;padding:6px 10px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);">
                 ${nodes.map(n => `<option value="${escapeHtml(n.id)}" ${n.id === nodeId ? 'selected' : ''}>${escapeHtml(n.hostname || n.id)}${n.is_self ? ' (this node)' : ''}</option>`).join('')}
             </select>
-            <span style="font-size:12px;color:var(--text-muted);">Pull, edit and Save a node's file locations. <strong>Fleet</strong> pushes one setting to every node.</span>
+            <label style="font-size:13px;color:var(--text-secondary);font-weight:600;margin-left:8px;">Push target:</label>
+            <select id="paths-push-scope" style="font-size:13px;padding:6px 10px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);">
+                ${clusters.map(c => `<option value="${escapeHtml(c)}" ${c === defaultCluster ? 'selected' : ''}>Cluster: ${escapeHtml(c)} (${nodes.filter(n => (n.cluster_name || 'WolfStack') === c).length})</option>`).join('')}
+                <option value="__fleet__">Whole fleet — all clusters (${fleetCount})</option>
+            </select>
+            <span style="font-size:12px;color:var(--text-muted);">Pull, edit and Save a node's file locations. <strong>↗ Push</strong> sends one setting to every node in the selected Push target.</span>
         </div>`;
 
         let currentGroup = '';
@@ -40765,7 +40777,7 @@ async function loadFileLocations(nodeId) {
                 <label style="font-size:13px;color:var(--text-secondary);white-space:nowrap;">${field.label}</label>
                 <input type="text" id="path-${field.key}" value="${val.replace(/"/g, '&quot;')}"
                     style="font-size:13px;padding:6px 10px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:var(--font-mono, monospace);">
-                <button class="btn btn-sm" onclick="pushPathFieldToFleet('${field.key}')" title="Push this value to every node in the fleet" style="font-size:11px;padding:5px 9px;white-space:nowrap;background:var(--bg-tertiary);border:1px solid var(--border);">&#8599; Fleet</button>
+                <button class="btn btn-sm" onclick="pushPathField('${field.key}')" title="Push this value to every node in the selected Push target" style="font-size:11px;padding:5px 9px;white-space:nowrap;background:var(--bg-tertiary);border:1px solid var(--border);">&#8599; Push</button>
             </div>`;
         }
         html += `<div style="margin-top:20px;display:flex;gap:8px;">
@@ -40812,19 +40824,29 @@ async function saveFileLocations() {
     }
 }
 
-// Push a single file-location setting (its current edited value) to EVERY
-// node in the fleet, read-modify-write so the other settings on each node are
-// left untouched. Confirmed first.
-async function pushPathFieldToFleet(key) {
+// The cluster of the node currently selected in the editor — used as the
+// default selection of the "Push target" dropdown so a federated operator who
+// can now admin another person's cluster lands on their own by default and
+// doesn't push file-location settings outside it (wabil 2026-06-18). Cluster
+// grouping follows the app-wide `cluster_name || 'WolfStack'` convention.
+function pathsCurrentClusterLabel() {
+    const list = Array.isArray(allNodes) ? allNodes : [];
+    const sel = list.find(n => n.id === window._pathsNodeId) || list.find(n => n.is_self);
+    return (sel && (sel.cluster_name || 'WolfStack')) || 'WolfStack';
+}
+
+// Push a single file-location setting (its current edited value) to a set of
+// nodes, read-modify-write so each node's OTHER settings are left untouched.
+// `scopeNoun` ("fleet" / "cluster") drives the wording. Confirmed first.
+async function _pushPathFieldTo(key, nodes, scopeNoun) {
     const field = _pathFields.find(f => f.key === key);
     const input = document.getElementById('path-' + key);
     if (!field || !input) return;
     const value = input.value.trim();
-    const nodes = pathsFleetNodes();
     if (!nodes.length) { showToast('No reachable nodes', 'error', 0); return; }
     const ok = await wolfConfirm(
-        `Push "${field.label}" = "${value || '(empty)'}" to all ${nodes.length} node(s)?\n\nOnly this one setting is overwritten on each node; their other file locations are left unchanged. Each node needs a WolfStack restart for it to take effect.`,
-        'Push setting to the whole fleet', { okText: `Push to ${nodes.length} node(s)`, danger: true });
+        `Push "${field.label}" = "${value || '(empty)'}" to all ${nodes.length} node(s) in the ${scopeNoun}?\n\nOnly this one setting is overwritten on each node; their other file locations are left unchanged. Each node needs a WolfStack restart for it to take effect.`,
+        `Push setting to the ${scopeNoun}`, { okText: `Push to ${nodes.length} node(s)`, danger: true });
     if (!ok) return;
     showToast(`Pushing "${field.label}" to ${nodes.length} node(s)…`, 'info');
     let okc = 0; const errs = [];
@@ -40844,14 +40866,26 @@ async function pushPathFieldToFleet(key) {
     }
     const total = nodes.length;
     if (errs.length === 0) {
-        showToast(`Pushed "${field.label}" to all ${okc} node(s). Restart each for it to take effect.`, 'success');
+        showToast(`Pushed "${field.label}" to all ${okc} node(s) in the ${scopeNoun}. Restart each for it to take effect.`, 'success');
     } else {
         showToast(`Pushed to ${okc}/${total}. Failed: ${errs.slice(0, 3).join('; ')}${errs.length > 3 ? ` (+${errs.length - 3} more)` : ''}`, 'error', 0);
     }
-    taskLog(`Pushed file-location "${field.label}" to ${okc}/${total} nodes`);
+    taskLog(`Pushed file-location "${field.label}" to ${okc}/${total} ${scopeNoun} node(s)`);
+}
+
+// Push a field to whatever the "Push target" dropdown is set to — a specific
+// cluster, or the whole fleet (all clusters).
+function pushPathField(key) {
+    const sel = document.getElementById('paths-push-scope');
+    const scope = sel ? sel.value : '__fleet__';
+    if (scope === '__fleet__') {
+        return _pushPathFieldTo(key, pathsFleetNodes(), 'fleet');
+    }
+    const nodes = pathsFleetNodes().filter(n => (n.cluster_name || 'WolfStack') === scope);
+    return _pushPathFieldTo(key, nodes, `cluster "${scope}"`);
 }
 window.loadFileLocations = loadFileLocations;
-window.pushPathFieldToFleet = pushPathFieldToFleet;
+window.pushPathField = pushPathField;
 
 // ─── Reverse Proxy config (Settings → 🌐 Reverse Proxy) ───
 
