@@ -12927,8 +12927,10 @@ pub async fn net_wireguard_init(req: HttpRequest, state: web::Data<AppState>, pa
     let cluster = path.into_inner();
     match networking::init_wireguard_bridge(&cluster, body.listen_port) {
         Ok(bridge) => {
-            let mut bridges = state.wireguard_bridges.write().unwrap();
-            bridges.insert(cluster, bridge.clone());
+            // Reload the live map from disk (mirrors toggle/delete) so the UI
+            // can never diverge from persisted state — the divergence that hid
+            // klasSponsor's half-created bridge from the WireGuard UI.
+            *state.wireguard_bridges.write().unwrap() = networking::load_wireguard_bridges();
             HttpResponse::Ok().json(serde_json::json!({
                 "status": "ok",
                 "bridge_subnet": bridge.bridge_subnet(),

@@ -3899,8 +3899,18 @@ pub fn init_wireguard_bridge(cluster: &str, listen_port: u16) -> Result<WireGuar
     }
 
     let mut bridges = load_wireguard_bridges();
-    if bridges.contains_key(cluster) {
-        return Err(format!("Bridge already exists for cluster '{}'", cluster));
+
+    // Idempotent: a config record already exists for this cluster. Rather than
+    // hard-erroring (which left klasSponsor 2026-06-18 stuck — "bridge already
+    // exists" with NOTHING in the WireGuard UI to view or remove, because a
+    // prior create saved to disk then failed mid-apply, so the live/UI map never
+    // received it while the wg-<cluster> iface lingered in Networking), re-apply
+    // the existing config (apply is idempotent) and return it. The API handler
+    // then refreshes the live map from disk, so the bridge reappears in the UI
+    // and becomes manageable/removable again.
+    if let Some(existing) = bridges.get(cluster).cloned() {
+        apply_wireguard_bridge(&existing)?;
+        return Ok(existing);
     }
 
     // Check port not already in use by another bridge
@@ -3934,11 +3944,15 @@ pub fn init_wireguard_bridge(cluster: &str, listen_port: u16) -> Result<WireGuar
         clients: Vec::new(),
     };
 
+    // Apply the interface FIRST. If apply fails we must NOT leave a phantom
+    // config record on disk — that's the half-state that blocks every future
+    // create ("already exists") while the bridge is unusable and invisible in
+    // the UI (klasSponsor 2026-06-18). Only persist once the kernel/wg side is
+    // actually up.
+    apply_wireguard_bridge(&bridge)?;
+
     bridges.insert(cluster.to_string(), bridge.clone());
     save_wireguard_bridges(&bridges)?;
-
-    // Apply the interface
-    apply_wireguard_bridge(&bridge)?;
 
     Ok(bridge)
 }
