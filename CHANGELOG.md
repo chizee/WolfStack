@@ -8,6 +8,8 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v24.51.2: in-app Support shows the 4 ticket statuses with labels** _(2026-06-18 — [`d6302e66`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/d6302e66101901a1cb487eed636c7a83552a2b3c))_
+- **v24.51.1: bridge-mode VMs/LXCs no longer keep/get a WolfNet IP (Gary, wabil)** _(2026-06-18 — [`12fe43be`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/12fe43bed23133cb24dfba3fd20c41ae581618c8))_
 - **v24.51.0: in-app Support tickets for licence holders & GitHub sponsors** _(2026-06-18 — [`bbd271e3`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/bbd271e30b646622352c68d6b6621a7ef92450f1))_
 - **v24.50.4: SSO/OIDC admin UI — configure identity providers from Settings (Team/MSP/Enterprise)** _(2026-06-18 — [`74a6be90`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/74a6be907dc3bb15c418c04e3609e2da079f0076))_
 - **v24.50.3: WireGuard bridge "already exists" with empty UI — fix the stuck half-state (klasSponsor)** _(2026-06-18 — [`99bf554e`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/99bf554e5e157bf812d2dedc45698010bb4f6655))_
