@@ -8,6 +8,9 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v24.50.3: WireGuard bridge "already exists" with empty UI — fix the stuck half-state (klasSponsor)** _(2026-06-18 — [`99bf554e`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/99bf554e5e157bf812d2dedc45698010bb4f6655))_
+- **v24.50.2: File Locations push — choose target cluster (or whole fleet)** _(2026-06-18 — [`a83f086e`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/a83f086e22c15b5deb66ad1fe2d2d0b7b74c96f8))_
+- **v24.50.1: WolfUSB reconnects after the USB-host (source) node reboots** _(2026-06-18 — [`3edb7aa6`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/3edb7aa65ceb56b0d8bf30cb20247f8fff555d65))_
 - **v24.50.0: S3 write data-loss fix + Docker/NFS boot ordering + WolfNet/cert/WAN sponsor fixes** _(2026-06-18 — [`1a1acd74`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/1a1acd74f8bd015f928972ae6353d52c4e90544a))_
 - **v24.49.2: stop ensure_lxc_bridge reload storm (daemon-reload churn every 60s)** _(2026-06-17 — [`2962ce4e`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/2962ce4ec045d37fe6906a7da0c00103f6ef8547))_
 - **v24.49.1: auto-block uses ipset (O(1)) — fixes router ksoftirqd/throughput collapse (PapaSchlumpf)** _(2026-06-17 — [`e50ce1c0`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/e50ce1c0e91a039b3e125af320dc5db7ee874c14))_
