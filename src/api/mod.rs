@@ -12290,11 +12290,33 @@ pub async fn ai_alerts(
 
 /// GET /api/ai/models?provider=claude|gemini — list available models
 pub async fn ai_models(
-    req: HttpRequest, state: web::Data<AppState>, query: web::Query<std::collections::HashMap<String, String>>,
+    req: HttpRequest, state: web::Data<AppState>,
+    query: web::Query<std::collections::HashMap<String, String>>,
+    body: web::Bytes,
 ) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let config = state.ai_agent.config.lock().unwrap().clone();
-    let provider = query.get("provider").map(|s| s.as_str()).unwrap_or(&config.provider);
+    // Optional POST body: lets the UI pass the selected provider plus a
+    // typed-but-not-yet-saved API key so the model dropdown can populate BEFORE
+    // the first Save. Without this it's a chicken-and-egg — saving requires a
+    // model already chosen, but the model list needs the saved key (the operator
+    // could only escape via "Custom…"). The key travels in the body, not the
+    // query string (which lands in access logs) nor a custom header (which the
+    // node proxy strips when this is fetched against a remote node).
+    let body_json: serde_json::Value = if body.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null)
+    };
+    // Reject a masked placeholder (••••…, as returned by GET /api/ai/config) so a
+    // mask never reaches the provider as a real key — fall back to the saved key.
+    let unsaved_key = body_json.get("api_key").and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty() && !s.contains('\u{2022}'));
+    let provider = query.get("provider").map(|s| s.as_str())
+        .or_else(|| body_json.get("provider").and_then(|v| v.as_str()))
+        .unwrap_or(&config.provider)
+        .to_string();
 
     // Cloudflare Workers AI exposes ~100 models across multiple modalities
     // (chat / embeddings / vision / image / TTS). The `/v1/models` listing
@@ -12351,21 +12373,24 @@ pub async fn ai_models(
     } else if provider == "claude-cli" {
         // Claude Code CLI has no API key (it uses the local subscription login)
         // — return its curated static model list directly.
-        match state.ai_agent.list_models(provider, "").await {
+        match state.ai_agent.list_models(&provider, "").await {
             Ok(models) => HttpResponse::Ok().json(serde_json::json!({ "models": models })),
             Err(e) => HttpResponse::Ok().json(serde_json::json!({ "models": [], "error": e })),
         }
     } else {
-        let api_key = match provider {
+        let saved_key = match provider.as_str() {
             "gemini" => &config.gemini_api_key,
             "openrouter" => &config.openrouter_api_key,
             "openai" => &config.openai_api_key,
             _ => &config.claude_api_key,
         };
+        // Prefer a key the operator just typed (POST body) over the saved one so
+        // the dropdown loads before the config is persisted.
+        let api_key = unsaved_key.unwrap_or(saved_key.as_str());
         if api_key.is_empty() {
             return HttpResponse::Ok().json(serde_json::json!({ "models": [], "error": "No API key configured for this provider" }));
         }
-        match state.ai_agent.list_models(provider, api_key).await {
+        match state.ai_agent.list_models(&provider, api_key).await {
             Ok(models) => HttpResponse::Ok().json(serde_json::json!({ "models": models })),
             Err(e) => HttpResponse::Ok().json(serde_json::json!({ "models": [], "error": e })),
         }
@@ -35881,6 +35906,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/ai/status", web::get().to(ai_status))
         .route("/api/ai/alerts", web::get().to(ai_alerts))
         .route("/api/ai/models", web::get().to(ai_models))
+        .route("/api/ai/models", web::post().to(ai_models))
         .route("/api/ai/exec", web::post().to(ai_exec))
         .route("/api/ai/action", web::post().to(ai_action))
         .route("/api/ai/action/command", web::get().to(ai_action_command))
