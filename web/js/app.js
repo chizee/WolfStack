@@ -32437,11 +32437,43 @@ async function loadAiConfig() {
             const _numEl = document.getElementById('ai-agent-max-tool-calls');
             if (_numEl) _numEl.disabled = !_limEl.checked;
         }
+        // Bind (once) a model-list refresh to each provider's key field so the
+        // dropdown loads as soon as a key is entered — no Save required. `change`
+        // fires on blur after editing, so we don't hammer the endpoint per
+        // keystroke.
+        ['ai-claude-key', 'ai-gemini-key', 'ai-openrouter-key', 'ai-openai-key'].forEach(function (id) {
+            var keyEl = document.getElementById(id);
+            if (keyEl && !keyEl.dataset.modelRefreshBound) {
+                keyEl.dataset.modelRefreshBound = '1';
+                keyEl.addEventListener('change', onAiProviderKeyInput);
+            }
+        });
         // Fetch models for the current provider, then select the saved model
         await fetchAiModels(cfg.provider || 'claude', cfg.model || '');
     } catch (e) {
         console.error('Failed to load AI config:', e);
     }
+}
+
+// Read the API key the operator has typed into the form for a given provider
+// (the field holds the real key — loadAiConfig populates it from the saved
+// config, or it's what the user just entered). Used to populate the model
+// dropdown before the config is saved. Returns '' for providers with no key
+// field (local/cloudflare/claude-cli have their own flows).
+function _aiProviderKeyFromForm(provider) {
+    var id = provider === 'gemini' ? 'ai-gemini-key'
+        : provider === 'openrouter' ? 'ai-openrouter-key'
+        : provider === 'openai' ? 'ai-openai-key'
+        : provider === 'claude' ? 'ai-claude-key'
+        : null;
+    if (!id) return '';
+    var el = document.getElementById(id);
+    var v = (el && el.value || '').trim();
+    // A saved key is returned masked (••••…) by GET /api/ai/config and pre-filled
+    // into the field. Never send the mask to the model endpoint — return '' so we
+    // fall back to the GET path, where the backend uses the real saved key.
+    if (v.indexOf('•') !== -1) return '';
+    return v;
 }
 
 async function fetchAiModels(provider, selectedModel) {
@@ -32455,8 +32487,27 @@ async function fetchAiModels(provider, selectedModel) {
     }
     select.innerHTML = '<option value="">Loading models...</option>';
     try {
-        var resp = await fetch(aiNodeUrl('/api/ai/models?provider=' + encodeURIComponent(provider)));
-        var data = await resp.json();
+        var data = null;
+        var formKey = _aiProviderKeyFromForm(provider);
+        if (formKey) {
+            // POST the typed-but-unsaved key in the body so the dropdown can
+            // populate before the first Save. The body survives the node proxy
+            // (custom headers don't) and keeps the key out of access logs (a
+            // query string would not). Fall back to GET if a (possibly older)
+            // node has no POST route — that path still lists saved-key models.
+            try {
+                var pr = await fetch(aiNodeUrl('/api/ai/models'), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ provider: provider, api_key: formKey })
+                });
+                if (pr.ok) data = await pr.json();
+            } catch (_) { /* fall through to GET */ }
+        }
+        if (!data) {
+            var resp = await fetch(aiNodeUrl('/api/ai/models?provider=' + encodeURIComponent(provider)));
+            data = await resp.json();
+        }
         var models = data.models || [];
         select.innerHTML = '';
         if (!models.length) {
@@ -32786,6 +32837,20 @@ function onAiProviderChange() {
     const claudeKeyGroup = document.getElementById('ai-claude-key-group');
     if (claudeKeyGroup) claudeKeyGroup.style.display = provider === 'claude-cli' ? 'none' : '';
     fetchAiModels(provider, '');
+}
+
+// Re-fetch the model list when the operator finishes entering/changing an API
+// key, so the dropdown populates from the typed (not-yet-saved) key. Without
+// this you'd have to Save first — but saving requires a model already picked,
+// the chicken-and-egg that left Gemini users stuck on an empty dropdown. Bound
+// (once) to each provider's key field in loadAiConfig.
+function onAiProviderKeyInput() {
+    var provider = (document.getElementById('ai-provider') || {}).value || 'claude';
+    // Preserve an already-chosen model across the refresh (but not the transient
+    // "__custom__" sentinel) so entering a key doesn't silently blank the pick.
+    var sel = document.getElementById('ai-model');
+    var current = sel ? sel.value : '';
+    fetchAiModels(provider, current && current !== '__custom__' ? current : '');
 }
 
 // Enable/disable the agent tool-call cap input alongside its checkbox.
