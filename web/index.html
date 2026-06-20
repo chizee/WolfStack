@@ -84,6 +84,9 @@
     <script>document.getElementById('main-css').href='/css/style.css?v='+Date.now();</script>
     <script src="/js/vendor/xterm.min.js?v=15.10.7a" defer></script>
     <script src="/js/vendor/xterm-addon-fit.min.js?v=15.10.7a" defer></script>
+    <!-- Reusable KDE-Konsole-style terminal engine (window.WolfTermConsole).
+         Loaded before app.js so the per-node Terminal panel can mount it. -->
+    <script src="/js/terminal-console.js?v=15.10.7a" defer></script>
     <style>
         /* Map Styles */
         #world-map {
@@ -3109,14 +3112,6 @@
              sync with the JS — no duplicated HTML/JS surface. -->
         <div id="page-inbox" class="page-view" style="display:none;"></div>
 
-        <!-- ═══ Fleet Terminal Console (byobu-style) ═══
-             Built/rendered by fleetConsoleInit() in app.js. The shell is
-             created once on first selectView('fleet-console') and then
-             KEPT LIVE — selectView hides page-views with display:none, so
-             the xterm + WebSocket instances persist across in-app
-             navigation. Do NOT dispose terminals when this page hides. -->
-        <div id="page-fleet-console" class="page-view" style="display:none; padding:0;"></div>
-
         <!-- ═══ Global WolfNet Page ═══ -->
         <div id="page-global-wolfnet" class="page-view" style="display:none;">
             <!-- Header -->
@@ -5093,7 +5088,7 @@
                     <div style="display:flex; align-items:center; gap:8px;">
                         <span id="inline-term-status"
                             style="font-size:12px; padding:3px 10px; border-radius:12px; background:#333; color:#888;">Connecting...</span>
-                        <button class="btn btn-sm" onclick="openConsole(inlineTermType || 'host', inlineTermName || '')"
+                        <button class="btn btn-sm" onclick="inlineTermPopOut()"
                             title="Pop out to separate window">↗️ Pop Out</button>
                     </div>
                 </div>
