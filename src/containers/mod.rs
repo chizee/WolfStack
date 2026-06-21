@@ -6212,6 +6212,33 @@ mod wolfnet_gate_tests {
     use super::*;
 
     #[test]
+    fn default_container_storage_picks_existing_not_hardcoded_lvm() {
+        // ZFS-only host (wabil): no local-lvm → must NOT return local-lvm;
+        // prefers local-zfs when present.
+        let zfs_host = "Name             Type     Status        Total    Used   Avail   %\n\
+                        local            dir      active        100      10     90      10\n\
+                        local-zfs        zfspool  active        500      50     450     10\n";
+        assert_eq!(pick_default_container_storage(zfs_host), "local-zfs");
+        // Classic LVM host → local-lvm (unchanged behaviour).
+        let lvm_host = "Name        Type   Status   Total Used Avail %\n\
+                        local       dir    active   1 1 1 1\n\
+                        local-lvm   lvmthin active  1 1 1 1\n";
+        assert_eq!(pick_default_container_storage(lvm_host), "local-lvm");
+        // Neither convention present → first active storage.
+        let custom = "Name      Type     Status  T U A %\n\
+                      tank-ct   zfspool  active  1 1 1 1\n";
+        assert_eq!(pick_default_container_storage(custom), "tank-ct");
+        // An INACTIVE local-lvm must be ignored (this is the exact bug —
+        // referencing a storage that exists-but-isn't-usable / is gone).
+        let inactive = "Name       Type     Status    T U A %\n\
+                        local-lvm  lvmthin  inactive  1 1 1 1\n\
+                        local-zfs  zfspool  active    1 1 1 1\n";
+        assert_eq!(pick_default_container_storage(inactive), "local-zfs");
+        // Empty / unparseable → historical default, nothing regresses.
+        assert_eq!(pick_default_container_storage(""), "local-lvm");
+    }
+
+    #[test]
     fn standalone_wolfnet_gate_preserves_default_clusters() {
         // lxcbr0 (the WolfStack default — every standard cluster) must take the
         // SAME path as before: do NOT skip.
@@ -8302,6 +8329,43 @@ fn pct_fix_nm_networking(
 
 /// Create an LXC container via Proxmox's pct command (public API entry point)
 #[allow(clippy::too_many_arguments)]
+/// Best available Proxmox storage for container rootfs (content=rootdir) when
+/// the caller didn't pick one. Hardcoding "local-lvm" breaks ZFS-only hosts —
+/// a host that removed local-lvm years ago gets "storage 'local-lvm' does not
+/// exist" on every `pct create` (wabil 2026-06-21). Prefers the conventional
+/// local-lvm / local-zfs if present, else the first active rootdir storage.
+/// Falls back to "local-lvm" only if `pvesm` can't be queried (preserves the
+/// historical default so nothing regresses where detection is unavailable).
+pub fn pve_default_container_storage() -> String {
+    let text = match Command::new("pvesm").args(["status", "--content", "rootdir"]).output() {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => String::new(),
+    };
+    pick_default_container_storage(&text)
+}
+
+/// Pure parser for `pvesm status --content rootdir` output: pick a sensible
+/// default container storage. Prefers local-lvm / local-zfs if active, else the
+/// first active storage; falls back to "local-lvm" when nothing parses (so a
+/// host where detection fails keeps the historical default).
+fn pick_default_container_storage(pvesm_status: &str) -> String {
+    let active: Vec<&str> = pvesm_status
+        .lines()
+        .skip(1) // header row
+        .filter_map(|l| {
+            let cols: Vec<&str> = l.split_whitespace().collect();
+            // Columns: Name Type Status ... — keep active storages only.
+            if cols.len() >= 3 && cols[2] == "active" { Some(cols[0]) } else { None }
+        })
+        .collect();
+    for pref in ["local-lvm", "local-zfs"] {
+        if active.iter().any(|n| *n == pref) {
+            return pref.to_string();
+        }
+    }
+    active.first().map(|s| s.to_string()).unwrap_or_else(|| "local-lvm".to_string())
+}
+
 pub fn pct_create_api(name: &str, distribution: &str, release: &str, architecture: &str,
               storage_id: Option<&str>, template_storage_id: Option<&str>,
               root_password: Option<&str>,
@@ -8311,7 +8375,9 @@ pub fn pct_create_api(name: &str, distribution: &str, release: &str, architectur
               bridge: Option<&str>, bridge_ip: Option<&str>, bridge_gateway: Option<&str>)
               -> Result<(u32, String), String> {
     let vmid = pct_next_vmid()?;
-    let storage = storage_id.unwrap_or("local-lvm");
+    // Detect a real rootdir storage when the caller didn't specify one.
+    let storage_default = if storage_id.is_none() { pve_default_container_storage() } else { String::new() };
+    let storage = storage_id.unwrap_or(&storage_default);
 
     // Prefer the caller-supplied template storage if they picked one in the
     // UI; otherwise fall back to the "'local' unless the rootfs storage can
@@ -8964,7 +9030,10 @@ pub fn lxc_import(
 
     if is_proxmox() {
         let new_vmid = pct_next_vmid()?;
-        let storage_id = storage.unwrap_or("local-lvm");
+        // Detect a real rootdir storage when the caller didn't specify one
+        // (hardcoded "local-lvm" fails on ZFS-only hosts).
+        let storage_default = if storage.is_none() { pve_default_container_storage() } else { String::new() };
+        let storage_id = storage.unwrap_or(&storage_default);
 
         // Check if this is a vzdump archive by looking for etc/vzdump/pct.conf inside
         let is_vzdump = archive_path.contains("vzdump-") || {
@@ -9095,6 +9164,12 @@ pub fn list_native_lxc_orphans() -> Vec<String> {
         let pve_conf = format!("/etc/pve/lxc/{}.conf", name);
         if std::path::Path::new(&pve_conf).is_file() { continue; }
 
+        // Skip orphans a prior adoption permanently failed on (e.g. their old
+        // storage no longer exists) so we don't retry and re-warn on every
+        // restart. The operator removes the marker file to force a retry.
+        let failed_marker = format!("{}/{}/.wolfstack-adopt-failed", LXC_DEFAULT_PATH, name);
+        if std::path::Path::new(&failed_marker).is_file() { continue; }
+
         orphans.push(name);
     }
     orphans
@@ -9179,7 +9254,17 @@ pub fn pct_adopt_native_orphan(name: &str) -> Result<String, String> {
         Ok(o) => o,
         Err(e) => {
             let _ = std::fs::remove_file(&archive_path);
-            return Err(format!("pct create for orphan '{}' failed: {}", name, e));
+            // Mark this orphan so we don't retry + re-warn every restart on a
+            // failure that won't fix itself (e.g. its old storage is gone).
+            // list_native_lxc_orphans skips marked dirs; removing the marker
+            // forces a retry. Best-effort — a write failure just means we warn
+            // again next time, which is no worse than before.
+            let failed_marker = format!("{}/.wolfstack-adopt-failed", container_dir);
+            let _ = std::fs::write(&failed_marker, format!("{}\n", e));
+            return Err(format!(
+                "pct create for orphan '{}' failed: {} (won't retry — remove {} to try again)",
+                name, e, failed_marker
+            ));
         }
     };
     let _ = std::fs::remove_file(&archive_path);
