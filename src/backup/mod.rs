@@ -6252,8 +6252,17 @@ fn retrieve_from_pbs(entry: &BackupEntry, dest: &Path) -> Result<(), String> {
                 let si = s.get("backup-id").and_then(|v| v.as_str()).unwrap_or("");
                 let stime = s.get("backup-time").and_then(|v| v.as_i64()).unwrap_or(0);
                 if st == backup_type && si == backup_id && stime > best_time {
-                    best_time = stime;
-                    best_snap = format!("{}/{}/{}", st, si, stime);
+                    // PBS needs the snapshot's time component as RFC3339 (e.g.
+                    // host/newt/2026-06-22T10:21:09Z), NOT the raw epoch that
+                    // `snapshot list --output-format json` reports. Passing the
+                    // epoch made `restore` fail with "unable to parse backup
+                    // snapshot path 'host/newt/1782104469'" (wabil 2026-06-22).
+                    // Mirrors the conversion already done on the notes path.
+                    if let Some(ts) = chrono::DateTime::from_timestamp(stime, 0) {
+                        best_time = stime;
+                        best_snap = format!("{}/{}/{}", st, si,
+                            ts.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+                    }
                 }
             }
             if best_snap.is_empty() {
