@@ -29922,14 +29922,21 @@ async function getSelectedStorage() {
                 pbs_fingerprint: _cachedPbsConfig.pbs_fingerprint || '',
                 pbs_namespace: _cachedPbsConfig.pbs_namespace || '',
                 // File-level (pxar) preference travels with the PBS destination
-                // so backup_pbs_file_level routes correctly. The per-backup
-                // toggle (if shown) overrides the connection default for THIS
-                // backup; otherwise fall back to the connection setting.
+                // so backup_pbs_file_level routes correctly. When the per-backup
+                // toggle is shown, its value is an EXPLICIT override for THIS
+                // backup (pbs_file_level_set:true) — including turning it OFF
+                // against an on-by-default connection. When not shown, fall back
+                // to the connection setting and don't claim an explicit choice.
                 pbs_file_level: (function () {
                     const cb = document.getElementById('backup-pbs-filelevel');
                     const wrap = document.getElementById('backup-pbs-filelevel-wrap');
                     if (cb && wrap && wrap.style.display !== 'none') return !!cb.checked;
                     return !!_cachedPbsConfig.pbs_file_level;
+                })(),
+                pbs_file_level_set: (function () {
+                    const cb = document.getElementById('backup-pbs-filelevel');
+                    const wrap = document.getElementById('backup-pbs-filelevel-wrap');
+                    return !!(cb && wrap && wrap.style.display !== 'none');
                 })(),
                 // Secrets are stored on server, leave empty so backend preserves them
                 pbs_token_secret: '',
@@ -45790,6 +45797,7 @@ async function openWolfRunAdoptModal() {
                         if (existingContainers.has(`${name}@${node.id}`)) return;
                         containers.push({
                             name,
+                            display_name: name,
                             image: c.Image || c.image || '—',
                             status: c.State || c.state || c.status || 'unknown',
                             runtime: 'docker',
@@ -45818,6 +45826,11 @@ async function openWolfRunAdoptModal() {
                         if (existingContainers.has(`${name}@${node.id}`)) return;
                         containers.push({
                             name,
+                            // Proxmox LXC: `name` is the VMID (the id pct manages
+                            // by, so adoption must keep it). `hostname` is the
+                            // friendly container name — show that, like the main
+                            // Containers page does (c.hostname || c.name).
+                            display_name: c.hostname || name,
                             image: c.distribution ? `${c.distribution} ${c.release || ''}`.trim() : '—',
                             status: c.status || c.state || 'unknown',
                             runtime: 'lxc',
@@ -45876,13 +45889,18 @@ function renderWolfRunAdoptItems(containers) {
         const runtimeIcon = c.runtime === 'lxc' ? '' : '';
         const statusColor = c.status === 'running' ? '#10b981' : (c.status === 'exited' || c.status === 'stopped') ? '#ef4444' : '#eab308';
         const selected = wolfrunAdoptSelected === idx;
+        const display = c.display_name || c.name;
+        // For an LXC whose friendly name differs from its VMID, surface the
+        // VMID in the subtitle (e.g. "CT 121 · proxm3") so the operator still
+        // sees the id pct manages it by; otherwise show the image.
+        const subLeft = (c.runtime === 'lxc' && c.name !== display) ? `CT ${c.name}` : c.image;
         return `<div class="wolfrun-adopt-item" data-idx="${idx}" onclick="selectWolfrunAdopt(${idx})"
             style="display:flex; align-items:center; gap:12px; padding:12px 16px; border:1px solid ${selected ? 'var(--accent)' : 'var(--border)'}; border-radius:8px; margin-bottom:8px; cursor:pointer; transition:all 0.15s;${selected ? ' background:rgba(59, 130, 246,0.06);' : ''}">
             <input type="radio" name="wolfrun-adopt" style="accent-color:var(--accent); flex-shrink:0;"${selected ? ' checked' : ''}>
             <span style="font-size:18px;">${runtimeIcon}</span>
             <div style="flex:1; min-width:0;">
-                <div style="font-weight:600; font-size:13px;">${c.name}</div>
-                <div style="font-size:11px; color:var(--text-muted);">${c.image} · ${c.hostname}</div>
+                <div style="font-weight:600; font-size:13px;">${escapeHtml(display)}</div>
+                <div style="font-size:11px; color:var(--text-muted);">${escapeHtml(subLeft)} · ${escapeHtml(c.hostname)}</div>
             </div>
             <span style="display:inline-flex; align-items:center; gap:4px; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:500; background:${statusColor}22; color:${statusColor}; border:1px solid ${statusColor}44;">
                 <span style="width:5px; height:5px; border-radius:50%; background:${statusColor};"></span> ${c.status}
@@ -45904,6 +45922,7 @@ function filterWolfRunAdoptList() {
     }
     const filtered = all.filter(c =>
         c.name.toLowerCase().includes(query) ||
+        (c.display_name || '').toLowerCase().includes(query) ||
         c.image.toLowerCase().includes(query) ||
         c.hostname.toLowerCase().includes(query) ||
         c.runtime.toLowerCase().includes(query)

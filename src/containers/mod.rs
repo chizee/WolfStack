@@ -9146,6 +9146,14 @@ pub fn lxc_export_cleanup(archive_path: &str) {
 
 }
 
+/// A purely-numeric `/var/lib/lxc/<name>` is PVE's own VMID-keyed staging dir,
+/// never a user's native `lxc-create` orphan (those carry human names). Stale
+/// such dirs linger after a CT is migrated away or destroyed — adopting them
+/// conjures ghost containers. Pure so it can be unit-tested without a host.
+fn is_pve_vmid_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_digit())
+}
+
 /// List native `lxc-create` containers on a Proxmox host that PVE doesn't
 /// know about — the footprint of the pre-fix App Store installer, which
 /// created LXC containers with native tooling instead of `pct`. Such a
@@ -9176,6 +9184,18 @@ pub fn list_native_lxc_orphans() -> Vec<String> {
         // way, presence of that PVE conf means it is NOT an orphan.
         let pve_conf = format!("/etc/pve/lxc/{}.conf", name);
         if std::path::Path::new(&pve_conf).is_file() { continue; }
+
+        // GHOST GUARD #1 — never adopt a purely-numeric directory name.
+        // /var/lib/lxc/<n> with a numeric name is PVE's own VMID-keyed staging
+        // dir, not a user's native `lxc-create` container (those carry human
+        // names; the App Store installer this feature targets always named its
+        // containers). When a PVE CT is migrated away or destroyed — common on
+        // a rebuilt/recovered cluster — its /var/lib/lxc/<vmid>/ staging dir
+        // (config + an empty/stale rootfs) can linger after /etc/pve/lxc/<vmid>.conf
+        // is gone. Without this guard the reconciler "adopts" those husks into
+        // fresh VMIDs with the old id as the hostname, conjuring ghost CTs with
+        // nothing behind them. Numeric names are never legitimate orphans here.
+        if is_pve_vmid_name(&name) { continue; }
 
         // Skip orphans a prior adoption permanently failed on (e.g. their old
         // storage no longer exists) so we don't retry and re-warn on every
@@ -11974,6 +11994,30 @@ mod pct_net0_tests {
             pct_net0_arg("bridge", Some("  "), None, None),
             Some("name=eth0,bridge=vmbr0,ip=dhcp".to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod orphan_guard_tests {
+    use super::*;
+
+    #[test]
+    fn numeric_dir_names_are_pve_vmid_husks() {
+        // The ghost CTs (134, 120, 139, 133) were PVE VMID-keyed staging dirs
+        // left behind by migrated/destroyed containers — never adopt these.
+        for n in ["134", "120", "139", "133", "0", "100"] {
+            assert!(is_pve_vmid_name(n), "{} should be treated as a PVE husk", n);
+        }
+    }
+
+    #[test]
+    fn human_names_are_adoptable() {
+        // Genuine native lxc-create / App Store orphans carry human names and
+        // must still be eligible for adoption — this is the path we mustn't break.
+        for n in ["nextcloud", "ct-mariadb", "web01", "frigate", "node1"] {
+            assert!(!is_pve_vmid_name(n), "{} should remain adoptable", n);
+        }
+        assert!(!is_pve_vmid_name(""), "empty name is not a vmid husk");
     }
 }
 

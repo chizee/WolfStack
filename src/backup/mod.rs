@@ -176,6 +176,13 @@ pub struct BackupStorage {
     /// byte-identical to the original behaviour.
     #[serde(default)]
     pub pbs_file_level: bool,
+    /// True when the caller EXPLICITLY chose `pbs_file_level` for this backup
+    /// (the per-backup override), so `merge_pbs_secrets` must keep it verbatim —
+    /// including an explicit `false` against an on-by-default connection. Absent
+    /// field → false → fall back to the old "adopt the saved default unless the
+    /// request set it true" behaviour, so older callers are byte-identical.
+    #[serde(default)]
+    pub pbs_file_level_set: bool,
     // ── NFS direct backup destination ─────────────────
     /// `server:/export` — same syntax as `mount -t nfs`.
     #[serde(default)]
@@ -279,6 +286,7 @@ impl Default for BackupStorage {
             pbs_fingerprint: String::new(),
             pbs_namespace: String::new(),
             pbs_file_level: false,
+            pbs_file_level_set: false,
             nfs_source: String::new(),
             nfs_options: String::new(),
             smb_source: String::new(),
@@ -378,6 +386,33 @@ mod tests {
         assert_eq!(d, short_path_discriminator("/data/temp"));
         assert_eq!(d.len(), 8);
         assert!(d.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn pbs_file_level_override_both_directions_and_legacy() {
+        // Per-backup override explicitly set → wins verbatim, BOTH directions.
+        assert!(!resolve_pbs_file_level(true, false, true), "explicit OFF beats on-default");
+        assert!(resolve_pbs_file_level(true, true, false), "explicit ON beats off-default");
+        // Not explicitly set → legacy: adopt saved unless request already true.
+        assert!(resolve_pbs_file_level(false, false, true), "unset adopts saved (on)");
+        assert!(!resolve_pbs_file_level(false, false, false), "unset adopts saved (off)");
+        assert!(resolve_pbs_file_level(false, true, false), "legacy: request-true still wins");
+    }
+
+    #[test]
+    fn archive_leaf_vs_contents_classification() {
+        use std::collections::HashSet;
+        let set = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<HashSet<_>>();
+
+        // Leaf-style: every top member is the folder's leaf name (how all
+        // pre-trailing-slash backups were made) → restore into the PARENT.
+        assert!(archive_is_leaf_style(&set(&["temp"]), "temp"));
+        // Contents-only: bare children → restore into the FOLDER itself.
+        assert!(!archive_is_leaf_style(&set(&["a", "b", "sub"]), "temp"));
+        // A different single dir is not leaf-style for this folder.
+        assert!(!archive_is_leaf_style(&set(&["other"]), "temp"));
+        // Empty listing must not be mistaken for leaf-style.
+        assert!(!archive_is_leaf_style(&HashSet::new(), "temp"));
     }
 
     #[test]
@@ -2076,14 +2111,22 @@ pub fn backup_system_path(label: &str, path: &str, exclude_mounts: &[String]) ->
     let filename = format!("systempath-{}-{}-{}.tar.gz", safe_label, path_disc, timestamp);
     let tar_path = staging.join(&filename);
 
+    // Trailing-slash semantics (rsync-style, wabil 2026-06-22): "/data/temp"
+    // archives the folder itself (top entry `temp/`), so restore lands it back
+    // where it was. "/data/temp/" archives only the folder's CONTENTS (no
+    // wrapper dir). The two are distinct backups — the discriminator already
+    // hashes the raw path, so their filenames never collide.
+    let contents_only = path.ends_with('/');
     let src = path.trim_end_matches('/');
-    // Archive the folder itself (so restore lands it back where it was):
-    // `tar -C <parent> <basename>` keeps the leaf dir as the top archive
-    // entry. For a top-level folder like /etc the parent is "/".
     let p = Path::new(src);
     let parent = p.parent().map(|x| x.to_string_lossy().to_string()).unwrap_or_else(|| "/".into());
     let leaf = p.file_name().map(|n| n.to_string_lossy().to_string())
         .ok_or_else(|| format!("Cannot determine folder name from '{}'", src))?;
+
+    // tar's `-C` base: the folder itself for contents-only, else the parent
+    // (so the leaf dir becomes the top archive member). Excludes are made
+    // relative to that same base so `--exclude=<rel>` matches.
+    let tar_base = if contents_only { src } else { parent.as_str() };
 
     let mut tar_cmd = Command::new("tar");
     let prefix = format!("{}/", src);
@@ -2092,12 +2135,19 @@ pub fn backup_system_path(label: &str, path: &str, exclude_mounts: &[String]) ->
         if ex.is_empty() { continue; }
         // Only sub-paths of the backed-up folder make sense to exclude.
         if ex != src && !ex.starts_with(&prefix) { continue; }
-        if let Ok(rel) = Path::new(ex).strip_prefix(&parent) {
+        if let Ok(rel) = Path::new(ex).strip_prefix(tar_base) {
+            // Excluding the archive root itself is degenerate — skip it (this
+            // is the `ex == src` case under contents-only, where rel is empty).
+            if rel.as_os_str().is_empty() { continue; }
             // `--exclude=<dir>` already excludes the subtree (see backup_lxc).
             tar_cmd.arg(format!("--exclude={}", rel.to_string_lossy()));
         }
     }
-    tar_cmd.args(["czf", &tar_path.to_string_lossy(), "-C", &parent, &leaf]);
+    if contents_only {
+        tar_cmd.args(["czf", &tar_path.to_string_lossy(), "-C", src, "."]);
+    } else {
+        tar_cmd.args(["czf", &tar_path.to_string_lossy(), "-C", &parent, &leaf]);
+    }
     let output = tar_cmd
         .output()
         .map_err(|e| format!("Failed to tar system folder: {}", e))?;
@@ -2108,26 +2158,97 @@ pub fn backup_system_path(label: &str, path: &str, exclude_mounts: &[String]) ->
     Ok((tar_path, size))
 }
 
-/// Restore a system-folder backup by extracting the tarball into `target_dir`
-/// (the parent into which the archived top-level folder is unpacked). The
-/// archive stores the folder by its leaf name, so extracting into the
-/// ORIGINAL parent restores it in place. Destructive over existing data —
-/// callers must require explicit confirmation.
+/// True when every top-level member of the archive is the folder's leaf name —
+/// i.e. the archive wraps the folder itself (`leaf/...`) rather than holding its
+/// bare contents. Pure so the leaf-vs-contents decision is unit-testable.
+/// `top_components` is the set of first path components (with any leading `./`
+/// stripped) seen in the tarball listing.
+fn archive_is_leaf_style(top_components: &std::collections::HashSet<String>, leaf: &str) -> bool {
+    !top_components.is_empty() && top_components.iter().all(|c| c == leaf)
+}
+
+/// Restore a system-folder backup. The archive is either *leaf-style* (top
+/// member is the folder's leaf name, e.g. `etc/...` — the default and how every
+/// pre-v24.55.11 backup was made) or *contents-only* (the folder's bare
+/// contents, produced when the source path carried a trailing slash). We read
+/// the actual tarball structure to tell which, so historical archives restore
+/// correctly regardless of how the stored path looks today.
+///
+/// `target_dir` empty → restore IN PLACE: a leaf-style archive unpacks into the
+/// folder's PARENT (recreating it where it was); a contents-only archive unpacks
+/// into the FOLDER itself. A non-empty `target_dir` is an operator-chosen
+/// extraction directory used verbatim. Destructive over existing data — callers
+/// must require explicit confirmation.
 pub fn restore_system_path(entry: &BackupEntry, target_dir: &str) -> Result<String, String> {
-    let dest = target_dir.trim();
+    let src = entry.target.system_path.trim_end_matches('/');
+    let leaf = Path::new(src).file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+    let parent = Path::new(src).parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/".to_string());
+
+    // A valid backup never has a root/empty source (validate_system_path blocks
+    // "/"), but refuse it defensively before fetching anything: an empty leaf
+    // would misclassify as contents-only and could extract into "/".
+    if leaf.is_empty() {
+        return Err(format!(
+            "Cannot restore system folder: invalid source path '{}'",
+            entry.target.system_path
+        ));
+    }
+
+    let local_path = retrieve_backup(entry)?;
+
+    // Inspect the archive's top-level members to classify leaf-style vs
+    // contents-only. This is the source of truth for where the bytes go —
+    // never inferred from the (possibly trailing-slash-trimmed) stored path.
+    let list = Command::new("tar")
+        .args(["tzf", &local_path.to_string_lossy()])
+        .output();
+    let leaf_style = match list {
+        Ok(o) if o.status.success() => {
+            let top_components: std::collections::HashSet<String> = String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(|l| l.trim_start_matches("./").trim_start_matches('/'))
+                .filter_map(|l| l.split('/').next())
+                .filter(|c| !c.is_empty())
+                .map(|c| c.to_string())
+                .collect();
+            archive_is_leaf_style(&top_components, &leaf)
+        }
+        // Listing failed (rare — a readable archive lists fine, and if it
+        // can't the extract below will fail too). Assume leaf-style: that's how
+        // every backup made before trailing-slash support was built, so the
+        // common case still restores into the correct place.
+        _ => true,
+    };
+
+    // Decide the extraction directory.
+    let dest_owned: String;
+    let dest = if target_dir.trim().is_empty() {
+        // In-place: leaf-style → parent; contents-only → the folder itself.
+        dest_owned = if leaf_style { parent } else { src.to_string() };
+        dest_owned.as_str()
+    } else {
+        target_dir.trim()
+    };
+
     if dest.is_empty() || !dest.starts_with('/') {
+        let _ = fs::remove_file(&local_path);
         return Err("Restore target directory must be an absolute path".into());
     }
-    // Refuse the kernel filesystems (/proc, /sys, /dev) as the restore
-    // destination. "/" IS allowed here: the archive's top member is the
-    // folder's leaf name (e.g. `etc/`), so extracting into "/" recreates only
-    // `/etc/...` in place and never touches other root entries — that's the
-    // correct in-place restore for a top-level folder. Destructive over
-    // existing data, so callers must require explicit confirmation.
-    reject_dangerous_root(dest, false)?;
-    fs::create_dir_all(dest)
-        .map_err(|e| format!("Cannot create restore target '{}': {}", dest, e))?;
-    let local_path = retrieve_backup(entry)?;
+    // Refuse the kernel filesystems (/proc, /sys, /dev). "/" is allowed: a
+    // leaf-style top-level folder (e.g. `etc/`) extracted into "/" lands back
+    // in place and touches only its own subtree. Destructive over existing
+    // data, so callers must require explicit confirmation.
+    if let Err(e) = reject_dangerous_root(dest, false) {
+        let _ = fs::remove_file(&local_path);
+        return Err(e);
+    }
+    if let Err(e) = fs::create_dir_all(dest) {
+        let _ = fs::remove_file(&local_path);
+        return Err(format!("Cannot create restore target '{}': {}", dest, e));
+    }
     let output = Command::new("tar")
         .args(["xzf", &local_path.to_string_lossy(), "-C", dest])
         .output();
@@ -5265,18 +5386,11 @@ pub fn restore_backup(entry: &BackupEntry, overwrite: bool) -> Result<String, St
         BackupTargetType::Lxc => restore_lxc(entry, "", overwrite, ""),
         BackupTargetType::Vm => restore_vm(entry),
         BackupTargetType::Config => restore_config_backup(entry),
-        // System-folder restore defaults to the PARENT of the original
-        // path so the folder lands back exactly where it came from. The
-        // streaming/targeted path (restore_entry_with_log) lets the
-        // operator choose a different parent.
-        BackupTargetType::SystemPath => {
-            let parent = Path::new(entry.target.system_path.trim_end_matches('/'))
-                .parent()
-                .map(|p| p.to_string_lossy().to_string())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "/".to_string());
-            restore_system_path(entry, &parent)
-        }
+        // System-folder restore defaults to IN PLACE — restore_system_path
+        // inspects the archive and picks the parent (leaf-style) or the folder
+        // itself (contents-only). The streaming/targeted path
+        // (restore_entry_with_log) lets the operator choose an explicit dir.
+        BackupTargetType::SystemPath => restore_system_path(entry, ""),
     }
 }
 
@@ -5744,19 +5858,16 @@ fn restore_entry_with_log(entry: &BackupEntry, overwrite: bool, storage: &str, n
             result
         }
         BackupTargetType::SystemPath => {
-            // `new_name` carries an operator-chosen restore-target directory
-            // (the PARENT into which the folder is unpacked). Empty = restore
-            // in place, i.e. the parent of the original `system_path`.
-            let target_dir = if new_name.trim().is_empty() {
-                Path::new(entry.target.system_path.trim_end_matches('/'))
-                    .parent()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| "/".to_string())
+            // `new_name` carries an optional operator-chosen restore-target
+            // directory, used verbatim. Empty = restore in place, where
+            // restore_system_path inspects the archive to land a leaf-style
+            // backup in its parent or a contents-only backup in the folder.
+            let target_dir = new_name.trim().to_string();
+            if target_dir.is_empty() {
+                let _ = log.send("Restoring system folder in place...".to_string());
             } else {
-                new_name.trim().to_string()
-            };
-            let _ = log.send(format!("Restoring system folder into {}...", target_dir));
+                let _ = log.send(format!("Restoring system folder into {}...", target_dir));
+            }
             let result = restore_system_path(entry, &target_dir);
             match &result {
                 Ok(msg) => { let _ = log.send(format!("✅ {}", msg)); }
@@ -6906,10 +7017,20 @@ pub fn merge_pbs_secrets(storage: &mut BackupStorage) {
     if storage.pbs_password.is_empty()    { storage.pbs_password    = saved.pbs_password; }
     if storage.pbs_fingerprint.is_empty() { storage.pbs_fingerprint = saved.pbs_fingerprint; }
     if storage.pbs_namespace.is_empty()   { storage.pbs_namespace   = saved.pbs_namespace; }
-    // file-level is a saved preference of the PBS destination — adopt it when
-    // the caller (e.g. the cluster scheduler form sending only `{type:"pbs"}`)
-    // didn't explicitly request it. A POST that DID set it wins.
-    if !storage.pbs_file_level         { storage.pbs_file_level  = saved.pbs_file_level; }
+    storage.pbs_file_level =
+        resolve_pbs_file_level(storage.pbs_file_level_set, storage.pbs_file_level, saved.pbs_file_level);
+}
+
+/// Resolve a PBS backup's effective file-level (pxar) flag from the per-backup
+/// override and the connection default. Pure so the precedence is unit-testable.
+///
+/// * `explicitly_set` true → the caller used the per-backup toggle, so its
+///   `requested` value wins verbatim — including an explicit `false` against an
+///   on-by-default connection (the half of the override a bare bool can't do).
+/// * `explicitly_set` false → legacy behaviour: adopt the saved default unless
+///   the request already asked for `true`. Keeps older callers byte-identical.
+fn resolve_pbs_file_level(explicitly_set: bool, requested: bool, saved: bool) -> bool {
+    if !explicitly_set && !requested { saved } else { requested }
 }
 
 /// PBS configuration — stored in /etc/wolfstack/pbs/config.json

@@ -3867,6 +3867,8 @@
                             Back up an arbitrary host folder (e.g. <code>/etc</code>, <code>/home</code>, app data) to the
                             destination selected above. Dangerous roots (<code>/</code>, <code>/proc</code>, <code>/sys</code>,
                             <code>/dev</code>) are refused.
+                            <br><strong>Trailing slash matters:</strong> <code>/srv/temp</code> backs up the folder itself
+                            (restores back to <code>/srv/temp</code>); <code>/srv/temp/</code> backs up only its contents.
                         </div>
                         <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center;">
                             <input type="text" id="sysfolder-path" placeholder="/etc"
