@@ -5655,9 +5655,18 @@ fn lxc_post_start_setup(container: &str) {
         vec!["-n", container, "--"]
     };
 
-    // Assign a unique bridge IP if not already configured by WolfNet
+    // Assign a unique lxcbr0 (10.0.3.x) bridge IP if not already configured by
+    // WolfNet. SKIP this entirely for a container on a KNOWN non-lxcbr0 primary
+    // bridge (Bridged-LAN / vSwitch mode, e.g. lanbr0): it gets its address
+    // from that bridge — DHCP or a static `lxc.net.0.ipv4.address` — and must
+    // NOT be flushed onto the lxcbr0 NAT subnet. Doing so silently "reverted" a
+    // freshly-created LAN-bridged container to 10.0.3.x right after start, with
+    // no restart (Gary KO4BSR 2026-06-22). lxcbr0 and unknown(None) proceed
+    // unchanged, so existing NAT containers are byte-identical (Golden Rule).
+    // Mirrors the same gate `lxc_apply_wolfnet` uses (v24.55.1).
     let wolfnet_file = format!("{}/{}/.wolfnet/ip", base, container);
-    if !std::path::Path::new(&wolfnet_file).exists() {
+    let on_custom_bridge = skip_standalone_wolfnet(lxc_primary_bridge(container).as_deref());
+    if !std::path::Path::new(&wolfnet_file).exists() && !on_custom_bridge {
         let bridge_ip = assign_container_bridge_ip(container);
 
         // Apply immediately
@@ -6251,6 +6260,10 @@ mod wolfnet_gate_tests {
         assert!(skip_standalone_wolfnet(Some("vmbr4001")));
         assert!(skip_standalone_wolfnet(Some("br0")));
         assert!(skip_standalone_wolfnet(Some("vmbr0")));
+        // A WolfStack-created LAN bridge (Bridged-LAN mode) → SKIP, so
+        // lxc_post_start_setup never flushes the container onto the lxcbr0
+        // 10.0.3.x NAT subnet (Gary KO4BSR 2026-06-22).
+        assert!(skip_standalone_wolfnet(Some("lanbr0")));
     }
 }
 

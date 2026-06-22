@@ -24117,6 +24117,8 @@ async function openLxcSettings(name) {
                 </div>
 
                 <button class="btn btn-sm" onclick="addLxcNic('${name}')" style="margin-top:4px;font-size:11px;padding:6px 12px;">+ Add Interface</button>
+                <button class="btn btn-sm" onclick="openCreateLanBridge('','')" style="margin-top:4px;margin-left:6px;font-size:11px;padding:6px 12px;">+ Create LAN bridge</button>
+                <div style="font-size:11px;color:var(--text-muted);margin-top:6px;">Click a NIC above to set its <strong>Bridge / Link</strong> (e.g. a LAN bridge for direct LAN access). Use <strong>+ Create LAN bridge</strong> to build one first.</div>
 
                 <div style="margin-top:12px;padding:12px;background:var(--bg-tertiary);border-radius:8px;border:1px solid var(--border);">
                     <h4 style="margin:0 0 8px 0;font-size:13px;">WolfNet</h4>
