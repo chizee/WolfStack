@@ -176,6 +176,13 @@ pub struct BackupStorage {
     /// byte-identical to the original behaviour.
     #[serde(default)]
     pub pbs_file_level: bool,
+    /// True when the caller EXPLICITLY chose `pbs_file_level` for this backup
+    /// (the per-backup override), so `merge_pbs_secrets` must keep it verbatim —
+    /// including an explicit `false` against an on-by-default connection. Absent
+    /// field → false → fall back to the old "adopt the saved default unless the
+    /// request set it true" behaviour, so older callers are byte-identical.
+    #[serde(default)]
+    pub pbs_file_level_set: bool,
     // ── NFS direct backup destination ─────────────────
     /// `server:/export` — same syntax as `mount -t nfs`.
     #[serde(default)]
@@ -279,6 +286,7 @@ impl Default for BackupStorage {
             pbs_fingerprint: String::new(),
             pbs_namespace: String::new(),
             pbs_file_level: false,
+            pbs_file_level_set: false,
             nfs_source: String::new(),
             nfs_options: String::new(),
             smb_source: String::new(),
@@ -378,6 +386,17 @@ mod tests {
         assert_eq!(d, short_path_discriminator("/data/temp"));
         assert_eq!(d.len(), 8);
         assert!(d.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn pbs_file_level_override_both_directions_and_legacy() {
+        // Per-backup override explicitly set → wins verbatim, BOTH directions.
+        assert!(!resolve_pbs_file_level(true, false, true), "explicit OFF beats on-default");
+        assert!(resolve_pbs_file_level(true, true, false), "explicit ON beats off-default");
+        // Not explicitly set → legacy: adopt saved unless request already true.
+        assert!(resolve_pbs_file_level(false, false, true), "unset adopts saved (on)");
+        assert!(!resolve_pbs_file_level(false, false, false), "unset adopts saved (off)");
+        assert!(resolve_pbs_file_level(false, true, false), "legacy: request-true still wins");
     }
 
     #[test]
@@ -6998,10 +7017,20 @@ pub fn merge_pbs_secrets(storage: &mut BackupStorage) {
     if storage.pbs_password.is_empty()    { storage.pbs_password    = saved.pbs_password; }
     if storage.pbs_fingerprint.is_empty() { storage.pbs_fingerprint = saved.pbs_fingerprint; }
     if storage.pbs_namespace.is_empty()   { storage.pbs_namespace   = saved.pbs_namespace; }
-    // file-level is a saved preference of the PBS destination — adopt it when
-    // the caller (e.g. the cluster scheduler form sending only `{type:"pbs"}`)
-    // didn't explicitly request it. A POST that DID set it wins.
-    if !storage.pbs_file_level         { storage.pbs_file_level  = saved.pbs_file_level; }
+    storage.pbs_file_level =
+        resolve_pbs_file_level(storage.pbs_file_level_set, storage.pbs_file_level, saved.pbs_file_level);
+}
+
+/// Resolve a PBS backup's effective file-level (pxar) flag from the per-backup
+/// override and the connection default. Pure so the precedence is unit-testable.
+///
+/// * `explicitly_set` true → the caller used the per-backup toggle, so its
+///   `requested` value wins verbatim — including an explicit `false` against an
+///   on-by-default connection (the half of the override a bare bool can't do).
+/// * `explicitly_set` false → legacy behaviour: adopt the saved default unless
+///   the request already asked for `true`. Keeps older callers byte-identical.
+fn resolve_pbs_file_level(explicitly_set: bool, requested: bool, saved: bool) -> bool {
+    if !explicitly_set && !requested { saved } else { requested }
 }
 
 /// PBS configuration — stored in /etc/wolfstack/pbs/config.json

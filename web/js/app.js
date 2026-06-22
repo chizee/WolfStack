@@ -29922,14 +29922,21 @@ async function getSelectedStorage() {
                 pbs_fingerprint: _cachedPbsConfig.pbs_fingerprint || '',
                 pbs_namespace: _cachedPbsConfig.pbs_namespace || '',
                 // File-level (pxar) preference travels with the PBS destination
-                // so backup_pbs_file_level routes correctly. The per-backup
-                // toggle (if shown) overrides the connection default for THIS
-                // backup; otherwise fall back to the connection setting.
+                // so backup_pbs_file_level routes correctly. When the per-backup
+                // toggle is shown, its value is an EXPLICIT override for THIS
+                // backup (pbs_file_level_set:true) — including turning it OFF
+                // against an on-by-default connection. When not shown, fall back
+                // to the connection setting and don't claim an explicit choice.
                 pbs_file_level: (function () {
                     const cb = document.getElementById('backup-pbs-filelevel');
                     const wrap = document.getElementById('backup-pbs-filelevel-wrap');
                     if (cb && wrap && wrap.style.display !== 'none') return !!cb.checked;
                     return !!_cachedPbsConfig.pbs_file_level;
+                })(),
+                pbs_file_level_set: (function () {
+                    const cb = document.getElementById('backup-pbs-filelevel');
+                    const wrap = document.getElementById('backup-pbs-filelevel-wrap');
+                    return !!(cb && wrap && wrap.style.display !== 'none');
                 })(),
                 // Secrets are stored on server, leave empty so backend preserves them
                 pbs_token_secret: '',
