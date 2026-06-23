@@ -3602,6 +3602,21 @@ impl VmManager {
     }
 
     pub fn autostart_vms(&self) {
+        // Autostart means "start this VM when the MACHINE boots", not when the
+        // WolfStack service restarts (e.g. a binary upgrade) — without these
+        // guards, updating WolfStack re-started VMs the operator had
+        // deliberately stopped (Restraint, 2026-06-23).
+        //
+        // On Proxmox the hypervisor's own pve-guests starts onboot VMs at node
+        // boot, so leave it entirely to Proxmox (mirrors lxc_autostart_all()).
+        if containers::is_proxmox() {
+            return;
+        }
+        // On native/libvirt hosts WolfStack drives autostart itself — but only
+        // on an actual machine boot, never on a mere service restart.
+        if !containers::host_recently_booted() {
+            return;
+        }
 
         for vm in self.list_vms() {
             if vm.auto_start && !vm.running {
