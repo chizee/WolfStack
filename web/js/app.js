@@ -36869,18 +36869,36 @@ async function issuesUpgradeAll(overrideTargets) {
 
     var channel = (document.getElementById('issues-channel-select') || {}).value || 'master';
 
-    // Track each node upgrade — persist to localStorage so tracking survives page reload
-    var trackers = JSON.parse(localStorage.getItem('wolfstack_upgrade_trackers') || '[]');
+    // Track each node upgrade — persist to localStorage so tracking survives page reload.
+    // Drop any already-done trackers left over from a prior upgrade so they don't
+    // accumulate (and so a re-upgrade of the same node gets a fresh tracker).
+    var trackers = JSON.parse(localStorage.getItem('wolfstack_upgrade_trackers') || '[]').filter(function (t) { return t && !t.done; });
     for (var i = 0; i < targets.length; i++) {
         var r = targets[i];
         var node = allNodes.find(function (n) { return n.id === r.node_id; });
         var safeId = (r.node_id || 'local').replace(/[^a-z0-9_-]/gi, '-');
         var url = (node && !node.is_self) ? '/api/nodes/' + encodeURIComponent(r.node_id) + '/proxy/upgrade?channel=' + channel : '/api/upgrade?channel=' + channel;
 
+        // Capture the node's CURRENT version BEFORE the upgrade POST (which
+        // triggers a restart). The tracker uses a version bump as a
+        // restart-proof "done" signal — unlike the offline→online heuristic
+        // below, a version comparison still works when the browser never
+        // witnessed the brief offline window (logout/login mid-upgrade, or a
+        // binary restart faster than the ~20s cluster offline detection).
+        // Issues-page targets already carry r.version from the scan; the
+        // per-node-settings path (upgradeNode) passes '?', so probe it here.
+        var preVersion = (r.version && r.version !== '?') ? r.version : null;
+        if (!preVersion && node && !node.is_self) {
+            try {
+                var vr = await fetch('/api/nodes/' + encodeURIComponent(r.node_id) + '/proxy/nodes', { credentials: 'include' });
+                if (vr.ok) { var vd = await vr.json(); if (vd && vd.version) preVersion = vd.version; }
+            } catch (_) { /* unreachable now → version probe falls back to offline heuristic */ }
+        }
+
         try {
             await fetch(url, { method: 'POST' });
             modal.updateRow(safeId, true, 'Upgrading...');
-            trackers.push({ nodeId: r.node_id, hostname: r.hostname || r.node_id, cluster: (node && node.cluster_name) || 'WolfStack', startedAt: Date.now(), done: false });
+            trackers.push({ nodeId: r.node_id, hostname: r.hostname || r.node_id, cluster: (node && node.cluster_name) || 'WolfStack', startedAt: Date.now(), done: false, preVersion: preVersion });
         } catch (e) {
             modal.updateRow(safeId, false, 'Failed: ' + e.message);
         }
@@ -36959,15 +36977,60 @@ async function issuesUpgradeAll(overrideTargets) {
     _startUpgradeTracking();
 }
 
+// In-flight / throttle guards for the version probe. Kept in memory (NOT
+// in the persisted tracker) so a reload can never leave a probe flagged
+// permanently in-flight and block all future probes for that node.
+var _upgradeProbeInflight = {}; // nodeId -> true while a probe is outstanding
+var _upgradeProbeLast = {};     // nodeId -> ts of last probe
+
+// Restart-proof completion probe: ask the node for its live WolfStack
+// version and compare against the version captured when the upgrade
+// launched. A higher version means the new binary is running — i.e. the
+// upgrade finished and the process restarted — which is true even if the
+// browser never saw the node go offline (exactly the logout/login case the
+// offline→online heuristic below misses). On a same-version reinstall the
+// version won't change, so the offline heuristic / 1h timeout still apply.
+function _probeUpgradeVersion(t) {
+    if (!t || t.done || !t.preVersion || !t.nodeId) return;
+    if (_upgradeProbeInflight[t.nodeId]) return;
+    var node = allNodes.find(function (n) { return n.id === t.nodeId; });
+    if (!node || node.is_self) return; // self can't be proxied; completed by the is_self/elapsed branch in the tick below
+    var nowTs = Date.now();
+    if (_upgradeProbeLast[t.nodeId] && (nowTs - _upgradeProbeLast[t.nodeId]) < 12000) return; // throttle ~12s
+    _upgradeProbeLast[t.nodeId] = nowTs;
+    _upgradeProbeInflight[t.nodeId] = true;
+    fetch('/api/nodes/' + encodeURIComponent(t.nodeId) + '/proxy/nodes', { credentials: 'include' })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) {
+            _upgradeProbeInflight[t.nodeId] = false;
+            if (t.done || !d || !d.version) return;
+            if (compareVersions(d.version, t.preVersion) > 0) {
+                t.done = true;
+                var elapsed = Math.floor((Date.now() - t.startedAt) / 1000);
+                var timeStr = elapsed >= 60 ? Math.floor(elapsed / 60) + 'm ' + (elapsed % 60) + 's' : elapsed + 's';
+                if (t.taskId) updateTaskLogEntry(t.taskId, { description: t.hostname + ' — upgrade complete, now v' + d.version + ' (' + timeStr + ')', status: 'success' });
+                // Persist immediately so a reload before the next 5s tick keeps the done state.
+                try { localStorage.setItem('wolfstack_upgrade_trackers', JSON.stringify(JSON.parse(localStorage.getItem('wolfstack_upgrade_trackers') || '[]').map(function (x) { return (x.nodeId === t.nodeId) ? Object.assign(x, { done: true }) : x; }))); } catch (_) {}
+            }
+        })
+        .catch(function () { _upgradeProbeInflight[t.nodeId] = false; });
+}
+
 // Persistent upgrade tracker — survives page reload
 function _startUpgradeTracking() {
     var trackers = JSON.parse(localStorage.getItem('wolfstack_upgrade_trackers') || '[]');
     if (trackers.length === 0) return;
 
-    // Create task log entries for any pending trackers
+    // Create task log entries for any pending trackers. Recreate when the
+    // entry is missing: either this is a fresh tracker (no taskId yet), or the
+    // persisted taskId no longer resolves because the entry was trimmed
+    // (500-cap), quota-evicted, or the operator cleared the task log since the
+    // tracker was saved. Without this, a resumed tracker would update a dead
+    // id and the upgrade would be invisible in the log.
     trackers.forEach(function(t) {
         if (t.done) return;
-        if (!t.taskId) {
+        var existing = t.taskId && _taskLogEntries.find(function (e) { return e.id === t.taskId; });
+        if (!existing) {
             t.taskId = addTaskLogEntry({
                 cluster: t.cluster || 'WolfStack',
                 node: t.hostname,
@@ -36982,6 +37045,10 @@ function _startUpgradeTracking() {
         var pending = 0;
         trackers.forEach(function(t) {
             if (t.done) return;
+            // Restart-proof signal first — fires regardless of whether we
+            // ever caught the node offline (survives logout/login). Async;
+            // sets t.done when it confirms a version bump, honored next tick.
+            _probeUpgradeVersion(t);
             var currentNode = allNodes.find(function(n) { return n.id === t.nodeId; });
             var elapsed = Math.floor((Date.now() - t.startedAt) / 1000);
             var timeStr = elapsed >= 60 ? Math.floor(elapsed/60) + 'm ' + (elapsed%60) + 's' : elapsed + 's';
