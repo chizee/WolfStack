@@ -7657,6 +7657,13 @@ pub fn lxc_autostart_all() {
     // Proxmox handles container autostart itself — skip
     if is_proxmox() { return; }
 
+    // Autostart is a machine-boot action, not a WolfStack-restart one. Without
+    // this, a WolfStack upgrade re-started onboot containers the operator had
+    // deliberately stopped — the same bug reported for VMs (Restraint,
+    // 2026-06-23). `lxc-autostart` only ever STARTS guests, so gate it on a real
+    // machine boot.
+    if !host_recently_booted() { return; }
+
     // Start containers with autostart enabled (timeout to prevent blocking startup)
     let _ = Command::new("timeout").args(["30", "lxc-autostart"]).output();
 
@@ -7907,6 +7914,52 @@ pub fn is_proxmox() -> bool {
             .map(|o| o.status.success())
             .unwrap_or(false)
     })
+}
+
+/// True only if the *machine* booted recently — used to gate guest autostart.
+///
+/// "Autostart" means "start this guest when the machine boots", NOT when the
+/// WolfStack service restarts (e.g. a binary upgrade). Without this gate,
+/// updating WolfStack re-started VMs/containers the operator had deliberately
+/// stopped — autostart is a reboot action, not a service-restart action
+/// (Restraint, 2026-06-23). We approximate "just booted" from host uptime:
+/// WolfStack comes up within the first minute or two of boot, so a generous
+/// 10-minute window covers slow boots while excluding a service restart on a
+/// host that's been up for hours. Reads `/proc/uptime`; if it can't be read we
+/// return false (do NOT autostart) so an unexpected platform errs toward the
+/// reported complaint — never re-starting a guest the operator stopped.
+pub fn host_recently_booted() -> bool {
+    const AUTOSTART_BOOT_WINDOW_SECS: f64 = 600.0;
+    std::fs::read_to_string("/proc/uptime").ok()
+        .map(|s| uptime_within_window(&s, AUTOSTART_BOOT_WINDOW_SECS))
+        .unwrap_or(false)
+}
+
+/// Parse the first field of `/proc/uptime` (seconds since boot) and test it
+/// against `window_secs`. Split out so the gating logic is unit-testable without
+/// touching /proc. Unparseable/empty input → false (don't autostart).
+fn uptime_within_window(proc_uptime: &str, window_secs: f64) -> bool {
+    proc_uptime.split_whitespace().next()
+        .and_then(|f| f.parse::<f64>().ok())
+        .map(|up| up < window_secs)
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod autostart_gate_tests {
+    use super::uptime_within_window;
+
+    #[test]
+    fn autostart_only_within_boot_window() {
+        // /proc/uptime is "<seconds-since-boot> <idle-seconds>".
+        assert!(uptime_within_window("42.13 100.00", 600.0));     // just booted → autostart
+        assert!(uptime_within_window("599.9 1.0", 600.0));        // inside the window
+        assert!(!uptime_within_window("600.0 1.0", 600.0));       // exactly at the edge → no
+        assert!(!uptime_within_window("3601.00 9000.0", 600.0));  // up over an hour → no
+        // Unreadable / malformed uptime errs toward NOT autostarting.
+        assert!(!uptime_within_window("", 600.0));
+        assert!(!uptime_within_window("garbage", 600.0));
+    }
 }
 
 /// Detect if system has libvirt/virsh for VM management (but is NOT Proxmox)
