@@ -11933,14 +11933,61 @@ pub async fn wolfnet_next_ip(
     if prefix.is_empty() {
         return HttpResponse::Ok().json(serde_json::json!({ "ip": null, "error": "WolfNet is not configured" }));
     }
-    let next_ip = (2..=254u8)
-        .map(|i| format!("{}.{}", prefix, i))
-        .find(|ip| !all_used.contains(ip));
 
-    match next_ip {
-        Some(ip) => HttpResponse::Ok().json(serde_json::json!({ "ip": ip })),
+    // Remember every currently-used IP in the ever-used history so a later
+    // release doesn't make the address look brand new.
+    containers::record_wolfnet_ips_used(&all_used.iter().cloned().collect::<Vec<_>>());
+    let history = containers::load_wolfnet_ip_history();
+
+    // Prefer a PRISTINE address (free AND never used). Only recycle a
+    // previously-used-but-released IP when no fresh one remains — and flag it
+    // so the UI warns the operator before they reuse it (klasSponsor 2026-06-24:
+    // a recycled IP black-holed because the old node's routing was stale).
+    let mut fresh: Option<String> = None;
+    let mut recycled: Option<String> = None;
+    for i in 2..=254u8 {
+        let ip = format!("{}.{}", prefix, i);
+        if all_used.contains(&ip) { continue; }
+        if !history.contains(&ip) { fresh = Some(ip); break; }
+        if recycled.is_none() { recycled = Some(ip); }
+    }
+    let (picked, previously_used) = match fresh {
+        Some(ip) => (Some(ip), false),
+        None => (recycled, true),
+    };
+
+    match picked {
+        // We deliberately do NOT record the suggestion in history — only
+        // genuinely in-use IPs (recorded above from all_used) count, so an
+        // unacted suggestion never pollutes the history with a false
+        // "previously used" flag.
+        Some(ip) => HttpResponse::Ok().json(serde_json::json!({ "ip": ip, "previously_used": previously_used })),
         None => HttpResponse::Ok().json(serde_json::json!({ "ip": null, "error": "No available IPs in the WolfNet subnet" })),
     }
+}
+
+/// GET /api/wolfnet/ip-status?ip=X — is this WolfNet IP previously used (and is
+/// it active on a workload right now)? Drives the reuse warning when an operator
+/// types/keeps a WolfNet IP manually.
+pub async fn wolfnet_ip_status(
+    req: HttpRequest, state: web::Data<AppState>,
+    query: web::Query<std::collections::HashMap<String, String>>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let ip = query.get("ip").cloned().unwrap_or_default();
+    let ip = ip.split('/').next().unwrap_or(&ip).trim().to_string();
+    if ip.parse::<std::net::Ipv4Addr>().is_err() {
+        return HttpResponse::Ok().json(serde_json::json!({ "previously_used": false, "active_holder": null }));
+    }
+    let ip_for_block = ip.clone();
+    let previously_used = web::block(move || containers::wolfnet_ip_previously_used(&ip_for_block))
+        .await.unwrap_or(false);
+    // If something currently holds it, that's the strongest "don't reuse" signal.
+    let active_holder = wolfnet_ip_active_elsewhere(&state, &ip).await;
+    HttpResponse::Ok().json(serde_json::json!({
+        "previously_used": previously_used,
+        "active_holder": active_holder,
+    }))
 }
 
 /// GET /api/network/conflicts — detect duplicate MACs/IPs across LXC containers
@@ -37058,6 +37105,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         // WolfNet
         .route("/api/wolfnet/status", web::get().to(wolfnet_network_status))
         .route("/api/wolfnet/next-ip", web::get().to(wolfnet_next_ip))
+        .route("/api/wolfnet/ip-status", web::get().to(wolfnet_ip_status))
         // AI Agent
         .route("/api/ai/config", web::get().to(ai_get_config))
         .route("/api/ai/config", web::post().to(ai_save_config))
