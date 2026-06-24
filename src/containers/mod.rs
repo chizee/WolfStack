@@ -7616,9 +7616,60 @@ fn wolfnet_used_ip_set() -> Option<(String, std::collections::HashSet<String>)> 
     Some((prefix, used))
 }
 
+/// Persistent record of every WolfNet IP we've ever handed out / seen in use.
+/// Unlike the live used-set, entries are NEVER removed when an IP is released —
+/// it's a HISTORY, so we can (a) prefer pristine addresses when allocating and
+/// (b) warn an operator before they reuse one. Reusing a released IP is the
+/// case that bit klasSponsor: stale routing on the old node black-holed the
+/// reassigned address (2026-06-24).
+const WOLFNET_IP_HISTORY_PATH: &str = "/var/lib/wolfstack/wolfnet-ip-history.json";
+
+pub fn load_wolfnet_ip_history() -> std::collections::HashSet<String> {
+    std::fs::read_to_string(WOLFNET_IP_HISTORY_PATH)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+/// Add IPs to the ever-used history (bare addresses, CIDR suffix stripped).
+/// Idempotent; only writes when something new is added.
+pub fn record_wolfnet_ips_used(ips: &[String]) {
+    if ips.is_empty() { return; }
+    let mut hist = load_wolfnet_ip_history();
+    let mut changed = false;
+    for ip in ips {
+        let bare = ip.split('/').next().unwrap_or(ip).trim().to_string();
+        if !bare.is_empty() && hist.insert(bare) { changed = true; }
+    }
+    if changed {
+        if let Some(parent) = std::path::Path::new(WOLFNET_IP_HISTORY_PATH).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(j) = serde_json::to_string(&hist) {
+            let _ = std::fs::write(WOLFNET_IP_HISTORY_PATH, j);
+        }
+    }
+}
+
+/// Has this WolfNet IP ever been used before? (Whether or not it's free now.)
+pub fn wolfnet_ip_previously_used(ip: &str) -> bool {
+    let bare = ip.split('/').next().unwrap_or(ip).trim();
+    !bare.is_empty() && load_wolfnet_ip_history().contains(bare)
+}
+
 pub fn next_available_wolfnet_ip() -> Option<String> {
     let (prefix, used) = wolfnet_used_ip_set()?;
-    // Find next available in the WolfNet /24 range
+    let history = load_wolfnet_ip_history();
+    // First choice: a PRISTINE address — free AND never used before. Reusing a
+    // released IP risks colliding with routing the old node never withdrew, so
+    // we exhaust fresh addresses before recycling.
+    for i in 2..=254u8 {
+        let candidate = format!("{}.{}", prefix, i);
+        if !used.contains(&candidate) && !history.contains(&candidate) {
+            return Some(candidate);
+        }
+    }
+    // Fallback: every fresh IP is taken — recycle the lowest released one.
     for i in 2..=254u8 {
         let candidate = format!("{}.{}", prefix, i);
         if !used.contains(&candidate) {
@@ -7637,10 +7688,20 @@ pub fn next_available_wolfnet_ip() -> Option<String> {
 pub fn next_available_wolfnet_ips(n: usize) -> Option<Vec<String>> {
     if n == 0 { return Some(Vec::new()); }
     let (prefix, used) = wolfnet_used_ip_set()?;
+    let history = load_wolfnet_ip_history();
     let mut out = Vec::with_capacity(n);
+    // Pristine (never-used) addresses first…
     for i in 2..=254u8 {
         let candidate = format!("{}.{}", prefix, i);
-        if !used.contains(&candidate) {
+        if !used.contains(&candidate) && !history.contains(&candidate) {
+            out.push(candidate);
+            if out.len() == n { return Some(out); }
+        }
+    }
+    // …then recycle released ones only if we still need more.
+    for i in 2..=254u8 {
+        let candidate = format!("{}.{}", prefix, i);
+        if !used.contains(&candidate) && !out.contains(&candidate) {
             out.push(candidate);
             if out.len() == n { return Some(out); }
         }

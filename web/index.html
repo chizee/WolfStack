@@ -9424,7 +9424,7 @@ pveum aclmod / -token 'root@pam!wolfstack' -role WolfStackMonitor</code></pre>
                                     onchange="onMappingWolfnetIpSelect()" style="flex:1;">
                                     <option value="">— Select —</option>
                                 </select>
-                                <input type="text" id="mapping-wolfnet-ip" class="form-control"
+                                <input type="text" id="mapping-wolfnet-ip" class="form-control" onchange="checkWolfnetIpReuse(this)"
                                     placeholder="e.g. 10.10.10.104"
                                     style="flex:1; font-family:var(--font-mono); font-size:13px;">
                             </div>

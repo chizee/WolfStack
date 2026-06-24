@@ -9498,7 +9498,7 @@ function buildVmNetSection(prefix) {
             <div id="${prefix}-net-wolfnet">
                 <div style="display:flex;align-items:center;gap:8px;">
                     <label style="font-size:13px;white-space:nowrap;">WolfNet IP:</label>
-                    <input id="${prefix}-wolfnet-ip" type="text" placeholder="auto (next free)"
+                    <input id="${prefix}-wolfnet-ip" type="text" placeholder="auto (next free)" onchange="checkWolfnetIpReuse(this)"
                         style="flex:1;padding:6px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg-primary);color:var(--text-primary);font-size:13px;">
                 </div>
                 <div style="font-size:11px;color:var(--text-muted);margin-top:4px;">Auto-assigned from the WolfNet subnet. Override with a specific IP or leave blank to skip WolfNet.</div>
@@ -23217,7 +23217,7 @@ async function openDockerSettings(name) {
                     <div style="display:grid;grid-template-columns:1fr auto;gap:8px;align-items:end;">
                         <div class="form-group" style="margin:0;">
                             <label>WolfNet IP</label>
-                            <input type="text" id="docker-wolfnet-ip" class="form-control" value="${escapeHtml(wolfnetIp)}"
+                            <input type="text" id="docker-wolfnet-ip" class="form-control" value="${escapeHtml(wolfnetIp)}" onchange="checkWolfnetIpReuse(this)"
                                 placeholder="e.g. 10.10.10.50 (leave blank for none)">
                         </div>
                         <div style="display:flex;gap:4px;padding-bottom:2px;">
@@ -24303,15 +24303,52 @@ async function findNextWolfnetIp() {
         var resp = await fetch(apiUrl('/api/wolfnet/next-ip'));
         var data = await resp.json();
         if (data.ip) {
+            // The allocator hands out never-used IPs first; it only returns a
+            // previously-used one when fresh addresses are exhausted. Reusing a
+            // released IP can be unreachable if the old node's routing wasn't
+            // fully withdrawn — so confirm before filling it in.
+            if (data.previously_used && !(await showConfirm(
+                `All fresh WolfNet IPs are taken, so ${data.ip} — which has been used before — is the next free one.\n\nIf its previous assignment isn't fully cleared, the address may not be reachable from other nodes. Use ${data.ip} anyway?`,
+                'Reusing a WolfNet IP'))) {
+                return;
+            }
             var el = document.getElementById('lxc-wolfnet-ip');
-            if (el) el.value = data.ip;
-            showToast('Next available: ' + data.ip, 'success');
+            if (el) { el.value = data.ip; checkWolfnetIpReuse(el); }
+            showToast('Next available: ' + data.ip + (data.previously_used ? ' (previously used)' : ''), data.previously_used ? 'warning' : 'success');
         } else {
             showToast('No available WolfNet IPs (10.10.10.2-254 all used)', 'error');
         }
     } catch (e) {
         showToast('Failed to check available IPs: ' + e.message, 'error');
     }
+}
+
+// Warn — inline, non-blocking — when a manually-entered WolfNet IP has been
+// used before or is currently held by a workload, so the operator sees the risk
+// before saving (klasSponsor 2026-06-24: reusing a released IP black-holed
+// because the old node's routing was stale). Wired to the WolfNet IP inputs'
+// onchange.
+async function checkWolfnetIpReuse(el) {
+    if (!el) return;
+    const noteId = el.id + '-reuse-note';
+    const existing = document.getElementById(noteId);
+    if (existing) existing.remove();
+    const ip = (el.value || '').trim();
+    if (!ip || ip.toLowerCase().startsWith('auto')) return;
+    try {
+        const r = await fetch(apiUrl('/api/wolfnet/ip-status?ip=' + encodeURIComponent(ip)));
+        if (!r.ok) return;
+        const d = await r.json();
+        if (!d.active_holder && !d.previously_used) return;
+        const msg = d.active_holder
+            ? `⚠ ${escapeHtml(ip)} is currently in use (on ${escapeHtml(String(d.active_holder))}). Assigning it here will conflict — pick a different IP.`
+            : `⚠ ${escapeHtml(ip)} has been used before. If its previous assignment isn't fully cleared it may be unreachable from other nodes — a never-used IP is safer.`;
+        const note = document.createElement('div');
+        note.id = noteId;
+        note.style.cssText = 'margin-top:4px; font-size:11px; color:var(--warning); font-weight:500; line-height:1.4;';
+        note.innerHTML = msg;
+        el.insertAdjacentElement('afterend', note);
+    } catch (_) { /* non-fatal */ }
 }
 
 async function openLxcSettings(name) {
@@ -24568,7 +24605,7 @@ async function openLxcSettings(name) {
                     <div style="display:grid;grid-template-columns:1fr auto;gap:8px;align-items:end;">
                         <div class="form-group" style="margin:0;">
                             <label>WolfNet IP</label>
-                            <input type="text" id="lxc-wolfnet-ip" class="form-control" value="${escapeHtml(cfg.wolfnet_ip || '')}"
+                            <input type="text" id="lxc-wolfnet-ip" class="form-control" value="${escapeHtml(cfg.wolfnet_ip || '')}" onchange="checkWolfnetIpReuse(this)"
                                 placeholder="e.g. 10.10.10.50 (leave blank for none)">
                         </div>
                         <div style="display:flex;gap:4px;padding-bottom:2px;">
@@ -26837,7 +26874,7 @@ function selectDockerImage(imageName) {
                 </div>
                 <div style="display:flex; align-items:center; gap:8px;">
                     <label style="font-size:13px; white-space:nowrap;">Assign IP:</label>
-                    <input id="docker-wolfnet-ip" type="text" placeholder="auto"
+                    <input id="docker-wolfnet-ip" type="text" placeholder="auto" onchange="checkWolfnetIpReuse(this)"
                         style="flex:1; padding:6px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg-primary); color:var(--text-primary); font-size:13px;">
                     <span style="font-size:12px; color:var(--text-muted);">Leave empty for no WolfNet</span>
                 </div>
@@ -27335,7 +27372,7 @@ function selectLxcTemplate(distro, release, arch, variant) {
                 <div id="lxc-net-wolfnet" style="">
                     <div style="display:flex; align-items:center; gap:8px;">
                         <label style="font-size:13px; white-space:nowrap;">WolfNet IP:</label>
-                        <input id="lxc-wolfnet-ip" type="text" placeholder="auto (next free)"
+                        <input id="lxc-wolfnet-ip" type="text" placeholder="auto (next free)" onchange="checkWolfnetIpReuse(this)"
                             style="flex:1; padding:6px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg-primary); color:var(--text-primary); font-size:13px;">
                     </div>
                     <div style="font-size:11px; color:var(--text-muted); margin-top:4px;">Auto-assigned from the WolfNet subnet. Override with a specific IP or leave blank to skip WolfNet.</div>
