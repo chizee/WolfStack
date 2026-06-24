@@ -235,6 +235,13 @@ chunk_size = 4194304
 [mount]
 path = "/mnt/wolfdisk"
 allow_other = true
+
+# S3-compatible API gateway. Off by default. When enabled, set access_key and
+# secret_key (WolfStack pre-fills strong generated defaults in the UI) — an
+# enabled gateway with blank keys would accept unauthenticated access.
+[s3]
+enabled = false
+bind = "0.0.0.0:9878"
 "#;
 
 const DEFAULT_WOLFSCALE: &str = r#"# WolfScale Configuration
@@ -423,6 +430,20 @@ mod tests {
             "wolfproxy default template must include server.host");
         assert!(tpl["server"]["bind_address"].is_string());
         assert!(tpl["server"]["bind_address_ssl"].is_string());
+    }
+
+    #[test]
+    fn wolfdisk_default_template_has_s3_section() {
+        // Lock in the [s3] gateway section (field names/types must match
+        // wolfdisk's S3Config) so a future template edit can't silently drop
+        // it or mistype a field.
+        let tpl = default_template_json(Component::WolfDisk).expect("template parses");
+        assert!(tpl["s3"]["enabled"].is_boolean(),
+            "wolfdisk default template must include s3.enabled (bool)");
+        assert!(tpl["s3"]["bind"].is_string(),
+            "wolfdisk default template must include s3.bind (string)");
+        assert_eq!(tpl["s3"]["bind"].as_str(), Some("0.0.0.0:9878"),
+            "s3.bind must match wolfdisk's default_s3_bind()");
     }
 
     #[test]

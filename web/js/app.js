@@ -15336,6 +15336,38 @@ async function apacheToggleModule(name, enable) {
 
 // ── TOML Configurator (WolfDisk & WolfScale) ──
 
+// Cryptographically-strong random token from an alphanumeric alphabet, used
+// for generated S3 default credentials. Rejection-samples bytes to avoid the
+// modulo bias a raw `% 62` would introduce. Returns '' if no CSPRNG is
+// available (very old/embedded browsers) — callers then leave the field blank
+// rather than fall back to a weak Math.random key, and the operator sets it.
+function _randomToken(len) {
+    const charset = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    const cryptoObj = window.crypto || window.msCrypto;
+    if (!cryptoObj || !cryptoObj.getRandomValues) return '';
+    const limit = 256 - (256 % charset.length); // largest unbiased cut-off (248 for 62)
+    const buf = new Uint8Array(1);
+    let s = '';
+    while (s.length < len) {
+        cryptoObj.getRandomValues(buf);
+        if (buf[0] < limit) s += charset[buf[0] % charset.length];
+    }
+    return s;
+}
+
+// Ensure the WolfDisk S3 gateway has credentials. If the loaded config has no
+// access_key / secret_key, generate strong per-install defaults so an enabled
+// gateway is never unauthenticated. Mutates `cfg` in place (it's the value the
+// form renders from); nothing is written until the operator saves. If the
+// browser has no CSPRNG, the keys are left blank for manual entry — never a
+// weak fallback.
+function ensureWolfdiskS3Defaults(cfg) {
+    if (!cfg || typeof cfg !== 'object') return;
+    if (!cfg.s3 || typeof cfg.s3 !== 'object') cfg.s3 = {};
+    if (!cfg.s3.access_key) { const k = _randomToken(18); if (k) cfg.s3.access_key = 'wd' + k; } // 20-char AWS-style id
+    if (!cfg.s3.secret_key) { const k = _randomToken(40); if (k) cfg.s3.secret_key = k; }
+}
+
 function getTomlSchema(component) {
     if (component === 'wolfdisk') {
         return [
@@ -15358,6 +15390,12 @@ function getTomlSchema(component) {
             { key: 'mount', label: 'Mount', description: 'FUSE mount settings — this is where the distributed filesystem appears as a local directory.', fields: [
                 { key: 'path', label: 'Mount Path', type: 'string', default: '/mnt/wolfdisk', placeholder: '/mnt/wolfdisk', help: 'Local directory where WolfDisk will be mounted. Applications read/write files here as if it were a normal folder' },
                 { key: 'allow_other', label: 'Allow Other Users', type: 'boolean', default: true, help: 'Allow users other than root to access the mount. Required for most applications and containers to use the filesystem' },
+            ]},
+            { key: 's3', label: 'S3-Compatible Gateway', description: 'Expose this WolfDisk storage as an S3-compatible API so apps and tools (aws-cli, restic, rclone, backups…) can read and write it over the S3 protocol. WolfStack pre-fills strong, per-install default keys for you — keep them or set your own, but don\'t leave them blank while enabled (that would expose the gateway with no authentication).', fields: [
+                { key: 'enabled', label: 'Enable S3 Gateway', type: 'boolean', default: false, help: 'Serve an S3-compatible API from this node. When off, WolfDisk is filesystem-only.' },
+                { key: 'bind', label: 'S3 Bind Address', type: 'string', default: '0.0.0.0:9878', placeholder: '0.0.0.0:9878', help: 'IP and port the S3 API listens on. Use 0.0.0.0 for all interfaces, or a specific IP / 127.0.0.1 to keep it local-only' },
+                { key: 'access_key', label: 'Access Key', type: 'string', default: '', placeholder: 'auto-generated', help: 'The S3 access key ID your clients authenticate with. A strong default is generated — copy it into your S3 client (e.g. aws-cli), or replace it with your own' },
+                { key: 'secret_key', label: 'Secret Key', type: 'string', default: '', placeholder: 'auto-generated', help: 'The S3 secret access key. Shown so you can copy it into your client; treat it like a password. A strong default is generated so the gateway is never left unauthenticated' },
             ]},
         ];
     }
@@ -15479,6 +15517,11 @@ async function loadTomlConfigurator(component, displayName) {
                 missingRequired = Array.isArray(valData.missing_required) ? valData.missing_required : [];
             }
         } catch (_) { /* non-fatal */ }
+        // WolfDisk S3 gateway: pre-fill strong per-install default credentials
+        // when the config has none, so an enabled gateway is never left without
+        // auth. The operator sees them in the form and can keep or replace them;
+        // they only persist to disk when the form is saved.
+        if (component === 'wolfdisk') ensureWolfdiskS3Defaults(data);
         renderTomlForm(component, data, { missingRequired, displayName });
     } catch (e) {
         body.innerHTML = `<div style="color:var(--danger);">Failed to load config: ${escapeHtml(e.message)}</div>`;
