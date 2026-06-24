@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v24.57.9: WolfDisk S3 gateway settings (with safe default keys)** _(2026-06-24 — [`db54847c`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/db54847c4d8292eeeaaf2923228eaf9095317798))_
 - **v24.57.8: "Remove failed" button on the Backups page** _(2026-06-24 — [`4d704e28`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/4d704e28bf66de7f734fb891d985544053582fc6))_
 - **v24.57.7: sidebar fixes — LXC count excludes ghosts; remembered collapse state** _(2026-06-24 — [`8cd0bca6`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/8cd0bca6259944f488136f8e1248934523b59256))_
 - **v24.57.6: gzip/brotli response compression (fix app.js ERR_CONNECTION_RESET)** _(2026-06-24 — [`0306d738`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/0306d7388643b52debadf4ed78406495a28412e8))_
