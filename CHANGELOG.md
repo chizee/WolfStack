@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v24.57.12: fix WolfDisk install paths ("Unit wolfdisk.service not found")** _(2026-06-24 — [`05ba21d6`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/05ba21d6455bf316834d39bd7d0035138086b05e))_
 - **v24.57.11: warn before reusing a previously-used WolfNet IP (don't silently recycle)** _(2026-06-24 — [`0b2a2bb6`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/0b2a2bb6257773cf8bc9cf18f41e18548c6cb4d3))_
 - **v24.57.10: WolfRouter tool tabs always visible (don't hide them in Rack view)** _(2026-06-24 — [`95a64737`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/95a647374fecd4835f7144495d98b011ede6b4b0))_
 - **v24.57.9: WolfDisk S3 gateway settings (with safe default keys)** _(2026-06-24 — [`db54847c`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/db54847c4d8292eeeaaf2923228eaf9095317798))_
