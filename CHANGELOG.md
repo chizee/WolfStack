@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v24.57.8: "Remove failed" button on the Backups page** _(2026-06-24 — [`4d704e28`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/4d704e28bf66de7f734fb891d985544053582fc6))_
 - **v24.57.7: sidebar fixes — LXC count excludes ghosts; remembered collapse state** _(2026-06-24 — [`8cd0bca6`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/8cd0bca6259944f488136f8e1248934523b59256))_
 - **v24.57.6: gzip/brotli response compression (fix app.js ERR_CONNECTION_RESET)** _(2026-06-24 — [`0306d738`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/0306d7388643b52debadf4ed78406495a28412e8))_
 - **v24.57.5: hide ghost PVE husks from the LXC list (don't badge them)** _(2026-06-24 — [`8498215d`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/8498215d7d81d9ede22f94812c99e7f2188a1196))_
