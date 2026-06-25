@@ -8,6 +8,8 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v24.57.27: wrap backup_schedule_toggle file I/O in web::block (actix canon)** _(2026-06-25 — [`65cab34a`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/65cab34a39b3d0ad27d6fb29ce4603315d5f1dfe))_
+- **v24.57.27: scheduled-backup Run Now / Edit / Enable-Disable + multi-folder system backups (Gary)** _(2026-06-25 — [`61ace393`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/61ace3934ac0f5807f08d7d5f56b06c7eddad697))_
 - **v24.57.26: stop WolfNet IP-mapping iptables rules accumulating (PapaSchlumpf throughput collapse)** _(2026-06-25 — [`4914f521`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/4914f52128245e8b10d50975583ebc2300f8c942))_
 - **v24.57.25: harden destructive disk operations against data loss (paranoid review)** _(2026-06-25 — [`099e60a3`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/099e60a30c0bbfe5f8e390e161744ba71a7bd750))_
 - **v24.57.24: WolfDisk SSD cache tier settings in the configurator** _(2026-06-25 — [`3a4c92b9`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/3a4c92b95b7ae433aff1cd359bc606e03ff683a9))_
