@@ -17535,9 +17535,12 @@ pub async fn backup_schedule_toggle(
     body: web::Json<ToggleScheduleRequest>,
 ) -> HttpResponse {
     if let Err(e) = require_auth(&req, &state) { return e; }
-    match backup::set_schedule_enabled(&path.into_inner(), body.enabled) {
-        Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
-        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    let id = path.into_inner();
+    let enabled = body.enabled;
+    match web::block(move || backup::set_schedule_enabled(&id, enabled)).await {
+        Ok(Ok(msg)) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
+        Ok(Err(e)) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("{}", e) })),
     }
 }
 
