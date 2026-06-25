@@ -8,7 +8,12 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v24.57.26: stop WolfNet IP-mapping iptables rules accumulating (PapaSchlumpf throughput collapse)** _(2026-06-25 — [`4914f521`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/4914f52128245e8b10d50975583ebc2300f8c942))_
+- **v24.57.25: harden destructive disk operations against data loss (paranoid review)** _(2026-06-25 — [`099e60a3`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/099e60a30c0bbfe5f8e390e161744ba71a7bd750))_
+- **v24.57.24: WolfDisk SSD cache tier settings in the configurator** _(2026-06-25 — [`3a4c92b9`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/3a4c92b95b7ae433aff1cd359bc606e03ff683a9))_
+- **v24.57.23: give WolfDisk its own dedicated disk (klasSponsor)** _(2026-06-25 — [`bec67afe`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/bec67afe336d8b683fbd6e86f3bd473cec095ed5))_
 - **v24.57.22: WolfDisk cluster sync healthcheck (klasSponsor)** _(2026-06-25 — [`b0942e54`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/b0942e54ff22512278bd55c763d82b0e3899ab6d))_
+- **v24.57.22: WolfDisk cluster sync healthcheck (klasSponsor)** _(2026-06-25 — [`3f63d21a`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/3f63d21adf7b5ca6591504f5f9b53bc48267afaa))_
 - **v24.57.21: mount local disks to directories + App Store Storage category (klasSponsor)** _(2026-06-25 — [`99985f3f`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/99985f3fa894f778d2dc07487c568cf6aecfd39c))_
 - **v24.57.20: collapsing a sidebar cluster sticks across reload (wabil)** _(2026-06-25 — [`b82a89f3`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/b82a89f3083f7b7f69768f6c7b2dc37f1f4326c8))_
 - **v24.57.19: terminal tabs route to the right node (2nd tab no longer hijacks the 1st's host)** _(2026-06-25 — [`6fa68420`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/6fa68420583689bb585f6a6ef2b467dc4a56c8d7))_
