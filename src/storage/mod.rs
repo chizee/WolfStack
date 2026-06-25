@@ -1403,6 +1403,191 @@ pub fn wolfdisk_cluster_status() -> Option<serde_json::Value> {
     Some(status)
 }
 
+/// A single lsblk column for a device (`-d` = device only, not children).
+fn lsblk_field(device: &str, col: &str) -> String {
+    Command::new("lsblk").args(["-dno", col, device]).output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+/// True if `device` or ANY of its partitions is in use — mounted OR claimed by a
+/// subsystem that holds data without a mountpoint: an LVM physical volume (even
+/// with no LV currently mounted), an mdraid member, a LUKS container (even closed),
+/// or active swap. is_protected_device only catches *system* mountpoints; this is
+/// the wipe-safety gate, so it must catch everything that would mean "this disk
+/// already holds data" — otherwise dedicate-disk would silently destroy an LVM PV
+/// or LUKS volume that has nothing mounted right now (code review 2026-06-25).
+fn device_or_children_in_use(device: &str) -> Result<bool, String> {
+    // Subsystems that hold data (or an active pool/array) WITHOUT a mountpoint — a
+    // wipe would destroy them. ZFS/bcache/Ceph added after the paranoid disk review.
+    const CLAIMED: &[&str] = &[
+        "LVM2_member", "linux_raid_member", "crypto_LUKS", "swap",
+        "zfs_member", "bcache", "ceph_bluestore",
+    ];
+    let output = Command::new("lsblk").args(["-Jno", "MOUNTPOINTS,FSTYPE", device]).output()
+        .map_err(|e| format!("lsblk: {}", e))?;
+    fn in_use(nodes: &[serde_json::Value]) -> bool {
+        nodes.iter().any(|n| {
+            let mounted = n.get("mountpoints").and_then(|m| m.as_array())
+                .map(|a| a.iter().any(|m| m.as_str().map(|s| !s.is_empty()).unwrap_or(false)))
+                .unwrap_or(false);
+            let claimed = n.get("fstype").and_then(|f| f.as_str())
+                .map(|f| CLAIMED.contains(&f)).unwrap_or(false);
+            mounted || claimed
+                || n.get("children").and_then(|c| c.as_array()).map(|c| in_use(c)).unwrap_or(false)
+        })
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout))
+        .unwrap_or(serde_json::json!({}));
+    Ok(parsed.get("blockdevices").and_then(|b| b.as_array()).map(|d| in_use(d)).unwrap_or(false))
+}
+
+/// Idempotently set an /etc/fstab line mounting `UUID=` at `mountpoint`. Boot-time
+/// fstab mounts are ordered before services (local-fs.target), so the data disk is
+/// present before wolfdisk.service starts. `nofail` keeps a missing disk from
+/// wedging boot. Any prior line for the same mountpoint is replaced.
+fn ensure_fstab_entry(uuid: &str, mountpoint: &str, fstype: &str) -> Result<(), String> {
+    let existing = fs::read_to_string("/etc/fstab").unwrap_or_default();
+    let mut lines: Vec<String> = existing.lines()
+        .filter(|l| {
+            let t = l.trim();
+            t.is_empty() || t.starts_with('#') || t.split_whitespace().nth(1) != Some(mountpoint)
+        })
+        .map(|s| s.to_string())
+        .collect();
+    lines.push(format!("UUID={} {} {} defaults,nofail 0 2", uuid, mountpoint, fstype));
+    let mut out = lines.join("\n");
+    out.push('\n');
+    fs::write("/etc/fstab", out).map_err(|e| format!("write /etc/fstab: {}", e))
+}
+
+/// Give WolfDisk its own disk (klasSponsor 2026-06): wipe `device` with a fresh
+/// filesystem, migrate WolfDisk's existing data onto it, mount it at WolfDisk's
+/// data_dir, persist via /etc/fstab (so it mounts at boot before wolfdisk.service),
+/// and restart the daemon. DESTRUCTIVE — the caller MUST have confirmed the wipe.
+/// A whole-disk filesystem (no partition table) keeps it simple and robust.
+pub fn wolfdisk_dedicate_disk(device: &str, fstype: &str) -> Result<String, String> {
+    let info = read_wolfdisk_info()
+        .ok_or("WolfDisk is not installed/configured on this node")?;
+    let data_dir = info.data_dir.clone();
+    if data_dir.is_empty() || data_dir == "/" || is_unsafe_mount_target(&data_dir) {
+        return Err(format!("WolfDisk data_dir '{}' is unset or unsafe", data_dir));
+    }
+
+    // Restrict to data-appropriate filesystems and map their whole-device force flag.
+    let force_flag = match fstype {
+        "ext4" | "ext3" | "ext2" => "-F",
+        "xfs" | "btrfs" | "f2fs" => "-f",
+        _ => return Err(format!("Use ext4, xfs or btrfs for a WolfDisk data disk (got '{}')", fstype)),
+    };
+
+    validate_device(device)?;
+    if lsblk_field(device, "TYPE") != "disk" {
+        return Err(format!("{} is not a whole disk — pick an unused disk to dedicate", device));
+    }
+    if device_or_children_in_use(device)? {
+        return Err(format!(
+            "{} is in use (mounted, or an LVM/RAID/LUKS/swap member) — pick a truly unused disk", device));
+    }
+    if is_protected_device(device)? {
+        return Err(format!("{} carries a system mount — refusing", device));
+    }
+    // Never let the migration temp path collide with the data_dir itself.
+    let tmp = "/mnt/.wolfdisk-dedicate";
+    if data_dir.trim_end_matches('/') == tmp {
+        return Err("WolfDisk data_dir collides with the migration temp path".into());
+    }
+
+    // Quiesce WolfDisk while we move its data_dir.
+    let _ = Command::new("systemctl").args(["stop", "wolfdisk"]).output();
+    let restart = || { let _ = Command::new("systemctl").args(["start", "wolfdisk"]).output(); };
+
+    // Wipe stale signatures, then lay a fresh whole-disk filesystem.
+    let _ = Command::new("wipefs").args(["-a", device]).output();
+    let mkfs = format!("mkfs.{}", fstype);
+    match Command::new(&mkfs).args([force_flag, device]).output() {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => { restart(); return Err(format!("Format failed: {}", String::from_utf8_lossy(&o.stderr).trim())); }
+        Err(e) => { restart(); return Err(format!("{} not available: {}", mkfs, e)); }
+    }
+
+    let uuid = lsblk_field(device, "UUID");
+    if uuid.is_empty() {
+        restart();
+        return Err("Could not read the new filesystem UUID after formatting".into());
+    }
+
+    // Migrate any existing WolfDisk data onto the new disk: mount it at a temp
+    // path, copy the data_dir contents in (cp -a preserves perms/symlinks), unmount.
+    let data_path = Path::new(&data_dir);
+    let had_data = data_path.exists()
+        && fs::read_dir(data_path).map(|mut d| d.next().is_some()).unwrap_or(false);
+    if had_data {
+        let _ = fs::create_dir_all(tmp);
+        match Command::new("mount").args([device, tmp]).output() {
+            Ok(o) if o.status.success() => {}
+            other => {
+                restart();
+                let err = other.map(|o| String::from_utf8_lossy(&o.stderr).trim().to_string())
+                    .unwrap_or_else(|e| e.to_string());
+                return Err(format!("Could not mount new disk to migrate data: {}", err));
+            }
+        }
+        let cp = Command::new("cp").args(["-a", &format!("{}/.", data_dir), tmp]).output();
+        let _ = Command::new("umount").arg(tmp).output();
+        let _ = fs::remove_dir(tmp);
+        match cp {
+            Ok(o) if o.status.success() => {}
+            other => {
+                restart();
+                let err = other.map(|o| String::from_utf8_lossy(&o.stderr).trim().to_string())
+                    .unwrap_or_else(|e| e.to_string());
+                return Err(format!("Migrating existing data failed: {}", err));
+            }
+        }
+    }
+
+    // Mount the dedicated disk at data_dir (shadowing the old on-root copy, which
+    // stays recoverable underneath), then persist it for boot.
+    let _ = fs::create_dir_all(&data_dir);
+    match Command::new("mount").args([device, &data_dir]).output() {
+        Ok(o) if o.status.success() => {}
+        other => {
+            restart();
+            let err = other.map(|o| String::from_utf8_lossy(&o.stderr).trim().to_string())
+                .unwrap_or_else(|e| e.to_string());
+            return Err(format!("Mounting dedicated disk at {} failed: {}", data_dir, err));
+        }
+    }
+    if let Err(e) = ensure_fstab_entry(&uuid, &data_dir, fstype) {
+        // The disk IS mounted now, but without an fstab entry it won't remount on
+        // boot and wolfdisk would write to the bare rootfs underneath. Restart so
+        // the daemon runs on the disk for now, and tell the operator to fix fstab.
+        let _ = Command::new("systemctl").args(["start", "wolfdisk"]).output();
+        return Err(format!(
+            "Disk mounted and data migrated, but writing /etc/fstab failed ({}). \
+             Add a boot mount for {} manually or it won't persist across reboot.", e, data_dir));
+    }
+
+    // Make wolfdisk.service explicitly wait for the data_dir mount at boot rather
+    // than relying solely on local-fs ordering (review 2026-06-25).
+    let dropin_dir = "/etc/systemd/system/wolfdisk.service.d";
+    let _ = fs::create_dir_all(dropin_dir);
+    let _ = fs::write(
+        format!("{}/dedicated-disk.conf", dropin_dir),
+        format!("[Unit]\nRequiresMountsFor={}\n", data_dir),
+    );
+    let _ = Command::new("systemctl").arg("daemon-reload").output();
+
+    let _ = Command::new("systemctl").args(["start", "wolfdisk"]).output();
+
+    Ok(format!(
+        "WolfDisk now stores its data on {} ({}) mounted at {}{}. It mounts on boot via /etc/fstab and WolfDisk has been restarted.",
+        device, fstype, data_dir,
+        if had_data { " — existing data migrated" } else { "" }
+    ))
+}
+
 fn install_s3fs() -> Result<(), String> {
 
     let distro = crate::installer::detect_distro();
@@ -2317,6 +2502,14 @@ pub fn create_partition_table(disk: &str, table_type: &str) -> Result<String, St
     if is_protected_device(disk)? {
         return Err(format!("{} has partitions mounted at protected locations — refusing", disk));
     }
+    // A new partition table erases EVERY partition on the disk. Refuse if any
+    // partition is mounted (even at a non-system path like /mnt/data) or is an
+    // LVM/RAID/LUKS/swap/ZFS member — that data would be destroyed (paranoid review).
+    if device_or_children_in_use(disk)? {
+        return Err(format!(
+            "{} has a partition that is mounted or in use (LVM/RAID/LUKS/swap/ZFS) — \
+             unmount/clear it first; a new partition table erases the whole disk", disk));
+    }
 
     let label = match table_type {
         "gpt" => "gpt",
@@ -2469,15 +2662,17 @@ pub fn delete_partition(device: &str) -> Result<String, String> {
     if is_protected_device(device)? {
         return Err(format!("{} is mounted at a protected location — refusing", device));
     }
-
-    // Unmount if currently mounted
+    // Refuse to delete a partition that is mounted ANYWHERE or in use as an
+    // LVM/RAID/LUKS/swap/ZFS member. Previously this silently `umount`ed a live
+    // data mount (e.g. /mnt/data) and then deleted it — a careless YES could wipe a
+    // running mount. Make the operator unmount/clear it deliberately first.
     if is_mounted(device) {
-        let output = Command::new("umount").arg(device).output()
-            .map_err(|e| format!("umount: {}", e))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("Cannot unmount {}: {}", device, stderr.trim()));
-        }
+        return Err(format!(
+            "{} is currently mounted — unmount it first, then delete the partition", device));
+    }
+    if device_or_children_in_use(device)? {
+        return Err(format!(
+            "{} is in use (LVM/RAID/LUKS/swap/ZFS member) — clear it before deleting the partition", device));
     }
 
     // Extract disk and partition number
@@ -2543,15 +2738,12 @@ pub fn format_partition(device: &str, fstype: &str, label: Option<&str>) -> Resu
     if is_protected_device(device)? {
         return Err(format!("{} is mounted at a protected location — refusing", device));
     }
-
-    // Unmount if currently mounted
+    // Refuse to format a mounted partition rather than silently unmounting it — a
+    // careless YES on a live data mount (e.g. /mnt/data) would otherwise wipe it
+    // (paranoid review). The operator must unmount it deliberately first.
     if is_mounted(device) {
-        let output = Command::new("umount").arg(device).output()
-            .map_err(|e| format!("umount: {}", e))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("Cannot unmount {}: {}", device, stderr.trim()));
-        }
+        return Err(format!(
+            "{} is currently mounted — unmount it first, then format", device));
     }
 
     // Build mkfs command

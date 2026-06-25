@@ -7485,8 +7485,10 @@ async function populateDiskDevices() {
         const resp = await fetch(apiUrl('/api/storage/disk-info'));
         const data = await resp.json();
         const disks = Array.isArray(data) ? data : (data.disks || data.devices || []);
+        const NOT_MOUNTABLE = ['LVM2_member', 'linux_raid_member', 'crypto_LUKS', 'swap', 'zfs_member', 'bcache', 'ceph_bluestore'];
         const usable = disks.filter(d =>
-            d && d.fstype &&                                   // has a filesystem
+            d && d.fstype &&                                   // has a mountable filesystem
+            !NOT_MOUNTABLE.includes(d.fstype) &&               // not an LVM/RAID/LUKS/swap/ZFS member
             (!Array.isArray(d.mountpoints) || d.mountpoints.length === 0) && // not already mounted
             !String(d.device || '').startsWith('/dev/loop') && // skip loop devices
             d.type !== 'rom');                                 // skip optical/rom
@@ -9164,8 +9166,14 @@ function renderDiskInfo(devices) {
                 </div>`;
             }
         } else if (d.type === 'part') {
+            const mp = Array.isArray(d.mountpoints) ? d.mountpoints.filter(Boolean) : [];
             if (prot) {
                 actions = `<span style="font-size:11px; color:var(--text-muted);" title="Protected mount point"></span>`;
+            } else if (mp.length > 0) {
+                // Mounted: format/delete are refused by the backend (data safety).
+                // Show where it's mounted and tell the operator to unmount first,
+                // rather than offering destructive actions that will be rejected.
+                actions = `<span style="font-size:11px; color:var(--warning,#f59e0b);" title="Unmount before you can format or delete this partition">⚠ mounted at ${mp.map(escapeHtml).join(', ')} — unmount to manage</span>`;
             } else {
                 actions = `<div style="display:flex; gap:4px; flex-wrap:wrap;">
                     <button class="btn btn-sm" onclick="showDiskResizeModal('${esc(d.device)}')" style="font-size:10px; padding:1px 6px;" title="Grow partition + filesystem to fill available space">Resize</button>
@@ -15462,6 +15470,12 @@ function getTomlSchema(component) {
                 { key: 'access_key', label: 'Access Key', type: 'string', default: '', placeholder: 'auto-generated', help: 'The S3 access key ID your clients authenticate with. A strong default is generated — copy it into your S3 client (e.g. aws-cli), or replace it with your own' },
                 { key: 'secret_key', label: 'Secret Key', type: 'string', default: '', placeholder: 'auto-generated', help: 'The S3 secret access key. Shown so you can copy it into your client; treat it like a password. A strong default is generated so the gateway is never left unauthenticated' },
                 { key: 'buckets', label: 'Bucket → Folder Mappings', type: 'map', keyLabel: 'bucket', keyPlaceholder: 'photos', valuePlaceholder: '/data/photos', help: 'Optionally map an S3 bucket name to a specific folder inside WolfDisk instead of a top-level directory of the same name — e.g. bucket "photos" → "/data/photos". Buckets not listed here keep the default behaviour (a top-level directory matching the bucket name). Paths are from the WolfDisk root; leading/trailing slashes are ignored. Removing a row here removes the mapping.' },
+            ]},
+            { key: 'cache', label: 'SSD Cache Tier', description: 'Optionally put a faster disk (SSD/NVMe) in front of the bulk data directory. Hot chunks and, by default, the index/WAL metadata live on the fast disk. Leave the directory blank to disable (default).', fields: [
+                { key: 'dir', label: 'Cache Disk Directory', type: 'string', default: '', placeholder: '/mnt/ssd-cache', help: 'A directory on your fast disk (e.g. a mounted SSD). Blank = no cache. WolfDisk creates chunks/ (and, if enabled below, index/ + wal/) under here.' },
+                { key: 'mode', label: 'Cache Mode', type: 'select', default: 'writethrough', options: ['off', 'writethrough', 'writeback'], help: 'writethrough (recommended): writes go to the HDD AND the SSD; reads hit the SSD first — zero data-loss risk, the HDD is always authoritative. writeback: uploads land on the SSD first and flush to the HDD in the background (faster writes, but a chunk can be SSD-only until flushed — covered by peer replicas in a replicated cluster). off: disable without clearing the path.' },
+                { key: 'max_bytes', label: 'Max Cache Size (bytes)', type: 'number', default: 0, help: 'Soft ceiling on cached chunk data on the SSD; cold, already-flushed chunks are evicted above it (the HDD copy stays). 0 = unbounded. Example: 50000000000 ≈ 50 GB.' },
+                { key: 'metadata_on_cache', label: 'Metadata on Cache Disk', type: 'boolean', default: true, help: 'Also place the index/ and WAL metadata on the cache disk for fast lookups. Recommended when a cache disk is set.' },
             ]},
         ];
     }
@@ -46794,6 +46808,104 @@ async function loadWolfDiskSyncHealth() {
                 <tbody>${rowHtml}</tbody>
             </table>
         </div>`;
+}
+
+// ─── Dedicate a disk to WolfDisk (klasSponsor 2026-06) ───
+// Pick an online node + an unused whole disk; the backend wipes it, migrates this
+// node's WolfDisk data onto it, mounts it at the data_dir (+ fstab), and restarts
+// WolfDisk. DESTRUCTIVE — gated behind an explicit confirmation checkbox.
+function wdOpenDedicateDiskModal() {
+    const nodes = (typeof getClusterNodes === 'function' ? getClusterNodes(wdCurrentCluster) : []).filter(n => n.online);
+    if (nodes.length === 0) { showToast('No online nodes in this cluster', 'error'); return; }
+    const nodeOpts = nodes.map(n => `<option value="${escapeAttr(n.id)}">${escapeHtml(n.hostname || n.name || n.id)}</option>`).join('');
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay active';
+    overlay.style.cssText = 'display:flex; z-index:10001;';
+    overlay.innerHTML = `
+      <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:14px; padding:26px; max-width:520px; width:92%; max-height:90vh; display:flex; flex-direction:column; overflow-y:auto;">
+        <h3 style="margin:0 0 6px; font-size:17px; color:var(--text-primary);">Dedicate a Disk to WolfDisk</h3>
+        <p style="color:var(--text-secondary); font-size:13px; margin:0 0 14px;">Wipe an unused disk and move a node's WolfDisk data onto it. The disk is formatted, mounted at WolfDisk's data directory, added to <code>/etc/fstab</code> (mounts on boot), and WolfDisk is restarted.</p>
+        <div class="form-group"><label>Node</label>
+          <select id="wd-dd-node" class="form-control" onchange="wdDedicateLoadDisks()">${nodeOpts}</select></div>
+        <div class="form-group"><label>Unused disk</label>
+          <select id="wd-dd-disk" class="form-control"><option value="">Loading…</option></select>
+          <small style="color:var(--text-muted); font-size:11px;">Only whole disks with nothing mounted on them are listed.</small></div>
+        <div class="form-group"><label>Filesystem</label>
+          <select id="wd-dd-fs" class="form-control"><option value="ext4">ext4 (recommended)</option><option value="xfs">xfs</option><option value="btrfs">btrfs</option></select></div>
+        <div style="background:rgba(239,68,68,0.08); border:1px solid rgba(239,68,68,0.35); border-radius:8px; padding:10px 12px; margin:6px 0 12px; font-size:12px; color:#fca5a5;">
+          ⚠ This <b>erases the selected disk completely</b>. WolfDisk is stopped, the disk is formatted, existing WolfDisk data is copied onto it, then WolfDisk restarts. Make sure the disk holds nothing you need.</div>
+        <label style="display:flex; gap:8px; align-items:center; font-size:13px; margin-bottom:12px; cursor:pointer;">
+          <input type="checkbox" id="wd-dd-confirm"> I understand the selected disk will be erased.</label>
+        <div id="wd-dd-status" style="font-size:12px; margin-bottom:10px;"></div>
+        <div style="display:flex; gap:8px; justify-content:flex-end;">
+          <button class="btn btn-sm" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
+          <button class="btn btn-primary btn-sm" id="wd-dd-go" onclick="wdDedicateDiskGo(this)">Erase &amp; Dedicate</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    wdDedicateLoadDisks();
+}
+
+async function wdDedicateLoadDisks() {
+    const nodeId = document.getElementById('wd-dd-node') && document.getElementById('wd-dd-node').value;
+    const sel = document.getElementById('wd-dd-disk');
+    if (!nodeId || !sel) return;
+    sel.innerHTML = '<option value="">Loading…</option>';
+    try {
+        const resp = await fetch(nodeApiUrl(nodeId, '/api/storage/disk-info'));
+        const data = await resp.json();
+        const devs = Array.isArray(data) ? data : (data.devices || []);
+        // Group every entry under its parent disk so we can require the WHOLE disk
+        // (and all its partitions) to be unmounted before offering it.
+        const byDisk = {};
+        devs.forEach(d => { if (d.disk) (byDisk[d.disk] = byDisk[d.disk] || []).push(d); });
+        const CLAIMED = ['LVM2_member', 'linux_raid_member', 'crypto_LUKS', 'swap', 'zfs_member', 'bcache', 'ceph_bluestore'];
+        const usable = devs
+            .filter(d => d.type === 'disk' && !String(d.device || '').startsWith('/dev/loop'))
+            // Require the WHOLE disk + every partition to be unmounted AND not an
+            // LVM/RAID/LUKS/swap member (those hold data without a mountpoint).
+            .filter(d => (byDisk[d.device] || [d]).every(x =>
+                (!Array.isArray(x.mountpoints) || x.mountpoints.length === 0) &&
+                !CLAIMED.includes(x.fstype)));
+        if (usable.length === 0) { sel.innerHTML = '<option value="">No unused whole disks found</option>'; return; }
+        sel.innerHTML = usable.map(d =>
+            `<option value="${escapeAttr(d.device)}">${escapeHtml(d.device + ' — ' + (d.size || '') + (d.model ? ' ' + d.model : ''))}</option>`
+        ).join('');
+    } catch (e) { sel.innerHTML = '<option value="">Could not load disks</option>'; }
+}
+
+async function wdDedicateDiskGo(btn) {
+    const nodeId = document.getElementById('wd-dd-node').value;
+    const device = document.getElementById('wd-dd-disk').value;
+    const fstype = document.getElementById('wd-dd-fs').value;
+    const confirmed = document.getElementById('wd-dd-confirm').checked;
+    const statusEl = document.getElementById('wd-dd-status');
+    if (!device) { statusEl.innerHTML = '<span style="color:var(--danger)">Pick a disk.</span>'; return; }
+    if (!confirmed) { statusEl.innerHTML = '<span style="color:var(--danger)">Tick the confirmation box first.</span>'; return; }
+    btn.disabled = true; btn.textContent = 'Working…';
+    statusEl.innerHTML = '<span style="color:var(--text-muted)">Formatting &amp; migrating — this can take a moment…</span>';
+    try {
+        const resp = await fetch(nodeApiUrl(nodeId, '/api/storage/wolfdisk/dedicate-disk'), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ device, fstype }),
+        });
+        const data = await resp.json();
+        if (resp.ok && data.ok) {
+            // Destructive op — leave the result on screen (don't auto-dismiss) so
+            // the operator can read/copy it; turn the action button into Close.
+            statusEl.innerHTML = '<span style="color:#10b981">' + escapeHtml(data.message || 'Done') + '</span>';
+            showToast('WolfDisk dedicated disk set up', 'success');
+            btn.disabled = false;
+            btn.textContent = 'Close';
+            btn.onclick = () => { const o = document.querySelector('.modal-overlay'); if (o) o.remove(); loadWolfDiskCluster(); };
+        } else {
+            statusEl.innerHTML = '<span style="color:var(--danger)">' + escapeHtml(data.error || 'Failed') + '</span>';
+            btn.disabled = false; btn.textContent = 'Erase & Dedicate';
+        }
+    } catch (e) {
+        statusEl.innerHTML = '<span style="color:var(--danger)">' + escapeHtml(e.message) + '</span>';
+        btn.disabled = false; btn.textContent = 'Erase & Dedicate';
+    }
 }
 
 async function loadWolfDiskCluster() {
