@@ -19409,6 +19409,30 @@ pub async fn disk_format_partition(
 }
 
 #[derive(Deserialize)]
+pub struct DedicateDiskRequest {
+    pub device: String,
+    pub fstype: String,
+}
+
+/// POST /api/storage/wolfdisk/dedicate-disk — wipe a whole disk, migrate
+/// WolfDisk's data onto it, mount it at WolfDisk's data_dir + fstab, restart the
+/// daemon. DESTRUCTIVE: the frontend confirms the wipe before calling. klasSponsor.
+pub async fn disk_dedicate_wolfdisk(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<DedicateDiskRequest>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let device = body.device.clone();
+    let fstype = body.fstype.clone();
+    match web::block(move || storage::wolfdisk_dedicate_disk(&device, &fstype)).await {
+        Ok(Ok(msg)) => HttpResponse::Ok().json(serde_json::json!({"ok": true, "message": msg})),
+        Ok(Err(e)) => HttpResponse::BadRequest().json(serde_json::json!({"ok": false, "error": e})),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"ok": false, "error": format!("{}", e)})),
+    }
+}
+
+#[derive(Deserialize)]
 pub struct ResizePartitionRequest {
     pub device: String,
 }
@@ -37275,6 +37299,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         // Disk partition info
         .route("/api/storage/disk-info", web::get().to(storage_disk_info))
         .route("/api/storage/wolfdisk/status", web::get().to(storage_wolfdisk_status))
+        .route("/api/storage/wolfdisk/dedicate-disk", web::post().to(disk_dedicate_wolfdisk))
         // Disk Partitioning & Formatting
         .route("/api/storage/disk/partition-table", web::post().to(disk_create_partition_table))
         .route("/api/storage/disk/partition", web::post().to(disk_create_partition))
