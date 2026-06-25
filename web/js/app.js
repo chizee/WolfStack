@@ -7485,8 +7485,10 @@ async function populateDiskDevices() {
         const resp = await fetch(apiUrl('/api/storage/disk-info'));
         const data = await resp.json();
         const disks = Array.isArray(data) ? data : (data.disks || data.devices || []);
+        const NOT_MOUNTABLE = ['LVM2_member', 'linux_raid_member', 'crypto_LUKS', 'swap', 'zfs_member', 'bcache', 'ceph_bluestore'];
         const usable = disks.filter(d =>
-            d && d.fstype &&                                   // has a filesystem
+            d && d.fstype &&                                   // has a mountable filesystem
+            !NOT_MOUNTABLE.includes(d.fstype) &&               // not an LVM/RAID/LUKS/swap/ZFS member
             (!Array.isArray(d.mountpoints) || d.mountpoints.length === 0) && // not already mounted
             !String(d.device || '').startsWith('/dev/loop') && // skip loop devices
             d.type !== 'rom');                                 // skip optical/rom
@@ -9164,8 +9166,14 @@ function renderDiskInfo(devices) {
                 </div>`;
             }
         } else if (d.type === 'part') {
+            const mp = Array.isArray(d.mountpoints) ? d.mountpoints.filter(Boolean) : [];
             if (prot) {
                 actions = `<span style="font-size:11px; color:var(--text-muted);" title="Protected mount point"></span>`;
+            } else if (mp.length > 0) {
+                // Mounted: format/delete are refused by the backend (data safety).
+                // Show where it's mounted and tell the operator to unmount first,
+                // rather than offering destructive actions that will be rejected.
+                actions = `<span style="font-size:11px; color:var(--warning,#f59e0b);" title="Unmount before you can format or delete this partition">⚠ mounted at ${mp.map(escapeHtml).join(', ')} — unmount to manage</span>`;
             } else {
                 actions = `<div style="display:flex; gap:4px; flex-wrap:wrap;">
                     <button class="btn btn-sm" onclick="showDiskResizeModal('${esc(d.device)}')" style="font-size:10px; padding:1px 6px;" title="Grow partition + filesystem to fill available space">Resize</button>
@@ -46851,7 +46859,7 @@ async function wdDedicateLoadDisks() {
         // (and all its partitions) to be unmounted before offering it.
         const byDisk = {};
         devs.forEach(d => { if (d.disk) (byDisk[d.disk] = byDisk[d.disk] || []).push(d); });
-        const CLAIMED = ['LVM2_member', 'linux_raid_member', 'crypto_LUKS', 'swap'];
+        const CLAIMED = ['LVM2_member', 'linux_raid_member', 'crypto_LUKS', 'swap', 'zfs_member', 'bcache', 'ceph_bluestore'];
         const usable = devs
             .filter(d => d.type === 'disk' && !String(d.device || '').startsWith('/dev/loop'))
             // Require the WHOLE disk + every partition to be unmounted AND not an

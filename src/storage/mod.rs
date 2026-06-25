@@ -1418,7 +1418,12 @@ fn lsblk_field(device: &str, col: &str) -> String {
 /// already holds data" — otherwise dedicate-disk would silently destroy an LVM PV
 /// or LUKS volume that has nothing mounted right now (code review 2026-06-25).
 fn device_or_children_in_use(device: &str) -> Result<bool, String> {
-    const CLAIMED: &[&str] = &["LVM2_member", "linux_raid_member", "crypto_LUKS", "swap"];
+    // Subsystems that hold data (or an active pool/array) WITHOUT a mountpoint — a
+    // wipe would destroy them. ZFS/bcache/Ceph added after the paranoid disk review.
+    const CLAIMED: &[&str] = &[
+        "LVM2_member", "linux_raid_member", "crypto_LUKS", "swap",
+        "zfs_member", "bcache", "ceph_bluestore",
+    ];
     let output = Command::new("lsblk").args(["-Jno", "MOUNTPOINTS,FSTYPE", device]).output()
         .map_err(|e| format!("lsblk: {}", e))?;
     fn in_use(nodes: &[serde_json::Value]) -> bool {
@@ -2497,6 +2502,14 @@ pub fn create_partition_table(disk: &str, table_type: &str) -> Result<String, St
     if is_protected_device(disk)? {
         return Err(format!("{} has partitions mounted at protected locations — refusing", disk));
     }
+    // A new partition table erases EVERY partition on the disk. Refuse if any
+    // partition is mounted (even at a non-system path like /mnt/data) or is an
+    // LVM/RAID/LUKS/swap/ZFS member — that data would be destroyed (paranoid review).
+    if device_or_children_in_use(disk)? {
+        return Err(format!(
+            "{} has a partition that is mounted or in use (LVM/RAID/LUKS/swap/ZFS) — \
+             unmount/clear it first; a new partition table erases the whole disk", disk));
+    }
 
     let label = match table_type {
         "gpt" => "gpt",
@@ -2649,15 +2662,17 @@ pub fn delete_partition(device: &str) -> Result<String, String> {
     if is_protected_device(device)? {
         return Err(format!("{} is mounted at a protected location — refusing", device));
     }
-
-    // Unmount if currently mounted
+    // Refuse to delete a partition that is mounted ANYWHERE or in use as an
+    // LVM/RAID/LUKS/swap/ZFS member. Previously this silently `umount`ed a live
+    // data mount (e.g. /mnt/data) and then deleted it — a careless YES could wipe a
+    // running mount. Make the operator unmount/clear it deliberately first.
     if is_mounted(device) {
-        let output = Command::new("umount").arg(device).output()
-            .map_err(|e| format!("umount: {}", e))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("Cannot unmount {}: {}", device, stderr.trim()));
-        }
+        return Err(format!(
+            "{} is currently mounted — unmount it first, then delete the partition", device));
+    }
+    if device_or_children_in_use(device)? {
+        return Err(format!(
+            "{} is in use (LVM/RAID/LUKS/swap/ZFS member) — clear it before deleting the partition", device));
     }
 
     // Extract disk and partition number
@@ -2723,15 +2738,12 @@ pub fn format_partition(device: &str, fstype: &str, label: Option<&str>) -> Resu
     if is_protected_device(device)? {
         return Err(format!("{} is mounted at a protected location — refusing", device));
     }
-
-    // Unmount if currently mounted
+    // Refuse to format a mounted partition rather than silently unmounting it — a
+    // careless YES on a live data mount (e.g. /mnt/data) would otherwise wipe it
+    // (paranoid review). The operator must unmount it deliberately first.
     if is_mounted(device) {
-        let output = Command::new("umount").arg(device).output()
-            .map_err(|e| format!("umount: {}", e))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("Cannot unmount {}: {}", device, stderr.trim()));
-        }
+        return Err(format!(
+            "{} is currently mounted — unmount it first, then format", device));
     }
 
     // Build mkfs command
