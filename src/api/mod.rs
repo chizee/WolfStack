@@ -16472,6 +16472,10 @@ pub struct CreateBackupRequest {
 
 #[derive(Deserialize)]
 pub struct CreateScheduleRequest {
+    /// Present when EDITING an existing schedule (Gary 2026-06-25) — the existing
+    /// id is updated in place (created_at/last_run preserved). Absent = create new.
+    #[serde(default)]
+    pub id: Option<String>,
     pub name: String,
     pub frequency: backup::BackupFrequency,
     pub time: String,
@@ -16481,6 +16485,11 @@ pub struct CreateScheduleRequest {
     pub targets: Vec<backup::BackupTarget>,
     pub storage: backup::BackupStorage,
     #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+#[derive(Deserialize)]
+pub struct ToggleScheduleRequest {
     pub enabled: bool,
 }
 
@@ -17473,8 +17482,16 @@ pub async fn backup_schedule_create(
         }
     }
     backup::merge_pbs_secrets(&mut storage);
+    // Edit vs create: when the body carries an existing id, update that schedule in
+    // place and PRESERVE its created_at + last_run (otherwise an edit would reset the
+    // freshness clock and lose "last ran" history). Absent id = brand-new schedule.
+    let editing = body.id.as_deref()
+        .filter(|id| !id.is_empty())
+        .and_then(|id| backup::list_schedules().into_iter().find(|s| s.id == id));
+    let is_edit = editing.is_some();
     let schedule = backup::BackupSchedule {
-        id: uuid::Uuid::new_v4().to_string(),
+        id: editing.as_ref().map(|s| s.id.clone())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
         name: body.name.clone(),
         frequency: body.frequency.clone(),
         time: body.time.clone(),
@@ -17483,14 +17500,43 @@ pub async fn backup_schedule_create(
         targets: body.targets.clone(),
         storage,
         enabled: body.enabled,
-        last_run: String::new(),
-        created_at: chrono::Utc::now().to_rfc3339(),
+        last_run: editing.as_ref().map(|s| s.last_run.clone()).unwrap_or_default(),
+        created_at: editing.as_ref().map(|s| s.created_at.clone())
+            .filter(|c| !c.is_empty())
+            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
     };
     match backup::save_schedule(schedule) {
         Ok(s) => HttpResponse::Ok().json(serde_json::json!({
-            "message": format!("Schedule '{}' created", s.name),
+            "message": format!("Schedule '{}' {}", s.name, if is_edit { "updated" } else { "created" }),
             "schedule": s,
         })),
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// POST /api/backups/schedules/{id}/run — run a scheduled backup on demand.
+pub async fn backup_schedule_run(
+    req: HttpRequest, state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let id = path.into_inner();
+    match web::block(move || backup::run_schedule_now(&id)).await {
+        Ok(Ok(msg)) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
+        Ok(Err(e)) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("{}", e) })),
+    }
+}
+
+/// POST /api/backups/schedules/{id}/enabled — enable/disable a schedule.
+pub async fn backup_schedule_toggle(
+    req: HttpRequest, state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<ToggleScheduleRequest>,
+) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    match backup::set_schedule_enabled(&path.into_inner(), body.enabled) {
+        Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
         Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
     }
 }
@@ -37467,6 +37513,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/backups/schedules", web::post().to(backup_schedule_create))
         .route("/api/backups/test-storage", web::post().to(backup_test_storage))
         .route("/api/backups/schedules/{id}", web::delete().to(backup_schedule_delete))
+        .route("/api/backups/schedules/{id}/run", web::post().to(backup_schedule_run))
+        .route("/api/backups/schedules/{id}/enabled", web::post().to(backup_schedule_toggle))
         .route("/api/backups/import", web::post().to(backup_import))
         .route("/api/backups/scan-folder", web::get().to(backup_scan_folder))
         .route("/api/backups/restore-from-path/stream", web::post().to(backup_restore_from_path_stream))

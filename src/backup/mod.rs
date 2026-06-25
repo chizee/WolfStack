@@ -6089,6 +6089,95 @@ pub fn delete_schedule(id: &str) -> Result<String, String> {
     Ok(format!("Schedule {} deleted", id))
 }
 
+/// Enable or disable a schedule without rewriting the whole thing (Gary 2026-06-25).
+pub fn set_schedule_enabled(id: &str, enabled: bool) -> Result<String, String> {
+    let mut config = load_config();
+    let s = config.schedules.iter_mut().find(|s| s.id == id)
+        .ok_or_else(|| format!("Schedule not found: {}", id))?;
+    s.enabled = enabled;
+    let name = s.name.clone();
+    save_config(&config)?;
+    Ok(format!("Schedule '{}' {}", name, if enabled { "enabled" } else { "disabled" }))
+}
+
+/// Prune a schedule's completed backups down to `retention`, deleting the oldest
+/// files + entries first. Shared by the nightly scheduler and the on-demand
+/// "Run Now" so both prune identically.
+fn prune_schedule_backups(config: &mut BackupConfig, schedule_id: &str, retention: usize) {
+    let mut schedule_entries: Vec<usize> = config.entries.iter().enumerate()
+        .filter(|(_, e)| e.schedule_id == schedule_id && e.status == BackupStatus::Completed)
+        .map(|(i, _)| i)
+        .collect();
+    // Newest first; anything past `retention` is removed.
+    schedule_entries.sort_by(|a, b| config.entries[*b].created_at.cmp(&config.entries[*a].created_at));
+    if schedule_entries.len() > retention {
+        let to_remove: Vec<usize> = schedule_entries[retention..].to_vec();
+        for &idx in to_remove.iter().rev() {
+            let entry = &config.entries[idx];
+            match entry.storage.storage_type {
+                StorageType::Local | StorageType::Wolfdisk => {
+                    let path = Path::new(&entry.storage.resolved_local_path()).join(&entry.filename);
+                    let _ = fs::remove_file(&path);
+                },
+                StorageType::Nfs => {
+                    if let Ok(dir) = ensure_nfs_mounted(&entry.storage) {
+                        let _ = fs::remove_file(Path::new(&dir).join(&entry.filename));
+                    }
+                },
+                StorageType::Smb => {
+                    if let Ok(dir) = ensure_smb_mounted(&entry.storage) {
+                        let _ = fs::remove_file(Path::new(&dir).join(&entry.filename));
+                    }
+                },
+                StorageType::Pbs => { /* PBS handles its own GC/pruning */ },
+                _ => {}
+            }
+            config.entries.remove(idx);
+        }
+    }
+}
+
+/// Run a scheduled backup on demand (Gary 2026-06-25 "Run Now"), ignoring the
+/// time-of-day / already-ran-this-period gate. Same path as the nightly
+/// scheduler: runs the schedule's targets (or all), tags the new entries with the
+/// schedule id, stamps last_run, and prunes by retention. Runs synchronously —
+/// the API handler wraps it in web::block.
+pub fn run_schedule_now(id: &str) -> Result<String, String> {
+    let mut config = load_config();
+    let idx = config.schedules.iter().position(|s| s.id == id)
+        .ok_or_else(|| format!("Schedule not found: {}", id))?;
+
+    // Snapshot what we need so we don't hold a borrow of schedules while mutating entries.
+    let (mut storage, backup_all_flag, targets, retention, schedule_id, name) = {
+        let s = &config.schedules[idx];
+        (s.storage.clone(), s.backup_all, s.targets.clone(), s.retention, s.id.clone(), s.name.clone())
+    };
+    merge_pbs_secrets(&mut storage);
+
+    let new_entries = if backup_all_flag {
+        backup_all(&storage)
+    } else {
+        targets.iter().map(|t| create_backup_entry(t.clone(), &storage)).collect::<Vec<_>>()
+    };
+    let made = new_entries.len();
+    // Only count the run as "ran" (which gates the nightly auto-run) if at least
+    // one backup actually completed — a fully-failed on-demand run must not
+    // suppress tonight's scheduled run.
+    let any_ok = new_entries.iter().any(|e| e.status == BackupStatus::Completed);
+    for mut entry in new_entries {
+        entry.schedule_id = schedule_id.clone();
+        config.entries.push(entry);
+    }
+    if any_ok {
+        config.schedules[idx].last_run = Utc::now().to_rfc3339();
+    }
+    if retention > 0 {
+        prune_schedule_backups(&mut config, &schedule_id, retention as usize);
+    }
+    save_config(&config)?;
+    Ok(format!("Ran scheduled backup '{}' — {} backup(s) created", name, made))
+}
+
 // ─── Available Targets ───
 
 /// List all available backup targets on the system with full details
@@ -6282,6 +6371,10 @@ pub fn check_schedules() {
     let now = Utc::now();
     let current_time = now.format("%H:%M").to_string();
     let mut changed = false;
+    // (schedule_id, retention) for schedules that ran this pass — pruned AFTER the
+    // loop, since prune_schedule_backups needs &mut config and we can't borrow that
+    // while config.schedules.iter_mut() is still live.
+    let mut to_prune: Vec<(String, usize)> = Vec::new();
 
     for schedule in config.schedules.iter_mut() {
         if !schedule.enabled {
@@ -6344,51 +6437,14 @@ pub fn check_schedules() {
         schedule.last_run = now.to_rfc3339();
         changed = true;
 
-        // Prune old backups if retention is set
+        // Queue retention pruning for after the loop (shared helper, see above).
         if schedule.retention > 0 {
-            let schedule_id = schedule.id.clone();
-            let retention = schedule.retention as usize;
-            let mut schedule_entries: Vec<usize> = config.entries.iter()
-                .enumerate()
-                .filter(|(_, e)| e.schedule_id == schedule_id && e.status == BackupStatus::Completed)
-                .map(|(i, _)| i)
-                .collect();
-
-            // Sort by date (newest first), remove excess
-            schedule_entries.sort_by(|a, b| {
-                config.entries[*b].created_at.cmp(&config.entries[*a].created_at)
-            });
-
-            if schedule_entries.len() > retention {
-                let to_remove: Vec<usize> = schedule_entries[retention..].to_vec();
-                // Delete files and remove entries (in reverse order to preserve indices)
-                for &idx in to_remove.iter().rev() {
-                    let entry = &config.entries[idx];
-                    match entry.storage.storage_type {
-                        StorageType::Local | StorageType::Wolfdisk => {
-                            let path = Path::new(&entry.storage.resolved_local_path()).join(&entry.filename);
-                            let _ = fs::remove_file(&path);
-                        },
-                        StorageType::Nfs => {
-                            if let Ok(dir) = ensure_nfs_mounted(&entry.storage) {
-                                let _ = fs::remove_file(Path::new(&dir).join(&entry.filename));
-                            }
-                        },
-                        StorageType::Smb => {
-                            if let Ok(dir) = ensure_smb_mounted(&entry.storage) {
-                                let _ = fs::remove_file(Path::new(&dir).join(&entry.filename));
-                            }
-                        },
-                        StorageType::Pbs => {
-                            // PBS handles its own garbage collection / pruning
-                        },
-                        _ => {}
-                    }
-                    config.entries.remove(idx);
-                }
-
-            }
+            to_prune.push((schedule.id.clone(), schedule.retention as usize));
         }
+    }
+
+    for (schedule_id, retention) in to_prune {
+        prune_schedule_backups(&mut config, &schedule_id, retention);
     }
 
     if changed {

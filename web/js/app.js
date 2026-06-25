@@ -30372,6 +30372,9 @@ function renderSchedules(schedules) {
     }
     if (empty) empty.style.display = 'none';
 
+    // Stash the full schedules so Edit can pre-fill the form from the row's id.
+    _backupSchedules = Array.isArray(schedules) ? schedules : [];
+
     tbody.innerHTML = schedules.map(s => {
         const targets = s.backup_all ? 'All' : (s.targets || []).map(t => `${t.type}:${t.name}`).join(', ');
         const storageLabel = formatStorageLabel(s.storage);
@@ -30379,6 +30382,8 @@ function renderSchedules(schedules) {
         const enabled = s.enabled
             ? '<span class="badge" style="background:#22c55e; color:#fff;">Active</span>'
             : '<span class="badge" style="background:#6b7280; color:#fff;">Disabled</span>';
+        const bd = 'background:var(--bg-tertiary); color:var(--text-primary); border:1px solid var(--border);';
+        const sid = escapeAttr(s.id);
 
         return `<tr>
             <td>${escapeHtml(s.name)}</td>
@@ -30388,11 +30393,68 @@ function renderSchedules(schedules) {
             <td>${escapeHtml(storageLabel)}</td>
             <td>${retention}</td>
             <td>${enabled}</td>
-            <td style="text-align:right;">
-                <button class="btn btn-sm" onclick="deleteSchedule('${s.id}')" style="background:var(--bg-tertiary); color:var(--text-primary); border:1px solid var(--border);"><span class="ws-icon-clean-wrap" data-icon="trash"></span></button>
+            <td style="text-align:right; white-space:nowrap;">
+                <button class="btn btn-sm" onclick="runSchedule('${sid}', this)" style="${bd}" title="Run this backup now"><span class="ws-icon-clean-wrap" data-icon="play"></span></button>
+                <button class="btn btn-sm" onclick="editSchedule('${sid}')" style="${bd}" title="Edit schedule"><span class="ws-icon-clean-wrap" data-icon="settings"></span></button>
+                <button class="btn btn-sm" onclick="toggleSchedule('${sid}', ${s.enabled ? 'false' : 'true'})" style="${bd}" title="${s.enabled ? 'Disable' : 'Enable'} schedule">${s.enabled ? '⏸' : '▶'}</button>
+                <button class="btn btn-sm" onclick="deleteSchedule('${sid}')" style="${bd}" title="Delete schedule"><span class="ws-icon-clean-wrap" data-icon="trash"></span></button>
             </td>
         </tr>`;
     }).join('');
+}
+
+let _backupSchedules = [];
+
+// Run a scheduled backup on demand (Gary 2026-06-25).
+async function runSchedule(id, btn) {
+    if (btn) { btn.disabled = true; }
+    try {
+        const res = await fetch(apiUrl(`/api/backups/schedules/${id}/run`), { method: 'POST' });
+        const data = await res.json();
+        if (res.ok) { showToast(data.message || 'Backup started', 'success'); if (typeof loadBackups === 'function') loadBackups(); }
+        else showToast(data.error || 'Failed to run backup', 'error');
+    } catch (e) { showToast('Failed to run backup: ' + e.message, 'error'); }
+    finally { if (btn) btn.disabled = false; }
+}
+
+// Enable/disable a schedule.
+async function toggleSchedule(id, enabled) {
+    try {
+        const res = await fetch(apiUrl(`/api/backups/schedules/${id}/enabled`), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled }),
+        });
+        const data = await res.json();
+        if (res.ok) { showToast(data.message || 'Updated', 'success'); if (typeof loadBackups === 'function') loadBackups(); }
+        else showToast(data.error || 'Failed', 'error');
+    } catch (e) { showToast('Failed: ' + e.message, 'error'); }
+}
+
+let _editingSchedule = null;
+
+// Edit a schedule (Gary 2026-06-25): open the create-schedule modal pre-filled
+// with the schedule's name/frequency/time/retention and its targets pre-selected.
+// The storage DESTINATION is preserved as-is (so credentials never have to be
+// re-entered) — createSchedule sends the existing storage on the edit path.
+function editSchedule(id) {
+    const s = (_backupSchedules || []).find(x => x.id === id);
+    if (!s) { showToast('Schedule not found', 'error'); return; }
+    const modal = document.getElementById('create-schedule-modal');
+    if (!modal) { showToast('Schedule editor not available', 'error'); return; }
+    _editingSchedule = s;
+    _scheduleFolderTarget = null;
+    const setVal = (elId, v) => { const el = document.getElementById(elId); if (el && v != null) el.value = v; };
+    setVal('schedule-name', s.name);
+    setVal('schedule-frequency', s.frequency);
+    setVal('schedule-time', s.time);
+    setVal('schedule-retention', s.retention);
+    // We deliberately do NOT re-derive targets/storage from the form on save (the
+    // target list may not even be rendered yet, which would silently wipe the
+    // selection). The edit PRESERVES the schedule's existing targets + storage and
+    // only changes name/frequency/time/retention/enabled. (To change what's backed
+    // up or where, delete + recreate.)
+    modal.classList.add('active');
+    showToast('Editing schedule — change name, frequency, time or retention. Its targets and storage destination are kept.', 'info', 5000);
 }
 
 function formatStorageLabel(storage) {
@@ -30573,48 +30635,55 @@ let _scheduleFolderTarget = null;
 // Build a SystemPath target from the folder fields and open the schedule modal
 // for it (recurring local-folder backup).
 async function scheduleSystemFolder() {
-    const pathEl = document.getElementById('sysfolder-path');
-    const labelEl = document.getElementById('sysfolder-label');
-    const exclEl = document.getElementById('sysfolder-excludes');
-    const path = (pathEl && pathEl.value || '').trim();
-    if (!path) { showToast('Enter a folder path to schedule', 'error'); return; }
-    if (!path.startsWith('/')) { showToast('Folder path must be absolute (start with /)', 'error'); return; }
-    const label = (labelEl && labelEl.value || '').trim();
-    const excludes = (exclEl && exclEl.value || '').split(',').map(s => s.trim()).filter(Boolean);
-    const target = {
-        type: 'systempath',
-        name: label || path.replace(/\/+$/, '').split('/').pop() || 'folder',
-        system_path: path,
-    };
-    if (excludes.length) target.exclude_mounts = excludes;
-    _scheduleFolderTarget = target;
+    const targets = parseSystemFolderTargets();
+    if (!targets) return;
+    _scheduleFolderTarget = targets;       // now an array — one target per folder
+    _editingSchedule = null;               // new folder schedule, not an edit
 
     const storage = await getSelectedStorage();
     if (!(await ensureBackupStorageReady(storage))) { _scheduleFolderTarget = null; return; }
+    const pathLabel = targets.map(t => t.system_path).join(', ');
     const summary = document.getElementById('schedule-selected-summary');
-    if (summary) summary.textContent = `Will schedule backup of folder ${path} → ${storage.path || storage.type || 'destination'}`;
-    document.getElementById('schedule-name').value = target.name + ' folder';
+    if (summary) summary.textContent = `Will schedule backup of ${targets.length > 1 ? targets.length + ' folders' : 'folder ' + pathLabel} → ${storage.path || storage.type || 'destination'}`;
+    document.getElementById('schedule-name').value = (targets.length === 1 ? targets[0].name : 'Folders') + ' folder';
     document.getElementById('create-schedule-modal').classList.add('active');
 }
 
-async function backupSystemFolder() {
-    const pathEl = document.getElementById('sysfolder-path');
-    const labelEl = document.getElementById('sysfolder-label');
-    const exclEl = document.getElementById('sysfolder-excludes');
-    const path = (pathEl && pathEl.value || '').trim();
-    if (!path) { showToast('Enter a folder path to back up', 'error'); return; }
-    if (!path.startsWith('/')) { showToast('Folder path must be absolute (start with /)', 'error'); return; }
-
-    const label = (labelEl && labelEl.value || '').trim();
-    const excludes = (exclEl && exclEl.value || '')
+// Parse the system-folder "Folder path" field into one backup target per folder.
+// The include field now accepts MULTIPLE comma-separated folders, matching the
+// exclude field (Gary 2026-06-25: entering several folders stored a single bogus
+// "/a, /b" path and the backup failed). Excludes apply to every folder. Returns
+// null (after a toast) if any path is missing or not absolute.
+function parseSystemFolderTargets() {
+    const rawPath = (document.getElementById('sysfolder-path')?.value || '').trim();
+    const label = (document.getElementById('sysfolder-label')?.value || '').trim();
+    const excludes = (document.getElementById('sysfolder-excludes')?.value || '')
         .split(',').map(s => s.trim()).filter(Boolean);
+    const paths = rawPath.split(',').map(s => s.trim()).filter(Boolean);
+    if (paths.length === 0) { showToast('Enter a folder path', 'error'); return null; }
+    for (const p of paths) {
+        if (!p.startsWith('/')) {
+            showToast(`Folder path must be absolute (start with /): ${p}`, 'error');
+            return null;
+        }
+    }
+    return paths.map(p => {
+        const t = {
+            type: 'systempath',
+            // A single folder keeps the custom label; multiple folders each take a
+            // name from their own basename so the backups stay distinguishable.
+            name: (paths.length === 1 && label) ? label : (p.replace(/\/+$/, '').split('/').pop() || 'folder'),
+            system_path: p,
+        };
+        if (excludes.length) t.exclude_mounts = excludes;
+        return t;
+    });
+}
 
-    const target = {
-        type: 'systempath',
-        name: label || path.replace(/\/+$/, '').split('/').pop() || 'folder',
-        system_path: path,
-    };
-    if (excludes.length) target.exclude_mounts = excludes;
+async function backupSystemFolder() {
+    const targets = parseSystemFolderTargets();
+    if (!targets) return;
+    const path = targets.map(t => t.system_path).join(', ');
 
     const storage = await getSelectedStorage();
     if (!(await ensureBackupStorageReady(storage))) return;
@@ -30636,12 +30705,15 @@ async function backupSystemFolder() {
     });
 
     let failed = false;
-    try {
-        await runStreamingBackup({ target, storage, cluster_name }, taskId);
-    } catch (e) {
-        appendBackupLog(`Error: ${e.message}`);
-        showToast(`Backup error: ${e.message}`, 'error');
-        failed = true;
+    for (const target of targets) {
+        try {
+            if (targets.length > 1) appendBackupLog(`Backing up ${target.system_path}…`);
+            await runStreamingBackup({ target, storage, cluster_name }, taskId);
+        } catch (e) {
+            appendBackupLog(`Error backing up ${target.system_path}: ${e.message}`);
+            showToast(`Backup error (${target.system_path}): ${e.message}`, 'error');
+            failed = true;
+        }
     }
     stopBackupProgressSpinner();
     const titleEl = document.getElementById('backup-progress-title');
@@ -30973,6 +31045,7 @@ async function showScheduleSelectedModal() {
         }
     }
 
+    _editingSchedule = null; // opening for a NEW schedule, not an edit
     document.getElementById('schedule-name').value = '';
     document.getElementById('create-schedule-modal').classList.add('active');
 }
@@ -30984,29 +31057,45 @@ async function createSchedule() {
     const frequency = document.getElementById('schedule-frequency').value;
     const time = document.getElementById('schedule-time').value.trim();
     const retention = parseInt(document.getElementById('schedule-retention').value) || 0;
-    // A folder schedule (scheduleSystemFolder) overrides the table selection.
-    const targets = _scheduleFolderTarget ? [_scheduleFolderTarget] : getSelectedTargets();
-    const storage = await getSelectedStorage();
-    const allSelected = !_scheduleFolderTarget
-        && targets.length === document.querySelectorAll('.backup-target-cb').length;
+    const editing = _editingSchedule;
+    let backup_all, finalTargets, storage;
+    if (editing) {
+        // EDIT: preserve what's backed up and where (avoids the unrendered-target
+        // -list race wiping the selection, and never makes the operator re-enter
+        // storage credentials). Only name/frequency/time/retention change here.
+        backup_all = !!editing.backup_all;
+        finalTargets = backup_all ? [] : (editing.targets || []);
+        storage = editing.storage;
+    } else {
+        // A folder schedule (scheduleSystemFolder) overrides the table selection —
+        // it's an ARRAY of targets (one per folder), so use it directly.
+        const folderTargets = (_scheduleFolderTarget && _scheduleFolderTarget.length) ? _scheduleFolderTarget : null;
+        const targets = folderTargets || getSelectedTargets();
+        backup_all = !folderTargets
+            && targets.length === document.querySelectorAll('.backup-target-cb').length;
+        finalTargets = backup_all ? [] : targets;
+        storage = await getSelectedStorage();
+    }
     _scheduleFolderTarget = null; // consumed — don't leak into the next schedule
+    _editingSchedule = null;
 
     const body = {
         name,
         frequency,
         time,
         retention,
-        backup_all: allSelected,
-        targets: allSelected ? [] : targets,
+        backup_all,
+        targets: finalTargets,
         storage,
-        enabled: true,
+        enabled: editing ? !!editing.enabled : true,
     };
+    if (editing) body.id = editing.id; // update in place
 
-    // Pre-flight the destination when it's a mount-based type. Catches
-    // missing cifs-utils / nfs-common at save time so the user can accept
-    // the install-in-terminal prompt, rather than finding out hours later
-    // when the scheduled backup fails in the background.
-    if (!(await ensureBackupStorageReady(storage))) return;
+    // Pre-flight the destination when it's a mount-based type — only for a NEW
+    // schedule (an edit keeps the already-validated existing storage). Catches
+    // missing cifs-utils / nfs-common at save time so the user can accept the
+    // install-in-terminal prompt rather than finding out when it fails at night.
+    if (!editing && !(await ensureBackupStorageReady(storage))) return;
 
     closeModal();
     try {
@@ -31016,8 +31105,8 @@ async function createSchedule() {
             body: JSON.stringify(body),
         });
         const data = await res.json();
-        if (data.error) showToast(`Schedule creation failed: ${data.error}`, 'error');
-        else showToast('Schedule created', 'success');
+        if (data.error) showToast(`Schedule ${editing ? 'update' : 'creation'} failed: ${data.error}`, 'error');
+        else showToast(editing ? 'Schedule updated' : 'Schedule created', 'success');
     } catch (e) {
         showToast(`Schedule error: ${e.message}`, 'error');
     }
