@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v24.57.30: S3 region — fix backup upload ignoring configured region + expose WolfDisk gateway region (klasSponsor)** _(2026-06-26 — [`fabc7b5b`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/fabc7b5b18acf7c0b9cc96fa6f33ab46317620d5))_
 - **v24.57.29: sync Cargo.lock to bumped package version** _(2026-06-26 — [`cf4d2e6d`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/cf4d2e6d027565739dbffa158682d85cb522b68c))_
 - **v24.57.29: WolfRouter stops planting + retrying impossible default-bridge routes (AstroMando)** _(2026-06-26 — [`861865a8`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/861865a81df79863bfcebda6a716ca39042ea1d5))_
 - **v24.57.28: edit a schedule's backed-up items + mount exclusions in place (wabil)** _(2026-06-25 — [`5d81ca8d`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/5d81ca8d8f1a77f67f32ce53ab8fa1b522ad1b70))_
