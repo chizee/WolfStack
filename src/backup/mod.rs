@@ -2800,16 +2800,21 @@ fn store_s3(local_path: &Path, storage: &BackupStorage, filename: &str) -> Resul
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let region = if endpoint_str.is_empty() {
-                s3::Region::Custom {
-                    region: region_str,
-                    endpoint: format!("https://s3.{}.amazonaws.com", "us-east-1"),
-                }
+            // Honour the operator's configured region for the AWS endpoint
+            // (empty endpoint = real AWS). A blank region falls back to
+            // us-east-1 so the host never becomes "https://s3..amazonaws.com".
+            let aws_region = if region_str.trim().is_empty() {
+                "us-east-1".to_string()
             } else {
-                s3::Region::Custom {
-                    region: region_str,
-                    endpoint: endpoint_str,
-                }
+                region_str.clone()
+            };
+            let region = s3::Region::Custom {
+                region: aws_region.clone(),
+                endpoint: if endpoint_str.is_empty() {
+                    format!("https://s3.{}.amazonaws.com", aws_region)
+                } else {
+                    endpoint_str
+                },
             };
 
             let credentials = s3::creds::Credentials::new(
@@ -3869,10 +3874,17 @@ fn retrieve_from_s3(entry: &BackupEntry, dest: &Path) -> Result<(), String> {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
+            // A blank region falls back to us-east-1 so the AWS host never
+            // becomes "https://s3..amazonaws.com" (mirrors the upload path).
+            let aws_region = if region_str.trim().is_empty() {
+                "us-east-1".to_string()
+            } else {
+                region_str.clone()
+            };
             let region = s3::Region::Custom {
-                region: region_str.clone(),
+                region: aws_region.clone(),
                 endpoint: if endpoint_str.is_empty() {
-                    format!("https://s3.{}.amazonaws.com", region_str)
+                    format!("https://s3.{}.amazonaws.com", aws_region)
                 } else {
                     endpoint_str
                 },

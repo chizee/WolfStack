@@ -300,6 +300,9 @@ allow_other = true
 [s3]
 enabled = false
 bind = "0.0.0.0:9878"
+# Region reported in GetBucketLocation. Auth accepts any region the client
+# signs with; set this when a tool validates the bucket region. Default us-east-1.
+region = "us-east-1"
 "#;
 
 const DEFAULT_WOLFSCALE: &str = r#"# WolfScale Configuration
