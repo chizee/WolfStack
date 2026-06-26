@@ -8,6 +8,9 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v24.57.29: sync Cargo.lock to bumped package version** _(2026-06-26 — [`cf4d2e6d`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/cf4d2e6d027565739dbffa158682d85cb522b68c))_
+- **v24.57.29: WolfRouter stops planting + retrying impossible default-bridge routes (AstroMando)** _(2026-06-26 — [`861865a8`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/861865a81df79863bfcebda6a716ca39042ea1d5))_
+- **v24.57.28: edit a schedule's backed-up items + mount exclusions in place (wabil)** _(2026-06-25 — [`5d81ca8d`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/5d81ca8d8f1a77f67f32ce53ab8fa1b522ad1b70))_
 - **v24.57.27: wrap backup_schedule_toggle file I/O in web::block (actix canon)** _(2026-06-25 — [`65cab34a`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/65cab34a39b3d0ad27d6fb29ce4603315d5f1dfe))_
 - **v24.57.27: scheduled-backup Run Now / Edit / Enable-Disable + multi-folder system backups (Gary)** _(2026-06-25 — [`61ace393`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/61ace3934ac0f5807f08d7d5f56b06c7eddad697))_
 - **v24.57.26: stop WolfNet IP-mapping iptables rules accumulating (PapaSchlumpf throughput collapse)** _(2026-06-25 — [`4914f521`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/4914f52128245e8b10d50975583ebc2300f8c942))_
