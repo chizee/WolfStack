@@ -208,6 +208,11 @@ pub struct Node {
     pub lxc_count: u32,
     #[serde(default)]
     pub vm_count: u32,
+    /// Number of Docker Compose stacks on this node — shown in the nav next to
+    /// Docker/LXC/VM counts (Gary/KO4BSR 2026-06-27). Backward-compat: missing
+    /// in older nodes.json / older peers' gossip → deserializes as 0.
+    #[serde(default)]
+    pub compose_count: u32,
     #[serde(default)]
     pub public_ip: Option<String>,
     #[serde(default = "default_node_type")]
@@ -526,6 +531,9 @@ impl ClusterState {
             docker_count,
             lxc_count,
             vm_count,
+            // Cheap dir scan; keeps the self node's nav compose count current
+            // (Gary/KO4BSR 2026-06-27).
+            compose_count: crate::api::compose_stack_count(),
             public_ip,
             node_type: "wolfstack".to_string(),
             pve_token: None,
@@ -691,6 +699,7 @@ impl ClusterState {
             docker_count: 0,
             lxc_count: 0,
             vm_count: 0,
+            compose_count: 0,
             public_ip: None,
             node_type,
             pve_token,
@@ -1301,6 +1310,8 @@ pub enum AgentMessage {
         #[serde(default)]
         vm_count: u32,
         #[serde(default)]
+        compose_count: u32,
+        #[serde(default)]
         public_ip: Option<String>,
         #[serde(default)]
         known_nodes: Vec<Node>,
@@ -1845,7 +1856,7 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
                         continue;
                     }
                     if let Ok(msg) = resp.json::<AgentMessage>().await {
-                        if let AgentMessage::StatusReport { node_id: peer_self_id, hostname, metrics, components, docker_count, lxc_count, vm_count, public_ip, known_nodes, deleted_ids, wolfnet_ips, has_docker, has_lxc, has_kvm, workload_subnets: peer_workload_subnets, site: peer_site, display_name: peer_display_name, license_key } = msg {
+                        if let AgentMessage::StatusReport { node_id: peer_self_id, hostname, metrics, components, docker_count, lxc_count, vm_count, compose_count, public_ip, known_nodes, deleted_ids, wolfnet_ips, has_docker, has_lxc, has_kvm, workload_subnets: peer_workload_subnets, site: peer_site, display_name: peer_display_name, license_key } = msg {
                             let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                             // Detect TLS by the URL scheme that actually
                             // answered. v23.12 chain is HTTPS → HTTP-over-
@@ -1877,6 +1888,7 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
                                 docker_count,
                                 lxc_count,
                                 vm_count,
+                                compose_count,
                                 public_ip: public_ip.clone(),
                                 node_type: "wolfstack".to_string(),
                                 pve_token: None,

@@ -1922,6 +1922,7 @@ async fn main() -> std::io::Result<()> {
                     docker_count,
                     lxc_count,
                     vm_count,
+                    compose_count: crate::api::compose_stack_count(),
                     public_ip: public_ip.clone(),
                     known_nodes,
                     deleted_ids,
