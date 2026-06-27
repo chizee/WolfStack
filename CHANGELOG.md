@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.1.1: Compose/container/VM list action bars wrap horizontally on mobile (.unit-actions)** _(2026-06-27 — [`17eb246a`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/17eb246ad024642f327346ecb660869ae46582c6))_
 - **v25.1.0 follow-up: keep compose_stack_count() inside spawn_blocking (code review)** _(2026-06-27 — [`5927c604`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/5927c60443046a87ee42af962825897e4295c96c))_
 - **v25.1.0: Compose UX — pull/up feedback, env-var validation, nav count, icon actions (wabil + Gary)** _(2026-06-27 — [`09f84921`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/09f8492193c0e41f1e3f71a3086646442a4f0ca4))_
 - **v25.0.3: activate the dormant WolfNet-IP conflict check in add_node (completes AstroMando #3 batch)** _(2026-06-27 — [`4d0bf565`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/4d0bf5659ab89e7db81b269ba348c3a6155535ae))_
