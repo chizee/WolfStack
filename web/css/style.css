@@ -2958,6 +2958,21 @@ body.sidebar-collapsed #task-log-footer {
     font-size: 12px;
 }
 
+/* ─── Container/VM card action bars (docker / lxc / qemu / compose) ───
+   The row of icon buttons at the top of each unit card. Explicitly horizontal
+   and wrapping: on a narrow/portrait phone the icons spill onto a 2nd/3rd line
+   but stay in rows rather than stacking one-per-line, and never grow to fill the
+   width (which is what made each list item tall on mobile — wabil 2026-06-27). */
+.unit-actions {
+    display: flex;
+    flex-flow: row wrap;
+    align-items: center;
+    gap: 1px;
+}
+.unit-actions > .btn {
+    flex: 0 0 auto;   /* size to the icon; pack horizontally and wrap as a group */
+}
+
 /* ─── Grid Layouts ─── */
 .grid-2 {
     display: grid;
