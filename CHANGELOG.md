@@ -8,6 +8,8 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.0.3: activate the dormant WolfNet-IP conflict check in add_node (completes AstroMando #3 batch)** _(2026-06-27 — [`4d0bf565`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/4d0bf5659ab89e7db81b269ba348c3a6155535ae))_
+- **v25.0.2: AstroMando cluster-networking batch — WolfRun Docker VIP backend, bind-all LAN endpoint, reimage identity reconcile** _(2026-06-27 — [`665a2804`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/665a280406343550e1968bcc9414f8936de32d7f))_
 - **v25.0.1: two Compose UX fixes — running 'Up' button + Validate no longer saves (wabil)** _(2026-06-26 — [`94e34f13`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/94e34f1347c3385ec96b58ad1381aea7bd022c5f))_
 - **v25.0.0: container/VM lists no longer come up blank for 10-20s — offload blocking handlers to web::block** _(2026-06-26 — [`301b4321`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/301b43216af646f362f18b3ca893b9b4ebf470da))_
 - **v24.57.36: container list no longer flickers behind a flaky reverse proxy (wabil)** _(2026-06-26 — [`3b5885ef`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/3b5885ef9a0220d4864a13e8d335cf1834e67bb5))_
