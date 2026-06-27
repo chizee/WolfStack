@@ -8,6 +8,8 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.1.4: same mobile Actions-column wrap for docker/lxc/vm list views (wabil)** _(2026-06-27 — [`06c71b62`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/06c71b62ce5f0ac4a574066c77d695e599392a02))_
+- **v25.1.3: cluster-sync repairs a node's WolfNet address when it's a WAN hostname/IP, not just 0.0.0.0 (wabil)** _(2026-06-27 — [`cc94b28d`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/cc94b28dcf3cf41aab10f534cc45c5c3803dbcc4))_
 - **v25.1.2: Compose Actions column min-width on mobile so icons wrap horizontally (wabil)** _(2026-06-27 — [`bace92f9`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/bace92f94fd49b8e5b74e6da336c8b9bcfe16c6c))_
 - **v25.1.2: cluster-settings preflight nudge when WolfNet has no peers (wabil/Paul)** _(2026-06-27 — [`3d21b5ce`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/3d21b5ce1272c1a9968da1ed9512a29f4655f685))_
 - **v25.1.1: Compose/container/VM list action bars wrap horizontally on mobile (.unit-actions)** _(2026-06-27 — [`17eb246a`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/17eb246ad024642f327346ecb660869ae46582c6))_
