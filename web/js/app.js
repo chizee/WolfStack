@@ -5947,7 +5947,7 @@ function renderVms(vms) {
                 <td>${wolfnetIp !== '—' ? `<span class="badge" style="background:var(--accent-bg); color:var(--accent);">${wolfnetIp}</span>` : '—'}</td>
                 <td>${vncText}</td>
                 <td><input type="checkbox" ${autostart} onchange="toggleVmAutostart('${vm.name}', this.checked)"></td>
-                <td><div style="display:flex; flex-wrap:wrap; gap:2px; min-width:0;">
+                <td class="ws-actions-cell"><div style="display:flex; flex-wrap:wrap; gap:2px; min-width:0;">
                     <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="showVmLogs('${vm.name}')" title="Logs"><span class="ws-icon-clean-wrap" data-icon="logs"></span></button>
                     ${(() => {
                         // Shared button styles. `disabledStyle` mirrors the
@@ -23014,7 +23014,7 @@ function renderDockerContainers(containers) {
             <td style="font-size:12px; font-family:monospace;">${c.ip_address || '-'}${c.gateway ? '<div style="font-size:10px;color:var(--text-muted);">GW: ' + escapeHtml(c.gateway) + '</div>' : ''}${c.mac_address ? '<div style="font-size:10px;color:var(--text-muted);">MAC: ' + escapeHtml(c.mac_address) + '</div>' : ''}</td>
             <td style="font-size:11px;">${ports}</td>
             <td><input type="checkbox" ${c.autostart ? 'checked' : ''} onchange="toggleDockerAutostart('${c.id}', this.checked)"></td>
-            <td><div style="display:flex; flex-wrap:wrap; gap:2px; min-width:0;">
+            <td class="ws-actions-cell"><div style="display:flex; flex-wrap:wrap; gap:2px; min-width:0;">
                 ${isRunning ? `
                     <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;opacity:0.4;cursor:not-allowed;pointer-events:none;" disabled title="Start"><span class="ws-icon-clean-wrap" data-icon="play"></span></button>
                     <button class="btn btn-sm" style="margin:2px;font-size:20px;line-height:1;padding:4px 6px;" onclick="dockerAction('${c.name}', 'stop', this)" title="Stop"><span class="ws-icon-clean-wrap" data-icon="stop"></span></button>
@@ -23834,7 +23834,7 @@ function renderLxcContainers(containers, stats) {
             <td><span style="color:${stateColor}">●</span> ${c.state}</td>
             <td style="font-size:12px; font-family:monospace;">${c.ip_address || '-'}${c.gateway ? '<div style="font-size:10px;color:var(--text-muted);">GW: ' + escapeHtml(c.gateway) + '</div>' : ''}${c.mac_address ? '<div style="font-size:10px;color:var(--text-muted);">MAC: ' + escapeHtml(c.mac_address) + '</div>' : ''}</td>
             <td><input type="checkbox" ${c.autostart ? 'checked' : ''} onchange="toggleLxcAutostart('${c.name}', this.checked)"></td>
-            <td><div style="display:flex; flex-wrap:wrap; gap:2px; min-width:0;">
+            <td class="ws-actions-cell"><div style="display:flex; flex-wrap:wrap; gap:2px; min-width:0;">
                 <button class="btn btn-sm" style="${isRunning ? disStyle : btnStyle}" ${isRunning ? 'disabled' : ''} ${!isRunning ? `onclick="lxcAction('${c.name}', 'start', this)"` : ''} title="Start"><span class="ws-icon-clean-wrap" data-icon="play"></span></button>
                 <button class="btn btn-sm" style="${!isRunning ? disStyle : btnStyle}" ${!isRunning ? 'disabled' : ''} ${isRunning ? `onclick="lxcAction('${c.name}', 'stop', this)"` : ''} title="Stop"><span class="ws-icon-clean-wrap" data-icon="stop"></span></button>
                 <button class="btn btn-sm" style="${!isRunning ? disStyle : btnStyle}" ${!isRunning ? 'disabled' : ''} ${isRunning ? `onclick="lxcAction('${c.name}', 'restart', this)"` : ''} title="Restart"><span class="ws-icon-clean-wrap" data-icon="restart"></span></button>
