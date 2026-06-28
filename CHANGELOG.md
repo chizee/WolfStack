@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.1.6: fix the cluster membership split + the sync prune footgun (wabil — completes the cluster recovery)** _(2026-06-28 — [`ada02d05`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/ada02d05860761300378243a63130d036e3b6cd3))_
 - **v25.1.5: cluster-sync picks the cluster-/24 LAN IP deterministically (fixes flapping public/LAN endpoint on Proxmox — wabil)** _(2026-06-27 — [`b337a81f`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/b337a81faa3bd0a75f96a5f400fa5399564ef354))_
 - **v25.1.4: same mobile Actions-column wrap for docker/lxc/vm list views (wabil)** _(2026-06-27 — [`06c71b62`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/06c71b62ce5f0ac4a574066c77d695e599392a02))_
 - **v25.1.3: cluster-sync repairs a node's WolfNet address when it's a WAN hostname/IP, not just 0.0.0.0 (wabil)** _(2026-06-27 — [`cc94b28d`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/cc94b28dcf3cf41aab10f534cc45c5c3803dbcc4))_
