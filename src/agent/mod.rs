@@ -134,6 +134,17 @@ fn is_private_address(addr: &str) -> bool {
     }
 }
 
+/// The `/24` prefix (`a.b.c`) of a private IPv4 address, else None. Used to
+/// match a node's local LAN IP to the subnet its private peers live on.
+fn lan24_prefix(addr: &str) -> Option<String> {
+    let ip = addr.parse::<std::net::Ipv4Addr>().ok()?;
+    if !ip.is_private() {
+        return None;
+    }
+    let o = ip.octets();
+    Some(format!("{}.{}.{}", o[0], o[1], o[2]))
+}
+
 /// An address peers can actually CONNECT to. A node advertises its own address
 /// as the bind address (`cli.bind`, usually the wildcard `0.0.0.0`), which is
 /// unreachable from anywhere else — so a self-entry carrying `0.0.0.0` must
@@ -493,8 +504,66 @@ impl ClusterState {
         }
     }
 
+    /// The address this node advertises to peers in its OWN self entry.
+    ///
+    /// Normally the configured `self_address`. But a node reached via a
+    /// reverse-proxy WAN hostname (or a public IP) has a `self_address` that
+    /// LAN peers cannot dial — they end up with an un-pollable entry and the
+    /// node shows up nowhere / as a red phantom (wabil 2026-06-28). When
+    /// `self_address` is NOT already a private LAN IPv4, substitute a local LAN
+    /// IP, preferring one whose `/24` matches a known private peer so we pick
+    /// the cluster-facing NIC deterministically on a multi-bridge Proxmox host
+    /// (the same determinism v25.1.5 added to wolfnet-sync). If nothing matches
+    /// (fresh cluster, no private peers yet) keep `self_address` — never guess.
+    fn self_registry_address(
+        &self,
+        nodes: &HashMap<String, Node>,
+        my_ips: &std::collections::HashSet<String>,
+    ) -> String {
+        let already_lan_ip = self
+            .self_address
+            .parse::<std::net::IpAddr>()
+            .map(|a| a.to_canonical())
+            .map(|ip| matches!(ip, std::net::IpAddr::V4(v4) if v4.is_private()))
+            .unwrap_or(false);
+        if already_lan_ip {
+            return self.self_address.clone();
+        }
+        let peer_prefixes: std::collections::HashSet<String> = nodes
+            .values()
+            .filter(|n| !n.is_self && n.node_type == "wolfstack")
+            .filter_map(|n| lan24_prefix(&n.address))
+            .collect();
+        if peer_prefixes.is_empty() {
+            // Fresh cluster / no private peers yet — nothing to match against, so
+            // keep the configured address rather than guess a NIC.
+            return self.self_address.clone();
+        }
+        if let Some(ip) = my_ips
+            .iter()
+            .find(|ip| lan24_prefix(ip).map(|p| peer_prefixes.contains(&p)).unwrap_or(false))
+        {
+            // debug, not info: update_self runs every ~2s — an info line here
+            // would be a per-tick heartbeat. Operators diagnosing visibility
+            // enable debug to confirm the substitution is active.
+            tracing::debug!("agent: advertising LAN address {} to peers (self_address {} is not a private IP)", ip, self.self_address);
+            return ip.clone();
+        }
+        tracing::debug!("agent: self_address {} is not a private IP and no local IP shares a /24 with a peer — peers may not reach this node; set a LAN bind address", self.self_address);
+        self.self_address.clone()
+    }
+
     /// Update this node's own status
     pub fn update_self(&self, metrics: SystemMetrics, components: Vec<ComponentStatus>, docker_count: u32, lxc_count: u32, vm_count: u32, compose_count: u32, public_ip: Option<String>, has_docker: bool, has_lxc: bool, has_kvm: bool, tls_enabled: bool) {
+        // Our own LAN IPs (cached 60s) — used both to advertise a dialable
+        // address and to self-heal phantoms saved under one of our own IPs.
+        let my_ips = local_ipv4_addrs();
+        // Resolve the address we advertise to peers under a READ lock, so the
+        // (rare, cached) interface enumeration never runs under the write lock.
+        let registry_address = {
+            let nodes_r = self.nodes.read().unwrap();
+            self.self_registry_address(&nodes_r, &my_ips)
+        };
         let mut nodes = self.nodes.write().unwrap();
         // Fetch existing cluster_name: in-memory first, then persisted file, then default
         let cluster_name = nodes.get(&self.self_id)
@@ -521,7 +590,7 @@ impl ClusterState {
         nodes.insert(self.self_id.clone(), Node {
             id: self.self_id.clone(),
             hostname: metrics.hostname.clone(),
-            address: self.self_address.clone(),
+            address: registry_address,
             port: self.port,
             last_seen: now,
             metrics: Some(metrics),
@@ -560,6 +629,35 @@ impl ClusterState {
             site: prev_site,
             display_name: prev_display_name,
         });
+
+        // Self-heal: drop any NON-self entry previously saved under one of our
+        // OWN LAN IPs. Pre-fix gossip (before the address-based is_self check)
+        // admitted this node's LAN IP as a foreign "red" phantom; on upgrade
+        // those entries reload from nodes.json. They are unambiguously us (their
+        // address is one of our local IPs), never pollable as a real peer, and
+        // the is_self check now prevents re-creation, so removing them here
+        // self-heals the cluster without operator action (wabil 2026-06-28).
+        let self_id = self.self_id.clone();
+        let before = nodes.len();
+        // Keep everything that is NOT a self-phantom: the self entry, any
+        // is_self entry, address-less entries, and any peer whose address is
+        // not one of our own IPs.
+        nodes.retain(|id, n| {
+            *id == self_id
+                || n.is_self
+                || n.address.is_empty()
+                || !my_ips.contains(&n.address)
+        });
+        let phantom_removed = nodes.len() < before;
+        // Drop the write guard BEFORE save_nodes (which takes a read lock), and
+        // only persist when we actually removed something — otherwise the
+        // healed phantom lingers in nodes.json until some other write fires,
+        // reloading on the next restart (re-trimmed from memory but never from
+        // disk). The guard means a healthy cluster does no I/O here.
+        drop(nodes);
+        if phantom_removed {
+            self.save_nodes();
+        }
     }
 
     /// Update a remote node's status
@@ -2007,8 +2105,18 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
                                 // sending peer, while `self_id` is the global ws-{uuid}.
                                 // The pre-fix condition never matched cross-node, so
                                 // gossip-driven cluster-name adoption was dead code.
+                                // Also recognise a gossip entry carrying one of our OWN
+                                // LAN IPs as self. A node behind a reverse-proxy WAN
+                                // hostname self-identifies by that hostname, so when a peer
+                                // gossips this node's LAN IP back, neither id nor self_id
+                                // match and it was admitted as a foreign, un-pollable "red"
+                                // node named after our own IP (wabil 2026-06-28: main showed
+                                // a red 192.168.1.10, immich a red 192.168.1.4). `local_ips`
+                                // is the cached set already computed at the top of this fn.
                                 let is_self = known.id == cluster.self_id
-                                    || known.self_id.as_deref() == Some(cluster.self_id.as_str());
+                                    || known.self_id.as_deref() == Some(cluster.self_id.as_str())
+                                    || (!known.address.is_empty()
+                                        && local_ips.contains(&known.address));
                                 if is_self {
                                     // Accept cluster_name updates from gossip (admin may have changed it on another node)
                                     if let Some(ref gossiped_cluster) = known.cluster_name {
