@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.1.20: Predictive Inbox shows first-seen / last-seen / last-checked timestamps (KO4BSR)** _(2026-06-29 — [`8dd15631`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/8dd15631f6ef8fdb45199877073d8a8ec4a0158c))_
 - **v25.1.19: PBS restore no longer dead-locks on 'EEXIST: File exists' after a failed attempt** _(2026-06-29 — [`ea559c89`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/ea559c89b527777788a85a30e1d933df506620fd))_
 - **v25.1.18: enforce required app-store params + 'Ask the AI' course prompts** _(2026-06-29 — [`663ddc9b`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/663ddc9bb799622c6a13b9277245166b14271962))_
 - **v25.1.17: keeping a container/VM's own WolfNet IP no longer falsely reports 'in use'** _(2026-06-29 — [`a1a30673`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/a1a3067349d62cc77bc89c3e5ec3884587767f6f))_
