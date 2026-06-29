@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.1.12: Getting Started course — printable handout + two new lessons** _(2026-06-29 — [`3ae49f5e`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/3ae49f5e971bcfdc7a44a17c7c9e657d736260fd))_
 - **v25.1.11: cluster nodes recognise their own LAN IP — fixes red self-phantoms + others not seeing a reverse-proxied main (wabil)** _(2026-06-28 — [`6d168298`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/6d1682982524641c9f5270032a5ebe791804fe69))_
 - **v25.1.10: LXC restart is HA-safe — uses pct reboot for HA-managed containers (wabil)** _(2026-06-28 — [`3355c123`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/3355c123bb58178e135ba7e492a496ac1f6b7cd5))_
 - **v25.1.9: WolfRun resolves an instance's node by EITHER id form (node-… or ws-…) — fixes AstroMando's online-entry orphaning** _(2026-06-28 — [`84df2438`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/84df24389436627cad078c428d75cbbf88926efd))_
