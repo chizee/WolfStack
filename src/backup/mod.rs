@@ -6591,6 +6591,15 @@ fn retrieve_from_pbs(entry: &BackupEntry, dest: &Path) -> Result<(), String> {
         return Err(format!("PBS snapshot list failed: {}", String::from_utf8_lossy(&list_output.stderr)));
     };
 
+    // `proxmox-backup-client restore` extracts backup.pxar into the target
+    // directory and REFUSES to overwrite an existing file (EEXIST). A previous
+    // FAILED restore leaves the staged archive (`dest`) behind, so every retry
+    // then dies with `failed to create file "…": EEXIST: File exists` and the
+    // backup can never be restored. Clear the stale staged file first (other
+    // storage paths use fs::copy, which overwrites — only PBS needs this).
+    // wabil 2026-06-29.
+    let _ = std::fs::remove_file(dest);
+
     let mut cmd = Command::new("proxmox-backup-client");
     cmd.arg("restore")
        .arg(&snapshot)
