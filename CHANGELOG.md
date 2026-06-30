@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.1.22: AI chatbot no longer fails with 'NetworkError' on slow local models** _(2026-06-30 — [`6e6af1f5`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/6e6af1f5e6d4538f57367605cbbfb7cf48ce12f0))_
 - **v25.1.21: Predictive Inbox shows 'checked Xm ago' on every collapsed row (KO4BSR)** _(2026-06-29 — [`0a73fe30`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/0a73fe30ee423cbbf09139813ef3a3739e885593))_
 - **v25.1.20: Predictive Inbox shows first-seen / last-seen / last-checked timestamps (KO4BSR)** _(2026-06-29 — [`8dd15631`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/8dd15631f6ef8fdb45199877073d8a8ec4a0158c))_
 - **v25.1.19: PBS restore no longer dead-locks on 'EEXIST: File exists' after a failed attempt** _(2026-06-29 — [`ea559c89`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/ea559c89b527777788a85a30e1d933df506620fd))_
