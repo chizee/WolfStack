@@ -1078,6 +1078,47 @@ async fn main() -> std::io::Result<()> {
                             }
                         }
                     }
+
+                    // Standalone (non-array) physical disks. A failing SSD/NVMe
+                    // on a plain host (e.g. a Docker box not in any mdadm array)
+                    // was only visible buried under Storage → disk layout; it
+                    // never reached the alert log / Issues (RutgerDiehard). Check
+                    // every physical disk's SMART health and raise the same
+                    // critical alert, skipping disks already covered as array
+                    // members above (compared by basename: array disks are bare
+                    // `sda`, lsblk yields `/dev/sda`).
+                    let array_basenames: std::collections::HashSet<String> = arrays.iter()
+                        .flat_map(|a| a.disks.iter()
+                            .map(|d| d.device.trim_start_matches("/dev/").to_string()))
+                        .collect();
+                    let phys = tokio::task::spawn_blocking(|| {
+                        crate::array::list_physical_disks().into_iter()
+                            .filter_map(|dev| crate::array::disk_smart_status(&dev).map(|s| (dev, s)))
+                            .collect::<Vec<(String, String)>>()
+                    }).await.unwrap_or_default();
+                    for (dev, status) in &phys {
+                        let base = dev.trim_start_matches("/dev/");
+                        // Skip disks already covered by the array loop. mdadm
+                        // members can be whole disks (`sda`) OR partitions
+                        // (`sda1`/`nvme0n1p1`), so a member partition of THIS
+                        // disk also counts as covered (else we'd double-alert).
+                        if array_basenames.contains(base)
+                            || array_basenames.iter().any(|ab| ab.starts_with(base)) {
+                            continue;
+                        }
+                        if status.eq_ignore_ascii_case("FAILED") {
+                            let key = format!("smart:{}", dev);
+                            current.insert(key.clone());
+                            if !last_seen.contains(&key) {
+                                new_alerts.push((
+                                    "critical".into(),
+                                    format!("SMART failure on {}", dev),
+                                    format!("disk {} reports SMART health FAILED — back up and replace it", dev),
+                                ));
+                            }
+                        }
+                    }
+
                     if !new_alerts.is_empty() {
                         let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string();
                         // 1. Write to the in-memory alert_log so the
