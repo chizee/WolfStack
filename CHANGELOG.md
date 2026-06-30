@@ -8,6 +8,8 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.1.25: separate SMTP "From" address + support unauthenticated relays** _(2026-06-30 — [`d12fbf82`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/d12fbf8229606dab856b8fd2f4d31db0ff687f76))_
+- **v25.1.24: prune stale Docker-bridge MASQUERADE rules; setup offers to start a stopped service** _(2026-06-30 — [`6cb74d5b`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/6cb74d5b65d2c8673f0ee0580faca2b54d066a0d))_
 - **v25.1.23: AI chatbot uses async job + polling so a buffering proxy can't break it** _(2026-06-30 — [`600c2f32`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/600c2f32d5fcc604ea66052a8845d07f250d3e2d))_
 - **v25.1.22: AI chatbot no longer fails with 'NetworkError' on slow local models** _(2026-06-30 — [`6e6af1f5`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/6e6af1f5e6d4538f57367605cbbfb7cf48ce12f0))_
 - **v25.1.21: Predictive Inbox shows 'checked Xm ago' on every collapsed row (KO4BSR)** _(2026-06-29 — [`0a73fe30`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/0a73fe30ee423cbbf09139813ef3a3739e885593))_
