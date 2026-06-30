@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.1.28: stop VIP-map iptables rules accumulating (throughput collapse)** _(2026-06-30 — [`19fcbe33`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/19fcbe33082b1a83f91a19bb00645cc0921653fc))_
 - **v25.1.27: Level 3 "Defend Your Systems" course + multi-course picker** _(2026-06-30 — [`ec2ffe3e`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/ec2ffe3ea4f078e972525bbeadd4a138b5d04534))_
 - **v25.1.26: add Level 2 "Going Further" course (follow-on to Getting Started)** _(2026-06-30 — [`4ebe6bc4`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/4ebe6bc4666407930eafb88f353e6b5e9aebe60b))_
 - **v25.1.25: separate SMTP "From" address + support unauthenticated relays** _(2026-06-30 — [`d12fbf82`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/d12fbf8229606dab856b8fd2f4d31db0ff687f76))_
