@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.1.30: config backup now captures the WHOLE /etc/wolfstack (was 4 files)** _(2026-06-30 — [`516a805a`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/516a805a3b60ba3b9c9faa6d55e732f0d6c90e59))_
 - **v25.1.29: fix KDE Breeze icon pack install (installed-but-unlisted) + harden installer** _(2026-06-30 — [`8eb16d46`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/8eb16d46eb4b6b23a1676e1bae93af687dbb4d8d))_
 - **v25.1.28: stop VIP-map iptables rules accumulating (throughput collapse)** _(2026-06-30 — [`19fcbe33`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/19fcbe33082b1a83f91a19bb00645cc0921653fc))_
 - **v25.1.27: Level 3 "Defend Your Systems" course + multi-course picker** _(2026-06-30 — [`ec2ffe3e`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/ec2ffe3ea4f078e972525bbeadd4a138b5d04534))_
