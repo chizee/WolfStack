@@ -31312,8 +31312,12 @@ async function openRestoreDialog(id, type, name) {
         const overwrite = !!(backdrop.querySelector('#restore-overwrite') || {}).checked;
         const storageSel = backdrop.querySelector('#restore-storage');
         const nameEl = backdrop.querySelector('#restore-name');
+        // Read the config-restore mode from THIS dialog, not a document-wide
+        // search — a stale radio elsewhere must never flip new_machine on.
+        const cfgMode = backdrop.querySelector('input[name="restore-config-mode"]:checked');
+        const newMachine = !!(cfgMode && cfgMode.value === 'new');
         const ok = await _runRestoreStream(id, overwrite, storageSel ? storageSel.value : '',
-                                           nameEl ? nameEl.value.trim() : '', progressEl, resultEl);
+                                           nameEl ? nameEl.value.trim() : '', progressEl, resultEl, newMachine);
         running = false;
         _restoreInFlight = false;
         cancelBtn.disabled = false;
@@ -31337,14 +31341,13 @@ async function openRestoreDialog(id, type, name) {
 
 // Stream a restore over SSE, appending progress lines into `progressEl`
 // and the final outcome into `resultEl`. Resolves true on success.
-async function _runRestoreStream(id, overwrite, storage, name, progressEl, resultEl) {
+async function _runRestoreStream(id, overwrite, storage, name, progressEl, resultEl, newMachine) {
     const params = new URLSearchParams();
     if (overwrite) params.set('overwrite', 'true');
     if (storage) params.set('storage', storage);
     if (name) params.set('name', name);
-    // Config restore mode (only present for config backups).
-    const cfgMode = document.querySelector('input[name="restore-config-mode"]:checked');
-    if (cfgMode && cfgMode.value === 'new') params.set('new_machine', 'true');
+    // Config restore mode — passed in from the dialog (only true for config backups).
+    if (newMachine) params.set('new_machine', 'true');
     const qs = params.toString();
     const append = (line) => {
         progressEl.style.display = 'block';

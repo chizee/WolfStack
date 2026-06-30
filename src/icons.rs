@@ -118,7 +118,6 @@ pub fn semantic_to_freedesktop() -> HashMap<&'static str, &'static [&'static str
     m.insert("movie",          &["folder-video", "folder-videos", "applications-multimedia", "dragonplayer", "totem", "vlc"]);
     m.insert("target",         &["folder-bookmark", "folder-important", "emblem-favorite", "cs-cat-overview"]);
     m.insert("alien",          &["applications-games", "folder-games", "input-gaming", "cs-cat-games"]);
-    m.insert("robot",          &["utilities-terminal", "application-x-executable", "applications-development", "cs-sources", "terminal", "yakuake"]);
     m
     // dont forget to put m on its own on the last line or it will break the code and cause a compile error. PC
 }

@@ -983,6 +983,13 @@ async fn main() -> std::io::Result<()> {
                             }
                         }).await.ok();
                     }
+                    // Safety-net: re-sync the host block set INTO any macvlan/
+                    // ipvlan container the host FORWARD chain can't reach. Blocks
+                    // already trigger this on the spot; this catches containers
+                    // STARTED since the last block. Single-flight + self-detached,
+                    // and a no-op (one cheap `docker network ls`) when no such
+                    // container exists.
+                    crate::auth::trigger_macvlan_reconcile();
                     // Alert once per new refused-block event.
                     let events = crate::auth::recent_protected_block_events();
                     let newest = events.last().map(|e| e.id).unwrap_or(0);

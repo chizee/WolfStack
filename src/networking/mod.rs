@@ -2833,7 +2833,23 @@ fn purge_matching_lines(table: &str, chain: &str, markers: &[&str]) -> usize {
                     // bounded so a pathological state can't spin forever.
                     if removed >= 200_000 { return removed; }
                 }
-                _ => break,
+                Ok(o) => {
+                    // Non-zero is usually "Bad rule (Does a matching rule
+                    // exist…)" — the expected end-of-drain. Any OTHER stderr
+                    // (permission denied, no such chain/module) means the purge
+                    // silently left rules in place, so surface it rather than
+                    // swallowing it.
+                    let stderr = String::from_utf8_lossy(&o.stderr);
+                    let s = stderr.trim();
+                    if !s.is_empty() && !s.contains("Does a matching rule exist") {
+                        warn!("purge_matching_lines: iptables -D {} {} failed: {}", table, chain, s);
+                    }
+                    break;
+                }
+                Err(e) => {
+                    warn!("purge_matching_lines: could not run iptables -D {} {}: {}", table, chain, e);
+                    break;
+                }
             }
         }
     }
@@ -3920,8 +3936,11 @@ fn default_true() -> bool { true }
 impl WireGuardBridge {
     /// Interface name for this bridge (e.g. "wg-prod")
     pub fn interface_name(&self) -> String {
+        // ASCII-only: is_alphanumeric() accepts Unicode letters, but the kernel's
+        // dev_valid_name rejects them — a cluster named e.g. "kläs" would pass the
+        // filter yet fail `ip link add`. Restrict to chars valid in an iface name.
         let safe: String = self.cluster.chars()
-            .filter(|c| c.is_alphanumeric() || *c == '-')
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
             .take(12)
             .collect();
         format!("wg-{}", if safe.is_empty() { "bridge".to_string() } else { safe })
@@ -4343,6 +4362,12 @@ fn apply_wireguard_bridge_inner(bridge: &WireGuardBridge, iface: &str) -> Result
     // Bring up
     run_cmd("ip", &["link", "set", iface, "up"])?;
 
+    // Clamp MTU to 1280. The kernel default (1420) blackholes large response
+    // packets behind PMTUD-broken paths (notably iPhone-over-cellular): pings
+    // work but bulk HTTP/SSH silently stalls. 1280 is the IPv6 minimum and
+    // safely under any WireGuard overhead, so it's a robust floor.
+    let _ = Command::new("ip").args(["link", "set", iface, "mtu", "1280"]).output();
+
     // Add all enabled client peers
     for client in &bridge.clients {
         if client.enabled {
@@ -4507,33 +4532,45 @@ fn setup_bridge_nat(bridge: &WireGuardBridge) -> Result<(), String> {
     // Clean up any existing rules for this bridge first
     cleanup_bridge_nat(bridge);
 
+    // Run an iptables rule and surface failures. Previously each rule was
+    // `let _ = …output()`, so on a pure-nftables host with no iptables(-nft)
+    // every rule silently failed and the bridge had NO NAT/forwarding — the
+    // operator saw "tunnel up, can't reach anything" with nothing in the log.
+    let mut failures = 0u32;
+    let mut run_nat = |args: &[&str]| {
+        match Command::new("iptables").args(args).output() {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => {
+                failures += 1;
+                warn!("WG bridge NAT rule failed (iptables {}): {}",
+                    args.join(" "), String::from_utf8_lossy(&o.stderr).trim());
+            }
+            Err(e) => {
+                failures += 1;
+                warn!("WG bridge NAT rule could not run (iptables {}): {}", args.join(" "), e);
+            }
+        }
+    };
+
     // NETMAP: translate bridge subnet ↔ WolfNet subnet (1:1 mapping)
     // Inbound on WG: 10.20.X.5 → 10.0.10.5
-    let _ = Command::new("iptables").args([
-        "-t", "nat", "-A", "PREROUTING",
-        "-i", &iface, "-d", &subnet, "-j", "NETMAP", "--to", &wn_subnet,
-    ]).output();
-
+    run_nat(&["-t", "nat", "-A", "PREROUTING",
+        "-i", &iface, "-d", &subnet, "-j", "NETMAP", "--to", &wn_subnet]);
     // Return traffic: 10.0.10.5 → 10.20.X.5 (for packets going back out WG)
-    let _ = Command::new("iptables").args([
-        "-t", "nat", "-A", "POSTROUTING",
-        "-o", &iface, "-s", &wn_subnet, "-j", "NETMAP", "--to", &subnet,
-    ]).output();
-
-    // MASQUERADE the client source IP so WolfNet peers route replies back to this node
-    let _ = Command::new("iptables").args([
-        "-t", "nat", "-A", "POSTROUTING",
-        "-s", &subnet, "-o", &wn_iface, "-j", "MASQUERADE",
-    ]).output();
-
+    run_nat(&["-t", "nat", "-A", "POSTROUTING",
+        "-o", &iface, "-s", &wn_subnet, "-j", "NETMAP", "--to", &subnet]);
+    // MASQUERADE the client source IP so WolfNet peers route replies back here
+    run_nat(&["-t", "nat", "-A", "POSTROUTING",
+        "-s", &subnet, "-o", &wn_iface, "-j", "MASQUERADE"]);
     // Allow forwarding in both directions between WG and WolfNet
-    let _ = Command::new("iptables").args([
-        "-A", "FORWARD", "-i", &iface, "-o", &wn_iface, "-j", "ACCEPT",
-    ]).output();
-    let _ = Command::new("iptables").args([
-        "-A", "FORWARD", "-i", &wn_iface, "-o", &iface, "-j", "ACCEPT",
-    ]).output();
+    run_nat(&["-A", "FORWARD", "-i", &iface, "-o", &wn_iface, "-j", "ACCEPT"]);
+    run_nat(&["-A", "FORWARD", "-i", &wn_iface, "-o", &iface, "-j", "ACCEPT"]);
 
+    if failures > 0 {
+        warn!("WG bridge '{}' NAT setup had {} failed iptables rule(s) — the \
+            tunnel may come up but not pass traffic. Ensure iptables (or \
+            iptables-nft on an nftables host) is installed.", bridge.cluster, failures);
+    }
     Ok(())
 }
 

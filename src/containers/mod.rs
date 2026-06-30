@@ -866,6 +866,38 @@ pub fn cleanup_stale_wolfnet_routes() {
         }
     }
 
+    // Same subnet-collision /32 route for LXC. An LXC on a USER bridge with a
+    // static IP inside the WolfNet /24 black-holes into wolfnet0 exactly like
+    // the Docker case above — and the WolfNet route-maintenance pass only repairs
+    // lxcbr0 / WolfNet-IP-labelled containers, not a plain user-bridge collision.
+    // Covers native LXC (lxc.net.0.link) and Proxmox (net0 bridge=).
+    for c in lxc_list_all() {
+        if c.state != "running" { continue; }
+        // `ip_address` here may be multi-homed ("10.0.10.5, 192.168.1.5"),
+        // CIDR-suffixed ("10.0.10.5/24" from the pct config fallback), or carry
+        // a " (wolfnet)" annotation — none of which `ip route` accepts. The
+        // Docker loop above gets a clean single IP from docker_container_egress;
+        // LXC has to sanitise its own.
+        let Some(cip) = first_reportable_ip(&c.ip_address) else { continue };
+        let cip = cip.as_str();
+        if !cip.starts_with(&prefix) { continue; }
+        if local_ips.contains(cip) { continue; }
+        // The WolfNet-IP-labelled / lxcbr0 path is repaired elsewhere.
+        if lxc_get_wolfnet_ip(&c.name).is_some() { continue; }
+        let Some(egress) = lxc_primary_bridge_any(&c.name) else { continue; };
+        if egress == "lxcbr0" { continue; }
+        let res = Command::new("ip")
+            .args(["route", "replace", &format!("{}/32", cip), "dev", &egress])
+            .output();
+        if res.map(|o| o.status.success()).unwrap_or(false) {
+            bridge_devs.insert(egress.clone());
+            info!(
+                "subnet-collision route: {}/32 dev {} (LXC '{}' on a user bridge in WolfNet subnet)",
+                cip, egress, c.name
+            );
+        }
+    }
+
     // Inject WolfNet subnet route into ALL running Docker containers (not just ones with WolfNet IPs)
     // so any container can reach remote WolfNet hosts via the Docker gateway
     if let Ok(output) = Command::new("docker")
@@ -2529,6 +2561,196 @@ fn lxc_primary_bridge(container: &str) -> Option<String> {
         .and_then(|l| l.split('=').nth(1))
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// Extract the host bridge an LXC's primary NIC is attached to, cross-platform:
+/// native LXC keys it as `lxc.net.0.link = brX`; Proxmox as `net0: …,bridge=vmbrX`
+/// in `/etc/pve/lxc/<vmid>.conf`. `name` is the native container name OR the PVE
+/// vmid (lxc_list_all sets name==vmid for Proxmox). Trying both is safe — the
+/// config for the wrong platform simply doesn't exist → None.
+fn lxc_primary_bridge_any(name: &str) -> Option<String> {
+    if let Some(b) = lxc_primary_bridge(name) {
+        return Some(b);
+    }
+    let cfg = std::fs::read_to_string(format!("/etc/pve/lxc/{}.conf", name)).ok()?;
+    bridge_from_pve_net0(&cfg)
+}
+
+/// Extract the first usable bare IP from an LXC `ip_address` field, which can
+/// hold forms `ip route` rejects: multi-homed (`"a, b"`), a CIDR suffix
+/// (`"10.0.0.5/24"`), or a `" (wolfnet)"` annotation. Returns the canonical bare
+/// address, or None when the first token isn't a valid IP.
+fn first_reportable_ip(raw: &str) -> Option<String> {
+    let first = raw.split(',').next()?.trim();
+    let token = first.split_whitespace().next()?; // drop trailing " (wolfnet)"
+    let addr = token.split('/').next()?; // drop any CIDR suffix
+    addr.parse::<std::net::IpAddr>().ok().map(|a| a.to_string())
+}
+
+/// Parse the `bridge=` value out of a Proxmox container's `net0:` line.
+fn bridge_from_pve_net0(config: &str) -> Option<String> {
+    for line in config.lines() {
+        if let Some(rest) = line.trim().strip_prefix("net0:") {
+            for part in rest.split(',') {
+                if let Some(b) = part.trim().strip_prefix("bridge=") {
+                    let b = b.trim();
+                    if !b.is_empty() { return Some(b.to_string()); }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// A running container whose traffic bypasses the host's netfilter FORWARD
+/// chain — a Docker macvlan/ipvlan network or a native-LXC macvlan/ipvlan NIC.
+/// Carries the init PID needed to enter the container's network namespace via
+/// `nsenter --net`. The host-side `kernel_block_ip` DROP in FORWARD never sees
+/// these containers' packets (kernel bypass by design), so a security block has
+/// to be mirrored INSIDE their namespace — see `auth::reconcile_macvlan_blocks`.
+pub struct NetnsTarget {
+    /// Human label for logs, e.g. `docker:web01` / `lxc:db1`.
+    pub label: String,
+    /// Host-side PID of the container's init, for `nsenter --target`.
+    pub pid: i32,
+}
+
+/// Enumerate running macvlan/ipvlan containers (Docker + native LXC) whose
+/// traffic bypasses the host FORWARD chain. Returns an empty Vec — cheaply —
+/// when the container tools are absent or none are configured that way, so a
+/// host with everything on standard bridges pays only one `docker network ls`.
+pub fn macvlan_netns_targets() -> Vec<NetnsTarget> {
+    let mut out = docker_macvlan_netns_targets();
+    out.extend(native_lxc_macvlan_netns_targets());
+    out
+}
+
+/// Docker containers attached to a macvlan/ipvlan network, with their PIDs.
+fn docker_macvlan_netns_targets() -> Vec<NetnsTarget> {
+    let mut targets = Vec::new();
+    // Same-key filters are OR'd, so this returns every macvlan OR ipvlan net.
+    let nets = match Command::new("docker")
+        .args([
+            "network", "ls", "--filter", "driver=macvlan", "--filter",
+            "driver=ipvlan", "--format", "{{.Name}}",
+        ])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return targets, // docker absent/errored — nothing to mirror into
+    };
+    let mut seen_pids = std::collections::HashSet::new();
+    for net in String::from_utf8_lossy(&nets.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    {
+        // `.Containers` is a map keyed by container ID.
+        let insp = match Command::new("docker")
+            .args([
+                "network", "inspect", net, "--format",
+                "{{range $id, $c := .Containers}}{{$id}}\n{{end}}",
+            ])
+            .output()
+        {
+            Ok(o) if o.status.success() => o,
+            _ => continue,
+        };
+        for cid in String::from_utf8_lossy(&insp.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+        {
+            let det = match Command::new("docker")
+                .args(["inspect", "--format", "{{.State.Running}}|{{.State.Pid}}|{{.Name}}", cid])
+                .output()
+            {
+                Ok(o) if o.status.success() => o,
+                _ => continue,
+            };
+            let txt = String::from_utf8_lossy(&det.stdout);
+            let parts: Vec<&str> = txt.trim().split('|').collect();
+            if parts.len() < 2 || parts[0].trim() != "true" {
+                continue; // not running
+            }
+            let pid: i32 = match parts[1].trim().parse() {
+                Ok(p) if p > 0 => p,
+                _ => continue,
+            };
+            if !seen_pids.insert(pid) {
+                continue; // same container on >1 macvlan network
+            }
+            let name = parts
+                .get(2)
+                .map(|s| s.trim().trim_start_matches('/'))
+                .filter(|s| !s.is_empty())
+                .unwrap_or(cid);
+            targets.push(NetnsTarget { label: format!("docker:{}", name), pid });
+        }
+    }
+    targets
+}
+
+/// Native-LXC containers whose primary NIC is macvlan/ipvlan, with their PIDs.
+/// Proxmox CTs always use veth (the host FORWARD chain covers them), so this is
+/// a no-op on a Proxmox host.
+fn native_lxc_macvlan_netns_targets() -> Vec<NetnsTarget> {
+    let mut targets = Vec::new();
+    if Command::new("which").arg("pct").output().map(|o| o.status.success()).unwrap_or(false) {
+        return targets;
+    }
+    let mut seen = std::collections::HashSet::new();
+    for base in lxc_storage_paths() {
+        let dir = match std::fs::read_dir(&base) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        for de in dir.flatten() {
+            let name = de.file_name().to_string_lossy().to_string();
+            if name.is_empty() || !seen.insert(name.clone()) {
+                continue;
+            }
+            let cfg = match std::fs::read_to_string(format!("{}/{}/config", base, name)) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            if !lxc_config_is_macvlan_or_ipvlan(&cfg) {
+                continue;
+            }
+            // -pH = bare PID, no field label. A stopped container has no PID
+            // (lxc-info prints "-1" or nothing) → parse fails → skip.
+            let pid = Command::new("lxc-info")
+                .args(["-P", &base, "-n", &name, "-pH"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<i32>().ok())
+                .unwrap_or(-1);
+            if pid <= 0 {
+                continue;
+            }
+            targets.push(NetnsTarget { label: format!("lxc:{}", name), pid });
+        }
+    }
+    targets
+}
+
+/// True if any `lxc.net.<n>.type` in a native-LXC config is macvlan or ipvlan
+/// (the default is `veth`, which rides the host bridge and IS firewalled).
+fn lxc_config_is_macvlan_or_ipvlan(cfg: &str) -> bool {
+    for line in cfg.lines() {
+        let Some(rest) = line.trim().strip_prefix("lxc.net.") else { continue };
+        // rest e.g. "0.type = macvlan"
+        let Some((_idx, kv)) = rest.split_once('.') else { continue };
+        let Some((key, val)) = kv.split_once('=') else { continue };
+        if key.trim() == "type" {
+            let v = val.trim();
+            if v == "macvlan" || v == "ipvlan" {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Whether to SKIP the standalone (lxcbr0-based, eth0-flushing) WolfNet reapply
@@ -12933,6 +13155,64 @@ mod orphan_guard_tests {
         assert!(!pct_list_line_is_ghost("116   stopped   regions11"), "stopped human-named CT is not a ghost");
         // Lock column present between status and name — still parsed correctly.
         assert!(pct_list_line_is_ghost("109   stopped   backup   104"), "lock column doesn't fool the parser");
+    }
+
+    #[test]
+    fn lxc_macvlan_ipvlan_detection() {
+        // Default veth on a bridge — host FORWARD covers it, NOT a target.
+        let veth = "lxc.net.0.type = veth\nlxc.net.0.link = lxcbr0\n";
+        assert!(!super::lxc_config_is_macvlan_or_ipvlan(veth));
+        // macvlan — bypasses host netfilter, IS a target.
+        let mac = "lxc.net.0.type = macvlan\nlxc.net.0.link = eth0\n";
+        assert!(super::lxc_config_is_macvlan_or_ipvlan(mac));
+        // ipvlan likewise.
+        let ipv = "lxc.net.0.type = ipvlan\nlxc.net.0.link = eth0\n";
+        assert!(super::lxc_config_is_macvlan_or_ipvlan(ipv));
+        // A second NIC carrying macvlan still trips it.
+        let second = "lxc.net.0.type = veth\nlxc.net.1.type = macvlan\n";
+        assert!(super::lxc_config_is_macvlan_or_ipvlan(second));
+        // No NIC type lines at all → not a target.
+        assert!(!super::lxc_config_is_macvlan_or_ipvlan("arch: amd64\nhostname: x\n"));
+    }
+
+    #[test]
+    fn first_reportable_ip_sanitises() {
+        // Clean single address passes through.
+        assert_eq!(super::first_reportable_ip("10.0.10.5"), Some("10.0.10.5".to_string()));
+        // Multi-homed: take the first.
+        assert_eq!(
+            super::first_reportable_ip("10.0.10.5, 192.168.1.5"),
+            Some("10.0.10.5".to_string())
+        );
+        // CIDR suffix (pct config fallback) stripped.
+        assert_eq!(super::first_reportable_ip("10.0.10.5/24"), Some("10.0.10.5".to_string()));
+        // " (wolfnet)" annotation dropped.
+        assert_eq!(
+            super::first_reportable_ip("10.0.10.5 (wolfnet)"),
+            Some("10.0.10.5".to_string())
+        );
+        // Combined: CIDR + annotation, first of several.
+        assert_eq!(
+            super::first_reportable_ip("10.0.10.5/24 (wolfnet), 192.168.1.5"),
+            Some("10.0.10.5".to_string())
+        );
+        // Empty / dash / junk → None (no route attempted).
+        assert_eq!(super::first_reportable_ip(""), None);
+        assert_eq!(super::first_reportable_ip("-"), None);
+        assert_eq!(super::first_reportable_ip("not-an-ip"), None);
+    }
+
+    #[test]
+    fn pve_net0_bridge_parse() {
+        let cfg = "arch: amd64\n\
+                   hostname: web01\n\
+                   net0: name=eth0,bridge=vmbr1,hwaddr=AA:BB:CC:DD:EE:FF,ip=10.10.10.5/24,type=veth\n\
+                   rootfs: local-lvm:vm-104-disk-0,size=8G\n";
+        assert_eq!(super::bridge_from_pve_net0(cfg), Some("vmbr1".to_string()));
+        // No net0 line → None.
+        assert_eq!(super::bridge_from_pve_net0("arch: amd64\nhostname: x\n"), None);
+        // net0 present but no bridge= (e.g. a NAT/none layout) → None, not a panic.
+        assert_eq!(super::bridge_from_pve_net0("net0: name=eth0,ip=dhcp,type=veth\n"), None);
     }
 }
 

@@ -5519,13 +5519,19 @@ pub fn restore_config_backup(entry: &BackupEntry, new_machine: bool) -> Result<S
     // and files uniformly.
     let staging = ensure_staging_dir()?.join("config-restore");
     let _ = fs::remove_dir_all(&staging);
-    fs::create_dir_all(&staging).map_err(|e| format!("Failed to create restore staging: {}", e))?;
     // Restrict to root: the default staging base is under /tmp and this dir
     // briefly holds TLS key material + /etc/wolfstack before the cp into place,
-    // so don't let any other local user read or plant files in it.
+    // so don't let any other local user read or plant files in it. Create with
+    // mode 0o700 in the mkdir(2) call itself (DirBuilder) rather than chmod-ing
+    // after — that closes the window where the dir is world-readable. umask can
+    // only clear bits, never add them, so 0o700 is guaranteed regardless of it.
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&staging, fs::Permissions::from_mode(0o700));
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&staging)
+            .map_err(|e| format!("Failed to create restore staging: {}", e))?;
     }
 
     let output = Command::new("tar")
@@ -5993,6 +5999,10 @@ pub fn restore_by_id(id: &str, overwrite: bool) -> Result<String, String> {
 }
 
 /// Restore from a backup by ID with streaming log output
+// Each parameter is an independent restore knob (id, overwrite, target storage,
+// rename target, config new-machine mode, progress sink) — not incidental state
+// that a wrapper struct would meaningfully tidy; bundling them would add
+// indirection without removing a real argument. Allowed deliberately.
 #[allow(clippy::too_many_arguments)]
 pub fn restore_by_id_with_log(id: &str, overwrite: bool, storage: &str, new_name: &str, new_machine: bool, log: std::sync::mpsc::Sender<String>) -> Result<String, String> {
     let config = load_config();
