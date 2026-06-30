@@ -58058,6 +58058,28 @@ const LEARN_COURSE = [
     { title: 'You did it', lessons: [
         { id: 'done-1', title: 'Your starter checklist', mins: 3, file: 'done-1-checklist.md' },
     ] },
+    // ── Level 2: Going Further ──────────────────────────────────────────
+    // The follow-on course for operators who've completed Getting Started.
+    // One door per lesson; same calm, one-task-at-a-time method.
+    { title: 'Level 2 · Going further', lessons: [
+        { id: 'l2-1', title: 'Welcome to Level 2', mins: 3, file: 'l2-1-going-further.md' },
+    ] },
+    { title: 'Connect your servers', lessons: [
+        { id: 'l2-2', title: 'Link servers with WolfNet', mins: 5, file: 'l2-2-wolfnet.md' },
+    ] },
+    { title: 'Beyond containers', lessons: [
+        { id: 'l2-3', title: 'Run a full virtual machine', mins: 5, file: 'l2-3-run-a-vm.md' },
+    ] },
+    { title: 'Storage that scales', lessons: [
+        { id: 'l2-4', title: 'Storage that outgrows one disk', mins: 5, file: 'l2-4-storage.md' },
+    ] },
+    { title: 'Work less, know more', lessons: [
+        { id: 'l2-5', title: 'Automate with WolfFlow', mins: 4, file: 'l2-5-wolfflow.md' },
+        { id: 'l2-6', title: 'Your AI co-pilot (WolfAgents)', mins: 4, file: 'l2-6-wolfagents.md' },
+    ] },
+    { title: 'You made it', lessons: [
+        { id: 'l2-7', title: "You're an operator now", mins: 3, file: 'l2-7-operator.md' },
+    ] },
 ];
 
 const LEARN_PROGRESS_KEY = 'wolfstack_learn_progress';
@@ -58389,7 +58411,7 @@ function learnCompleteAndNext() {
         learnRenderToc();
         learnUpdateNavButtons();
         if (typeof showToast === 'function') {
-            showToast('\u{1F389} You finished the Getting Started course. Nicely done.', 'success');
+            showToast('\u{1F389} You finished the whole course — Getting Started and Level 2. You’re an operator now. \u{1F43A}', 'success');
         }
     }
 }
