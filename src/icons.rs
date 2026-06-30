@@ -182,21 +182,29 @@ fn parse_index_theme(path: &Path) -> Option<(String, String)> {
 }
 
 /// Find a .theme.in template file in a directory (used by KDE repos like Breeze).
-/// Returns the path to the first non-dark .theme.in, or any .theme.in if none found.
+/// Returns the first non-dark .theme.in that is a *valid* icon theme (a real
+/// `[Icon Theme]` section with a `Name=`), falling back to a dark variant.
+///
+/// Validation matters: KDE's `icons/` ships helper fragments alongside the real
+/// theme — e.g. `commonthemeinfo.theme.in` has no `[Icon Theme]`/`Name=`. Picking
+/// one of those (read_dir order is arbitrary) and copying it to `index.theme`
+/// produced an unparseable theme, so `scan_icon_dir` skipped the pack: it stayed
+/// "installed" (dir present, blocks reinstall) yet unlisted and unselectable.
 fn find_theme_in_file(dir: &Path) -> Option<PathBuf> {
     let entries = std::fs::read_dir(dir).ok()?;
     let mut fallback: Option<PathBuf> = None;
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.ends_with(".theme.in") {
-            let path = entry.path();
-            // Prefer the non-dark variant
-            if !name.to_lowercase().contains("dark") {
-                return Some(path);
-            }
-            if fallback.is_none() {
-                fallback = Some(path);
-            }
+        if !name.ends_with(".theme.in") { continue; }
+        let path = entry.path();
+        // Must be a real icon theme, not a config fragment.
+        if parse_index_theme(&path).is_none() { continue; }
+        // Prefer the non-dark variant.
+        if !name.to_lowercase().contains("dark") {
+            return Some(path);
+        }
+        if fallback.is_none() {
+            fallback = Some(path);
         }
     }
     fallback
@@ -403,11 +411,35 @@ pub async fn install_from_github(url: &str) -> Result<IconPack, String> {
         .ok_or("Could not parse repository name from URL")?
         .to_string();
 
+    // Harden against path traversal. repo_name flows into `dest =
+    // install_dir.join(repo_name)` and then into git clone AND remove_dir_all
+    // (the self-heal path below). A crafted URL like `https://github.com/u/..`
+    // still contains "github.com/" but yields repo_name ".." → dest would escape
+    // the icon-packs dir and a remove_dir_all could wipe /etc/wolfstack. Require
+    // a single safe path component (git repo names are `[A-Za-z0-9._-]`).
+    let safe_name = !repo_name.is_empty()
+        && repo_name != "."
+        && repo_name != ".."
+        && repo_name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if !safe_name {
+        return Err(format!("Refusing to install: '{}' is not a valid repository name", repo_name));
+    }
+
     let install_dir = PathBuf::from(icon_packs_dir());
     let dest = install_dir.join(&repo_name);
 
     if dest.exists() {
-        return Err(format!("Icon pack '{}' is already installed", repo_name));
+        // Only block reinstall if what's there is actually a usable pack. A
+        // previous broken install (e.g. an unparseable index.theme) is NOT
+        // listed by scan_all_packs, so the UI can't offer to delete it either —
+        // the user gets stuck on "already installed" with nothing selectable.
+        // Self-heal: remove the broken dir and continue with a fresh install.
+        if parse_index_theme(&dest.join("index.theme")).is_some() {
+            return Err(format!("Icon pack '{}' is already installed", repo_name));
+        }
+        info!("Removing broken/incomplete icon pack '{}' before reinstall", repo_name);
+        std::fs::remove_dir_all(&dest)
+            .map_err(|e| format!("Failed to remove broken icon pack '{}' for reinstall: {}", repo_name, e))?;
     }
 
     // Ensure parent dir exists
@@ -450,17 +482,15 @@ pub async fn install_from_github(url: &str) -> Result<IconPack, String> {
                     if !sub.is_dir() { continue; }
                     let sub_index = sub.join("index.theme");
                     let has_index = sub_index.exists();
-                    // Also check for .theme.in files in subdirectory
-                    let has_theme_in = if !has_index {
-                        find_theme_in_file(&sub).is_some()
-                    } else { false };
+                    // Also check for a valid .theme.in in the subdirectory.
+                    // Resolve it once and reuse (find_theme_in_file does a full
+                    // read_dir + parse of every candidate).
+                    let theme_in = if has_index { None } else { find_theme_in_file(&sub) };
 
-                    if has_index || has_theme_in {
+                    if has_index || theme_in.is_some() {
                         // If only .theme.in exists, create index.theme from it
-                        if !has_index {
-                            if let Some(tin) = find_theme_in_file(&sub) {
-                                let _ = std::fs::copy(&tin, &sub_index);
-                            }
+                        if let Some(ref tin) = theme_in {
+                            let _ = std::fs::copy(tin, &sub_index);
                         }
                         // Move subdirectory contents up
                         let tmp = install_dir.join(format!("{}-tmp", repo_name));
@@ -482,9 +512,17 @@ pub async fn install_from_github(url: &str) -> Result<IconPack, String> {
         }
     }
 
-    // Parse and return the pack info
-    let (name, comment) = parse_index_theme(&dest.join("index.theme"))
-        .unwrap_or_else(|| (repo_name.clone(), String::new()));
+    // Parse and return the pack info. If the resulting index.theme isn't a
+    // valid icon theme, scan_all_packs would skip it (leaving the same stuck
+    // "installed but unlisted" state) — so fail loudly and clean up instead of
+    // falling back to the repo name and reporting a phantom success.
+    let (name, comment) = match parse_index_theme(&dest.join("index.theme")) {
+        Some(v) => v,
+        None => {
+            let _ = std::fs::remove_dir_all(&dest);
+            return Err("Repository did not yield a valid icon theme (its index.theme has no [Icon Theme]/Name=). It may not be a freedesktop-style icon pack.".into());
+        }
+    };
 
     let has_scalable = dest.join("scalable").exists()
         || dest.join("apps").join("scalable").exists();
@@ -573,6 +611,27 @@ mod tests {
         std::fs::write(dir.join("index.theme"), "[Icon Theme]\nName=Test Theme\nComment=A test\n").unwrap();
         let result = parse_index_theme(&dir.join("index.theme"));
         assert_eq!(result, Some(("Test Theme".into(), "A test".into())));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_find_theme_in_skips_fragment() {
+        // Mirrors KDE Breeze's icons/ dir: a real theme template plus the
+        // commonthemeinfo.theme.in fragment (no [Icon Theme]/Name=). The
+        // fragment must NEVER be chosen — picking it produced an unparseable
+        // index.theme and left the pack installed-but-unlisted.
+        let dir = std::env::temp_dir().join(format!("wolfstack-test-themein-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("commonthemeinfo.theme.in"),
+            "DisplayDepth=32\nDesktopDefault=48\n").unwrap();
+        std::fs::write(dir.join("breeze.theme.in"),
+            "[Icon Theme]\nName=Breeze\nComment=Breeze Team\n").unwrap();
+        std::fs::write(dir.join("breeze-dark.theme.in"),
+            "[Icon Theme]\nName=Breeze Dark\n").unwrap();
+        let chosen = find_theme_in_file(&dir).expect("should find a valid theme template");
+        assert_eq!(chosen.file_name().unwrap().to_string_lossy(), "breeze.theme.in",
+            "must pick the valid non-dark theme, never the fragment");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
