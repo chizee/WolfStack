@@ -1076,6 +1076,47 @@ fn smart_summary(device: &str) -> Option<(String, Option<i32>)> {
     Some((status, temp))
 }
 
+/// List whole physical disk device paths (`/dev/sda`, `/dev/nvme0n1`, …) —
+/// lsblk type=disk only, so partitions, loop and rom devices are excluded.
+pub fn list_physical_disks() -> Vec<String> {
+    let out = match Command::new("lsblk").args(["-dnpo", "NAME,TYPE"]).output() {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return Vec::new(),
+    };
+    String::from_utf8_lossy(&out)
+        .lines()
+        .filter_map(|line| {
+            let mut it = line.split_whitespace();
+            let name = it.next()?;
+            let typ = it.next()?;
+            if typ == "disk" { Some(name.to_string()) } else { None }
+        })
+        .collect()
+}
+
+/// SMART overall-health status for a single device (e.g. "PASSED", "FAILED").
+/// `None` when smartctl is unavailable, the device can't be read, or the disk
+/// is in standby. Uses `-H` only (health, no attribute scan) and `-n standby`
+/// so a spun-down disk is NOT woken just to be polled — important now that the
+/// health watcher checks every physical disk every minute, not only the
+/// (usually-active) array members.
+pub fn disk_smart_status(device: &str) -> Option<String> {
+    let out = Command::new("timeout")
+        .args(["5", "smartctl", "-H", "-n", "standby", device])
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    for line in s.lines() {
+        if let Some(idx) = line.find("overall-health self-assessment test result:") {
+            let marker_len = "overall-health self-assessment test result:".len();
+            return Some(line[idx + marker_len..].trim().to_string());
+        }
+    }
+    // No health line: smartctl found the disk in standby (we asked not to wake
+    // it) or returned nothing parseable. Treat as unknown → skip, don't alert.
+    None
+}
+
 fn filesystem_used_bytes_for(device: &str) -> Option<u64> {
     // If the array's underlying device has a mounted filesystem,
     // report its `df` usage. Best-effort — not every array has one

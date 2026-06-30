@@ -2055,13 +2055,18 @@ pub fn backup_config() -> Result<(PathBuf, u64), String> {
         }
     }
 
-    // WolfNet's config lives outside /etc/wolfstack.
-    let wolfnet_cfg = Path::new("/etc/wolfnet/config.toml");
-    if wolfnet_cfg.exists() {
-        let dest = temp_dir.join("etc/wolfnet/config.toml");
-        if let Some(parent) = dest.parent() { let _ = fs::create_dir_all(parent); }
-        if let Err(e) = fs::copy(wolfnet_cfg, &dest) {
-            warn!("config backup: failed to copy WolfNet config ({})", e);
+    // Sibling Wolf components keep their config outside /etc/wolfstack. Back up
+    // each WHOLE dir — WolfNet has more than config.toml (keys / peer state) and
+    // WolfUSB keeps wolfusb.env; the old code grabbed only wolfnet/config.toml,
+    // so a reinstall lost the rest (Gary, 2026-06-30).
+    for comp_dir in &["/etc/wolfnet", "/etc/wolfusb"] {
+        let p = Path::new(comp_dir);
+        // strip_prefix must succeed (these are absolute literals); skip rather
+        // than fall back to an absolute `rel`, which `temp_dir.join` would
+        // resolve to the real /etc path and copy a dir onto itself.
+        let Ok(rel) = p.strip_prefix("/") else { continue };
+        if p.exists() {
+            copy_config_tree(p, &temp_dir.join(rel), &[])?;
         }
     }
 
