@@ -898,8 +898,11 @@ pub async fn abuse_report_preview(
     let our_hostname = hostname::get()
         .map(|h| h.to_string_lossy().to_string())
         .unwrap_or_else(|_| "this node".into());
+    // Draft preview sender: prefer the explicit From address, fall back to the
+    // login user (matches resolve_from_mailbox's precedence) so a relay-only
+    // setup with no SMTP user still shows the right sender in the draft.
     let from_email = state.ai_agent.config.lock()
-        .map(|c| c.smtp_user.clone())
+        .map(|c| if c.smtp_from.trim().is_empty() { c.smtp_user.clone() } else { c.smtp_from.clone() })
         .unwrap_or_default();
     let draft = crate::abuse_report::compose_report(
         &ip, &whois, &evidence, &our_hostname, &from_email);
@@ -2312,7 +2315,9 @@ pub async fn threat_intel_lookup(req: HttpRequest, state: web::Data<AppState>, p
 /// GET /api/auth/smtp-configured — check if SMTP is configured (controls "Lost Password" visibility)
 pub async fn smtp_configured() -> HttpResponse {
     let config = crate::ai::AiConfig::load();
-    let configured = !config.smtp_host.is_empty() && !config.smtp_user.is_empty() && !config.smtp_pass.is_empty();
+    // Host is the only hard requirement — auth (user/pass) is optional for
+    // unauthenticated relays, consistent with the send path and abuse-report gate.
+    let configured = !config.smtp_host.is_empty();
     HttpResponse::Ok().json(serde_json::json!({ "smtp_configured": configured, "version": env!("CARGO_PKG_VERSION") }))
 }
 
@@ -2341,9 +2346,11 @@ pub async fn forgot_password(state: web::Data<AppState>, body: web::Json<serde_j
         return generic_ok;
     }
 
-    // Check SMTP is configured
+    // Check SMTP is configured. Host is the only hard requirement — auth is
+    // optional (unauthenticated relays). If the From/host turn out unsendable we
+    // still return the generic response below to avoid leaking account state.
     let config = crate::ai::AiConfig::load();
-    if config.smtp_host.is_empty() || config.smtp_user.is_empty() || config.smtp_pass.is_empty() {
+    if config.smtp_host.is_empty() {
         return generic_ok;
     }
 
@@ -12612,6 +12619,9 @@ pub async fn ai_save_config(
         }
         if let Some(v) = body.get("smtp_port").and_then(|v| v.as_u64()) {
             config.smtp_port = v as u16;
+        }
+        if let Some(v) = body.get("smtp_from").and_then(|v| v.as_str()) {
+            config.smtp_from = v.to_string();
         }
         if let Some(v) = body.get("smtp_user").and_then(|v| v.as_str()) {
             config.smtp_user = v.to_string();

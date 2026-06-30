@@ -1619,7 +1619,10 @@ async fn tool_send_email(
     };
 
     let config = crate::ai::AiConfig::load();
-    if config.smtp_host.is_empty() || config.smtp_user.is_empty() {
+    // Only the host is required — username/password are optional (unauthenticated
+    // relays are valid). A missing From address surfaces a clear error from the
+    // send path itself.
+    if config.smtp_host.is_empty() {
         return ToolResult::err(
             "SMTP is not configured on this WolfStack. Configure Settings → AI Agent → Email first.".into());
     }
@@ -1696,12 +1699,12 @@ pub(crate) fn send_email_generic(
     body: &str,
     html: bool,
 ) -> Result<(), String> {
-    use lettre::{Message, SmtpTransport, Transport};
-    use lettre::transport::smtp::authentication::Credentials;
+    use lettre::{Message, Transport};
     use lettre::message::{SinglePart, header::ContentType};
 
-    let from_addr: lettre::message::Mailbox = format!("WolfStack Agent <{}>", config.smtp_user)
-        .parse().map_err(|e| format!("from: {}", e))?;
+    // Shared with the AI alert path: honours a separate From address and only
+    // authenticates when an SMTP user is set (so unauthenticated relays work).
+    let from_addr = crate::ai::resolve_from_mailbox(config, "WolfStack Agent")?;
     let mut builder = Message::builder().from(from_addr).subject(subject);
     for r in to {
         let mb: lettre::message::Mailbox = r.parse()
@@ -1717,18 +1720,9 @@ pub(crate) fn send_email_generic(
         builder.body(body.to_string())
             .map_err(|e| format!("build text: {}", e))?
     };
-    let creds = Credentials::new(config.smtp_user.clone(), config.smtp_pass.clone());
-    let mailer = match config.smtp_tls.as_str() {
-        "tls" => SmtpTransport::relay(&config.smtp_host)
-            .map_err(|e| format!("relay: {}", e))?
-            .port(config.smtp_port).credentials(creds).build(),
-        "none" => SmtpTransport::builder_dangerous(&config.smtp_host)
-            .port(config.smtp_port).credentials(creds).build(),
-        _ => SmtpTransport::starttls_relay(&config.smtp_host)
-            .map_err(|e| format!("starttls: {}", e))?
-            .port(config.smtp_port).credentials(creds).build(),
-    };
-    mailer.send(&email).map_err(|e| format!("send: {}", e))?;
+    crate::ai::build_smtp_mailer(config)?
+        .send(&email)
+        .map_err(|e| format!("send: {}", e))?;
     Ok(())
 }
 
