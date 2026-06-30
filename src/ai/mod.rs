@@ -134,6 +134,14 @@ pub struct AiConfig {
     pub smtp_port: u16,
     pub smtp_user: String,
     pub smtp_pass: String,
+    /// The envelope/header "From" address (e.g. `alerts@example.com` or
+    /// `Alerts <alerts@example.com>`). This is the SENDER shown to recipients —
+    /// distinct from `smtp_user`, which is only the login credential. Empty on
+    /// older configs: we then fall back to `smtp_user` (back-compat) when it
+    /// looks like an email, and otherwise require this field. Letting it differ
+    /// from the login user is what makes unauthenticated internal relays work.
+    #[serde(default)]
+    pub smtp_from: String,
     #[serde(default)]
     pub smtp_tls: String,         // "none", "starttls", or "tls"
     pub check_interval_minutes: u32,
@@ -203,6 +211,7 @@ impl Default for AiConfig {
             smtp_port: 587,
             smtp_user: String::new(),
             smtp_pass: String::new(),
+            smtp_from: String::new(),
             smtp_tls: "starttls".to_string(),
             check_interval_minutes: 60,
             scan_schedule: "off".to_string(),
@@ -287,6 +296,7 @@ impl AiConfig {
             "smtp_port": self.smtp_port,
             "smtp_user": self.smtp_user,
             "smtp_pass": mask_key(&self.smtp_pass),
+            "smtp_from": self.smtp_from,
             "check_interval_minutes": self.check_interval_minutes,
             "scan_schedule": self.scan_schedule,
             "accepted_risks": self.accepted_risks,
@@ -652,6 +662,7 @@ mod agent_tool_call_limit_tests {
             "smtp_port": 587,
             "smtp_user": "",
             "smtp_pass": "",
+            "smtp_from": "",
             "smtp_tls": "starttls",
             "check_interval_minutes": 60,
             "scan_schedule": "off",
@@ -3643,61 +3654,93 @@ async fn call_gemini(
 
 // ─── Email Alerts ───
 
-pub fn send_alert_email(config: &AiConfig, subject: &str, body: &str) -> Result<(), String> {
-    use lettre::{Message, SmtpTransport, Transport};
+/// Resolve the message "From" mailbox. Prefers the explicit `smtp_from`
+/// (the sender shown to recipients); for back-compat with configs saved before
+/// that field existed, falls back to the login `smtp_user` *only* when it looks
+/// like an email address. If neither yields an address, returns a clear error
+/// pointing the operator at the right field — rather than building
+/// `WolfStack AI <>` and failing deep inside lettre with "Email from: Invalid
+/// input" (the bug Rutger hit when sending via an unauthenticated relay with no
+/// SMTP user). `fallback_display` is the display name used only when wrapping a
+/// bare `smtp_user` address.
+pub(crate) fn resolve_from_mailbox(
+    config: &AiConfig,
+    fallback_display: &str,
+) -> Result<lettre::message::Mailbox, String> {
+    let raw = if !config.smtp_from.trim().is_empty() {
+        // Accept either "addr@host" or "Name <addr@host>" verbatim.
+        config.smtp_from.trim().to_string()
+    } else if config.smtp_user.contains('@') {
+        format!("{} <{}>", fallback_display, config.smtp_user.trim())
+    } else {
+        return Err(
+            "No From address set. Add a From Address in Settings → AI Alerting \
+             (e.g. alerts@yourdomain) — it is the sender shown to recipients and \
+             is separate from the SMTP username."
+                .to_string(),
+        );
+    };
+    raw.parse()
+        .map_err(|e| format!("Invalid From address '{}': {}", raw, e))
+}
+
+/// Build the SMTP transport for the configured host/port/encryption. Credentials
+/// are attached ONLY when an SMTP username is set: an unauthenticated internal
+/// relay (port 25, no user/pass) advertises no AUTH mechanism, and handing
+/// lettre empty credentials makes it fail with "No compatible authentication
+/// mechanism was found" (the second half of Rutger's report). No user → no auth
+/// attempted → plain relay works.
+pub(crate) fn build_smtp_mailer(config: &AiConfig) -> Result<lettre::SmtpTransport, String> {
+    use lettre::SmtpTransport;
     use lettre::transport::smtp::authentication::Credentials;
 
+    let mut builder = match config.smtp_tls.as_str() {
+        // Implicit TLS (port 465 typically)
+        "tls" => SmtpTransport::relay(&config.smtp_host)
+            .map_err(|e| format!("SMTP relay: {}", e))?,
+        // No encryption (e.g. internal relay on port 25)
+        "none" => SmtpTransport::builder_dangerous(&config.smtp_host),
+        // STARTTLS (default, port 587 typically)
+        _ => SmtpTransport::starttls_relay(&config.smtp_host)
+            .map_err(|e| format!("SMTP STARTTLS: {}", e))?,
+    }
+    .port(config.smtp_port)
+    .timeout(Some(std::time::Duration::from_secs(20)));
+
+    if !config.smtp_user.is_empty() {
+        builder = builder.credentials(Credentials::new(
+            config.smtp_user.clone(),
+            config.smtp_pass.clone(),
+        ));
+    }
+
+    Ok(builder.build())
+}
+
+pub fn send_alert_email(config: &AiConfig, subject: &str, body: &str) -> Result<(), String> {
+    use lettre::{Message, Transport};
+
     let email = Message::builder()
-        .from(format!("WolfStack AI <{}>", config.smtp_user).parse().map_err(|e| format!("Email from: {}", e))?)
+        .from(resolve_from_mailbox(config, "WolfStack AI")?)
         .to(config.email_to.parse().map_err(|e| format!("Email to: {}", e))?)
         .subject(subject)
         .body(body.to_string())
         .map_err(|e| format!("Email build: {}", e))?;
 
-    let creds = Credentials::new(config.smtp_user.clone(), config.smtp_pass.clone());
-
-    let mailer = match config.smtp_tls.as_str() {
-        "tls" => {
-            // Implicit TLS (port 465 typically)
-            SmtpTransport::relay(&config.smtp_host)
-                .map_err(|e| format!("SMTP relay: {}", e))?
-                .port(config.smtp_port)
-                .credentials(creds)
-                .timeout(Some(std::time::Duration::from_secs(20)))
-                .build()
-        }
-        "none" => {
-            // No encryption
-            SmtpTransport::builder_dangerous(&config.smtp_host)
-                .port(config.smtp_port)
-                .credentials(creds)
-                .timeout(Some(std::time::Duration::from_secs(20)))
-                .build()
-        }
-        _ => {
-            // STARTTLS (default, port 587 typically)
-            SmtpTransport::starttls_relay(&config.smtp_host)
-                .map_err(|e| format!("SMTP STARTTLS: {}", e))?
-                .port(config.smtp_port)
-                .credentials(creds)
-                .timeout(Some(std::time::Duration::from_secs(20)))
-                .build()
-        }
-    };
-
-    mailer.send(&email).map_err(|e| format!("SMTP send: {}", e))?;
+    build_smtp_mailer(config)?
+        .send(&email)
+        .map_err(|e| format!("SMTP send: {}", e))?;
 
     Ok(())
 }
 
 /// Send an HTML email (used for the daily report with tables)
 pub fn send_html_email(config: &AiConfig, subject: &str, html_body: &str) -> Result<(), String> {
-    use lettre::{Message, SmtpTransport, Transport};
-    use lettre::transport::smtp::authentication::Credentials;
+    use lettre::{Message, Transport};
     use lettre::message::{SinglePart, header::ContentType};
 
     let email = Message::builder()
-        .from(format!("WolfStack AI <{}>", config.smtp_user).parse().map_err(|e| format!("Email from: {}", e))?)
+        .from(resolve_from_mailbox(config, "WolfStack AI")?)
         .to(config.email_to.parse().map_err(|e| format!("Email to: {}", e))?)
         .subject(subject)
         .singlepart(SinglePart::builder()
@@ -3705,35 +3748,10 @@ pub fn send_html_email(config: &AiConfig, subject: &str, html_body: &str) -> Res
             .body(html_body.to_string()))
         .map_err(|e| format!("Email build: {}", e))?;
 
-    let creds = Credentials::new(config.smtp_user.clone(), config.smtp_pass.clone());
+    build_smtp_mailer(config)?
+        .send(&email)
+        .map_err(|e| format!("SMTP send: {}", e))?;
 
-    let mailer = match config.smtp_tls.as_str() {
-        "tls" => {
-            SmtpTransport::relay(&config.smtp_host)
-                .map_err(|e| format!("SMTP relay: {}", e))?
-                .port(config.smtp_port)
-                .credentials(creds)
-                .timeout(Some(std::time::Duration::from_secs(20)))
-                .build()
-        }
-        "none" => {
-            SmtpTransport::builder_dangerous(&config.smtp_host)
-                .port(config.smtp_port)
-                .credentials(creds)
-                .timeout(Some(std::time::Duration::from_secs(20)))
-                .build()
-        }
-        _ => {
-            SmtpTransport::starttls_relay(&config.smtp_host)
-                .map_err(|e| format!("SMTP STARTTLS: {}", e))?
-                .port(config.smtp_port)
-                .credentials(creds)
-                .timeout(Some(std::time::Duration::from_secs(20)))
-                .build()
-        }
-    };
-
-    mailer.send(&email).map_err(|e| format!("SMTP send: {}", e))?;
     Ok(())
 }
 

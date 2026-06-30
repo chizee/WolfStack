@@ -34547,6 +34547,7 @@ async function loadAiConfig() {
         if ((el = document.getElementById('ai-email-to'))) el.value = cfg.email_to || '';
         if ((el = document.getElementById('ai-smtp-host'))) el.value = cfg.smtp_host || '';
         if ((el = document.getElementById('ai-smtp-port'))) el.value = cfg.smtp_port || 587;
+        if ((el = document.getElementById('ai-smtp-from'))) el.value = cfg.smtp_from || '';
         if ((el = document.getElementById('ai-smtp-user'))) el.value = cfg.smtp_user || '';
         if ((el = document.getElementById('ai-smtp-pass'))) el.value = cfg.has_smtp_pass ? cfg.smtp_pass : '';
         if ((el = document.getElementById('ai-smtp-tls'))) el.value = cfg.smtp_tls || 'starttls';
@@ -34743,6 +34744,7 @@ function _buildAiConfigPayload(model) {
         email_to: (document.getElementById('ai-email-to') || {}).value || '',
         smtp_host: (document.getElementById('ai-smtp-host') || {}).value || '',
         smtp_port: parseInt((document.getElementById('ai-smtp-port') || {}).value) || 587,
+        smtp_from: (document.getElementById('ai-smtp-from') || {}).value || '',
         smtp_user: (document.getElementById('ai-smtp-user') || {}).value || '',
         smtp_pass: (document.getElementById('ai-smtp-pass') || {}).value || '',
         smtp_tls: (document.getElementById('ai-smtp-tls') || {}).value || 'starttls',

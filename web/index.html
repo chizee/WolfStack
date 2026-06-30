@@ -6487,7 +6487,13 @@
                                         <input type="number" id="ai-smtp-port" class="form-control" value="587">
                                     </div>
                                     <div class="form-group" style="margin-bottom:12px;">
-                                        <label>SMTP User</label>
+                                        <label>From Address</label>
+                                        <input type="text" id="ai-smtp-from" class="form-control"
+                                            placeholder="alerts@yourdomain.com">
+                                        <small style="display:block;margin-top:4px;color:var(--text-muted);">The sender shown to recipients. Separate from the SMTP user — set this for unauthenticated relays. If blank, the SMTP user is used (when it's an email address).</small>
+                                    </div>
+                                    <div class="form-group" style="margin-bottom:12px;">
+                                        <label>SMTP User <span style="color:var(--text-muted);font-weight:400;">(leave blank for an unauthenticated relay)</span></label>
                                         <input type="text" id="ai-smtp-user" class="form-control">
                                     </div>
                                     <div class="form-group" style="margin-bottom:12px;">

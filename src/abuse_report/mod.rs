@@ -412,8 +412,8 @@ pub fn send_report(
     if draft.to.trim().is_empty() {
         return Err("recipient address is empty — set it explicitly before sending".into());
     }
-    if ai_config.smtp_user.is_empty() || ai_config.smtp_pass.is_empty() {
-        return Err("SMTP not configured. Set smtp_user/smtp_pass via Settings → AI Alerting before sending abuse reports.".into());
+    if ai_config.smtp_host.is_empty() {
+        return Err("SMTP not configured. Set the SMTP host (and a From address) via Settings → AI Alerting before sending abuse reports. Username/password are only needed for relays that require authentication.".into());
     }
     // Temporarily swap the email_to so send_alert_email goes to the
     // abuse desk rather than the operator's own address. We clone
