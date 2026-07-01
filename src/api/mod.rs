@@ -23277,8 +23277,10 @@ pub async fn wolfusb_assign(req: HttpRequest, state: web::Data<AppState>, body: 
                 });
             } else if !is_local_target && !target_node_id.is_empty() {
                 // Case 4: target is a different node — forward the attach call.
-                let nodes = state.cluster.get_all_nodes();
-                if let Some(target_node) = nodes.iter().find(|n| n.id == target_node_id) {
+                // Resolve by either id form (map-key or canonical self_id) so a
+                // frontend-supplied ws-… id still matches a peer keyed under a
+                // node-… map key. Raw n.id== scans miss the self_id form.
+                if let Some(target_node) = state.cluster.get_node(target_node_id) {
                     let urls = crate::api::build_node_urls(&target_node.address, target_node.port, "/api/wolfusb/attach");
                     let secret = state.cluster_secret.clone();
                     let client = API_HTTP_CLIENT.clone();
@@ -23511,8 +23513,10 @@ pub async fn wolfusb_reattach(
     // single step describes exactly which proxy hop failed and why,
     // which is the information the operator actually needs.
     if a.target_node_id != self_id {
-        let nodes = state.cluster.get_all_nodes();
-        let Some(target) = nodes.iter().find(|n| n.id == a.target_node_id) else {
+        // Resolve by either id form (map-key `id` or canonical `self_id`) — see
+        // the source-lookup note below; the same id-form drift breaks the target
+        // hop when the assignment stored the canonical self_id.
+        let Some(target) = state.cluster.get_node(&a.target_node_id) else {
             return HttpResponse::Ok().json(serde_json::json!({
                 "ok": false,
                 "steps": [{
@@ -23598,14 +23602,35 @@ pub async fn wolfusb_reattach(
     let mut all_steps: Vec<crate::wolfusb::ReattachStep> = Vec::new();
     let mut source_bus_addr: Option<(u8, u8)> = None;
     if a.source_node_id != self_id {
-        let nodes = state.cluster.get_all_nodes();
-        let Some(source) = nodes.iter().find(|n| n.id == a.source_node_id) else {
-            all_steps.push(crate::wolfusb::ReattachStep {
-                step: "Locate source node".into(),
-                ok: false,
-                detail: format!("source node {} not in cluster — check node membership", a.source_node_id),
-            });
-            return HttpResponse::Ok().json(serde_json::json!({ "ok": false, "steps": all_steps }));
+        // Resolve the source by EITHER id form — the local map-key `id` OR the
+        // canonical `self_id` — via get_node, then fall back to the address
+        // stored on the assignment when the node isn't in cluster gossip at all.
+        // Why both matter: the frontend stores whichever id it displayed (usually
+        // the canonical `ws-…` self_id), while a peer's LOCAL map key is a
+        // `node-…` uuid, so a raw `n.id == source_node_id` scan silently misses
+        // it — that was PapaSchlumpf's "source node ws-aa8c09ff not in cluster"
+        // on a reboot (2026-07-01), even though the source was fully reachable.
+        // And `source_address` is proven-good — the mount unit itself connects to
+        // it — so even a genuinely-absent node id must not block re-attach.
+        let source = match resolve_target_node(
+            &state,
+            &a.source_node_id,
+            (!a.source_address.is_empty()).then_some(a.source_address.as_str()),
+            Some(8553),
+        ) {
+            Some(n) => n,
+            None => {
+                all_steps.push(crate::wolfusb::ReattachStep {
+                    step: "Locate source node".into(),
+                    ok: false,
+                    detail: format!(
+                        "source node {} not in cluster and the assignment has no \
+                         stored source address — check node membership",
+                        a.source_node_id
+                    ),
+                });
+                return HttpResponse::Ok().json(serde_json::json!({ "ok": false, "steps": all_steps }));
+            }
         };
         let urls = build_node_urls(&source.address, source.port, "/api/wolfusb/prepare-for-export");
         let client = &*API_HTTP_CLIENT;
@@ -26806,6 +26831,33 @@ pub fn collect_issues(metrics: &crate::monitoring::SystemMetrics) -> Vec<Issue> 
         }
     }
 
+    // ── Failing physical disks (SMART) ──
+    // The free-space loop above catches FULL disks; this catches DYING ones.
+    // Uses the SAME evaluator the Storage page and the Issues alerting watcher
+    // use (array::disk_smart_health + DiskSmart::failing_reasons — Backblaze
+    // SMART 5/187/197/198, NVMe wear/spare, overall-health FAILED), so a drive
+    // the operator sees reddened under Storage also shows up HERE, on the page
+    // where they run upgrades (a failing SSD used to raise nothing on this scan
+    // — collect_issues never checked disk health; PapaSchlumpf 2026-07-01). The
+    // standby guard is gated on rotational-ness so an SSD/NVMe whose power-mode
+    // probe can't confirm an active state is still read (never skipped), while a
+    // spun-down HDD is left asleep. Physical-disk SMART is host-level and
+    // independent of `metrics`, so it's read directly here.
+    for dev in crate::array::list_physical_disks() {
+        let guard = crate::array::disk_is_rotational(&dev);
+        if let Some(health) = crate::array::disk_smart_health(&dev, guard) {
+            let reasons = health.failing_reasons();
+            if !reasons.is_empty() {
+                issues.push(Issue {
+                    severity: "critical".into(),
+                    category: "disk".into(),
+                    title: format!("Disk {} is failing (SMART)", dev),
+                    detail: format!("{} — back up and plan replacement: {}", dev, reasons.join("; ")),
+                });
+            }
+        }
+    }
+
     // ── Swap check ──
     if metrics.swap_total_bytes > 0 {
         let swap_pct = (metrics.swap_used_bytes as f64 / metrics.swap_total_bytes as f64) * 100.0;
@@ -27063,11 +27115,16 @@ pub async fn scan_issues(
 ) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
 
+    // Both the monitor sample AND collect_issues run on the blocking pool:
+    // collect_issues shells out (systemctl, docker, journalctl, du) and now
+    // also probes SMART (`timeout 10 smartctl` per physical disk), so it must
+    // never run on the actix worker thread.
     let st = state.clone().into_inner();
-    let metrics = tokio::task::spawn_blocking(move || {
-        st.monitor.lock().unwrap().collect()
+    let (metrics, issues) = tokio::task::spawn_blocking(move || {
+        let metrics = st.monitor.lock().unwrap().collect();
+        let issues = collect_issues(&metrics);
+        (metrics, issues)
     }).await.unwrap();
-    let issues = collect_issues(&metrics);
 
     // Enrich each issue with its one-click repair (when one exists) without
     // bloating the Issue struct or its ~18 producers. Serialising the issue
@@ -40129,6 +40186,13 @@ mod issue_repair_tests {
         let tmp = Issue { severity: "info".into(), category: "disk".into(),
             title: "/tmp using 2.3G".into(), detail: "…".into() };
         assert!(repair_for(&tmp).is_none());
+
+        // A failing-SMART disk is a "disk" issue too, but there is no one-click
+        // fix for dying hardware — it must NOT offer a bogus Clean button.
+        let failing = Issue { severity: "critical".into(), category: "disk".into(),
+            title: "Disk /dev/sda is failing (SMART)".into(),
+            detail: "/dev/sda — back up and plan replacement: 24 reallocated sector(s)".into() };
+        assert!(repair_for(&failing).is_none());
     }
 
     #[test]
