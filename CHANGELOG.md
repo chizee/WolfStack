@@ -8,6 +8,11 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.1.42: predictive vulnerability scanning now covers Docker images (via trivy)** _(2026-07-01 — [`d4d902fa`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/d4d902fa6866e6435b991c14d5a10ab678f9eab0))_
+- **v25.1.41: integrations framework is now usable end-to-end — operations metadata, action/dashboard/credential routes, and a full UI** _(2026-07-01 — [`31b7a197`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/31b7a197d618d1c67811c18c96b16c137a45f26c))_
+- **v25.1.40: antivirus on-access works on any distro with clamd; WolfRouter requests a WAN DHCP lease when the NIC has none** _(2026-07-01 — [`3142bc2a`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/3142bc2aaa7766ab02b0188c0371d24c5396698f))_
+- **v25.1.39: gateway sources — implement RBD, container-volume, LXC-dir and VM-export (smb/nfs) re-export** _(2026-07-01 — [`6a5f360c`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/6a5f360cde9f7a8ddf992868cd8cafd7eb8a22a8))_
+- **v25.1.38: finishable-tier sweep — backup remote-delete, at-rest auto-migrate, VLAN dealloc, tenant auto-poll, browser-proxy streaming** _(2026-07-01 — [`f846aaa6`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/f846aaa6be75c38621ed046a772e4337bd5e3aba))_
 - **v25.1.37: WolfUSB re-attach resolves source node by self_id; failing disks surface on the Issues/upgrade scanner; SMART detection generalized across HDD/SSD/NVMe/SAS/USB** _(2026-07-01 — [`5b7d6155`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/5b7d61558fcc528a04f3a9f91de87c3e1666bc1d))_
 - **v25.1.36: finish the arm64 arch sweep — WolfRun API create, Galera/WolfScale nodes, PVE arch parse, app-store binary URLs** _(2026-07-01 — [`f537dd08`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/f537dd08284bb42a68c2a32a63cbfd2accd9e3cc))_
 - **v25.1.35: LXC / app-store containers request the host's arch (arm64), not a hardcoded amd64** _(2026-07-01 — [`068311cc`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/068311cc9da3b7426825c54e8aa645638e071b51))_
