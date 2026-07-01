@@ -8,6 +8,8 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.1.44: finish API_HTTP_CLIENT pooling migration for admin fleet fanouts** _(2026-07-01 — [`d9ebc915`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/d9ebc915bc44ab45c16d515c4b7a86b5fa448b50))_
+- **v25.1.43: fix inter-node socket FD leak → EMFILE → cluster-wide CPU storm** _(2026-07-01 — [`6c0b16f9`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/6c0b16f97507351f6484bb07b7bc987102bd9104))_
 - **v25.1.42: predictive vulnerability scanning now covers Docker images (via trivy)** _(2026-07-01 — [`d4d902fa`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/d4d902fa6866e6435b991c14d5a10ab678f9eab0))_
 - **v25.1.41: integrations framework is now usable end-to-end — operations metadata, action/dashboard/credential routes, and a full UI** _(2026-07-01 — [`31b7a197`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/31b7a197d618d1c67811c18c96b16c137a45f26c))_
 - **v25.1.40: antivirus on-access works on any distro with clamd; WolfRouter requests a WAN DHCP lease when the NIC has none** _(2026-07-01 — [`3142bc2a`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/3142bc2aaa7766ab02b0188c0371d24c5396698f))_
