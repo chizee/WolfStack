@@ -1791,6 +1791,8 @@ pub fn kernel_block_ip(ip: &str) {
             ),
             Err(e) => tracing::error!("auth: could not run ipset to block {}: {}", ip, e),
         }
+        // Mirror into any macvlan/ipvlan container the host FORWARD can't reach.
+        trigger_macvlan_reconcile();
         return;
     }
     // Fallback: no usable ipset — per-IP rules in INPUT + FORWARD (the old
@@ -1798,6 +1800,8 @@ pub fn kernel_block_ip(ip: &str) {
     let cmd = if v6 { "ip6tables" } else { "iptables" };
     insert_drop_rule(cmd, "INPUT", ip);
     insert_drop_rule(cmd, "FORWARD", ip);
+    // Mirror into any macvlan/ipvlan container the host FORWARD can't reach.
+    trigger_macvlan_reconcile();
 }
 
 /// Idempotently insert `-I <chain> 1 -s <ip> -j DROP` for the given
@@ -1853,6 +1857,8 @@ pub fn kernel_unblock_ip(ip: &str) {
     remove_drop_rule(cmd, "INPUT", ip);
     remove_drop_rule(cmd, "FORWARD", ip);
     tracing::info!("auth: kernel-unblocked {} (ipset + INPUT/FORWARD)", ip);
+    // Lift the mirrored block from any macvlan/ipvlan container too.
+    trigger_macvlan_reconcile();
 }
 
 fn remove_drop_rule(cmd: &str, chain: &str, ip: &str) {
@@ -1865,6 +1871,225 @@ fn remove_drop_rule(cmd: &str, chain: &str, ip: &str) {
             _ => break,
         }
     }
+}
+
+// ─── macvlan / ipvlan block fan-in ───────────────────────────────────────────
+//
+// `kernel_block_ip` writes a DROP into the host INPUT + FORWARD chains. INPUT
+// protects host services; FORWARD protects guests on standard Linux/OVS bridges
+// (br_netfilter feeds bridged frames through iptables). But macvlan/ipvlan
+// containers — and SR-IOV/passthrough VMs — bypass the host netfilter path BY
+// DESIGN, so the host FORWARD DROP never sees their packets. For containers we
+// CAN reach, mirror the block INSIDE the container's own network namespace.
+//
+// We enter the netns with `nsenter --net` and run the HOST's iptables binary, so
+// this works even on minimal images that ship no iptables (the same reason the
+// WolfNet connect path uses nsenter + the host `ip`). Every rule we add carries
+// the `wolfstack-ns-block` comment so the reconcile can add/remove exactly our
+// rules and never touch the operator's own in-container firewall.
+
+/// iptables comment marking a DROP rule WolfStack injected into a container's
+/// network namespace, so the reconcile owns exactly its own rules.
+const NS_BLOCK_TAG: &str = "wolfstack-ns-block";
+
+static MACVLAN_RECONCILE_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static MACVLAN_RECONCILE_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Request a macvlan/ipvlan block reconcile. Single-flight + coalescing: any
+/// number of concurrent blocks (e.g. a botnet brute-force storm) collapse to AT
+/// MOST ONE worker thread, which re-runs once more if more requests arrived
+/// while it worked. Called from every block/unblock and from the periodic
+/// safety-net loop, so a host with no such containers spends nothing beyond one
+/// cheap `docker network ls` per request. Detached so it never delays the
+/// security-critical host block.
+pub fn trigger_macvlan_reconcile() {
+    use std::sync::atomic::Ordering;
+    MACVLAN_RECONCILE_PENDING.store(true, Ordering::SeqCst);
+    // If a worker is already running it will observe PENDING and loop again.
+    if MACVLAN_RECONCILE_RUNNING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(|| {
+        loop {
+            MACVLAN_RECONCILE_PENDING.store(false, Ordering::SeqCst);
+            reconcile_macvlan_blocks();
+            // More work arrived during the reconcile — handle it without
+            // releasing ownership.
+            if MACVLAN_RECONCILE_PENDING.load(Ordering::SeqCst) {
+                continue;
+            }
+            // Tentatively release. A trigger that fired between the load above
+            // and this store would have seen RUNNING still true and returned
+            // without spawning, so its PENDING=true could otherwise be lost.
+            MACVLAN_RECONCILE_RUNNING.store(false, Ordering::SeqCst);
+            if !MACVLAN_RECONCILE_PENDING.load(Ordering::SeqCst) {
+                break; // nothing pending — clean exit
+            }
+            // Pending work appeared in that window. Try to re-acquire; if a
+            // concurrent trigger already did, it owns the work and we exit.
+            if MACVLAN_RECONCILE_RUNNING.swap(true, Ordering::SeqCst) {
+                break;
+            }
+            // Re-acquired — loop to drain the pending request.
+        }
+    });
+}
+
+/// Reconcile the in-namespace DROP rules of every reachable macvlan/ipvlan
+/// container to match the current host block set — adds new blocks, lifts ones
+/// no longer blocked, and covers containers started since the last pass.
+/// Idempotent and best-effort; runs only when such a container exists.
+pub fn reconcile_macvlan_blocks() {
+    let targets = crate::containers::macvlan_netns_targets();
+    if targets.is_empty() {
+        return;
+    }
+    let (v4, v6) = current_block_set();
+    // Nothing to enforce AND nothing tagged to clean up is the common case once
+    // a block is lifted — but we still pass empty sets through so any leftover
+    // tagged rule from an earlier block gets removed.
+    for t in &targets {
+        reconcile_one_netns(t, "iptables", &v4);
+        reconcile_one_netns(t, "ip6tables", &v6);
+    }
+}
+
+/// The IPs WolfStack currently blocks at the host, split by family. Source of
+/// truth is the ipset (the O(1) path); falls back to the legacy per-IP INPUT
+/// DROP rules where ipset is absent — mirroring `kernel_block_ip`'s two paths.
+fn current_block_set() -> (Vec<String>, Vec<String>) {
+    let mut v4: Vec<String> = Vec::new();
+    let mut v6: Vec<String> = Vec::new();
+    if ipset_available() {
+        for (set, dst) in [(BLOCK_SET_V4, &mut v4), (BLOCK_SET_V6, &mut v6)] {
+            let out = match std::process::Command::new("ipset").args(["list", set]).output() {
+                Ok(o) if o.status.success() => o,
+                _ => continue,
+            };
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                // Skip the header block (Name:, Type:, …); only members parse as
+                // an address/CIDR. Normalise a /32 (/128) host to its bare form
+                // so it compares equal to an in-namespace `-s 1.2.3.4/32` rule.
+                let m = line.trim();
+                let head = m.split('/').next().unwrap_or(m);
+                if head.parse::<std::net::IpAddr>().is_ok() {
+                    dst.push(normalise_host_cidr(m));
+                }
+            }
+        }
+    } else {
+        for (cmd, dst) in [("iptables", &mut v4), ("ip6tables", &mut v6)] {
+            let out = match std::process::Command::new(cmd).args(["-S", "INPUT"]).output() {
+                Ok(o) if o.status.success() => o,
+                _ => continue,
+            };
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                if let Some(ip) = parse_wolfstack_drop_rule(line, "INPUT") {
+                    dst.push(ip); // already bare-normalised
+                }
+            }
+        }
+    }
+    (v4, v6)
+}
+
+/// Strip a full-host `/32` or `/128` suffix so host entries compare equal across
+/// ipset's bare form and iptables' `-S` (which always echoes the prefix). Real
+/// CIDR blocks (e.g. `/24`) are left intact.
+fn normalise_host_cidr(addr: &str) -> String {
+    match addr.split_once('/') {
+        Some((ip, "32")) | Some((ip, "128")) => ip.to_string(),
+        _ => addr.to_string(),
+    }
+}
+
+/// Reconcile ONE container netns's WolfStack-tagged DROP rules (for one iptables
+/// variant) to exactly `want`. Touches only rules carrying `NS_BLOCK_TAG`.
+fn reconcile_one_netns(t: &crate::containers::NetnsTarget, cmd: &str, want: &[String]) {
+    let listed = match nsenter_ipt(t.pid, cmd, &["-S", "INPUT"]) {
+        Some(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        // No ip6tables in the netns, or the namespace is gone — best-effort skip.
+        _ => return,
+    };
+    let mut have: Vec<String> = Vec::new();
+    for line in listed.lines() {
+        if !line.contains(NS_BLOCK_TAG) {
+            continue;
+        }
+        if let Some(ip) = parse_ns_tagged_drop(line) {
+            have.push(ip);
+        }
+    }
+
+    // Lift blocks no longer in the host set (loop-until-gone for any duplicate).
+    for ip in &have {
+        if want.iter().any(|w| w == ip) {
+            continue;
+        }
+        for _ in 0..10 {
+            let removed = nsenter_ipt(
+                t.pid, cmd,
+                &["-D", "INPUT", "-s", ip, "-m", "comment", "--comment", NS_BLOCK_TAG, "-j", "DROP"],
+            )
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+            if !removed {
+                break;
+            }
+        }
+        tracing::info!("auth: lifted ns-block {} in {} ({})", ip, t.label, cmd);
+    }
+
+    // Add blocks present in the host set but missing from this namespace.
+    for ip in want {
+        if have.iter().any(|h| h == ip) {
+            continue;
+        }
+        let exists = nsenter_ipt(
+            t.pid, cmd,
+            &["-C", "INPUT", "-s", ip, "-m", "comment", "--comment", NS_BLOCK_TAG, "-j", "DROP"],
+        )
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+        if exists {
+            continue;
+        }
+        let added = nsenter_ipt(
+            t.pid, cmd,
+            &["-I", "INPUT", "1", "-s", ip, "-m", "comment", "--comment", NS_BLOCK_TAG, "-j", "DROP"],
+        )
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+        if added {
+            tracing::warn!("auth: ns-blocked {} in {} ({})", ip, t.label, cmd);
+        }
+    }
+}
+
+/// Run the host iptables/ip6tables binary inside container PID's network
+/// namespace via `nsenter --net`. Returns the process output, or None if
+/// nsenter itself couldn't be launched.
+fn nsenter_ipt(pid: i32, cmd: &str, args: &[&str]) -> Option<std::process::Output> {
+    let mut full: Vec<String> = vec![
+        "--target".into(),
+        pid.to_string(),
+        "--net".into(),
+        cmd.into(),
+    ];
+    full.extend(args.iter().map(|s| s.to_string()));
+    std::process::Command::new("nsenter").args(&full).output().ok()
+}
+
+/// Pull the source IP out of one of our tagged DROP lines, e.g.
+/// `-A INPUT -s 1.2.3.4/32 -m comment --comment wolfstack-ns-block -j DROP`,
+/// normalised to bare host form so it compares to `current_block_set`.
+fn parse_ns_tagged_drop(line: &str) -> Option<String> {
+    let toks: Vec<&str> = line.split_whitespace().collect();
+    let pos = toks.iter().position(|t| *t == "-s")?;
+    let raw = toks.get(pos + 1)?;
+    Some(normalise_host_cidr(raw))
 }
 
 impl LoginRateLimiter {
@@ -2428,5 +2653,44 @@ mod protected_node_tests {
         assert_eq!(parse_wolfstack_drop_rule("-A INPUT -s fd00::1/32 -j DROP", "INPUT"), None);
         assert_eq!(parse_wolfstack_drop_rule("-A INPUT -s fd00::/64 -j DROP", "INPUT"), None);
         assert_eq!(parse_wolfstack_drop_rule("-A INPUT -s 172.18.0.5/128 -j DROP", "INPUT"), None);
+    }
+
+    #[test]
+    fn normalise_host_cidr_strips_only_full_host() {
+        // /32 (v4) and /128 (v6) collapse to bare so ipset's bare form and
+        // iptables' echoed prefix compare equal.
+        assert_eq!(normalise_host_cidr("1.2.3.4/32"), "1.2.3.4");
+        assert_eq!(normalise_host_cidr("fd00::1/128"), "fd00::1");
+        assert_eq!(normalise_host_cidr("1.2.3.4"), "1.2.3.4");
+        // Real CIDR blocks are preserved verbatim.
+        assert_eq!(normalise_host_cidr("10.0.0.0/24"), "10.0.0.0/24");
+        assert_eq!(normalise_host_cidr("fd00::/64"), "fd00::/64");
+    }
+
+    #[test]
+    fn parse_ns_tagged_drop_extracts_source() {
+        // The exact shape `iptables -S` echoes for a rule we inserted.
+        assert_eq!(
+            parse_ns_tagged_drop(
+                "-A INPUT -s 1.2.3.4/32 -m comment --comment wolfstack-ns-block -j DROP"
+            ),
+            Some("1.2.3.4".to_string())
+        );
+        // ip6tables variant, /128 normalised.
+        assert_eq!(
+            parse_ns_tagged_drop(
+                "-A INPUT -s fd00::5/128 -m comment --comment wolfstack-ns-block -j DROP"
+            ),
+            Some("fd00::5".to_string())
+        );
+        // A CIDR block survives intact.
+        assert_eq!(
+            parse_ns_tagged_drop(
+                "-A INPUT -s 10.8.0.0/24 -m comment --comment wolfstack-ns-block -j DROP"
+            ),
+            Some("10.8.0.0/24".to_string())
+        );
+        // No source → None (e.g. the chain-policy line).
+        assert_eq!(parse_ns_tagged_drop("-P INPUT ACCEPT"), None);
     }
 }
