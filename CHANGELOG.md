@@ -8,6 +8,8 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.1.34: failing disks raise a critical Issue on the Backblaze SMART signals, not just overall-health FAILED** _(2026-07-01 — [`1e61e8be`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/1e61e8be65f47ab96fa7b7ef6682ab64895c9198))_
+- **v25.1.33: backlog sweep — macvlan block fan-in, LXC subnet-collision route, WG bridge + purge hardening** _(2026-06-30 — [`d7d6afea`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/d7d6afea38e8e431f36216021ad13ab97d431410))_
 - **v25.1.32: config restore — same-machine vs different-machine mode** _(2026-06-30 — [`e0c41327`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/e0c413271a546fe221325bdbccf0c27185cfb63d))_
 - **v25.1.31: back up wolfnet/wolfusb config; surface non-array failing disks in Issues** _(2026-06-30 — [`be6c14b0`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/be6c14b0f4ee6904b7130e78928e7aacbfecd3c1))_
 - **v25.1.30: config backup now captures the WHOLE /etc/wolfstack (was 4 files)** _(2026-06-30 — [`516a805a`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/516a805a3b60ba3b9c9faa6d55e732f0d6c90e59))_
