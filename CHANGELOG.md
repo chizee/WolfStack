@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.1.37: WolfUSB re-attach resolves source node by self_id; failing disks surface on the Issues/upgrade scanner; SMART detection generalized across HDD/SSD/NVMe/SAS/USB** _(2026-07-01 — [`5b7d6155`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/5b7d61558fcc528a04f3a9f91de87c3e1666bc1d))_
 - **v25.1.36: finish the arm64 arch sweep — WolfRun API create, Galera/WolfScale nodes, PVE arch parse, app-store binary URLs** _(2026-07-01 — [`f537dd08`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/f537dd08284bb42a68c2a32a63cbfd2accd9e3cc))_
 - **v25.1.35: LXC / app-store containers request the host's arch (arm64), not a hardcoded amd64** _(2026-07-01 — [`068311cc`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/068311cc9da3b7426825c54e8aa645638e071b51))_
 - **v25.1.34: failing disks raise a critical Issue on the Backblaze SMART signals, not just overall-health FAILED** _(2026-07-01 — [`1e61e8be`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/1e61e8be65f47ab96fa7b7ef6682ab64895c9198))_
