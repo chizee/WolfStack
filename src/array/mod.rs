@@ -1094,6 +1094,36 @@ pub fn list_physical_disks() -> Vec<String> {
         .collect()
 }
 
+/// Whether a whole-disk device spins (HDD) or is solid-state (SSD/NVMe),
+/// read from `/sys/block/<name>/queue/rotational` (`1` = rotational).
+/// Used to decide the SMART standby guard: only a rotational disk can be
+/// spun down and woken, so only it needs `-n standby` protection — an SSD
+/// or NVMe has no spin state and must ALWAYS be read (see the Issues
+/// watcher). Defaults to `true` (keep the guard) when nothing can be read,
+/// so an unknown device is never woken on a hunch.
+///
+/// Handles partition paths too (`/dev/sdb1`, `/dev/nvme0n1p2`): those have
+/// no `/sys/block/<name>` entry, so we follow the `/sys/class/block/<name>`
+/// symlink to its parent whole-disk directory and read the flag there. That
+/// matters for array members, which are often partition slices.
+pub fn disk_is_rotational(device: &str) -> bool {
+    let name = device.strip_prefix("/dev/").unwrap_or(device);
+    // Whole disk (sda, nvme0n1): direct queue attribute.
+    if let Ok(s) = std::fs::read_to_string(format!("/sys/block/{}/queue/rotational", name)) {
+        return s.trim() == "1";
+    }
+    // Partition: /sys/class/block/<name> symlinks to …/block/<parent>/<name>;
+    // the parent dir name is the whole disk that carries the queue attribute.
+    if let Ok(target) = std::fs::read_link(format!("/sys/class/block/{}", name)) {
+        if let Some(parent) = target.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) {
+            if let Ok(s) = std::fs::read_to_string(format!("/sys/block/{}/queue/rotational", parent)) {
+                return s.trim() == "1";
+            }
+        }
+    }
+    true
+}
+
 /// Full SMART health snapshot for one physical disk. Field names match the JSON
 /// the Storage page's frontend already reads, so the same struct feeds both the
 /// Storage UI and the Issues watcher — ONE definition of "failing", no drift.
@@ -1122,6 +1152,13 @@ pub struct DiskSmart {
     pub nvme_pct_used: Option<u64>,
     /// NVMe media_and_data_integrity_errors (uncorrectable — data loss).
     pub nvme_media_errors: Option<u64>,
+    /// NVMe SMART/Health `critical_warning` bitfield. The canonical NVMe
+    /// failure flag — a drive can raise this without tripping the
+    /// spare/endurance/media-error counters. Bits per Linux `nvme.h`
+    /// NVME_SMART_CRIT_* / NVMe base spec: 0x01 available-spare below
+    /// threshold, 0x02 temperature, 0x04 reliability degraded, 0x08 media
+    /// read-only, 0x10 volatile-memory backup failed, 0x20 PMR read-only.
+    pub nvme_critical_warning: Option<u64>,
 }
 
 impl DiskSmart {
@@ -1160,20 +1197,53 @@ impl DiskSmart {
         if let Some(e) = self.nvme_media_errors.filter(|&e| e > 0) {
             r.push(format!("{} NVMe media/data-integrity error(s)", e));
         }
+        // NVMe critical_warning bitfield (Linux nvme.h NVME_SMART_CRIT_* /
+        // NVMe base spec). Flag every hardware-failure bit but deliberately
+        // EXCLUDE 0x02 temperature — an environmental, usually-transient
+        // over/under-temp condition (a fanless mini-PC NVMe throttles, it isn't
+        // dying), same spirit as excluding ATA 188 command-timeout above. Any
+        // remaining bit = back up and replace the drive.
+        if let Some(cw) = self.nvme_critical_warning {
+            if cw & 0x01 != 0 { r.push("NVMe available spare below threshold (critical_warning 0x01)".to_string()); }
+            if cw & 0x04 != 0 { r.push("NVMe reliability degraded (critical_warning 0x04)".to_string()); }
+            if cw & 0x08 != 0 { r.push("NVMe media in read-only mode (critical_warning 0x08)".to_string()); }
+            if cw & 0x10 != 0 { r.push("NVMe volatile-memory backup failed (critical_warning 0x10)".to_string()); }
+            if cw & 0x20 != 0 { r.push("NVMe persistent-memory region read-only (critical_warning 0x20)".to_string()); }
+        }
         r
     }
 }
 
 /// Read the full SMART attribute set for a device via `smartctl --json -H -A`.
-/// `respect_standby` adds `-n standby` so a spun-down disk is NOT woken (returns
-/// None for it) — the Issues watcher passes true (polls every 60s), the Storage
-/// view passes false (an interactive read may wake the disk). None when smartctl
-/// is missing, the disk can't be read, or nothing parseable came back.
+/// `respect_standby` adds `-n standby` (ATA-only — smartmontools ignores it for
+/// NVMe/SCSI) so a spun-down ATA disk is NOT woken. The Issues watcher passes
+/// true (polls every 60s), the Storage view passes false. None when smartctl is
+/// missing, the disk can't be read, or nothing parseable came back.
+///
+/// Tries smartctl's auto device-type detection first; if that yields nothing
+/// parseable, retries once forcing SAT translation (`-d sat`). USB enclosures
+/// frequently need that — without it smartctl emits only an error envelope and
+/// the drive would be invisible to every health check. A readable disk parses on
+/// the first attempt and never retries; a standby ATA disk (respect_standby) does
+/// incur the second probe, but `-n standby` rides the SAT transport too so it
+/// still isn't woken — just an extra fast-returning smartctl process.
 pub fn disk_smart_health(device: &str, respect_standby: bool) -> Option<DiskSmart> {
+    read_disk_smart(device, respect_standby, None)
+        .or_else(|| read_disk_smart(device, respect_standby, Some("sat")))
+}
+
+/// One smartctl invocation with an optional explicit `-d <dev_type>`; parses the
+/// JSON into a DiskSmart, or None if nothing usable came back. Split out so
+/// `disk_smart_health` can fall back from auto-detection to `-d sat`.
+fn read_disk_smart(device: &str, respect_standby: bool, dev_type: Option<&str>) -> Option<DiskSmart> {
     let mut args: Vec<&str> = vec!["10", "smartctl", "--json=c", "-H", "-A"];
     if respect_standby {
         args.push("-n");
         args.push("standby");
+    }
+    if let Some(t) = dev_type {
+        args.push("-d");
+        args.push(t);
     }
     args.push(device);
     let out = Command::new("timeout").args(&args).output().ok()?;
@@ -1221,15 +1291,21 @@ pub fn disk_smart_health(device: &str, respect_standby: bool) -> Option<DiskSmar
         nvme_media_errors: json
             .pointer("/nvme_smart_health_information_log/media_errors")
             .and_then(|v| v.as_u64()),
+        nvme_critical_warning: json
+            .pointer("/nvme_smart_health_information_log/critical_warning")
+            .and_then(|v| v.as_u64()),
     };
 
     // Nothing parseable (disk in standby, or an unsupported device that emitted
-    // only an error envelope) → None, so the caller skips rather than alerts.
+    // only an error envelope) → None, so the caller skips rather than alerts —
+    // and disk_smart_health then retries with `-d sat`.
     let empty = smart.passed.is_none()
         && attrs.is_none()
         && smart.nvme_spare_pct.is_none()
+        && smart.nvme_spare_threshold.is_none()
         && smart.nvme_pct_used.is_none()
-        && smart.nvme_media_errors.is_none();
+        && smart.nvme_media_errors.is_none()
+        && smart.nvme_critical_warning.is_none();
     if empty {
         return None;
     }
@@ -1273,7 +1349,10 @@ pub fn predictive_findings() -> Vec<ArrayFinding> {
             // page use (Backblaze SMART 5/187/197/198, NVMe wear, overall-health)
             // rather than the overall-health-only `d.smart_status`, so this stays
             // consistent and doesn't silently under-alert if it's ever wired in.
-            if let Some(reasons) = disk_smart_health(&d.device, true)
+            // Standby guard gated on rotational-ness, same as the Issues watcher:
+            // an SSD/NVMe array member must always be read, never skipped because
+            // its power-mode probe couldn't confirm an active state.
+            if let Some(reasons) = disk_smart_health(&d.device, disk_is_rotational(&d.device))
                 .map(|h| h.failing_reasons())
                 .filter(|r| !r.is_empty())
             {
@@ -2036,6 +2115,14 @@ tmpfs /run tmpfs rw,nosuid,nodev 0 0
     fn failing(s: &DiskSmart) -> bool { !s.failing_reasons().is_empty() }
 
     #[test]
+    fn rotational_defaults_to_true_when_unreadable() {
+        // A device with no /sys/block entry must default to rotational=true so
+        // the SMART standby guard is kept (never wake an unknown disk on a
+        // hunch). A real SSD/NVMe reads "0" from sysfs and is handled live.
+        assert!(disk_is_rotational("/dev/definitely-not-a-real-disk-zzz"));
+    }
+
+    #[test]
     fn disk_smart_healthy_is_not_failing() {
         let s = DiskSmart {
             passed: Some(true),
@@ -2109,6 +2196,42 @@ tmpfs /run tmpfs rw,nosuid,nodev 0 0
         // NVMe media/data-integrity errors → failing.
         let media = DiskSmart { nvme_media_errors: Some(1), ..Default::default() };
         assert!(failing(&media));
+    }
+
+    #[test]
+    fn disk_smart_nvme_critical_warning() {
+        // Bit positions per Linux nvme.h NVME_SMART_CRIT_* / NVMe base spec:
+        // 0x01 spare-below-threshold, 0x02 temperature, 0x04 reliability,
+        // 0x08 media read-only, 0x10 volatile-backup, 0x20 PMR read-only.
+
+        // Healthy NVMe: critical_warning == 0 → not failing.
+        let ok = DiskSmart { nvme_critical_warning: Some(0), ..Default::default() };
+        assert!(!failing(&ok));
+
+        // 0x01 available-spare below threshold (hardware wear-out) → failing.
+        let spare = DiskSmart { nvme_critical_warning: Some(0x01), ..Default::default() };
+        assert!(spare.failing_reasons().iter().any(|r| r.contains("spare")));
+
+        // 0x04 reliability degraded → failing.
+        let rel = DiskSmart { nvme_critical_warning: Some(0x04), ..Default::default() };
+        assert!(rel.failing_reasons().iter().any(|r| r.contains("reliability")));
+
+        // 0x08 media read-only → failing.
+        let ro = DiskSmart { nvme_critical_warning: Some(0x08), ..Default::default() };
+        assert!(ro.failing_reasons().iter().any(|r| r.contains("read-only")));
+
+        // 0x02 temperature ALONE is environmental, not a hardware failure —
+        // deliberately NOT flagged (avoids crying wolf on a hot fanless NVMe).
+        // Same exclusion spirit as ATA 188 command-timeout.
+        let temp = DiskSmart { nvme_critical_warning: Some(0x02), ..Default::default() };
+        assert!(!failing(&temp));
+
+        // Combined bitfield (temperature + reliability) → reliability still
+        // flagged, temperature still ignored.
+        let combo = DiskSmart { nvme_critical_warning: Some(0x02 | 0x04), ..Default::default() };
+        let reasons = combo.failing_reasons();
+        assert!(reasons.iter().any(|r| r.contains("reliability")));
+        assert!(!reasons.iter().any(|r| r.contains("temperature")));
     }
 
     #[test]

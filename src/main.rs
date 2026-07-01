@@ -1088,11 +1088,24 @@ async fn main() -> std::io::Result<()> {
                     // mirrors exactly what the operator sees under Storage. This
                     // covers array members too (they ARE physical disks), so the
                     // array loop above no longer needs its own SMART check.
-                    // respect_standby=true so the 60s poll never wakes a spun-
-                    // down disk. See array::DiskSmart::failing_reasons.
+                    //
+                    // The standby guard (`-n standby`, ATA-only — smartmontools
+                    // ignores it for NVMe/SCSI) is applied ONLY to disks the
+                    // kernel reports as rotational. It exists to avoid spinning up
+                    // a sleeping HDD on the 60s poll; on solid-state it's pointless
+                    // (nothing to spin) and, for a SATA SSD that reports a low-power
+                    // ATA state, it can make smartctl skip the read — so gate it on
+                    // rotational-ness: SSD/NVMe are ALWAYS read, HDDs keep the
+                    // no-wake guard. (The failing SSD that raised nothing on the
+                    // Issues page was primarily collect_issues never checking SMART
+                    // at all — fixed there — plus USB drives needing `-d sat`, now
+                    // retried in disk_smart_health. PapaSchlumpf, 2026-07-01.)
                     let phys = tokio::task::spawn_blocking(|| {
                         crate::array::list_physical_disks().into_iter()
-                            .filter_map(|dev| crate::array::disk_smart_health(&dev, true).map(|h| (dev, h)))
+                            .filter_map(|dev| {
+                                let guard = crate::array::disk_is_rotational(&dev);
+                                crate::array::disk_smart_health(&dev, guard).map(|h| (dev, h))
+                            })
                             .collect::<Vec<(String, crate::array::DiskSmart)>>()
                     }).await.unwrap_or_default();
                     for (dev, health) in &phys {
@@ -1761,8 +1774,12 @@ async fn main() -> std::io::Result<()> {
                         continue;
                     }
                     // Remote target — trigger its full Re-attach recovery.
-                    let Some(target) = cluster_usb.get_all_nodes().into_iter()
-                        .find(|n| n.id == a.target_node_id) else {
+                    // Resolve by either id form (map-key or canonical self_id):
+                    // the assignment usually stores the target's canonical ws-…
+                    // self_id, but this node keys the peer under a node-… map key,
+                    // so a raw n.id== scan would miss it and silently skip the
+                    // restore (same class as the re-attach source-lookup bug).
+                    let Some(target) = cluster_usb.get_node(&a.target_node_id) else {
                         warn!("WolfUSB: target node {} for {} not in cluster — skipping source-side restore",
                             a.target_node_id, a.busid);
                         continue;
@@ -2446,10 +2463,15 @@ async fn main() -> std::io::Result<()> {
                         // Each entry: (cluster_name, hostname, issue)
                         let mut all_issues: Vec<(String, String, api::Issue)> = Vec::new();
 
-                        // Local node
+                        // Local node — sample metrics AND collect issues on the
+                        // blocking pool (collect_issues shells out and now probes
+                        // SMART per physical disk, so it must not run on an async
+                        // worker thread).
                         let ss = scan_state.clone();
-                        let metrics = tokio::task::spawn_blocking(move || {
-                            ss.monitor.lock().unwrap().collect()
+                        let (metrics, local_issues) = tokio::task::spawn_blocking(move || {
+                            let metrics = ss.monitor.lock().unwrap().collect();
+                            let issues = api::collect_issues(&metrics);
+                            (metrics, issues)
                         }).await.unwrap();
                         let local_hostname = metrics.hostname.clone();
                         let local_cluster = {
@@ -2458,7 +2480,7 @@ async fn main() -> std::io::Result<()> {
                                 .and_then(|n| n.cluster_name.clone())
                                 .unwrap_or_else(|| "Default".to_string())
                         };
-                        for issue in api::collect_issues(&metrics) {
+                        for issue in local_issues {
                             all_issues.push((local_cluster.clone(), local_hostname.clone(), issue));
                         }
 
