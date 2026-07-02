@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.2.0: WolfFunctions — serverless functions-as-a-service across the cluster** _(2026-07-02 — [`ad6d49c0`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/ad6d49c0c1800a9dd62d42b7e0c49912ed396577))_
 - **v25.1.47: fail2ban banned-IP list parsed properly — empty list no longer shows the header as a banned IP, per-IP unban now works, unban jail param sanitised** _(2026-07-02 — [`029ce1ae`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/029ce1ae2059a05f4ebc386a9b17995f2c22f2f9))_
 - **v25.1.46: sidebar count badges are outlined, not solid — counts no longer read as errors on red-accent themes** _(2026-07-02 — [`cbc7afc3`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/cbc7afc3a067ff65a35afff9c7ce25f6a88143f7))_
 - **v25.1.45: Tiny dashboard layout — server name + single worst-of status LED for small screens** _(2026-07-02 — [`902bd1be`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/902bd1bec39b59f5e36236f3d91ec3c4244510d5))_
