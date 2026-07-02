@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.1.45: Tiny dashboard layout — server name + single worst-of status LED for small screens** _(2026-07-02 — [`902bd1be`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/902bd1bec39b59f5e36236f3d91ec3c4244510d5))_
 - **v25.1.44: finish API_HTTP_CLIENT pooling migration for admin fleet fanouts** _(2026-07-01 — [`d9ebc915`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/d9ebc915bc44ab45c16d515c4b7a86b5fa448b50))_
 - **v25.1.43: fix inter-node socket FD leak → EMFILE → cluster-wide CPU storm** _(2026-07-01 — [`6c0b16f9`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/6c0b16f97507351f6484bb07b7bc987102bd9104))_
 - **v25.1.42: predictive vulnerability scanning now covers Docker images (via trivy)** _(2026-07-01 — [`d4d902fa`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/d4d902fa6866e6435b991c14d5a10ab678f9eab0))_
