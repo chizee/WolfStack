@@ -26033,7 +26033,14 @@ pub async fn security_status(
         }
     } else { None };
     let f2b_banned = if f2b_installed {
-        run_shell("fail2ban-client status sshd 2>/dev/null | grep 'Banned IP' || fail2ban-client status sshd 2>/dev/null | grep -i 'ban' || echo ''")
+        // `fail2ban-client status sshd` prints every currently-banned IP
+        // space-separated on ONE line — "`- Banned IP list:\t1.2.3.4 5.6.7.8"
+        // (beautifier.py renders list values with `" ".join(...)`). Strip the
+        // label and emit one IP per line for the UI; an empty ban list yields
+        // an empty string. The raw grep'd line used to leak through here, so
+        // zero bans rendered as "Banned (1)" with the label itself shown as
+        // the banned "IP" (RutgerDiehard, 2026-07-02).
+        run_shell("fail2ban-client status sshd 2>/dev/null | sed -n 's/.*Banned IP list:[[:space:]]*//p' | tr -s ' \\t' '\\n' | sed '/^$/d'")
             .unwrap_or_default()
     } else { String::new() };
     let f2b_jails = if f2b_installed {
@@ -26498,6 +26505,11 @@ pub async fn security_fail2ban_unban(
     // Sanitise IP — allow only digits, dots, colons (IPv6)
     if !ip.chars().all(|c| c.is_ascii_digit() || c == '.' || c == ':') {
         return HttpResponse::BadRequest().json(serde_json::json!({ "error": "Invalid IP" }));
+    }
+    // Sanitise jail name too — it goes into a shell command line, and jail
+    // names are plain identifiers (fail2ban section names).
+    if jail.is_empty() || !jail.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
+        return HttpResponse::BadRequest().json(serde_json::json!({ "error": "Invalid jail" }));
     }
     match run_shell(&format!("fail2ban-client set {} unbanip {}", jail, ip)) {
         Ok(out) => HttpResponse::Ok().json(serde_json::json!({ "ok": true, "output": out })),

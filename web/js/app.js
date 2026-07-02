@@ -40364,11 +40364,25 @@ async function threatIntelTestFeed(nodePrefix, btn) {
 }
 window.threatIntelTestFeed = threatIntelTestFeed;
 
+// fail2ban prints every currently-banned IP space-separated on a single
+// "`- Banned IP list:\t…" status line. Current backends pre-parse that to
+// one IP per line, but an older node proxied through this UI still returns
+// the raw line — strip the label and split on whitespace so an empty list
+// counts 0 (the label itself used to render as a banned "IP" —
+// RutgerDiehard, 2026-07-02) and each real IP gets its own row.
+function f2bBannedIps(raw) {
+    return (raw || '')
+        .split('\n')
+        .map(l => l.replace(/^.*Banned IP list:/, ''))
+        .join(' ')
+        .split(/\s+/)
+        .filter(Boolean);
+}
+
 function renderFail2banCard(node, f2b, nodePrefix) {
     const installed = f2b.installed;
     const jails = f2b.jails || 'none';
-    const banned = (f2b.banned || '').trim();
-    const bannedCount = banned ? banned.split('\n').filter(l => l.trim()).length : 0;
+    const bannedCount = f2bBannedIps(f2b.banned).length;
     const statusColor = installed ? '#22c55e' : '#ef4444';
     const statusLabel = installed ? 'Installed' : 'Not Installed';
     let actions = '';
@@ -40564,8 +40578,7 @@ function showFail2banSettings(nodePrefix) {
 function showFail2banBanned(nodePrefix) {
     if (!window._securityData) return;
     const { data } = window._securityData;
-    const banned = (data.fail2ban.banned || '').trim();
-    const lines = banned ? banned.split('\n').filter(l => l.trim()) : [];
+    const lines = f2bBannedIps(data.fail2ban.banned);
     showDialog({
         title: 'Banned IPs (' + lines.length + ')',
         html: `<div style="font-size:13px; max-height:400px; overflow-y:auto;">${lines.length === 0 ? '<p style="color:var(--text-muted); text-align:center; padding:20px;">No IPs currently banned</p>' : ''} ${lines.map((ip) => `<div style="padding:10px 12px; background:var(--bg-primary); border:1px solid var(--border); border-radius:6px; margin-bottom:8px; display:flex; justify-content:space-between; align-items:center;"><code style="color:#ef4444; font-weight:600;">${escapeHtml(ip)}</code><button class="btn btn-sm" onclick="unbanIp('${nodePrefix}', '${escapeHtml(ip)}', this)" style="font-size:11px;">Unban</button></div>`).join('')}</div>`,
@@ -40664,8 +40677,8 @@ function renderNodeSecurity(node, data) {
     let f2bHtml;
     if (data.fail2ban.installed) {
         const jails = data.fail2ban.jails || 'none';
-        const banned = (data.fail2ban.banned || '').trim();
-        const bannedLines = banned ? banned.split('\n').filter(l => l.trim()).map(l => `<div style="font-size:12px; color:#ef4444; padding:2px 0;">${escapeHtml(l.trim())}</div>`).join('') : '<span style="color:#22c55e; font-size:12px;">No banned IPs</span>';
+        const bannedIps = f2bBannedIps(data.fail2ban.banned);
+        const bannedLines = bannedIps.length ? bannedIps.map(l => `<div style="font-size:12px; color:#ef4444; padding:2px 0;">${escapeHtml(l)}</div>`).join('') : '<span style="color:#22c55e; font-size:12px;">No banned IPs</span>';
         const jailExists = data.fail2ban.jail_local_exists;
 
         const settingRow = (label, value, hint) => `
