@@ -8,6 +8,10 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.2.5: WolfFunctions UI — triggers column alignment + cluster-aware replicas default (KO4BSR/Gary)** _(2026-07-03 — [`a895f00f`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/a895f00ff2e6be886c797f9fcc00132aaa6af430))_
+- **v25.2.5: WolfFunctions UI — triggers column alignment + cluster-aware replicas default (KO4BSR/Gary)** _(2026-07-03 — [`963d1e3b`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/963d1e3b393bbb2e37532d204279317eda391bb7))_
+- **Remove scratch/helper files committed by mistake in v25.2.4** _(2026-07-02 — [`fd437785`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/fd43778589ae50ff882e1fe6d340b71b41757580))_
+- **v25.2.4: WolfFunctions public HTTP trigger honours the response shape (KO4BSR/Gary)** _(2026-07-02 — [`ca65fefe`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/ca65fefe04d3df58b6c6804ba81c6f41720320c3))_
 - **v25.2.3: fix container->WolfNet DNAT accumulation + orphans (KO4BSR/Gary)** _(2026-07-02 — [`f7e6924b`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/f7e6924b1197def2b04235104684ed78989fcb15))_
 - **v25.2.3: fix container→WolfNet DNAT accumulation + orphans (KO4BSR/Gary)** _(2026-07-02 — [`393c3dbd`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/393c3dbdee712b4d3ada730d835c8718fb8f012e))_
 - **v25.2.2: fix cluster leader election on mixed node-id clusters (WolfRun + WolfFunctions)** _(2026-07-02 — [`a1ad3fe6`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/a1ad3fe6fe8fbf3e13b5cae6548c19471f3e26c9))_
