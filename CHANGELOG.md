@@ -8,6 +8,10 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.2.11: WolfNet route seed can no longer block the bind (masterpier, part 2)** _(2026-07-03 — [`1ad6e00b`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/1ad6e00b4673d8ab637c9c1a87ec1cff54a1d9e3))_
+- **v25.2.11: WolfNet route seed can no longer block the bind (masterpier, part 2)** _(2026-07-03 — [`f0c71aa8`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/f0c71aa8cd1ce9d515d392f3bd97f3fe0ae6768c))_
+- **v25.2.10: cluster join reports every attempted URL's failure (masterpier)** _(2026-07-03 — [`ed326488`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/ed326488d1326ce9e8fc830e1b11e16afc3cae39))_
+- **v25.2.10: cluster join reports every attempted URL's failure (masterpier)** _(2026-07-03 — [`84256f89`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/84256f8985e43745c628d55bd57d3f31e21ef361))_
 - **v25.2.9: Unraid static tool bootstrapper — PBS client, pxar, smartctl survive reboots (klasSponsor)** _(2026-07-03 — [`f6e1e778`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/f6e1e7783c49b8dea709512987019ed8848f37b0))_
 - **v25.2.9: Unraid static tool bootstrapper — PBS client, pxar, smartctl survive reboots (klasSponsor)** _(2026-07-03 — [`e07f3c66`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/e07f3c66b4eda2c4285a13a464f5e7ff3c040577))_
 - **v25.2.8: startup can no longer hang before binding the dashboard (masterpier)** _(2026-07-03 — [`3cf288e9`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/3cf288e9ae8e1e3d158b638f21a376afe88fb354))_
