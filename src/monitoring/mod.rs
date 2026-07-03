@@ -78,14 +78,23 @@ impl SystemMonitor {
     pub fn new() -> Self {
         let mut sys = System::new_all();
         sys.refresh_all();
-        let disks = Disks::new_with_refreshed_list();
+        // Disks deliberately NOT refreshed at construction: sysinfo's disk
+        // refresh statvfs()'s every mount, and a dead/starting FUSE mount
+        // (/etc/pve while pve-cluster is still coming up, a stale sshfs, …)
+        // blocks statvfs UNINTERRUPTIBLY. Constructing the monitor on the
+        // startup path then wedges the whole process before the dashboard
+        // ever binds (masterpier's athena: 26h dark, 2026-07-03). Start
+        // empty and pre-arm `tick` so the FIRST collect() runs the slow-path
+        // list refresh — callers on the startup path wrap that collect in a
+        // timeout guard, and the polling loop repeats it every ~30s.
+        let disks = Disks::new();
         let networks = Networks::new_with_refreshed_list();
 
         Self {
             sys,
             disks,
             networks,
-            tick: 0,
+            tick: SLOW_REFRESH_TICKS,
         }
     }
 

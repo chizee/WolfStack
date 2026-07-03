@@ -1441,9 +1441,11 @@ fn wolfnet_ips_internal(running_only: bool) -> Vec<String> {
         }
     }
 
-    // Docker containers on a "wolfnet" Docker network (if it exists)
-    if let Ok(output) = Command::new("docker")
-        .args(["network", "inspect", "wolfnet", "--format",
+    // Docker containers on a "wolfnet" Docker network (if it exists).
+    // 10s cap — this runs in the WolfNet push/seed paths and a wedged
+    // dockerd hung the task forever (masterpier's athena, 2026-07-03).
+    if let Ok(output) = Command::new("timeout")
+        .args(["10", "docker", "network", "inspect", "wolfnet", "--format",
                "{{range .Containers}}{{.IPv4Address}} {{end}}"])
         .output()
     {
@@ -2779,10 +2781,12 @@ pub fn macvlan_netns_targets() -> Vec<NetnsTarget> {
 fn docker_macvlan_netns_targets() -> Vec<NetnsTarget> {
     let mut targets = Vec::new();
     // Same-key filters are OR'd, so this returns every macvlan OR ipvlan net.
-    let nets = match Command::new("docker")
+    // 10s cap — a wedged dockerd hung this loop's task forever (masterpier's
+    // athena, 2026-07-03).
+    let nets = match Command::new("timeout")
         .args([
-            "network", "ls", "--filter", "driver=macvlan", "--filter",
-            "driver=ipvlan", "--format", "{{.Name}}",
+            "10", "docker", "network", "ls", "--filter", "driver=macvlan",
+            "--filter", "driver=ipvlan", "--format", "{{.Name}}",
         ])
         .output()
     {
@@ -4186,8 +4190,14 @@ pub fn docker_status() -> RuntimeStatus {
         .unwrap_or(false);
 
     let running = if installed {
-        Command::new("docker")
-            .args(["info", "--format", "{{.ServerVersion}}"])
+        // Hard 10s cap: a wedged dockerd (socket accepts, daemon never
+        // answers — classic right after a host reboot) made this hang
+        // FOREVER, and with docker_status() on the startup path the
+        // dashboard never bound at all (masterpier's athena, PVE 7,
+        // 2026-07-03). timeout(1) is coreutils, same pattern as the
+        // backup hooks / proxy_runtime.
+        Command::new("timeout")
+            .args(["10", "docker", "info", "--format", "{{.ServerVersion}}"])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
