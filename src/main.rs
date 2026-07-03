@@ -492,7 +492,10 @@ async fn main() -> std::io::Result<()> {
     info!("  ──────────────────────────────────");
     info!("  Node ID:    {}", node_id);
     info!("  Hostname:   {}", hostname);
-    info!("  Dashboard:  http://{}", netaddr::host_port(&cli.bind, api_port));
+    // Scheme mirrors the TLS decision made later in startup: HTTPS is the
+    // default since v23.11 (self-signed generated when nothing is found);
+    // plain http only when the operator passed --no-tls.
+    info!("  Dashboard:  {}://{}", if cli.no_tls { "http" } else { "https" }, netaddr::host_port(&cli.bind, api_port));
     info!("  (C)Copyright Wolf Software Systems Ltd — https://wolf.uk.com");
     info!("  By Paul Clevett and my mate Claude - I have Autism");
     // Seed LXC storage paths from any mounted storage that has LXC containers
@@ -591,8 +594,9 @@ async fn main() -> std::io::Result<()> {
     }
     info!("");
 
-    // Initialize monitoring
-    let monitor = monitoring::SystemMonitor::new();
+    // Monitoring is initialized inside the timeout-guarded block below —
+    // its first collect() statvfs()'s every mount and must not be able to
+    // block the HTTP bind (masterpier's athena, 2026-07-03).
 
     // Initialize session manager
     let sessions = Arc::new(auth::SessionManager::new());
@@ -604,12 +608,15 @@ async fn main() -> std::io::Result<()> {
         api_port,
     ));
 
-    // Initialize VM manager
+    // Initialize VM manager (cheap — just ensures the config dir exists).
+    // autostart_vms moved into the background thread below: on libvirt it
+    // shells out to virsh, which can hang exactly like docker/pct on a sick
+    // just-booted host, and VM autostart has no business gating the bind.
     let vms_manager = vms::manager::VmManager::new();
-    vms_manager.autostart_vms();
 
     // Run potentially slow startup tasks in background so HTTP server can bind immediately
     std::thread::spawn(move || {
+        vms::manager::VmManager::new().autostart_vms();
         storage::auto_mount_all();
         networking::apply_ip_mappings();
         // Heal LXC configs that carry an apparmor key this host's LXC can't
@@ -665,25 +672,38 @@ async fn main() -> std::io::Result<()> {
 
     // Initial self-update — minimal blocking, polling loop fills in details within seconds
     {
-        let mut mon = monitor;
-        let metrics = mon.collect();
-        // Run component/runtime checks with a hard timeout so nothing can block startup
-        let (components, has_docker, has_lxc, has_kvm) = {
+        // The ENTIRE initial collection runs on a guarded thread with a hard
+        // timeout: the first sysinfo collect statvfs()'s every mount (a dead
+        // FUSE mount — /etc/pve while pve-cluster is still starting — hangs
+        // uninterruptibly), and the component/runtime checks shell out to
+        // docker & friends (a wedged dockerd hangs forever). None of it may
+        // gate the HTTP bind: masterpier's athena sat "active (running)" for
+        // 26 hours with port 8553 closed because of exactly this
+        // (2026-07-03). On timeout we bind anyway with a fresh cheap monitor
+        // (its construction no longer touches disks) and let the polling
+        // loop fill everything in once the system responds.
+        let mon = {
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
+                let mut mon = monitoring::SystemMonitor::new();
+                let metrics = mon.collect();
                 let comps = installer::get_all_status();
                 let docker = containers::docker_status().installed;
                 let lxc = containers::lxc_status().installed;
                 let kvm = containers::kvm_installed();
-                let _ = tx.send((comps, docker, lxc, kvm));
+                let _ = tx.send((mon, metrics, comps, docker, lxc, kvm));
             });
-            rx.recv_timeout(std::time::Duration::from_secs(10))
-                .unwrap_or_else(|_| {
-                    tracing::warn!("Startup: component status check timed out (10s) — will retry in polling loop");
-                    (vec![], false, false, false)
-                })
+            match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok((mon, metrics, components, has_docker, has_lxc, has_kvm)) => {
+                    cluster.update_self(metrics, components, 0, 0, 0, 0, public_ip.clone(), has_docker, has_lxc, has_kvm, tls_enabled);
+                    mon
+                }
+                Err(_) => {
+                    tracing::warn!("Startup: initial metrics/component collection timed out (10s) — binding the dashboard anyway; a wedged docker daemon or a dead FUSE mount is the usual cause. Details fill in via the polling loop once the system responds.");
+                    monitoring::SystemMonitor::new()
+                }
+            }
         };
-        cluster.update_self(metrics, components, 0, 0, 0, 0, public_ip.clone(), has_docker, has_lxc, has_kvm, tls_enabled);
 
         // Initialize AI agent
         let ai_agent = Arc::new(ai::AiAgent::new());
