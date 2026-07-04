@@ -48316,18 +48316,43 @@ async function loadWolfDiskSyncHealth() {
     const inSync = versions.length <= 1 && stale.length === 0;
     const maxVer = Math.max(...live.map(r => Number(r.status.index_version || 0)), 0);
 
-    const banner = inSync
-        ? `<span style="color:#10b981; font-weight:700;">✓ In sync</span> <span style="color:var(--text-muted); font-size:12px;">— all ${live.length} node(s) at index version ${maxVer}</span>`
-        : stale.length > 0
-            ? `<span style="color:#f59e0b; font-weight:700;">⚠ ${stale.length} node(s) not reporting</span> <span style="color:var(--text-muted); font-size:12px;">— WolfDisk may be stopped there</span>`
-            : `<span style="color:#f59e0b; font-weight:700;">⟳ Syncing</span> <span style="color:var(--text-muted); font-size:12px;">— index versions differ (a node is catching up)</span>`;
+    // Mixed wolfdisk SOFTWARE versions cannot sync (positional bincode wire —
+    // wabil's reinstalled node sat at v0 forever, 2026-07-04). The daemon
+    // reports its version since v2.11.8; older daemons omit the field and
+    // count as "pre-2.11.8" so the mix is still flagged.
+    const swVersions = [...new Set(live.map(r => r.status.version || 'pre-2.11.8'))];
+    const mixedSw = swVersions.length > 1;
+
+    // "Catching up" that makes no progress isn't catching up. Track the
+    // behind-set across refreshes: same nodes, same versions for >3 minutes
+    // → escalate the banner from soothing to actionable.
+    const behindKey = live.filter(r => Number(r.status.index_version || 0) < maxVer)
+        .map(r => `${r.status.node_id}@${r.status.index_version}`).sort().join(',');
+    const nowMs = Date.now();
+    if (behindKey && window._wdBehindKey === behindKey) {
+        window._wdBehindSince = window._wdBehindSince || nowMs;
+    } else {
+        window._wdBehindKey = behindKey;
+        window._wdBehindSince = behindKey ? nowMs : null;
+    }
+    const stuckMins = window._wdBehindSince ? Math.floor((nowMs - window._wdBehindSince) / 60000) : 0;
+
+    const banner = mixedSw
+        ? `<span style="color:#ef4444; font-weight:700;">✗ Mixed wolfdisk versions (${swVersions.map(escapeHtml).join(', ')})</span> <span style="color:var(--text-muted); font-size:12px;">— nodes on different versions cannot sync; upgrade every node to the same version</span>`
+        : inSync
+            ? `<span style="color:#10b981; font-weight:700;">✓ In sync</span> <span style="color:var(--text-muted); font-size:12px;">— all ${live.length} node(s) at index version ${maxVer}</span>`
+            : stale.length > 0
+                ? `<span style="color:#f59e0b; font-weight:700;">⚠ ${stale.length} node(s) not reporting</span> <span style="color:var(--text-muted); font-size:12px;">— WolfDisk may be stopped there</span>`
+                : stuckMins >= 3
+                    ? `<span style="color:#ef4444; font-weight:700;">✗ Not progressing</span> <span style="color:var(--text-muted); font-size:12px;">— a node has been ${maxVer ? 'behind' : 'at v0'} without progress for ${stuckMins} min. Check connectivity to the leader and that all nodes run the same wolfdisk version (journalctl -u wolfdisk | grep Re-sync)</span>`
+                    : `<span style="color:#f59e0b; font-weight:700;">⟳ Syncing</span> <span style="color:var(--text-muted); font-size:12px;">— index versions differ (a node is catching up)</span>`;
 
     const fmtBytes = (b) => (typeof formatStorageBytes === 'function') ? formatStorageBytes(b) : (b + ' B');
     const rowHtml = rows.map(r => {
         const s = r.status || {};
         const name = escapeHtml(r.node.hostname || r.node.name || r.node.id);
         if (!s.node_id) {
-            return `<tr><td style="padding:6px 10px;">${name}</td><td colspan="5" style="padding:6px 10px; color:var(--text-muted);">WolfDisk not running</td></tr>`;
+            return `<tr><td style="padding:6px 10px;">${name}</td><td colspan="6" style="padding:6px 10px; color:var(--text-muted);">WolfDisk not running</td></tr>`;
         }
         const ver = Number(s.index_version || 0);
         const isStale = s.status_age_secs != null && s.status_age_secs > 10;
@@ -48337,9 +48362,14 @@ async function loadWolfDiskSyncHealth() {
             : behind
                 ? `<span style="color:#f59e0b;">v${ver} — ${maxVer - ver} behind</span>`
                 : `<span style="color:#10b981;">v${ver}</span>`;
+        const swVer = s.version || 'pre-2.11.8';
+        const swCell = mixedSw
+            ? `<span style="color:#ef4444;">${escapeHtml(swVer)}</span>`
+            : escapeHtml(swVer);
         return `<tr>
             <td style="padding:6px 10px;">${name}</td>
             <td style="padding:6px 10px;">${escapeHtml(s.role || '—')}</td>
+            <td style="padding:6px 10px;">${swCell}</td>
             <td style="padding:6px 10px;">${verCell}</td>
             <td style="padding:6px 10px;">${Number(s.file_count || 0).toLocaleString()}</td>
             <td style="padding:6px 10px;">${escapeHtml(fmtBytes(Number(s.total_size || 0)))}</td>
@@ -48356,6 +48386,7 @@ async function loadWolfDiskSyncHealth() {
             <table style="width:100%; border-collapse:collapse; font-size:13px;">
                 <thead><tr style="color:var(--text-muted); font-size:11px; text-align:left;">
                     <th style="padding:4px 10px;">Node</th><th style="padding:4px 10px;">Role</th>
+                    <th style="padding:4px 10px;">Version</th>
                     <th style="padding:4px 10px;">Index Version</th><th style="padding:4px 10px;">Files</th>
                     <th style="padding:4px 10px;">Size</th><th style="padding:4px 10px;">Peers up</th>
                 </tr></thead>
