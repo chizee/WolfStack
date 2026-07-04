@@ -23126,6 +23126,12 @@ async function refreshDockerStats() {
         renderDockerCards(containers);
         applyContainerView('docker');
         renderDockerStats(statsArr);
+        // Re-render wipes the badge spans; repaint from the module caches —
+        // no refetch. Without this every 15s tick erased the image-update
+        // and package-update flags, which "vanished within 20 seconds" and
+        // disappeared behind an open policy dialog (RutgerDiehard 2026-07-04).
+        applyUpdateBadges();
+        applyImageUpdateBadges();
     } catch (e) { /* silent — keep the existing list on any transient error */ }
 }
 

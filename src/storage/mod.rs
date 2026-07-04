@@ -2387,12 +2387,70 @@ pub fn read_system_logs(lines: usize, search: Option<&str>, unit: Option<&str>) 
     }
 
     match Command::new("journalctl").args(&args).output() {
-        Ok(o) => {
+        Ok(o) if o.status.success() => {
             let text = String::from_utf8_lossy(&o.stdout);
             text.lines().map(|l| l.to_string()).collect()
         }
-        Err(e) => vec![format!("Error reading logs: {}", e)],
+        // journalctl absent (Unraid/Slackware, Alpine — no systemd) or
+        // erroring: fall back to the classic syslog files (klasSponsor
+        // 2026-07-04: System Logs view was empty on Unraid because only
+        // journald was ever consulted).
+        _ => read_syslog_file_fallback(lines, search, unit),
     }
+}
+
+/// Tail-read a classic syslog file for systems without journald. Reads a
+/// bounded window from the file's end (never the whole file — a busy syslog
+/// runs to hundreds of MB), newest window sized generously per requested
+/// line. `unit` approximates journald's -u by matching the syslog tag
+/// (`hostname tag[pid]:`), `search` is a case-insensitive substring, both
+/// mirroring the journalctl behaviour above.
+fn read_syslog_file_fallback(lines: usize, search: Option<&str>, unit: Option<&str>) -> Vec<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    // Unraid (Slackware/rsyslog) writes /var/log/syslog; Alpine and
+    // RHEL-family classic setups use /var/log/messages.
+    let path = ["/var/log/syslog", "/var/log/messages"]
+        .iter()
+        .find(|p| std::path::Path::new(p).exists());
+    let Some(path) = path else {
+        return vec!["No system log source found (no journalctl, no /var/log/syslog or /var/log/messages)".to_string()];
+    };
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => return vec![format!("Error reading {}: {}", path, e)],
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    // ~512 bytes/line is generous; floor 1MB so small requests still see
+    // enough history, cap 8MB to bound memory on 5000-line requests.
+    let window = ((lines as u64) * 512).clamp(1_048_576, 8 * 1_048_576).min(len);
+    if f.seek(SeekFrom::Start(len - window)).is_err() {
+        return vec![format!("Error seeking {}", path)];
+    }
+    let mut buf = Vec::with_capacity(window as usize);
+    if let Err(e) = f.read_to_end(&mut buf) {
+        return vec![format!("Error reading {}: {}", path, e)];
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let search_lower = search.filter(|s| !s.is_empty()).map(str::to_lowercase);
+    let unit_lower = unit.filter(|u| !u.is_empty()).map(str::to_lowercase);
+    let mut out: Vec<String> = text
+        .lines()
+        .skip(1) // first line of the window is almost always a partial record
+        .filter(|l| {
+            let ll = l.to_lowercase();
+            let search_ok = search_lower.as_ref().is_none_or(|s| ll.contains(s));
+            // syslog tag match: " tag[123]:" or " tag:" — approximates
+            // journald's unit filter by process name.
+            let unit_ok = unit_lower.as_ref().is_none_or(|u|
+                ll.contains(&format!(" {}[", u)) || ll.contains(&format!(" {}:", u)));
+            search_ok && unit_ok
+        })
+        .map(|l| l.to_string())
+        .collect();
+    if out.len() > lines {
+        out.drain(..out.len() - lines);
+    }
+    out
 }
 
 // ─── Disk Partitioning & Formatting ───
