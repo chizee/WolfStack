@@ -5902,9 +5902,16 @@ pub async fn install_component(req: HttpRequest, state: web::Data<AppState>, pat
         })),
     };
 
-    match installer::install_component(component) {
-        Ok(msg) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+    // web::block: the install pipes `curl | bash` synchronously and can run
+    // for minutes — inline it blocked an actix worker for the duration
+    // (sync-in-async class; found auditing wabil's WolfDisk install-button
+    // report, 2026-07-04).
+    match web::block(move || installer::install_component(component)).await {
+        Ok(Ok(msg)) => HttpResponse::Ok().json(serde_json::json!({ "message": msg })),
+        Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("install worker failed: {}", e)
+        })),
     }
 }
 
