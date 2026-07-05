@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.2.14: AI knowledge base rewritten against current source; over-cap upsell quotes real tiers** _(2026-07-05 — [`78076555`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/78076555bb0b7e814130eab483ca27b5d22af01f))_
 - **v25.2.13: WolfFunctions editor no longer closes on backdrop click, losing unsaved work (KO4BSR)** _(2026-07-04 — [`66cdfce3`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/66cdfce34957bfee395e7429a3fd8435498a51b0))_
 - **v25.2.12: TrueNAS WS-first transport, badge/log/install fixes, WolfDisk health versions + not-progressing** _(2026-07-04 — [`238c099f`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/238c099f720c0f6721712a6c439ab775be4dacee))_
 - **v25.2.12: TrueNAS WS-first transport, badge/log/install fixes, WolfDisk health shows versions + not-progressing** _(2026-07-04 — [`405c24f6`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/405c24f654a3bf3577e214f443227b92172c86fb))_
