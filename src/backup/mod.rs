@@ -399,6 +399,43 @@ mod tests {
         assert!(d.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
+    /// wabil 2026-07-06 EXACT repro: back up /mnt/docker, exclude
+    /// /mnt/docker/plex. End-to-end through the REAL backup_system_path
+    /// (pattern generation + tar), not a hand-built tar command. Proves
+    /// whether the backend honours the exclude for his precise inputs.
+    #[test]
+    fn backup_system_path_excludes_wabil_case_end_to_end() {
+        use std::io::Write;
+        let root = std::env::temp_dir().join(format!("wsfx-{}", uuid::Uuid::new_v4().simple()));
+        // Point staging at a writable temp dir (the real default,
+        // /tmp/wolfstack-backups, is root-owned on dev boxes from live runs).
+        let mut locs = crate::paths::get();
+        let staging = root.join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        locs.backup_staging_dir = staging.to_string_lossy().to_string();
+        crate::paths::set_for_test(locs);
+        let docker = root.join("docker");
+        std::fs::create_dir_all(docker.join("plex/config")).unwrap();
+        std::fs::create_dir_all(docker.join("keep")).unwrap();
+        std::fs::File::create(docker.join("plex/config/f")).unwrap().write_all(b"p").unwrap();
+        std::fs::File::create(docker.join("keep/f")).unwrap().write_all(b"k").unwrap();
+
+        let folder = docker.to_string_lossy().to_string();
+        let exclude = docker.join("plex").to_string_lossy().to_string();
+        let (tar_path, _size) = backup_system_path("docker", &folder, &[exclude])
+            .expect("backup_system_path failed");
+
+        let listing = std::process::Command::new("tar")
+            .args(["-tzf", &tar_path.to_string_lossy()])
+            .output().unwrap();
+        let members = String::from_utf8_lossy(&listing.stdout);
+        let _ = std::fs::remove_file(&tar_path);
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(members.contains("docker/keep"), "keep must be present: {}", members);
+        assert!(!members.contains("plex"), "plex MUST be excluded but was present:\n{}", members);
+    }
+
     #[test]
     fn classify_folder_excludes_flags_out_of_folder() {
         // Leaf-mode folder: in-folder excludes apply, cross-root ones drop.
@@ -418,6 +455,26 @@ mod tests {
         let (a2, d2) = classify_folder_excludes("/data/", &["/data/tmp".to_string(), "/other".to_string()]);
         assert_eq!(a2, vec!["/data/tmp".to_string()]);
         assert_eq!(d2, vec!["/other".to_string()]);
+    }
+
+    /// wabil 2026-07-06: excludes worked for local tarball but NOT PBS
+    /// file-level. The pxar path now translates them to anchored globs.
+    /// Covers his four attempts against folder /mnt/docker.
+    #[test]
+    fn pxar_exclude_pattern_wabil_attempts() {
+        // Absolute in-folder → anchored to archive root.
+        assert_eq!(pxar_exclude_pattern("/mnt/docker/plex", "/mnt/docker"), Some("/plex".into()));
+        // Relative name → same anchored glob.
+        assert_eq!(pxar_exclude_pattern("plex", "/mnt/docker"), Some("/plex".into()));
+        // Trailing slash trimmed.
+        assert_eq!(pxar_exclude_pattern("plex/", "/mnt/docker"), Some("/plex".into()));
+        // Leading-slash-but-not-under-folder → dropped (his '/plex' attempt,
+        // which reads as an absolute path outside /mnt/docker).
+        assert_eq!(pxar_exclude_pattern("/plex", "/mnt/docker"), None);
+        // Nested sub-path keeps its depth.
+        assert_eq!(pxar_exclude_pattern("/mnt/docker/plex/config", "/mnt/docker"), Some("/plex/config".into()));
+        // Wholly outside the folder → dropped.
+        assert_eq!(pxar_exclude_pattern("/etc/ssl", "/mnt/docker"), None);
     }
 
     #[test]
@@ -2467,6 +2524,22 @@ pub fn classify_folder_excludes(path: &str, excludes: &[String]) -> (Vec<String>
     (applied, dropped)
 }
 
+/// Convert one operator folder-exclusion into a `proxmox-backup-client
+/// --exclude` glob for a SystemPath file-level (pxar) backup, or None
+/// if it's not inside the folder (same drop rule as the tarball path).
+///
+/// The pxar archive's root IS the backed-up folder, so a path inside it
+/// is relative to that root. Per pbs.proxmox.com/docs/backup-client.html
+/// a leading `/` anchors the glob to the archive root (matches only
+/// there, not in subdirectories) — which is exactly tar's top-level
+/// exclusion semantics, so `/mnt/docker` + exclude `/mnt/docker/plex`
+/// becomes `/plex`. We reuse folder_exclude_pattern's contents-mode
+/// relativiser (archive root = folder, no leaf wrapper) and anchor it.
+fn pxar_exclude_pattern(raw: &str, src: &str) -> Option<String> {
+    let rel = folder_exclude_pattern(raw, src, "", true)?;
+    Some(format!("/{}", rel))
+}
+
 fn folder_exclude_pattern(raw: &str, src: &str, leaf: &str, contents_only: bool) -> Option<String> {
     let ex = raw.trim().trim_end_matches('/');
     if ex.is_empty() { return None; }
@@ -3695,7 +3768,13 @@ fn docker_compose_project(name: &str) -> Option<(String, String)> {
     Some((cf, wd))
 }
 
-fn build_pxar_pairs(target: &BackupTarget) -> Result<(String, String, Vec<PxarPair>), String> {
+/// Returns (backup_type, backup_id, pxar pairs, command-level pxar
+/// `--exclude` globs). Only SystemPath populates the excludes (its
+/// single archive is the folder itself); Docker already excludes at the
+/// volume/bind level and returns none. The excludes are command-level
+/// because `proxmox-backup-client --exclude` is a per-command flag and
+/// the populated case is always a single-archive backup.
+fn build_pxar_pairs(target: &BackupTarget) -> Result<(String, String, Vec<PxarPair>, Vec<String>), String> {
     let staging = ensure_staging_dir()?;
     match target.target_type {
         BackupTargetType::Docker => {
@@ -3824,7 +3903,7 @@ fn build_pxar_pairs(target: &BackupTarget) -> Result<(String, String, Vec<PxarPa
                     }
                 }
             }
-            Ok(("ct".to_string(), target.name.clone(), pairs))
+            Ok(("ct".to_string(), target.name.clone(), pairs, Vec::new()))
         }
         BackupTargetType::Lxc => {
             if crate::containers::is_proxmox() {
@@ -3840,16 +3919,26 @@ fn build_pxar_pairs(target: &BackupTarget) -> Result<(String, String, Vec<PxarPa
                 return Err(format!("LXC rootfs not found at {}", rootfs));
             }
             Ok(("ct".to_string(), target.name.clone(),
-                vec![PxarPair { archive: "root.pxar".into(), dir: PathBuf::from(rootfs), ephemeral: false }]))
+                vec![PxarPair { archive: "root.pxar".into(), dir: PathBuf::from(rootfs), ephemeral: false }],
+                Vec::new()))
         }
         BackupTargetType::SystemPath => {
             validate_system_path(&target.system_path)?;
             let dir = target.system_path.trim_end_matches('/').to_string();
+            // Translate operator folder-exclusions into anchored pxar
+            // globs (the SystemPath file-level path previously ignored
+            // exclude_mounts entirely — wabil 2026-07-06: excludes worked
+            // for tarball but not PBS file-level). Out-of-folder entries
+            // drop, mirroring the tarball path.
+            let excludes: Vec<String> = target.exclude_mounts.iter()
+                .filter_map(|e| pxar_exclude_pattern(e, &dir))
+                .collect();
             Ok(("host".to_string(),
                 sanitize_archive_name(if target.name.trim().is_empty() {
                     Path::new(&dir).file_name().and_then(|n| n.to_str()).unwrap_or("folder")
                 } else { target.name.trim() }),
-                vec![PxarPair { archive: "root.pxar".into(), dir: PathBuf::from(dir), ephemeral: false }]))
+                vec![PxarPair { archive: "root.pxar".into(), dir: PathBuf::from(dir), ephemeral: false }],
+                excludes))
         }
         BackupTargetType::Config => {
             // Config is the small tar bundle — no benefit to file-level; let
@@ -3878,7 +3967,7 @@ fn backup_pbs_file_level(
 ) -> Result<(String, String), String> {
     ensure_pbs_client_installed()?;
     let repo = pbs_repo_string(storage);
-    let (backup_type, backup_id, pairs) = build_pxar_pairs(target)?;
+    let (backup_type, backup_id, pairs, pxar_excludes) = build_pxar_pairs(target)?;
 
     // Owners we must clean up regardless of outcome.
     let ephemeral_dirs: Vec<PathBuf> = pairs.iter()
@@ -3899,6 +3988,12 @@ fn backup_pbs_file_level(
         cleanup(&ephemeral_dirs);
         return Err("file-level backup produced no archives to upload".into());
     }
+    // Folder exclusions (SystemPath). `--exclude` is a command-level flag
+    // and the populated case is always a single archive, so there's no
+    // cross-archive ambiguity. Source: pbs.proxmox.com/docs/backup-client.html.
+    for pat in &pxar_excludes {
+        cmd.arg("--exclude").arg(pat);
+    }
     cmd.arg("--repository").arg(&repo)
        .arg("--backup-id").arg(&backup_id)
        .arg("--backup-type").arg(&backup_type);
@@ -3907,6 +4002,32 @@ fn backup_pbs_file_level(
     if let Some(log_tx) = log {
         let _ = log_tx.send(format!("  PBS file-level: {} archive(s) → {}/{}",
             archive_count, backup_type, backup_id));
+        if !pxar_excludes.is_empty() {
+            // Show the operator's raw entry alongside the pxar glob it became
+            // (e.g. `/mnt/docker/plex → /plex`) so the transformed pattern is
+            // recognisable as what they typed (review 2026-07-06).
+            if target.target_type == BackupTargetType::SystemPath {
+                let (applied, _dropped) = classify_folder_excludes(&target.system_path, &target.exclude_mounts);
+                let shown: Vec<String> = applied.iter().zip(pxar_excludes.iter())
+                    .map(|(raw, pat)| format!("{} → {}", raw, pat))
+                    .collect();
+                let _ = log_tx.send(format!("  Excluding {} sub-path(s): {}",
+                    pxar_excludes.len(), shown.join(", ")));
+            } else {
+                let _ = log_tx.send(format!("  Excluding {} sub-path(s): {}",
+                    pxar_excludes.len(), pxar_excludes.join(", ")));
+            }
+        }
+        // Surface out-of-folder excludes that were dropped, matching the
+        // tarball path's diagnostic (a SystemPath target only).
+        if target.target_type == BackupTargetType::SystemPath && !target.exclude_mounts.is_empty() {
+            let (_applied, dropped) = classify_folder_excludes(&target.system_path, &target.exclude_mounts);
+            if !dropped.is_empty() {
+                let _ = log_tx.send(format!(
+                    "  ⚠ {} exclude(s) IGNORED — not inside '{}': {}. Exclusions must be sub-paths of the backed-up folder.",
+                    dropped.len(), target.system_path, dropped.join(", ")));
+            }
+        }
     }
 
     let output = cmd.output()
