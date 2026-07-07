@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.2.23: sort the Apps & Tools drawer tiles alphabetically** _(2026-07-07 — [`1f81ebeb`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/1f81ebeb23699d4a2888ed2197cc8f3ff6c2782f))_
 - **v25.2.22: WolfHost merged into WolfStack core — free, built-in, no plugin** _(2026-07-07 — [`201a8058`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/201a8058bb343985908cb7233e3f789db604461b))_
 - **v25.2.21: WolfHost admin screen honours the shared cluster selector** _(2026-07-07 — [`31712aa8`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/31712aa84f3e8512f34158a51e45ceb793fdfff9))_
 - **v25.2.20: WolfHost (managed hosting) moves to the base tier — free on every licence tier** _(2026-07-07 — [`a54e9656`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/a54e965674b72612912ef71ba4b27b68c02cd124))_
