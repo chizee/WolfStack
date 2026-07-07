@@ -69511,11 +69511,15 @@ function appDrawerTileHtml(t) {
 function renderAppDrawer(pluginTiles) {
     const grid = document.getElementById('app-drawer-grid');
     if (!grid) return;
+    // Tiles are sorted alphabetically by name (case-insensitive) at
+    // render time, so new tiles land in the right place without manual
+    // reordering of the source arrays.
+    const byName = (a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
     let html = `<div style="grid-column:1/-1;font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;margin:4px 0 -4px 4px;">Built-in views</div>`;
-    html += APP_DRAWER_TILES.map(appDrawerTileHtml).join('');
+    html += [...APP_DRAWER_TILES].sort(byName).map(appDrawerTileHtml).join('');
     if (pluginTiles && pluginTiles.length > 0) {
         html += `<div style="grid-column:1/-1;font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;margin:18px 0 -4px 4px;">Plugins</div>`;
-        html += pluginTiles.map(appDrawerTileHtml).join('');
+        html += [...pluginTiles].sort(byName).map(appDrawerTileHtml).join('');
     }
     grid.innerHTML = html;
 }
