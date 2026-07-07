@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.2.29: host mail relay — let host services send email via msmtp** _(2026-07-07 — [`f60d4cf3`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/f60d4cf3ebce9a1c3ff1f22932b567eda8d53184))_
 - **v25.2.28: fix blank performance-history charts on remote server dashboards (RutgerDiehard)** _(2026-07-07 — [`617f1998`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/617f1998c3f7a3bd4bf4472f941becf710ac4492))_
 - **v25.2.27: fix fleet threat-intel widget showing zeros; prompt for widget params on add** _(2026-07-07 — [`63c37e71`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/63c37e7163bd6223d858577a2527464f3d670c9c))_
 - **v25.2.26: dashboard widgets can target a specific server or cluster** _(2026-07-07 — [`24a32bd8`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/24a32bd8009386001314c2ba3f3fd632512ba747))_
