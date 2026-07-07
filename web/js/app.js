@@ -2327,8 +2327,13 @@ function selectServerView(nodeId, view) {
 
         if (node?.metrics) updateDashboard(node.metrics);
 
-        // If it's the local node (is_self), we could fetch history, but for now we'll build it live
-        if (node?.is_self) fetchMetricsHistory();
+        // Seed the performance-history charts for WHICHEVER server this is —
+        // local or a remote peer. This was previously gated to the local node
+        // (is_self) and only ever hit the local /api/metrics/history, so every
+        // remote host's dashboard opened with blank charts and only filled in
+        // slowly (if at all) off the 10s node poll. fetchMetricsHistory now
+        // fetches the viewed node's own history through the node proxy.
+        fetchMetricsHistory();
         // Start top-processes and services polling (only while on dashboard)
         startProcessPolling();
         startServicePolling();
@@ -7295,9 +7300,18 @@ function updateDashboard(m) {
 
 async function fetchMetricsHistory() {
     try {
-        const resp = await fetch(apiUrl('/api/metrics/history'));
+        // Fetch the CURRENTLY-VIEWED node's history — nodeApiUrl routes to the
+        // local endpoint for the self node and through the node proxy for a
+        // remote peer, so a remote host's charts get its own history rather
+        // than nothing (or the local node's data).
+        const nid = currentNodeId;
+        const resp = await fetch(nodeApiUrl(nid, '/api/metrics/history'));
         if (!resp.ok) return;
         const history = await resp.json();
+        // A concurrent node switch may have changed the viewed node while this
+        // request was in flight — drop a stale response so we don't paint one
+        // node's history onto another's charts.
+        if (currentPage !== 'dashboard' || currentNodeId !== nid) return;
 
         // Clear existing
         cpuHistory = [];
