@@ -537,6 +537,31 @@ mod tests {
     }
 
     #[test]
+    fn config_backups_do_file_level_pxar() {
+        // wabil 2026-07-08: "I want to use PBS to grab that one file" — config
+        // backups must honour the file-level option, not silently fall back.
+        let cfg = BackupTarget { target_type: BackupTargetType::Config, ..Default::default() };
+        assert!(pbs_file_level_applies(&cfg));
+        let pbs = BackupStorage { storage_type: StorageType::Pbs, pbs_file_level: true, ..Default::default() };
+        assert!(pbs_file_level_skip_note(&cfg, &pbs).is_none(), "no fallback note — config uses pxar now");
+        assert!(backup_format_explainer(&cfg, &pbs).contains("pxar file-level"));
+        // Flag off → still the tarball wrapped in PBS, stated as such.
+        let pbs_off = BackupStorage { storage_type: StorageType::Pbs, pbs_file_level: false, ..Default::default() };
+        assert!(backup_format_explainer(&cfg, &pbs_off).contains("tar.gz"));
+    }
+
+    #[test]
+    fn config_pxar_backup_id_is_stable_and_sanitized() {
+        // Backup writes with the local hostname; restore re-derives from the
+        // hostname recorded in the entry — the two must be identical, and odd
+        // hostnames must sanitize the same way every time.
+        assert_eq!(config_pxar_backup_id("ninni"), config_pxar_backup_id("ninni"));
+        let id = config_pxar_backup_id("my host.local");
+        assert!(id.starts_with("wolfstack-config-"), "got: {}", id);
+        assert!(!id.contains(' '), "sanitized: {}", id);
+    }
+
+    #[test]
     fn pbs_notes_positionals_never_emit_dashdash_separator() {
         // The PBS CLI (proxmox-router) does NOT honour `--` as an end-of-options
         // separator — passing one made it the <snapshot> positional and pushed
@@ -2333,8 +2358,36 @@ pub fn backup_config() -> Result<(PathBuf, u64), String> {
     let filename = format!("config-wolfstack-{}.tar.gz", timestamp);
     let tar_path = staging.join(&filename);
 
-    // Create a temp directory with all config files
-    let temp_dir = staging.join("config-bundle");
+    let temp_dir = stage_config_bundle()?;
+
+    // Tar the bundle
+    let output = Command::new("tar")
+        .args(["czf", &tar_path.to_string_lossy(), "-C", &temp_dir.to_string_lossy(), "."])
+        .output()
+        .map_err(|e| format!("Failed to tar config: {}", e))?;
+
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    if !output.status.success() {
+        return Err(format!("Config tar failed: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+
+    let size = fs::metadata(&tar_path).map(|m| m.len()).unwrap_or(0);
+
+    Ok((tar_path, size))
+}
+
+/// Assemble the config-backup tree in a staging directory and return it.
+/// Shared by `backup_config` (which tars it) and the PBS file-level path
+/// (which uploads it as a pxar archive so single files are browsable and
+/// restorable in PBS — wabil 2026-07-08: "I want to use PBS to grab that
+/// one file", not download-extract-delete a whole tarball). The caller
+/// owns cleanup of the returned directory.
+fn stage_config_bundle() -> Result<PathBuf, String> {
+    let staging = ensure_staging_dir()?;
+    // Unique per call: the tarball path and the PBS pxar path (and a scheduled
+    // vs manual run) can each stage concurrently without racing on one dir.
+    let temp_dir = staging.join(format!("config-bundle-{}", Uuid::new_v4().simple()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).map_err(|e| format!("Failed to create temp dir: {}", e))?;
 
@@ -2395,21 +2448,7 @@ pub fn backup_config() -> Result<(PathBuf, u64), String> {
         }
     }
 
-    // Tar the bundle
-    let output = Command::new("tar")
-        .args(["czf", &tar_path.to_string_lossy(), "-C", &temp_dir.to_string_lossy(), "."])
-        .output()
-        .map_err(|e| format!("Failed to tar config: {}", e))?;
-
-    let _ = fs::remove_dir_all(&temp_dir);
-
-    if !output.status.success() {
-        return Err(format!("Config tar failed: {}", String::from_utf8_lossy(&output.stderr)));
-    }
-
-    let size = fs::metadata(&tar_path).map(|m| m.len()).unwrap_or(0);
-
-    Ok((tar_path, size))
+    Ok(temp_dir)
 }
 
 /// Refuse the filesystem root and the kernel virtual filesystems (and any
@@ -2935,7 +2974,7 @@ fn create_backup_entry(target: BackupTarget, storage: &BackupStorage) -> BackupE
                 }
             }
         }
-        // else: fall through to the tarball path (VM/Proxmox-LXC/Config).
+        // else: fall through to the tarball path (VM/Proxmox-LXC).
     }
 
     let (result, docker_config, mounts) = match target.target_type {
@@ -3656,7 +3695,10 @@ fn pbs_file_level_applies(target: &BackupTarget) -> bool {
         BackupTargetType::Docker => true,
         BackupTargetType::Lxc => !crate::containers::is_proxmox(),
         BackupTargetType::SystemPath => true,
-        BackupTargetType::Vm | BackupTargetType::Config => false,
+        // Config is a file tree like any other — as pxar, PBS can browse and
+        // restore a single config file from any snapshot (wabil 2026-07-08).
+        BackupTargetType::Config => true,
+        BackupTargetType::Vm => false,
     }
 }
 
@@ -3678,8 +3720,6 @@ fn pbs_file_level_skip_note(target: &BackupTarget, storage: &BackupStorage) -> O
             "Proxmox LXC rootfs is on block storage (ZFS/LVM) — pxar file-level isn't possible, using vzdump image",
         BackupTargetType::Vm =>
             "VMs back up as a disk image, not per-file — pxar file-level doesn't apply",
-        BackupTargetType::Config =>
-            "config backups are a single archive — pxar file-level doesn't apply",
         _ => "pxar file-level isn't available for this target — using image/tarball backup",
     };
     Some(format!("{}{}", PBS_FL_SKIP_PREFIX, why))
@@ -3941,9 +3981,18 @@ fn build_pxar_pairs(target: &BackupTarget) -> Result<(String, String, Vec<PxarPa
                 excludes))
         }
         BackupTargetType::Config => {
-            // Config is the small tar bundle — no benefit to file-level; let
-            // the caller keep the tarball-in-pxar path.
-            Err("PBS file-level backup doesn't apply to config backups".into())
+            // Same tree the tarball path archives, uploaded as pxar so PBS
+            // can browse/restore a single config file from any snapshot
+            // (wabil 2026-07-08). Hostname in the backup-id: every node has
+            // "the" config target, so a shared datastore would otherwise
+            // interleave snapshots from different nodes under one id.
+            let bundle = stage_config_bundle()?;
+            Ok((
+                "host".to_string(),
+                config_pxar_backup_id(&local_hostname()),
+                vec![PxarPair { archive: "root.pxar".into(), dir: bundle, ephemeral: true }],
+                Vec::new(),
+            ))
         }
         BackupTargetType::Vm => {
             Err("PBS file-level backup isn't available for VMs (disk images are \
@@ -3957,7 +4006,7 @@ fn build_pxar_pairs(target: &BackupTarget) -> Result<(String, String, Vec<PxarPa
 /// restore works. `notes` becomes the snapshot comment. Returns the
 /// snapshot's backup-type/backup-id so the caller can record a matching
 /// BackupEntry (filename uses a `pbsfl-` marker so restore routes to the
-/// file-level path). On VM/Proxmox-LXC/Config the caller falls back to the
+/// file-level path). On VM/Proxmox-LXC the caller falls back to the
 /// tarball path — those return Err from build_pxar_pairs.
 fn backup_pbs_file_level(
     target: &BackupTarget,
@@ -4054,6 +4103,13 @@ fn backup_pbs_file_level(
 /// route to the file-level restore path.
 const PBS_FILE_LEVEL_PREFIX: &str = "pbsfl-";
 
+/// PBS backup-id for a file-level CONFIG snapshot of `hostname`. One helper so
+/// the backup side (local hostname) and the restore side (the hostname
+/// recorded in the entry) can never drift apart.
+fn config_pxar_backup_id(hostname: &str) -> String {
+    sanitize_archive_name(&format!("wolfstack-config-{}", hostname))
+}
+
 /// True if this entry is a PBS file-level (pxar) snapshot.
 fn is_pbs_file_level_entry(entry: &BackupEntry) -> bool {
     entry.storage.storage_type == StorageType::Pbs
@@ -4062,7 +4118,7 @@ fn is_pbs_file_level_entry(entry: &BackupEntry) -> bool {
 
 /// Run a file-level PBS backup for `target` and build the resulting
 /// BackupEntry. `None` means file-level doesn't apply to this target
-/// (VM/Proxmox-LXC/Config) — the caller falls back to the tarball path.
+/// (VM/Proxmox-LXC) — the caller falls back to the tarball path.
 /// `Some(Err)` means file-level applied but failed.
 fn make_pbs_file_level_entry(
     target: &BackupTarget,
@@ -4127,7 +4183,7 @@ fn restore_pbs_file_level_entry(entry: &BackupEntry, target_override: &str) -> R
     // any filename-parsing fragility. These mirror exactly what
     // build_pxar_pairs produced at backup time.
     let backup_type = match entry.target.target_type {
-        BackupTargetType::SystemPath => "host",
+        BackupTargetType::SystemPath | BackupTargetType::Config => "host",
         _ => "ct",
     }.to_string();
     let backup_id = match entry.target.target_type {
@@ -4135,6 +4191,9 @@ fn restore_pbs_file_level_entry(entry: &BackupEntry, target_override: &str) -> R
             Path::new(entry.target.system_path.trim_end_matches('/'))
                 .file_name().and_then(|n| n.to_str()).unwrap_or("folder")
         } else { entry.target.name.trim() }),
+        // Use the hostname RECORDED at backup time, not the local one — a
+        // new-machine restore runs on a different host by definition.
+        BackupTargetType::Config => config_pxar_backup_id(&entry.node_hostname),
         _ => entry.target.name.clone(),
     };
 
@@ -5926,6 +5985,19 @@ const MACHINE_SPECIFIC_CONFIG: &[&str] = &[
 /// (`MACHINE_SPECIFIC_CONFIG`) so the config can be carried onto a different box
 /// without clashing identities or wrong-NIC networking (wabil's request).
 pub fn restore_config_backup(entry: &BackupEntry, new_machine: bool) -> Result<String, String> {
+    // PBS file-level (pxar) config snapshot: materialise the tree into the
+    // same private staging the tarball path uses, then apply identically —
+    // so both formats honour the same-/new-machine choice. (Single-FILE
+    // restores are what pxar is for; those happen in PBS's own UI.)
+    if is_pbs_file_level_entry(entry) {
+        let staging = make_config_restore_staging()?;
+        if let Err(e) = restore_pbs_file_level_entry(entry, &staging.to_string_lossy()) {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(e);
+        }
+        return apply_config_staging(&staging, new_machine);
+    }
+
     let local_path = retrieve_backup(entry)?;
 
     if !new_machine {
@@ -5945,22 +6017,7 @@ pub fn restore_config_backup(entry: &BackupEntry, new_machine: bool) -> Result<S
     // then merge the remainder into place. Staging avoids tar --exclude glob
     // ambiguity (e.g. wolfnet vs wolfnet-tombstones) and lets us delete dirs
     // and files uniformly.
-    let staging = ensure_staging_dir()?.join("config-restore");
-    let _ = fs::remove_dir_all(&staging);
-    // Restrict to root: the default staging base is under /tmp and this dir
-    // briefly holds TLS key material + /etc/wolfstack before the cp into place,
-    // so don't let any other local user read or plant files in it. Create with
-    // mode 0o700 in the mkdir(2) call itself (DirBuilder) rather than chmod-ing
-    // after — that closes the window where the dir is world-readable. umask can
-    // only clear bits, never add them, so 0o700 is guaranteed regardless of it.
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&staging)
-            .map_err(|e| format!("Failed to create restore staging: {}", e))?;
-    }
+    let staging = make_config_restore_staging()?;
 
     let output = Command::new("tar")
         .args(["xzf", &local_path.to_string_lossy(), "-C", &staging.to_string_lossy()])
@@ -5972,11 +6029,40 @@ pub fn restore_config_backup(entry: &BackupEntry, new_machine: bool) -> Result<S
         return Err(format!("Config extract failed: {}", String::from_utf8_lossy(&output.stderr)));
     }
 
-    for rel in MACHINE_SPECIFIC_CONFIG {
-        let p = staging.join(rel);
-        // It may be a file or a directory; try both, ignore "not present".
-        let _ = fs::remove_file(&p);
-        let _ = fs::remove_dir_all(&p);
+    apply_config_staging(&staging, new_machine)
+}
+
+/// Private (0o700) staging dir for a config restore. Restrict to root: the
+/// default staging base is under /tmp and this dir briefly holds TLS key
+/// material + /etc/wolfstack before the cp into place, so don't let any other
+/// local user read or plant files in it. Create with mode 0o700 in the
+/// mkdir(2) call itself (DirBuilder) rather than chmod-ing after — that closes
+/// the window where the dir is world-readable. umask can only clear bits,
+/// never add them, so 0o700 is guaranteed regardless of it.
+fn make_config_restore_staging() -> Result<PathBuf, String> {
+    let staging = ensure_staging_dir()?.join("config-restore");
+    let _ = fs::remove_dir_all(&staging);
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&staging)
+        .map_err(|e| format!("Failed to create restore staging: {}", e))?;
+    Ok(staging)
+}
+
+/// Apply a staged config tree to this host. `new_machine = true` first drops
+/// the machine-specific identity/TLS/networking files (`MACHINE_SPECIFIC_
+/// CONFIG`). Consumes (deletes) the staging dir. Shared by the tarball and
+/// PBS-pxar restore paths so the two can't drift.
+fn apply_config_staging(staging: &Path, new_machine: bool) -> Result<String, String> {
+    if new_machine {
+        for rel in MACHINE_SPECIFIC_CONFIG {
+            let p = staging.join(rel);
+            // It may be a file or a directory; try both, ignore "not present".
+            let _ = fs::remove_file(&p);
+            let _ = fs::remove_dir_all(&p);
+        }
     }
 
     // Merge staging into / (cp -a preserves perms/ownership; `staging/.` copies
@@ -5985,13 +6071,17 @@ pub fn restore_config_backup(entry: &BackupEntry, new_machine: bool) -> Result<S
         .args(["-a", &format!("{}/.", staging.to_string_lossy()), "/"])
         .output()
         .map_err(|e| format!("Failed to copy restored config into place: {}", e))?;
-    let _ = fs::remove_dir_all(&staging);
+    let _ = fs::remove_dir_all(staging);
     if !cp.status.success() {
         return Err(format!("Config restore copy failed: {}", String::from_utf8_lossy(&cp.stderr)));
     }
 
-    Ok("WolfStack configuration restored (new-machine mode: node identity, TLS \
-        and networking left untouched). Restart services to apply changes.".to_string())
+    Ok(if new_machine {
+        "WolfStack configuration restored (new-machine mode: node identity, TLS \
+         and networking left untouched). Restart services to apply changes.".to_string()
+    } else {
+        "WolfStack configuration restored. Restart services to apply changes.".to_string()
+    })
 }
 
 /// Restore from a backup entry (auto-detects type). Non-streaming path:
@@ -6000,8 +6090,10 @@ pub fn restore_config_backup(entry: &BackupEntry, new_machine: bool) -> Result<S
 /// the operator picked in the restore dialog.
 pub fn restore_backup(entry: &BackupEntry, overwrite: bool) -> Result<String, String> {
     // PBS file-level (pxar) snapshots restore by extracting the tree, not via
-    // the tarball-based per-type restore paths.
-    if is_pbs_file_level_entry(entry) {
+    // the tarball-based per-type restore paths. Config is the exception: its
+    // restore must APPLY the tree (same-/new-machine rules), so it goes
+    // through restore_config_backup, which is pxar-aware.
+    if is_pbs_file_level_entry(entry) && entry.target.target_type != BackupTargetType::Config {
         return restore_pbs_file_level_entry(entry, "");
     }
     match entry.target.target_type {
@@ -6086,7 +6178,7 @@ pub fn create_backup_with_log(
 
         // PBS file-level (pxar) path — upload the workload's content directory
         // directly so PBS per-file restore works. Applies to Docker, native
-        // LXC, and SystemPath; for VM / Proxmox-LXC / Config make_pbs_file_
+        // LXC, SystemPath and Config; for VM / Proxmox-LXC make_pbs_file_
         // level_entry returns None and we fall through to the tarball path.
         if storage.storage_type == StorageType::Pbs && storage.pbs_file_level {
             let _ = log.send("  PBS file-level backup requested...".to_string());
@@ -6578,8 +6670,11 @@ fn restore_entry_with_log(entry: &BackupEntry, overwrite: bool, storage: &str, n
 
     // PBS file-level (pxar) snapshot — extract the tree directly. `new_name`
     // carries an optional target directory override (LXC rootfs / system
-    // folder / docker staging are the per-type defaults when empty).
-    if is_pbs_file_level_entry(entry) {
+    // folder / docker staging are the per-type defaults when empty). Config
+    // is the exception: its restore must APPLY the tree (same-/new-machine
+    // rules), so it falls through to the Config arm below, whose
+    // restore_config_backup is pxar-aware.
+    if is_pbs_file_level_entry(entry) && entry.target.target_type != BackupTargetType::Config {
         let _ = log.send("Restoring PBS file-level snapshot...".to_string());
         let result = restore_pbs_file_level_entry(entry, new_name);
         match &result {
