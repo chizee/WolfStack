@@ -8,6 +8,8 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.2.35: config backups honor PBS file-level pxar (wabil)** _(2026-07-08 — [`afefabbd`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/afefabbd4542382d78114f688b96daf3f00e15d8))_
+- **v25.2.35: config backups honor PBS file-level (pxar) — single-file browse/restore in PBS (wabil)** _(2026-07-08 — [`e0cdd527`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/e0cdd5279d652294028d4f350d2b8e12a35c394b))_
 - **v25.2.34: clearer UPS test-failure messages (klas)** _(2026-07-08 — [`76b4cfb6`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/76b4cfb6c7cf4e694a8fa5515f8ebe12bbaf4e35))_
 - **v25.2.34: clearer UPS test-failure messages — surface upsc's Error line, explain "Unknown error" (klas)** _(2026-07-08 — [`280ffdb2`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/280ffdb225811536411aa77649408274d393f64a))_
 - **v25.2.33: UPS Power — NUT integration with staged battery shutdown (klas)** _(2026-07-08 — [`495af838`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/495af8384d7a485f2fe65c132a6328c0acec3b4d))_
