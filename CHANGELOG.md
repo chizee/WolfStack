@@ -8,6 +8,8 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.2.38: HA hosting tiers — node roles + DNS/Postgres/mail/site-failover (NoroNetwork)** _(2026-07-09 — [`aff60cba`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/aff60cbac9145ff650f72fb77a3eeaed154cb6bc))_
+- **v25.2.38: HA hosting tiers — node roles + DNS/Postgres/mail/site-failover (NoroNetwork)** _(2026-07-09 — [`eb98ccb8`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/eb98ccb8f55906b2b59093e97dae0745c9ab30aa))_
 - **v25.2.37: threat-intel 6h feed refresh, Firefox chart fix, Internet Exposure v2** _(2026-07-09 — [`066775e3`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/066775e37911587a2810170387dfe43d6ef98b3b))_
 - **v25.2.37: threat-intel feed refreshes 6-hourly as documented (Rutger), Firefox chart-canvas fix (Rutger), Internet Exposure v2 — cross-node, HTTPS backends, cert picker (wabil)** _(2026-07-09 — [`42310621`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/42310621c6999cc3b39863409404fc12900eb50f))_
 - **v25.2.36: AI knowledge base refresh (UPS Power, Internet Exposure, home dashboard, mail relay, PBS config pxar)** _(2026-07-08 — [`31d13c27`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/31d13c27383b82d6ec434653bc5224581df387c3))_
