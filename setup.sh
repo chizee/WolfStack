@@ -997,6 +997,59 @@ fi
 # fails the .deb extraction path above. This block builds the client crate from
 # source via cargo so PBS backup destinations work on ARM hosts.
 #
+# WolfStack CI builds proxmox-backup-client for aarch64 (upstream ships amd64
+# only) and publishes it to the rolling `arm-tools-v1` GitHub release (see
+# .github/workflows/arm-tools.yml). Fetch that prebuilt binary so an arm64
+# install is a quick download instead of a 20-30 min on-device compile. It's
+# dynamically linked, so we install its runtime libraries and — crucially —
+# SELF-TEST it (`--version`) before accepting it: if the release is missing or
+# the binary won't run on this host (library/ABI mismatch), we return non-zero
+# and the caller falls back to the source build. So this is never worse than
+# the compile path, only faster when it works. aarch64 only (32-bit armv6/7
+# Pis fall straight through to the source build).
+PBS_ARM_RELEASE_URL="https://github.com/wolfsoftwaresystemsltd/WolfStack/releases/download/arm-tools-v1"
+pbs_install_prebuilt_arm64() {
+    [ "$HOST_ARCH" = "aarch64" ] || return 1
+    local tmp; tmp=$(mktemp -d)
+    echo "  Fetching prebuilt proxmox-backup-client (aarch64) from WolfStack releases..."
+    if ! curl -fsSL "$PBS_ARM_RELEASE_URL/proxmox-backup-client-aarch64" -o "$tmp/pbc" \
+       || ! curl -fsSL "$PBS_ARM_RELEASE_URL/pbs-client-arm64.sha256" -o "$tmp/pbc.sha256"; then
+        echo "  ℹ No prebuilt arm64 binary available (release not published yet)."
+        rm -rf "$tmp"; return 1
+    fi
+    # Integrity: the .sha256 lists 'HASH  proxmox-backup-client-aarch64'. This
+    # guards against a truncated/corrupt download, not a compromised release —
+    # both come from WolfStack's own GitHub release, the same trust domain as
+    # this installer (curl|bash from the same org).
+    local want got
+    want=$(awk '{print $1}' "$tmp/pbc.sha256" | head -1)
+    got=$(sha256sum "$tmp/pbc" | awk '{print $1}')
+    if [ -z "$want" ] || [ "$want" != "$got" ]; then
+        echo "  ⚠ prebuilt checksum mismatch — ignoring, will build from source."
+        rm -rf "$tmp"; return 1
+    fi
+    chmod 0755 "$tmp/pbc"
+    # Runtime libraries the dynamically-linked client needs (openssl 3, fuse3,
+    # acl, zstd). Best-effort per distro; the self-test below is the real gate.
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get install -y --no-install-recommends libssl3 libfuse3-3 libacl1 zstd 2>/dev/null || true
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y openssl-libs fuse3-libs libacl zstd 2>/dev/null || true
+    elif command -v pacman >/dev/null 2>&1; then
+        pacman -S --needed --noconfirm openssl fuse3 acl zstd 2>/dev/null || true
+    elif command -v zypper >/dev/null 2>&1; then
+        zypper install -y libopenssl3 libfuse3-3 libacl1 libzstd1 2>/dev/null || true
+    fi
+    # Only accept the binary if it actually runs on THIS host.
+    if "$tmp/pbc" --version >/dev/null 2>&1; then
+        install -m 0755 "$tmp/pbc" /usr/local/bin/proxmox-backup-client
+        echo "  ✓ proxmox-backup-client (prebuilt aarch64) installed to /usr/local/bin/ ($(/usr/local/bin/proxmox-backup-client --version 2>&1 | head -1))"
+        rm -rf "$tmp"; return 0
+    fi
+    echo "  ⚠ prebuilt binary didn't run here (library/ABI mismatch) — falling back to source build."
+    rm -rf "$tmp"; return 1
+}
+
 # Skip with --skip-pbs-build if you don't need PBS and don't want to wait
 # 20-30 min on a Pi. Force a rebuild attempt with --build-pbs even on amd64.
 pbs_build_from_source() {
@@ -1089,8 +1142,16 @@ if [ "$pbs_install_success" != "true" ] && [ "$SKIP_PBS_BUILD" != "true" ]; then
             echo ""
             echo "  ℹ Proxmox doesn't publish proxmox-backup-client binaries for $HOST_ARCH."
             echo "    The Debian PBS repo at download.proxmox.com only has binary-amd64/."
-            echo "    Falling back to source build so PBS backup destinations work here."
-            pbs_build_from_source && pbs_install_success=true
+            # Try WolfStack's prebuilt aarch64 binary first (a quick download);
+            # fall back to the from-source build if it's unavailable or won't
+            # run here. 32-bit arm returns 1 from the prebuilt helper and goes
+            # straight to source.
+            if pbs_install_prebuilt_arm64; then
+                pbs_install_success=true
+            else
+                echo "    Building from source so PBS backup destinations work here."
+                pbs_build_from_source && pbs_install_success=true
+            fi
             ;;
         *)
             echo "  ℹ No upstream proxmox-backup-client binary for $HOST_ARCH."
