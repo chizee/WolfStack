@@ -108,7 +108,7 @@ fn scope_label(node_id: &Option<String>) -> String {
     }
 }
 
-fn replicate_config_to_cluster(state: S) {
+pub(crate) fn replicate_config_to_cluster(state: S) {
     // The clone of the config and nodes happens INSIDE the spawned task,
     // by which time the caller has returned and any write lock from the
     // handler has been dropped. Calling this with the lock still held
@@ -6894,6 +6894,7 @@ pub async fn exposure_status(req: HttpRequest, state: S) -> HttpResponse {
             .map(|p| {
                 let src = p.exposure.clone().unwrap_or_else(|| crate::networking::router::http_proxy::ExposureSource {
                     workload_kind: "manual".into(), workload_ref: String::new(), port: 0,
+                    scheme: "http".into(),
                 });
                 serde_json::json!({
                     "subdomain": p.id.strip_prefix(crate::exposure::ID_PREFIX).unwrap_or(&p.id),
@@ -6903,6 +6904,7 @@ pub async fn exposure_status(req: HttpRequest, state: S) -> HttpResponse {
                     "workload_kind": src.workload_kind,
                     "workload_ref": src.workload_ref,
                     "port": src.port,
+                    "scheme": src.scheme,
                     "tls": p.tls.is_some(),
                     "enabled": p.enabled,
                 })
@@ -6963,6 +6965,9 @@ pub struct ExposureAddRequest {
     #[serde(default)]
     pub workload_ref: String,           // container name, or IP/host for manual
     pub port: u16,
+    /// "http" (default) or "https" for backends that only serve TLS.
+    #[serde(default)]
+    pub scheme: String,
 }
 
 /// POST /api/exposure/expose — publish a workload on `<subdomain>.<zone>`.
@@ -6979,11 +6984,17 @@ pub async fn exposure_add(req: HttpRequest, state: S, body: web::Json<ExposureAd
         Ok(s) => s,
         Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
     };
-    let upstream = match crate::exposure::resolve_upstream(&b.workload_kind, &b.workload_ref, b.port) {
+    // Cluster-wide lookup: the workload may live on any node, not just
+    // the one whose UI the operator happens to be using. The resolved
+    // upstream is always something the INGRESS node can reach.
+    let upstream = match crate::exposure::resolve_upstream_cluster(
+        &b.workload_kind, &b.workload_ref, b.port, &b.scheme,
+        &cfg.ingress_node_id, &state.cluster, &state.cluster_secret,
+    ).await {
         Ok(u) => u,
         Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
     };
-    let proxy = crate::exposure::build_proxy(&cfg, &subdomain, &b.workload_kind, &b.workload_ref, b.port, &upstream);
+    let proxy = crate::exposure::build_proxy(&cfg, &subdomain, &b.workload_kind, &b.workload_ref, b.port, &b.scheme, &upstream);
     let proxies = {
         let mut rcfg = state.router.config.write().unwrap();
         rcfg.http_proxies.retain(|p| p.id != proxy.id);

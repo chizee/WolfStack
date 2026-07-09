@@ -254,7 +254,7 @@ pub struct WolfRunState {
 /// id, or wrongly rescheduled) even though the node is online. This is the online
 /// `node-…`/`ws-…` mismatch AstroMando hit (2026-06-28); it mirrors how
 /// ClusterState::get_node already resolves either form.
-fn node_matches_id(n: &crate::agent::Node, id: &str) -> bool {
+pub(crate) fn node_matches_id(n: &crate::agent::Node, id: &str) -> bool {
     n.id == id || n.self_id.as_deref() == Some(id)
 }
 
