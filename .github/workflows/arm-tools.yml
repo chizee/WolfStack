@@ -1,0 +1,79 @@
+# Builds tool binaries WolfStack needs on arm64 that upstream ships for amd64
+# ONLY, and publishes them to the rolling `arm-tools-v1` GitHub release.
+# setup.sh downloads these on arm64 hosts (with a checksum + a runtime
+# self-test, falling back to an on-device source build if the download is
+# unavailable or won't run) so an arm64 install is a quick fetch instead of a
+# 20-30 min on-device compile (NoroNetwork/Pi users, 2026-07-09).
+#
+# proxmox-backup-client: Proxmox publishes the client for amd64 only
+#   (download.proxmox.com/debian/pbs-client has no binary-arm64), so we build
+#   it from their OFFICIAL source (git.proxmox.com/proxmox-backup) on a native
+#   aarch64 runner — the exact same crate + build the on-device fallback
+#   compiles, just done once in CI. Dynamically linked; setup.sh installs the
+#   runtime libs (openssl3/fuse3/acl/zstd) and self-tests before use.
+name: arm-tools
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # Monthly refresh so upstream fixes reach arm64 installs (offset from the
+    # unraid-tools cron so they don't contend for the same release API window).
+    - cron: "31 4 3 * *"
+
+permissions:
+  contents: write
+
+jobs:
+  pbs-client-arm64:
+    # GitHub-hosted native arm64 Linux runner — no cross-compile / QEMU needed.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          # The proxmox-backup-client crate links libssl, libacl, libfuse3
+          # (pxar fuse-mount) and libsystemd; clang is needed by some -sys crates.
+          sudo apt-get install -y --no-install-recommends \
+            git build-essential pkg-config clang \
+            libssl-dev libacl1-dev libfuse3-dev libsystemd-dev uuid-dev
+
+      - name: Ensure a Rust toolchain
+        run: |
+          set -euo pipefail
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Build proxmox-backup-client (aarch64) from Proxmox source
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://git.proxmox.com/git/proxmox-backup.git src
+          # Build only the client bin — the wider workspace pulls in server
+          # crates we don't need. Mirrors setup.sh's on-device fallback.
+          ( cd src && cargo build --release --bin proxmox-backup-client )
+          test -x src/target/release/proxmox-backup-client
+          cp src/target/release/proxmox-backup-client "$GITHUB_WORKSPACE/proxmox-backup-client-aarch64"
+
+      - name: Verify it runs + checksum
+        run: |
+          set -euo pipefail
+          file proxmox-backup-client-aarch64
+          ./proxmox-backup-client-aarch64 --version
+          sha256sum proxmox-backup-client-aarch64 > pbs-client-arm64.sha256
+          ./proxmox-backup-client-aarch64 --version 2>&1 | head -1 > pbs-client-arm64-version.txt
+
+      - name: Publish to the rolling arm-tools release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create arm-tools-v1 \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "WolfStack arm64 tools" \
+            --notes "arm64 tool binaries WolfStack builds because upstream ships amd64 only. Downloaded automatically by setup.sh on arm64 hosts (checksum-verified + runtime self-tested, with an on-device source-build fallback). Rolling release, refreshed monthly." \
+            2>/dev/null || true
+          gh release upload arm-tools-v1 \
+            --repo "$GITHUB_REPOSITORY" --clobber \
+            proxmox-backup-client-aarch64 pbs-client-arm64.sha256 pbs-client-arm64-version.txt
