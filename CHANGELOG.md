@@ -8,6 +8,8 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.2.37: threat-intel 6h feed refresh, Firefox chart fix, Internet Exposure v2** _(2026-07-09 — [`066775e3`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/066775e37911587a2810170387dfe43d6ef98b3b))_
+- **v25.2.37: threat-intel feed refreshes 6-hourly as documented (Rutger), Firefox chart-canvas fix (Rutger), Internet Exposure v2 — cross-node, HTTPS backends, cert picker (wabil)** _(2026-07-09 — [`42310621`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/42310621c6999cc3b39863409404fc12900eb50f))_
 - **v25.2.36: AI knowledge base refresh (UPS Power, Internet Exposure, home dashboard, mail relay, PBS config pxar)** _(2026-07-08 — [`31d13c27`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/31d13c27383b82d6ec434653bc5224581df387c3))_
 - **v25.2.36: AI knowledge base — UPS Power, Internet Exposure, home dashboard, mail relay, PBS config pxar** _(2026-07-08 — [`f685455a`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/f685455a030266995b80c4320fc71dab26116626))_
 - **v25.2.35: config backups honor PBS file-level pxar (wabil)** _(2026-07-08 — [`afefabbd`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/afefabbd4542382d78114f688b96daf3f00e15d8))_
