@@ -1220,6 +1220,159 @@ pub async fn set_site(req: HttpRequest, state: web::Data<AppState>, body: web::J
     HttpResponse::Ok().json(serde_json::json!({ "site": new_site }))
 }
 
+/// POST /api/settings/roles — set the tier roles on THIS node. Called by the
+/// control node when an admin edits a node's roles (push path for immediate
+/// effect; gossip re-asserts the value on the next poll anyway). Body:
+/// `{"roles": ["dns", "mail_relay"]}`. An empty list clears all roles
+/// (general-purpose node).
+pub async fn set_roles(req: HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    // Parse into the typed enum, dropping any token this build doesn't know
+    // (serde maps unknown → NodeRole::Unknown; we filter those out so an
+    // operator can never persist a role the node can't act on).
+    let roles: Vec<crate::agent::NodeRole> = body.get("roles")
+        .and_then(|v| serde_json::from_value::<Vec<crate::agent::NodeRole>>(v.clone()).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| *r != crate::agent::NodeRole::Unknown)
+        .collect::<std::collections::BTreeSet<_>>() // dedup, stable order
+        .into_iter()
+        .collect();
+    {
+        let mut nodes = state.cluster.nodes.write().unwrap();
+        if let Some(node) = nodes.get_mut(&state.cluster.self_id) {
+            node.roles = roles.clone();
+        }
+    }
+    crate::agent::ClusterState::save_self_roles(&roles);
+    HttpResponse::Ok().json(serde_json::json!({ "roles": roles }))
+}
+
+/// GET /api/cluster/roles/available — the assignable tier roles (value +
+/// label) for the node-settings role picker.
+pub async fn cluster_roles_available(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let roles: Vec<serde_json::Value> = crate::agent::NodeRole::assignable().iter().map(|r| {
+        // serde snake_case value is what the API round-trips; label is UI text.
+        let value = serde_json::to_value(r).ok()
+            .and_then(|v| v.as_str().map(String::from))
+            .unwrap_or_default();
+        serde_json::json!({ "value": value, "label": r.label() })
+    }).collect();
+    HttpResponse::Ok().json(serde_json::json!({ "roles": roles }))
+}
+
+/// GET /api/cluster/roles/summary — per-role membership across the cluster,
+/// so the UI can show "DNS tier: 3 nodes" and warn when a tier is thin.
+pub async fn cluster_roles_summary(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let summary: Vec<serde_json::Value> = crate::agent::NodeRole::assignable().iter().map(|r| {
+        let nodes: Vec<serde_json::Value> = state.cluster.nodes_with_role(*r).iter().map(|n| {
+            serde_json::json!({
+                "id": n.id,
+                "hostname": n.display_name.clone().unwrap_or_else(|| n.hostname.clone()),
+                "online": n.online,
+            })
+        }).collect();
+        let value = serde_json::to_value(r).ok()
+            .and_then(|v| v.as_str().map(String::from))
+            .unwrap_or_default();
+        serde_json::json!({ "role": value, "label": r.label(), "count": nodes.len(), "nodes": nodes })
+    }).collect();
+    HttpResponse::Ok().json(serde_json::json!({ "tiers": summary }))
+}
+
+// ─── WolfHost DNS tier — apply a zone op on THIS node's PowerDNS ───
+//
+// These run the WolfHost DNS provisioning locally on whichever node
+// receives them. The WolfHost control node fans a zone change out to
+// every node carrying the `dns` role by POSTing here (locally for a
+// self/ingress node, via the node proxy for remotes) — that's how a
+// single "create zone" lands on all ≥3 nameservers. Cluster-auth only:
+// this is an internal tier RPC, never operator-facing.
+
+/// Ensure PowerDNS is installed on this node, then apply. Idempotent —
+/// `install_powerdns` is a no-op reinstall when it's already present.
+fn dns_tier_ensure_pdns() -> Result<(), String> {
+    if crate::wolfhost::provisioning::dns::is_pdns_running() {
+        return Ok(());
+    }
+    crate::wolfhost::provisioning::dns::install_powerdns()
+}
+
+#[derive(serde::Deserialize)]
+pub struct DnsApplyZone {
+    pub domain: String,
+    pub host_ip: String,
+    pub ns1: String,
+    pub ns2: String,
+}
+
+/// POST /api/wolfhost-dns/apply-zone — create/replace a zone here.
+pub async fn dns_tier_apply_zone(req: HttpRequest, state: web::Data<AppState>, body: web::Json<DnsApplyZone>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let b = body.into_inner();
+    let result = tokio::task::spawn_blocking(move || {
+        dns_tier_ensure_pdns()?;
+        crate::wolfhost::provisioning::dns::create_zone(&b.domain, &b.host_ip, &b.ns1, &b.ns2)
+    }).await.unwrap_or_else(|e| Err(e.to_string()));
+    match result {
+        Ok(()) => HttpResponse::Ok().json(serde_json::json!({ "ok": true })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct DnsApplyDeleteZone { pub domain: String }
+
+/// POST /api/wolfhost-dns/delete-zone — remove a zone here.
+pub async fn dns_tier_delete_zone(req: HttpRequest, state: web::Data<AppState>, body: web::Json<DnsApplyDeleteZone>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let domain = body.into_inner().domain;
+    let result = tokio::task::spawn_blocking(move || {
+        crate::wolfhost::provisioning::dns::delete_zone(&domain)
+    }).await.unwrap_or_else(|e| Err(e.to_string()));
+    match result {
+        Ok(()) => HttpResponse::Ok().json(serde_json::json!({ "ok": true })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct DnsApplyRecord {
+    pub domain: String,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub rtype: String,
+    #[serde(default)]
+    pub content: String,
+    #[serde(default = "dns_default_ttl")]
+    pub ttl: u32,
+    /// true = delete this record, false/absent = set it.
+    #[serde(default)]
+    pub delete: bool,
+}
+fn dns_default_ttl() -> u32 { 3600 }
+
+/// POST /api/wolfhost-dns/record — set or delete one record here. No
+/// `ensure_pdns` here (nor in delete-zone): a record/zone op only ever
+/// follows a zone creation, which already installed PowerDNS on this node.
+pub async fn dns_tier_apply_record(req: HttpRequest, state: web::Data<AppState>, body: web::Json<DnsApplyRecord>) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let b = body.into_inner();
+    let result = tokio::task::spawn_blocking(move || {
+        if b.delete {
+            crate::wolfhost::provisioning::dns::delete_record(&b.domain, &b.name, &b.rtype)
+        } else {
+            crate::wolfhost::provisioning::dns::set_record(&b.domain, &b.name, &b.rtype, &b.content, b.ttl)
+        }
+    }).await.unwrap_or_else(|e| Err(e.to_string()));
+    match result {
+        Ok(()) => HttpResponse::Ok().json(serde_json::json!({ "ok": true })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+    }
+}
+
 /// POST /api/settings/login-disabled — set login_disabled on this node (cluster-auth required)
 pub async fn set_login_disabled(req: HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
     // Accept both cluster auth (from remote dashboard) and session auth (local admin)
@@ -4592,6 +4745,10 @@ pub struct UpdateNodeSettings {
     /// This is the operator-set "node name" from the fleet UI.
     #[serde(default)]
     pub display_name: Option<String>,
+    /// Tier roles — see `agent::Node::roles`. `Some([])` clears all roles
+    /// (general-purpose node); `None` (field absent) leaves them unchanged.
+    #[serde(default)]
+    pub roles: Option<Vec<crate::agent::NodeRole>>,
 }
 
 pub async fn update_node_settings(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>, body: web::Json<UpdateNodeSettings>) -> HttpResponse {
@@ -4692,6 +4849,63 @@ pub async fn update_node_settings(req: HttpRequest, state: web::Data<AppState>, 
                         if !delivered {
                             tracing::warn!(
                                 "site propagation push to '{}' ({}:{}) failed on all URLs — remote will keep its previous site until next direct StatusReport",
+                                hostname, address, port
+                            );
+                        }
+                    });
+                }
+            }
+        }
+        // Roles: authoritative on the OWNING node, exactly like site. Update
+        // the master's in-memory view immediately (so tier fan-outs from the
+        // control node see it at once), then either persist locally (self) or
+        // push to the remote's /api/settings/roles. Unknown tokens are dropped.
+        if let Some(ref roles_raw) = body.roles {
+            let roles: Vec<crate::agent::NodeRole> = roles_raw.iter().copied()
+                .filter(|r| *r != crate::agent::NodeRole::Unknown)
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            // Only real WolfStack nodes carry tier roles — a Proxmox-type
+            // node can't run DNS / mail / ingress subsystems, so refuse to
+            // tag one (guards the fan-out from proxying an RPC it can't serve).
+            let is_wolfstack = state.cluster.get_node(&id)
+                .map(|n| n.node_type == "wolfstack")
+                .unwrap_or(false);
+            let is_self = if is_wolfstack {
+                let mut nodes = state.cluster.nodes.write().unwrap();
+                if let Some(node) = nodes.get_mut(&id) {
+                    node.roles = roles.clone();
+                    node.is_self
+                } else { false }
+            } else { false };
+            if is_self {
+                crate::agent::ClusterState::save_self_roles(&roles);
+            } else if is_wolfstack {
+                if let Some(node) = state.cluster.get_node(&id) {
+                    let secret = state.cluster_secret.clone();
+                    let (address, port, hostname) = (node.address.clone(), node.port, node.hostname.clone());
+                    let payload = serde_json::json!({ "roles": roles });
+                    tokio::spawn(async move {
+                        let client = &*API_HTTP_CLIENT;
+                        let urls = build_node_urls(&address, port, "/api/settings/roles");
+                        let mut delivered = false;
+                        for url in &urls {
+                            if let Ok(resp) = client.post(url)
+                                .timeout(std::time::Duration::from_secs(5))
+                                .header("X-WolfStack-Secret", &secret)
+                                .header("Content-Type", "application/json")
+                                .body(payload.to_string())
+                                .send().await
+                            {
+                                let _ = resp.bytes().await;
+                                delivered = true;
+                                break;
+                            }
+                        }
+                        if !delivered {
+                            tracing::warn!(
+                                "roles propagation push to '{}' ({}:{}) failed on all URLs — remote will re-assert its previous roles until next direct StatusReport",
                                 hostname, address, port
                             );
                         }
@@ -6893,6 +7107,9 @@ pub async fn agent_status(req: HttpRequest, state: web::Data<AppState>) -> HttpR
         // Self's operator-set display name — gossiped so peers render the
         // chosen name rather than the OS hostname.
         display_name: state.cluster.get_node(&state.cluster.self_id).and_then(|n| n.display_name),
+        // Self's assigned tier roles — gossiped so peers know which nodes
+        // carry the DNS / mail / ingress / host roles.
+        roles: state.cluster.get_node(&state.cluster.self_id).map(|n| n.roles).unwrap_or_default(),
         license_key: if crate::compat::platform_ready() {
             std::fs::read_to_string(crate::compat::dm_path()).ok().map(|s| s.trim().to_string())
         } else { None },
@@ -10981,6 +11198,7 @@ fn resolve_target_node(
         workload_subnets: Vec::new(),
         site: None,
         display_name: None,
+        roles: Vec::new(),
     })
 }
 
@@ -17855,6 +18073,337 @@ pub async fn galera_local_tuning(req: HttpRequest, state: web::Data<AppState>, p
         Ok(Err(e)) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e.to_string() })),
     }
+}
+
+// ═══ PostgreSQL HA (streaming replication) — Noro stage 2 ═══
+// Mirrors the Galera API. Postgres HA clusters are placed onto Database-role
+// nodes (the roles keystone), one primary + N streaming standbys.
+
+/// GET /api/postgres-ha/clusters — list managed PG HA clusters (this node's
+/// config, scoped by ?cluster=). Passwords are never returned.
+pub async fn pgha_list(req: HttpRequest, state: web::Data<AppState>, query: web::Query<std::collections::HashMap<String, String>>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let scope = query.get("cluster").cloned().unwrap_or_default();
+    let self_id = crate::agent::self_node_id();
+    let mut clusters: Vec<_> = crate::postgres_ha::load_config().clusters.into_iter()
+        .filter(|c| scope.is_empty() || c.cluster == scope || c.cluster.is_empty())
+        .collect();
+    for c in clusters.iter_mut() {
+        c.db_password_enc = String::new();
+        c.repl_password_enc = String::new();
+        c.owner_node = self_id.clone();
+    }
+    HttpResponse::Ok().json(clusters)
+}
+
+/// GET /api/postgres-ha/clusters/{id}/status — live replication status.
+pub async fn pgha_status(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let id = path.into_inner();
+    let Some(cluster) = crate::postgres_ha::get_cluster(&id) else {
+        return HttpResponse::NotFound().json(serde_json::json!({ "error": "cluster not found" }));
+    };
+    match web::block(move || crate::postgres_ha::cluster_status(&cluster)).await {
+        Ok(st) => HttpResponse::Ok().json(st),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e.to_string() })),
+    }
+}
+
+/// GET /api/postgres-ha/placement?want=N — recommended Database-role hosts for
+/// a new N-node cluster. Surfaces the tier so the operator confirms rather than
+/// hand-picks. Warns (in `enough`) when fewer than `want` DB nodes exist.
+pub async fn pgha_placement(req: HttpRequest, state: web::Data<AppState>, query: web::Query<std::collections::HashMap<String, String>>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let want: usize = query.get("want").and_then(|v| v.parse().ok()).unwrap_or(3);
+    let ids = crate::postgres_ha::recommend_placement(&state.cluster, want);
+    let nodes: Vec<serde_json::Value> = ids.iter().filter_map(|id| {
+        state.cluster.get_node(id).map(|n| serde_json::json!({
+            "id": n.id,
+            "hostname": n.display_name.clone().unwrap_or(n.hostname),
+            "address": n.address,
+        }))
+    }).collect();
+    HttpResponse::Ok().json(serde_json::json!({
+        "want": want,
+        "available": nodes.len(),
+        "enough": nodes.len() >= want,
+        "nodes": nodes,
+    }))
+}
+
+/// POST /api/postgres-ha/provision — create the containers, install Postgres,
+/// configure streaming replication, persist. SSE progress (reuses the Galera
+/// streaming-job relay). Members must live on THIS node for v1 (single-host or
+/// operator points each at its owner); cross-host fan-out is a follow-up.
+pub async fn pgha_provision_stream(req: HttpRequest, state: web::Data<AppState>, body: web::Json<crate::postgres_ha::ProvisionRequest>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let p = body.into_inner();
+    let self_id = crate::agent::self_node_id();
+    galera_stream_job(move |tx| {
+        let _ = tx.send(format!("Provisioning Postgres HA cluster '{}' ({} node(s))…", p.name, p.members.len()));
+        match crate::postgres_ha::provision_cluster_local(&p, &tx) {
+            Ok(mut c) => {
+                c.owner_node = self_id;
+                match crate::postgres_ha::upsert_cluster(c) {
+                    Ok(c) => { let _ = tx.send(format!("RESULT:OK:Cluster '{}' provisioned with {} node(s).", c.name, c.nodes.len())); }
+                    Err(e) => { let _ = tx.send(format!("RESULT:ERR:persist failed: {}", e)); }
+                }
+            }
+            Err(e) => { let _ = tx.send(format!("RESULT:ERR:{}", e)); }
+        }
+    })
+}
+
+/// POST /api/postgres-ha/clusters/{id}/promote/{container} — promote a standby.
+pub async fn pgha_promote(req: HttpRequest, state: web::Data<AppState>, path: web::Path<(String, String)>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let (id, container) = path.into_inner();
+    let Some(cluster) = crate::postgres_ha::get_cluster(&id) else {
+        return HttpResponse::NotFound().json(serde_json::json!({ "error": "cluster not found" }));
+    };
+    match web::block(move || crate::postgres_ha::promote_standby(&cluster, &container)).await {
+        Ok(Ok(msg)) => HttpResponse::Ok().json(serde_json::json!({ "ok": true, "message": msg })),
+        Ok(Err(e)) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e.to_string() })),
+    }
+}
+
+/// POST /api/postgres-ha/clusters/{id}/node/{container}/{action} — start/stop/restart.
+pub async fn pgha_node_action(req: HttpRequest, state: web::Data<AppState>, path: web::Path<(String, String, String)>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let (id, container, action) = path.into_inner();
+    let Some(cluster) = crate::postgres_ha::get_cluster(&id) else {
+        return HttpResponse::NotFound().json(serde_json::json!({ "error": "cluster not found" }));
+    };
+    match web::block(move || crate::postgres_ha::node_service(&cluster, &container, &action)).await {
+        Ok(Ok(msg)) => HttpResponse::Ok().json(serde_json::json!({ "ok": true, "message": msg })),
+        Ok(Err(e)) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e.to_string() })),
+    }
+}
+
+/// DELETE /api/postgres-ha/clusters/{id} — forget a cluster definition (does
+/// NOT destroy the containers; mirrors Galera delete semantics).
+pub async fn pgha_delete(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let id = path.into_inner();
+    match crate::postgres_ha::delete_cluster(&id) {
+        Ok(()) => HttpResponse::Ok().json(serde_json::json!({ "ok": true })),
+        Err(e) => HttpResponse::NotFound().json(serde_json::json!({ "error": e })),
+    }
+}
+
+// ═══ HA mail tier — Noro stage 3 ═══
+// Topology + MX publishing from the Mail / MailRelay roles. MX/A records are
+// published through the DNS tier's own fan-out (stage 1), so one mechanism
+// writes them to every nameserver.
+
+/// GET /api/mail-tier/status — the mail tier as derived from node roles.
+pub async fn mail_tier_status(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    HttpResponse::Ok().json(crate::mail_tier::status(&state.cluster))
+}
+
+/// GET /api/mail-tier/domain/{domain}/records — the MX + A records that would
+/// publish this tier for `domain` (preview; publish applies them).
+pub async fn mail_tier_records(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let domain = path.into_inner();
+    let tier = crate::mail_tier::MailTier::from_cluster(&state.cluster);
+    HttpResponse::Ok().json(serde_json::json!({
+        "domain": domain,
+        "records": crate::mail_tier::mx_records_for(&domain, &tier),
+    }))
+}
+
+/// Publish one DNS record to every `dns`-role node, reusing the stage-1 apply
+/// endpoint (self via the local function, remotes via the node proxy). Returns
+/// (applied, errors). Shared by the mail tier's MX publishing.
+async fn publish_record_to_dns_tier(
+    state: &web::Data<AppState>, domain: &str, name: &str, rtype: &str, content: &str, ttl: u32,
+) -> (usize, Vec<String>) {
+    let dns_nodes: Vec<crate::agent::Node> = state.cluster.nodes_with_role(crate::agent::NodeRole::Dns);
+    let body = serde_json::json!({
+        "domain": domain, "name": name, "type": rtype, "content": content, "ttl": ttl, "delete": false,
+    });
+    // No DNS tier → nothing to publish to; report as an error so the caller
+    // surfaces "assign the DNS role first" rather than silently succeeding.
+    if dns_nodes.is_empty() {
+        return (0, vec!["no dns-role nodes — assign the DNS role to at least one node first".into()]);
+    }
+    let self_id = crate::agent::self_node_id();
+    let mut ok = 0usize;
+    let mut errs = Vec::new();
+    let client = &*API_HTTP_CLIENT;
+    for n in &dns_nodes {
+        if n.id == self_id || n.is_self {
+            // Apply locally, off-thread (pdns provisioning is blocking).
+            let (d, nm, rt, ct) = (domain.to_string(), name.to_string(), rtype.to_string(), content.to_string());
+            let r = web::block(move || {
+                crate::wolfhost::provisioning::dns::set_record(&d, &nm, &rt, &ct, ttl)
+            }).await;
+            match r { Ok(Ok(())) => ok += 1, Ok(Err(e)) => errs.push(format!("{}: {}", n.id, e)), Err(e) => errs.push(format!("{}: {}", n.id, e)) }
+        } else {
+            let urls = build_node_urls(&n.address, n.port, "/api/wolfhost-dns/record");
+            let mut done = false;
+            for url in &urls {
+                if let Ok(resp) = client.post(url)
+                    .timeout(std::time::Duration::from_secs(10))
+                    .header("X-WolfStack-Secret", &state.cluster_secret)
+                    .header("Content-Type", "application/json")
+                    .body(body.to_string())
+                    .send().await
+                {
+                    if resp.status().is_success() { let _ = resp.bytes().await; done = true; break; }
+                }
+            }
+            if done { ok += 1; } else { errs.push(format!("{}: unreachable", n.id)); }
+        }
+    }
+    (ok, errs)
+}
+
+/// POST /api/mail-tier/domain/{domain}/publish — generate the MX/A records for
+/// this tier and write them to every DNS-role nameserver via the DNS fan-out.
+pub async fn mail_tier_publish(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let domain = path.into_inner();
+    let tier = crate::mail_tier::MailTier::from_cluster(&state.cluster);
+    if !tier.has_store() {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "no Mail-role nodes — assign the Mail role to at least one node first",
+        }));
+    }
+    let records = crate::mail_tier::mx_records_for(&domain, &tier);
+    let mut published = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+    for r in &records {
+        let (ok, errs) = publish_record_to_dns_tier(&state, &domain, &r.name, &r.rtype, &r.content, r.ttl).await;
+        if ok > 0 { published += 1; }
+        errors.extend(errs);
+    }
+    let body = serde_json::json!({
+        "domain": domain,
+        "records_published": published,
+        "records_total": records.len(),
+        "errors": errors,
+        "note": "MX/A records published to the DNS tier. Postfix relay and dovecot replication config are available from /api/mail-tier/config-preview for the operator to apply to the tier's nodes; live cluster failover needs hardware verification.",
+    });
+    // Total failure (nothing published) is an error, not a 200 — mirrors the
+    // DNS fan-out's own semantics.
+    if published == 0 {
+        return HttpResponse::InternalServerError().json(body);
+    }
+    HttpResponse::Ok().json(body)
+}
+
+// ═══ Website failover across Host-role nodes — Noro stage 4 ═══
+
+/// GET /api/site-failover/status — hosted sites + their failover plan.
+pub async fn site_failover_status(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    HttpResponse::Ok().json(crate::site_failover::status(&state.cluster))
+}
+
+#[derive(serde::Deserialize)]
+pub struct HostedSiteReq {
+    pub domain: String,
+    pub docroot: String,
+    #[serde(default)] pub active_host: String,
+    #[serde(default)] pub cluster: String,
+    #[serde(default)] pub port: Option<u16>,
+}
+
+/// POST /api/site-failover/sites — register/update a hosted site. When
+/// `active_host` is empty, the first online Host node is chosen.
+pub async fn site_failover_upsert(req: HttpRequest, state: web::Data<AppState>, body: web::Json<HostedSiteReq>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let b = body.into_inner();
+    if b.domain.trim().is_empty() || b.docroot.trim().is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({ "error": "domain and docroot are required" }));
+    }
+    let active = if b.active_host.trim().is_empty() {
+        crate::site_failover::online_host_ids(&state.cluster).into_iter().next().unwrap_or_default()
+    } else { b.active_host.trim().to_string() };
+    let site = crate::site_failover::HostedSite {
+        domain: b.domain.trim().to_string(),
+        docroot: b.docroot.trim().to_string(),
+        active_host: active,
+        cluster: b.cluster,
+        port: b.port.unwrap_or(80),
+    };
+    match crate::site_failover::upsert_site(site) {
+        Ok(s) => HttpResponse::Ok().json(serde_json::json!({ "ok": true, "site": s })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// DELETE /api/site-failover/sites/{domain} — stop tracking a site.
+pub async fn site_failover_delete(req: HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    match crate::site_failover::delete_site(&path.into_inner()) {
+        Ok(()) => HttpResponse::Ok().json(serde_json::json!({ "ok": true })),
+        Err(e) => HttpResponse::NotFound().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// POST /api/site-failover/sites/{domain}/reassign/{host} — move a site to a
+/// Host node and re-point the ingress to it. The re-point reuses the same
+/// router-config replication the Internet Exposure reconciler uses.
+pub async fn site_failover_reassign(req: HttpRequest, state: web::Data<AppState>, path: web::Path<(String, String)>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let (domain, host) = path.into_inner();
+    // Refuse a reassignment to a host that isn't an online Host node.
+    let online = crate::site_failover::online_host_ids(&state.cluster);
+    if !online.iter().any(|id| id == &host) {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": format!("'{}' is not an online Host-role node", host),
+        }));
+    }
+    match crate::site_failover::reassign_site(&domain, &host) {
+        Ok(s) => {
+            // The router owns the actual ingress re-point; record the new
+            // upstream host so the exposure/router reconcile picks it up.
+            let target_addr = state.cluster.get_node(&host).map(|n| n.address).unwrap_or_default();
+            HttpResponse::Ok().json(serde_json::json!({
+                "ok": true,
+                "site": s,
+                "upstream_host": target_addr,
+                "note": "Active host updated; the ingress re-points to it on the next router reconcile. Verify the shared docroot mount is present on the target host.",
+            }))
+        }
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({ "error": e })),
+    }
+}
+
+/// GET /api/mail-tier/config-preview?domains=a.com,b.com — the exact Postfix
+/// relay config (for MailRelay nodes) and dovecot replication config (for Mail
+/// store nodes) this tier would apply. Surfacing it lets the operator review
+/// and apply it, and documents the tier's runtime shape.
+pub async fn mail_tier_config_preview(req: HttpRequest, state: web::Data<AppState>, query: web::Query<std::collections::HashMap<String, String>>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let tier = crate::mail_tier::MailTier::from_cluster(&state.cluster);
+    let domains: Vec<String> = query.get("domains")
+        .map(|s| s.split(',').map(|d| d.trim().to_string()).filter(|d| !d.is_empty()).collect())
+        .unwrap_or_default();
+    let store_addrs: Vec<String> = tier.store_nodes.iter().map(|n| n.address.clone()).collect();
+    let (relay_domains, transport_maps) = crate::mail_tier::relay_config(&domains, &store_addrs);
+    // Each store node replicates from its partners (the other store nodes).
+    let replication: Vec<serde_json::Value> = tier.store_nodes.iter().map(|n| {
+        let partners: Vec<String> = tier.store_nodes.iter()
+            .filter(|p| p.node_id != n.node_id)
+            .map(|p| p.address.clone())
+            .collect();
+        serde_json::json!({
+            "node": n.hostname,
+            "address": n.address,
+            "dovecot_replication_conf": crate::mail_tier::dovecot_replication_config(&partners),
+        })
+    }).collect();
+    HttpResponse::Ok().json(serde_json::json!({
+        "relay": { "relay_domains": relay_domains, "transport_maps": transport_maps },
+        "replication": replication,
+    }))
 }
 
 /// DELETE /api/backups/{id} — delete a backup entry + file
@@ -38926,6 +39475,14 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/settings/login-disabled", web::get().to(login_disabled_status))
         .route("/api/settings/login-disabled", web::post().to(set_login_disabled))
         .route("/api/settings/site", web::post().to(set_site))
+        .route("/api/settings/roles", web::post().to(set_roles))
+        .route("/api/cluster/roles/available", web::get().to(cluster_roles_available))
+        .route("/api/cluster/roles/summary", web::get().to(cluster_roles_summary))
+        // WolfHost DNS tier — internal cluster-authed apply endpoints, fanned
+        // to by the WolfHost control node for every `dns`-role nameserver.
+        .route("/api/wolfhost-dns/apply-zone", web::post().to(dns_tier_apply_zone))
+        .route("/api/wolfhost-dns/delete-zone", web::post().to(dns_tier_delete_zone))
+        .route("/api/wolfhost-dns/record", web::post().to(dns_tier_apply_record))
         .route("/api/auth/smtp-configured", web::get().to(smtp_configured))
         .route("/api/auth/forgot-password", web::post().to(forgot_password))
         .route("/api/auth/reset-password", web::post().to(reset_password))
@@ -39450,6 +40007,24 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/api/galera/provision", web::post().to(galera_provision_stream))
         .route("/api/galera/clusters/{id}/recover", web::post().to(galera_recover_stream))
         .route("/api/galera/clusters/{id}/add-nodes", web::post().to(galera_add_nodes_stream))
+        // PostgreSQL HA (streaming replication) — Noro stage 2
+        .route("/api/postgres-ha/clusters", web::get().to(pgha_list))
+        .route("/api/postgres-ha/clusters/{id}", web::delete().to(pgha_delete))
+        .route("/api/postgres-ha/clusters/{id}/status", web::get().to(pgha_status))
+        .route("/api/postgres-ha/clusters/{id}/promote/{container}", web::post().to(pgha_promote))
+        .route("/api/postgres-ha/clusters/{id}/node/{container}/{action}", web::post().to(pgha_node_action))
+        .route("/api/postgres-ha/placement", web::get().to(pgha_placement))
+        .route("/api/postgres-ha/provision", web::post().to(pgha_provision_stream))
+        // HA mail tier — Noro stage 3
+        .route("/api/mail-tier/status", web::get().to(mail_tier_status))
+        .route("/api/mail-tier/domain/{domain}/records", web::get().to(mail_tier_records))
+        .route("/api/mail-tier/domain/{domain}/publish", web::post().to(mail_tier_publish))
+        .route("/api/mail-tier/config-preview", web::get().to(mail_tier_config_preview))
+        // Website failover across Host-role nodes — Noro stage 4
+        .route("/api/site-failover/status", web::get().to(site_failover_status))
+        .route("/api/site-failover/sites", web::post().to(site_failover_upsert))
+        .route("/api/site-failover/sites/{domain}", web::delete().to(site_failover_delete))
+        .route("/api/site-failover/sites/{domain}/reassign/{host}", web::post().to(site_failover_reassign))
         .route("/api/galera/clusters/{id}/maxscale", web::post().to(galera_maxscale_stream))
         .route("/api/galera/clusters/{id}/proxies/{container}", web::delete().to(galera_remove_proxy))
         .route("/api/galera/clusters/{id}/nodes/{container}/{action}", web::post().to(galera_node_action))
