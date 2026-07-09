@@ -3034,8 +3034,15 @@
                         </div>
                         <div class="form-group">
                             <label>Ingress node</label>
-                            <select id="exp-ingress" class="form-control"></select>
+                            <select id="exp-ingress" class="form-control" onchange="exposureLoadIngressCerts()"></select>
                             <small style="color:var(--text-muted);">The node the wildcard points at; it fronts the traffic and routes to wherever each workload lives.</small>
+                        </div>
+                        <div class="form-group">
+                            <label>Certificate on the ingress node</label>
+                            <select id="exp-cert-pick" class="form-control" onchange="exposureApplyPickedCert()">
+                                <option value="">(enter paths manually below)</option>
+                            </select>
+                            <small style="color:var(--text-muted);">Certificates found on the ingress node — picking one fills the paths for you.</small>
                         </div>
                         <div class="form-group">
                             <label>Wildcard TLS cert path <span style="color:var(--text-muted);font-weight:400;">(optional)</span></label>
@@ -3055,7 +3062,7 @@
             <div class="card" style="margin-bottom:16px;">
                 <div class="card-header"><h3 style="font-size:15px;">2. Expose a workload</h3></div>
                 <div class="card-body">
-                    <div style="display:grid;grid-template-columns:repeat(4,1fr) auto;gap:10px;align-items:end;">
+                    <div style="display:grid;grid-template-columns:repeat(5,1fr) auto;gap:10px;align-items:end;">
                         <div class="form-group" style="margin:0;">
                             <label>Type</label>
                             <select id="exp-add-kind" class="form-control" onchange="exposureOnKindChange()">
@@ -3072,6 +3079,13 @@
                         <div class="form-group" style="margin:0;">
                             <label>Port</label>
                             <input type="number" id="exp-add-port" class="form-control" placeholder="8080" min="1" max="65535">
+                        </div>
+                        <div class="form-group" style="margin:0;">
+                            <label>Backend speaks</label>
+                            <select id="exp-add-scheme" class="form-control">
+                                <option value="http">HTTP</option>
+                                <option value="https">HTTPS</option>
+                            </select>
                         </div>
                         <div class="form-group" style="margin:0;">
                             <label>Subdomain</label>

@@ -2388,23 +2388,26 @@ async fn main() -> std::io::Result<()> {
         tokio::spawn(cluster_browser::run_reconcile_loop());
 
         // Background: Internet Exposure — refresh each exposed workload's
-        // upstream IP so its public URL keeps working after the workload
-        // restarts or gets a new address. Uses the cached container list
-        // (no shell-out) so the config lock is held only briefly; only
-        // re-renders nginx when an upstream actually changed.
+        // upstream so its public URL keeps working after the workload
+        // restarts or MOVES NODE. Uses the cached container list (no
+        // shell-out) so the config lock is held only briefly; only
+        // re-renders when an upstream actually changed — and then also
+        // replicates the router config, because the hosting node is
+        // usually NOT the ingress node that renders the route.
         {
-            let router = app_state.router.clone();
+            let exp_state = app_state.clone();
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
                 loop {
                     tick.tick().await;
-                    let router = router.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
+                    let router = exp_state.router.clone();
+                    let cluster = exp_state.cluster.clone();
+                    let changed = tokio::task::spawn_blocking(move || {
                         let self_id = crate::agent::self_node_id();
                         let changed = {
                             let mut cfg = router.config.write().unwrap();
                             let mut proxies = cfg.http_proxies.clone();
-                            if crate::exposure::reconcile_upstreams(&mut proxies) {
+                            if crate::exposure::reconcile_upstreams(&mut proxies, &cluster) {
                                 cfg.http_proxies = proxies.clone();
                                 let _ = cfg.save();
                                 Some(proxies)
@@ -2412,11 +2415,16 @@ async fn main() -> std::io::Result<()> {
                                 None
                             }
                         };
-                        if let Some(proxies) = changed {
-                            crate::networking::router::http_proxy::apply_for_node(&proxies, &self_id);
+                        if let Some(proxies) = &changed {
+                            crate::networking::router::http_proxy::apply_for_node(proxies, &self_id);
                         }
+                        changed.is_some()
                     })
-                    .await;
+                    .await
+                    .unwrap_or(false);
+                    if changed {
+                        crate::networking::router::api::replicate_config_to_cluster(exp_state.clone());
+                    }
                 }
             });
         }

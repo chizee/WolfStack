@@ -136,7 +136,14 @@ pub struct ExposureSource {
     pub workload_ref: String,
     /// The workload port the upstream targets.
     pub port: u16,
+    /// Scheme the BACKEND speaks — "http" (default) or "https" for
+    /// workloads that only serve TLS. Default keeps pre-scheme configs
+    /// working unchanged.
+    #[serde(default = "default_exposure_scheme")]
+    pub scheme: String,
 }
+
+fn default_exposure_scheme() -> String { "http".to_string() }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Upstream {
