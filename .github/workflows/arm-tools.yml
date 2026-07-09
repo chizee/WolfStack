@@ -106,10 +106,14 @@ jobs:
       - name: Verify it runs + checksum
         run: |
           set -euo pipefail
-          file proxmox-backup-client-aarch64
-          ./proxmox-backup-client-aarch64 --version
+          # Hard gate: it must be an aarch64 ELF (confirms we built for the
+          # right target, not the host).
+          file proxmox-backup-client-aarch64 | tee /dev/stderr | grep -q "ARM aarch64"
+          # proxmox-backup-client uses a `version` SUBCOMMAND, not --version.
+          # A clean run of it proves the binary actually executes on arm64.
+          ./proxmox-backup-client-aarch64 version
           sha256sum proxmox-backup-client-aarch64 > pbs-client-arm64.sha256
-          ./proxmox-backup-client-aarch64 --version 2>&1 | head -1 > pbs-client-arm64-version.txt
+          ./proxmox-backup-client-aarch64 version 2>&1 | head -1 > pbs-client-arm64-version.txt
 
       - name: Publish to the rolling arm-tools release
         env:
