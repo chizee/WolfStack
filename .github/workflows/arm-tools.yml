@@ -79,6 +79,13 @@ jobs:
         run: |
           set -euo pipefail
           cd proxmox-backup
+          # Two things are needed together: (1) drop the source-replacement
+          # config that pins crates-io at Proxmox's Debian vendor dir
+          # (/usr/share/cargo/registry) — which doesn't exist here — so
+          # THIRD-PARTY crates (anyhow, tokio, …) come from real crates.io; and
+          # (2) uncomment the [patch.crates-io] entries below so PROXMOX's own
+          # crates (pathpatterns/pxar/proxmox-*) come from the sibling checkouts.
+          rm -f .cargo/config.toml .cargo/config
           echo "── [patch.crates-io] block BEFORE uncommenting ──"
           sed -n '/patch\.crates-io/,/^$/p' Cargo.toml || true
           # Uncomment the ENTRIES under [patch.crates-io] (the header line itself
