@@ -129,9 +129,17 @@ const MIGRATION_SENTINEL_PATH: &str = "/var/lib/wolfstack/threat-intel/migrated_
 const CLUSTER_STATE_PATH: &str = "/etc/wolfstack/predictive-threat-intel.json";
 const ALLOWLIST_PATH: &str = "/var/lib/wolfstack/threat-intel/allowlist.txt";
 const IPSET_NAME: &str = "wolfstack_blocklist";
-/// Refresh at most once per 24h. Feed itself updates several times
-/// per day; daily is enough to keep up without hammering the host.
-const REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 3600);
+/// Refresh at most once per 6h (checked every predictive tick, i.e.
+/// 5 minutes). The feed itself updates several times per day; 6h
+/// keeps the blocklist current without hammering the source — and it
+/// matches what the UI has always told operators ("refreshes every
+/// 6 hours") plus the Security-page threat-intel default. The old
+/// 24h value made the fleet widget's amber >6h feed-age indicator
+/// the STEADY state (18h of every day), and because an update wave
+/// restarts every node together, feed mtimes synchronised and whole
+/// fleets crossed the 24h "stale" label in the same window a day
+/// later (RutgerDiehard 2026-07-09).
+const REFRESH_INTERVAL: Duration = Duration::from_secs(6 * 3600);
 /// Promote-to-Enforce gate: a preflight must have completed within
 /// this window to be considered "fresh enough" to confirm against.
 pub const PREFLIGHT_FRESHNESS_SECS: u64 = 5 * 60;
