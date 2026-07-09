@@ -220,6 +220,14 @@ Per-server page (server tree → UPS Power). Reads any existing NUT setup via `u
 - If a driver reports no battery.charge, %-keyed stages cannot fire (logged once per outage)
 - Known hardware quirk: UniFi UPS Tower's built-in NUT server can require a login for reads (plain upsc can't authenticate) and sends nonstandard replies — disable its login requirement and use the exact UPS name from the UniFi console
 
+## Node roles + HA hosting tiers (NoroNetwork, v25.2.38-dev)
+Node-ROLES keystone for HA shared hosting. Each node carries `roles: Vec<NodeRole>` (Dns/Mail/MailRelay/Ingress/Host/Database; empty = general-purpose, the default — existing clusters unchanged). Assign in node-settings modal (checkboxes, hidden for Proxmox nodes). Gossiped owner-authoritative like `site`; persisted self_roles.json. `POST /api/settings/roles`, `GET /api/cluster/roles/{available,summary}`, `ClusterState::nodes_with_role(role)`.
+- **DNS tier**: WolfHost zone/record writes fan out to EVERY `dns`-role node (all ≥3 NS get the zone; PowerDNS per node). Falls back to local when no dns nodes (single-node WolfHost unchanged). Cluster-authed apply endpoints `/api/wolfhost-dns/{apply-zone,delete-zone,record}`.
+- **Postgres HA** (`postgres_ha` module, Galera analogue): one primary + N streaming standbys on `Database`-role nodes. Provision (lxc + install + configure_primary/standby via pg_basebackup), status (pg_stat_replication / pg_is_in_recovery), promote_standby (pg_promote, operator-driven — NOT auto). API `/api/postgres-ha/*`. Identifiers strictly validated + SQL via quoted heredoc (injection-safe).
+- **Mail tier** (`mail_tier`): derives Mail (store) + MailRelay (backup MX) from roles; generates MX/A records (primary MX pri 10, relay pri 20) published via the DNS-tier fan-out; postfix relay + dovecot replication config previews. API `/api/mail-tier/*`.
+- **Site failover** (`site_failover`): tracks HostedSite (docroot on shared storage / active Host node); plan_failover deterministically reassigns an offline host's sites to the first online `Host` node; `/api/site-failover/*`.
+- STATUS: management planes built + reviewed, NOT live-tested vs real hardware; UI beyond the role picker + docroot/failover automation are follow-ups pending NoroNetwork's schema. See [[project_noro_wolfhost_ha_request]].
+
 ## App Store
 - **~530 one-click applications**
 - **Four install targets**: Docker, LXC, bare-metal, VM — a manifest can offer any subset (`docker` / `lxc` / `bare_metal` / `vm` fields)

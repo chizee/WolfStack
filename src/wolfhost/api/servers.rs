@@ -45,7 +45,7 @@ pub fn wolfstack_urls(path: &str) -> Vec<String> {
     ]
 }
 
-async fn wolfstack_api(path: &str) -> Result<serde_json::Value, String> {
+pub async fn wolfstack_api(path: &str) -> Result<serde_json::Value, String> {
     let client = wolfstack_client();
     let secrets = get_cluster_secrets();
     for url in wolfstack_urls(path) {

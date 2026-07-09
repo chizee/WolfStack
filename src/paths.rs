@@ -61,6 +61,8 @@ pub struct FileLocations {
     pub self_site_config: String,
     #[serde(default = "default_self_display_name_config")]
     pub self_display_name_config: String,
+    #[serde(default = "default_self_roles_config")]
+    pub self_roles_config: String,
     #[serde(default = "default_pending_identity_config")]
     pub pending_identity_config: String,
     #[serde(default = "default_node_id_file")]
@@ -216,6 +218,7 @@ fn default_deleted_nodes_config() -> String { "/etc/wolfstack/deleted_nodes.json
 fn default_self_cluster_config() -> String { "/etc/wolfstack/self_cluster.json".into() }
 fn default_self_site_config() -> String { "/etc/wolfstack/self_site.json".into() }
 fn default_self_display_name_config() -> String { "/etc/wolfstack/self_display_name.json".into() }
+fn default_self_roles_config() -> String { "/etc/wolfstack/self_roles.json".into() }
 fn default_pending_identity_config() -> String { "/etc/wolfstack/pending_identity.json".into() }
 fn default_node_id_file() -> String { "/etc/wolfstack/node_id".into() }
 fn default_xo_pools_config() -> String { "/etc/wolfstack/xo_pools.json".into() }

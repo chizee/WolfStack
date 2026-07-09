@@ -201,6 +201,66 @@ pub fn is_usable_addr(addr: &str) -> bool {
 static POLL_FAIL_COUNTS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, u32>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
+/// A tier role an operator can assign to a node so it serves ONE part of an
+/// HA hosting stack (NoroNetwork 2026-07-09). A node's roles are the keystone
+/// the DNS / mail / ingress / host tiers dispatch on: config for a subsystem
+/// is pushed only to the nodes that carry its role.
+///
+/// An EMPTY roles list is the default and means "general-purpose node" — it
+/// participates in everything exactly as before roles existed (Golden Rule:
+/// older nodes.json and older peers deserialize `roles` as empty, so nothing
+/// changes for an existing cluster until an operator assigns a role). Roles
+/// are additive: one node may be both `Dns` and `MailRelay`, e.g. a cheap VPS
+/// acting as a nameserver AND a backup MX.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeRole {
+    /// Authoritative DNS server (one of the ≥3 NS tier). WolfHost zone
+    /// writes fan out to every node carrying this role.
+    Dns,
+    /// Dedicated mail store (the ≥2-node mail tier).
+    Mail,
+    /// SMTP relay / backup MX — pairs well with `Dns` on a cheap VPS with a
+    /// good PTR record.
+    MailRelay,
+    /// Public ingress / reverse proxy. Client traffic enters here and is
+    /// proxied to `Host` nodes.
+    Ingress,
+    /// Web host — runs client websites. Site data lives on shared storage so
+    /// another `Host` can take over when one fails.
+    Host,
+    /// Database tier node (Galera / Postgres HA member).
+    Database,
+    /// Catch-all for a role a newer peer added that this build doesn't know.
+    /// Never assigned locally, never offered in the UI — keeps a mixed-version
+    /// gossip payload decodable instead of rejecting the whole node.
+    #[serde(other)]
+    Unknown,
+}
+
+impl NodeRole {
+    /// Operator-facing label.
+    pub fn label(&self) -> &'static str {
+        match self {
+            NodeRole::Dns => "DNS",
+            NodeRole::Mail => "Mail",
+            NodeRole::MailRelay => "Mail relay",
+            NodeRole::Ingress => "Ingress",
+            NodeRole::Host => "Web host",
+            NodeRole::Database => "Database",
+            NodeRole::Unknown => "Unknown",
+        }
+    }
+
+    /// The roles an operator can pick in the UI (excludes `Unknown`).
+    pub fn assignable() -> &'static [NodeRole] {
+        &[
+            NodeRole::Dns, NodeRole::Mail, NodeRole::MailRelay,
+            NodeRole::Ingress, NodeRole::Host, NodeRole::Database,
+        ]
+    }
+}
+
 /// A node in the WolfStack cluster
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
@@ -300,6 +360,14 @@ pub struct Node {
     /// stays compatible); `None` means "no override, show the hostname".
     #[serde(default)]
     pub display_name: Option<String>,
+    /// Tier roles assigned to this node (DNS / mail / ingress / host / …).
+    /// Persisted on the OWNING node (`self_roles.json`), carried in its
+    /// StatusReport, authoritative on merge — exactly like `site` and
+    /// `display_name`. Empty = general-purpose node (the default).
+    ///
+    /// Backward-compat: missing for older configs and older peers → empty Vec.
+    #[serde(default)]
+    pub roles: Vec<NodeRole>,
 }
 
 fn default_node_type() -> String { "wolfstack".to_string() }
@@ -346,6 +414,8 @@ pub fn migrate_local_cluster_tags(old_name: &str, new_name: &str) -> usize {
     n += crate::truenas::TrueNasStore::load().rename_cluster(old_name, new_name);
     n += crate::unraid::UnraidStore::load().rename_cluster(old_name, new_name);
     n += crate::galera::rename_wolfstack_cluster_tags(old_name, new_name);
+    n += crate::postgres_ha::rename_wolfstack_cluster_tags(old_name, new_name);
+    n += crate::site_failover::rename_wolfstack_cluster_tags(old_name, new_name);
     n += crate::wolfscale::rename_wolfstack_cluster_tags(old_name, new_name);
     n += crate::networking::rename_wireguard_bridge_cluster(old_name, new_name);
     if n > 0 {
@@ -587,6 +657,12 @@ impl ClusterState {
         let prev_display_name = nodes.get(&self.self_id)
             .and_then(|n| n.display_name.clone())
             .or_else(Self::load_self_display_name);
+        // Roles re-assert from in-memory then disk, same as site/display_name,
+        // so this node keeps advertising its assigned tier roles on every poll.
+        let prev_roles = nodes.get(&self.self_id)
+            .map(|n| n.roles.clone())
+            .filter(|r| !r.is_empty())
+            .unwrap_or_else(Self::load_self_roles);
         nodes.insert(self.self_id.clone(), Node {
             id: self.self_id.clone(),
             hostname: metrics.hostname.clone(),
@@ -628,6 +704,7 @@ impl ClusterState {
             workload_subnets: crate::networking::collect_workload_subnets(),
             site: prev_site,
             display_name: prev_display_name,
+            roles: prev_roles,
         });
 
         // Self-heal: drop any NON-self entry previously saved under one of our
@@ -667,6 +744,15 @@ impl ClusterState {
     }
 
     /// Get all nodes (deduplicated: if a non-self WolfStack node has same hostname+port as self, skip it)
+    /// Every cluster node carrying `role`, deduplicated via `get_all_nodes`.
+    /// The tier subsystems (DNS zone fan-out, mail, ingress) dispatch on this:
+    /// "write this zone to all Dns nodes", "this MX pair is the Mail nodes".
+    pub fn nodes_with_role(&self, role: NodeRole) -> Vec<Node> {
+        self.get_all_nodes().into_iter()
+            .filter(|n| n.node_type == "wolfstack" && n.roles.contains(&role))
+            .collect()
+    }
+
     pub fn get_all_nodes(&self) -> Vec<Node> {
         let nodes = self.nodes.read().unwrap();
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
@@ -822,6 +908,8 @@ impl ClusterState {
             // Display name likewise arrives on the first poll from the
             // peer's own self-report.
             display_name: None,
+            // Roles likewise arrive from the peer's own self-report.
+            roles: Vec::new(),
         });
         drop(nodes);
         self.save_nodes();
@@ -1336,6 +1424,37 @@ impl ClusterState {
         }
     }
 
+    fn self_roles_file() -> String { crate::paths::get().self_roles_config }
+
+    /// Load persisted self roles from disk. Empty vec for missing/malformed —
+    /// a node with no roles is a general-purpose node (the default).
+    pub fn load_self_roles() -> Vec<NodeRole> {
+        if let Ok(data) = std::fs::read_to_string(Self::self_roles_file())
+            && let Ok(roles) = serde_json::from_str::<Vec<NodeRole>>(&data)
+        {
+            return roles;
+        }
+        Vec::new()
+    }
+
+    /// Persist self roles to disk (survives reinstalls). An empty list clears
+    /// the file so the node reverts to general-purpose.
+    pub fn save_self_roles(roles: &[NodeRole]) {
+        let path = Self::self_roles_file();
+        if let Some(dir) = std::path::Path::new(&path).parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if roles.is_empty() {
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+        if let Ok(json) = serde_json::to_string(roles)
+            && let Err(e) = std::fs::write(&path, json)
+        {
+            warn!("Failed to save self roles: {}", e);
+        }
+    }
+
     /// Load persisted self display name from disk. Same path/format as the
     /// site tag. `None` for missing/empty/malformed — UI then shows the
     /// hostname.
@@ -1439,6 +1558,10 @@ pub enum AgentMessage {
         /// `None` from older peers; the UI then shows the hostname.
         #[serde(default)]
         display_name: Option<String>,
+        /// Tier roles assigned to this node — see `Node::roles`. Empty from
+        /// older peers → general-purpose node.
+        #[serde(default)]
+        roles: Vec<NodeRole>,
         /// Enterprise license key — propagated to cluster nodes that don't have one
         #[serde(default)]
         license_key: Option<String>,
@@ -1954,7 +2077,7 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
                         continue;
                     }
                     if let Ok(msg) = resp.json::<AgentMessage>().await {
-                        if let AgentMessage::StatusReport { node_id: peer_self_id, hostname, metrics, components, docker_count, lxc_count, vm_count, compose_count, public_ip, known_nodes, deleted_ids, wolfnet_ips, has_docker, has_lxc, has_kvm, workload_subnets: peer_workload_subnets, site: peer_site, display_name: peer_display_name, license_key } = msg {
+                        if let AgentMessage::StatusReport { node_id: peer_self_id, hostname, metrics, components, docker_count, lxc_count, vm_count, compose_count, public_ip, known_nodes, deleted_ids, wolfnet_ips, has_docker, has_lxc, has_kvm, workload_subnets: peer_workload_subnets, site: peer_site, display_name: peer_display_name, roles: peer_roles, license_key } = msg {
                             let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                             // Detect TLS by the URL scheme that actually
                             // answered. v23.12 chain is HTTPS → HTTP-over-
@@ -2030,6 +2153,10 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
                                 // display name — trust its self-report, same
                                 // as site. (None = no override → show hostname.)
                                 display_name: peer_display_name,
+                                // The owner is authoritative for its own roles
+                                // too — trust the self-report. Empty = a
+                                // general-purpose node (or an older peer).
+                                roles: peer_roles,
                             });
 
                             // Reset fail count on success
@@ -2543,6 +2670,53 @@ pub async fn poll_remote_nodes(cluster: Arc<ClusterState>, cluster_secret: Strin
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod role_tests {
+    use super::*;
+
+    #[test]
+    fn role_serde_is_snake_case_and_stable() {
+        assert_eq!(serde_json::to_string(&NodeRole::MailRelay).unwrap(), "\"mail_relay\"");
+        assert_eq!(serde_json::to_string(&NodeRole::Dns).unwrap(), "\"dns\"");
+        let parsed: NodeRole = serde_json::from_str("\"host\"").unwrap();
+        assert_eq!(parsed, NodeRole::Host);
+    }
+
+    #[test]
+    fn unknown_role_token_decodes_to_unknown_not_error() {
+        // A newer peer gossips a role this build predates — the whole node
+        // must still decode (serde(other)), not reject the payload.
+        let parsed: NodeRole = serde_json::from_str("\"quantum_tier\"").unwrap();
+        assert_eq!(parsed, NodeRole::Unknown);
+        // And a node carrying it round-trips as a Vec.
+        let roles: Vec<NodeRole> = serde_json::from_str("[\"dns\",\"quantum_tier\"]").unwrap();
+        assert_eq!(roles, vec![NodeRole::Dns, NodeRole::Unknown]);
+    }
+
+    #[test]
+    fn assignable_excludes_unknown() {
+        assert!(!NodeRole::assignable().contains(&NodeRole::Unknown));
+        assert!(NodeRole::assignable().contains(&NodeRole::Dns));
+        // Every assignable role has a non-empty label.
+        for r in NodeRole::assignable() {
+            assert!(!r.label().is_empty());
+        }
+    }
+
+    #[test]
+    fn empty_roles_default_for_backward_compat() {
+        // A node from before roles existed (field absent) deserializes with
+        // an empty roles list = general-purpose node.
+        #[derive(serde::Deserialize)]
+        struct OldNodeShape {
+            #[serde(default)]
+            roles: Vec<NodeRole>,
+        }
+        let old: OldNodeShape = serde_json::from_str("{}").unwrap();
+        assert!(old.roles.is_empty());
     }
 }
 

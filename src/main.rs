@@ -24,6 +24,9 @@ mod storage;
 mod networking;
 mod backup;
 mod galera;
+mod postgres_ha;
+mod mail_tier;
+mod site_failover;
 mod wolfscale;
 mod vms;
 mod proxmox;
@@ -2137,6 +2140,9 @@ async fn main() -> std::io::Result<()> {
                     // Self's operator-set display name — gossiped so peers
                     // show the chosen name, not the OS hostname.
                     display_name: cluster_clone.get_node(&cluster_clone.self_id).and_then(|n| n.display_name),
+                    // Self's assigned tier roles — gossiped so peers know the
+                    // DNS / mail / ingress / host tier membership.
+                    roles: cluster_clone.get_node(&cluster_clone.self_id).map(|n| n.roles).unwrap_or_default(),
                     // Propagate license to cluster nodes
                     license_key: if crate::compat::platform_ready() {
                         std::fs::read_to_string(crate::compat::dm_path()).ok().map(|s| s.trim().to_string())
