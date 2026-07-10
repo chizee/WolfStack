@@ -8,6 +8,8 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.2.42: Predictive Inbox AUTOFIX actually upgrades + modal/progress/cancel** _(2026-07-10 — [`0e9ff801`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/0e9ff801912ced7b82d879c848917ed35d51b899))_
+- **v25.2.42: Predictive Inbox AUTOFIX actually upgrades + styled modal, progress bar, cancel** _(2026-07-10 — [`439443d0`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/439443d04d07378fc6a2e30e0b168bf1e725d4bb))_
 - **v25.2.41: sortable Docker/LXC/VM lists now discoverable (Rutger)** _(2026-07-10 — [`cd767b23`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/cd767b23ff795291cce0de03dfe5a1c984aad14e))_
 - **v25.2.41: sortable Docker/LXC/VM lists now discoverable — visible sort indicators on every column + a sort control in card view (Rutger)** _(2026-07-10 — [`aed27a93`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/aed27a9392338aead5a2b2400320875c2a64196b))_
 - **v25.2.40: click-to-sort container/VM columns + prebuilt arm64 PBS client** _(2026-07-09 — [`89d8604f`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/89d8604f95447f6944a8d5e3ce855b9d71f9e48e))_
