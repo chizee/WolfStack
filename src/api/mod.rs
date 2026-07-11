@@ -13959,6 +13959,33 @@ pub async fn net_list_interfaces(req: HttpRequest, state: web::Data<AppState>) -
     HttpResponse::Ok().json(networking::list_interfaces())
 }
 
+/// GET /api/browse/roots — the directories the operator may browse (the
+/// mounted shares + local ISO/VM stores). Read-only; auth-gated.
+pub async fn browse_roots(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let roots = web::block(crate::browse::allowed_roots).await;
+    match roots {
+        Ok(r) => HttpResponse::Ok().json(r),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("{}", e) })),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct BrowseQuery { pub path: String }
+
+/// GET /api/browse?path=<abs> — list one directory. Path-jailed to the
+/// allowed roots (canonicalized; rejects `..` and symlink escapes).
+/// Returns metadata only — never file contents. Read-only; auth-gated.
+pub async fn browse_dir(req: HttpRequest, state: web::Data<AppState>, q: web::Query<BrowseQuery>) -> HttpResponse {
+    if let Err(e) = require_auth(&req, &state) { return e; }
+    let path = q.into_inner().path;
+    match web::block(move || crate::browse::list_dir(&path)).await {
+        Ok(Ok(listing)) => HttpResponse::Ok().json(listing),
+        Ok(Err(msg)) => HttpResponse::Forbidden().json(serde_json::json!({ "error": msg })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("{}", e) })),
+    }
+}
+
 /// GET /api/network-map — this node's OBSERVED network view for the
 /// read-only cluster Network Map. Returns the passive topology (bridges,
 /// interfaces, VLANs, VMs + containers with their IPs and attachments,
@@ -40082,6 +40109,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         // Networking
         .route("/api/networking/interfaces", web::get().to(net_list_interfaces))
         .route("/api/network-map", web::get().to(network_map))
+        .route("/api/browse/roots", web::get().to(browse_roots))
+        .route("/api/browse", web::get().to(browse_dir))
         .route("/api/networking/bridges", web::get().to(net_list_bridges))
         .route("/api/networking/lan-bridge", web::post().to(net_lan_bridge_create))
         .route("/api/networking/lan-bridge/confirm", web::post().to(net_lan_bridge_confirm))

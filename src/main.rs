@@ -23,6 +23,7 @@ mod vr_terminal;
 mod storage;
 mod networking;
 mod backup;
+mod browse;
 mod galera;
 mod postgres_ha;
 mod mail_tier;
