@@ -22,23 +22,34 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # image_digest pins the cross-rs build container by content digest.
+          # cross built from git always defaults to the mutable ":main" tag
+          # (cross src/docker/shared.rs DEFAULT_IMAGE_VERSION), so without
+          # this pin the toolchain container could change under us between
+          # releases. To bump: docker manifest inspect ghcr.io/cross-rs/<target>:main
           - target: x86_64-unknown-linux-musl
             arch: x86_64
             runner: ubuntu-latest
+            image_digest: sha256:f084277a81b3cdf05526f6cb2756b8d2a185e18f7f74a7aa90df9ee4b79855e2
           - target: aarch64-unknown-linux-musl
             arch: aarch64
             runner: ubuntu-latest
+            image_digest: sha256:d4eea544818d42a15c090b2102b03c1a63a282505c9ab4b6bb7abb76b028a706
 
     runs-on: ${{ matrix.runner }}
     # Bound the wall-clock so a stuck network call doesn't hold a
     # runner for the full 6-hour GitHub default.
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        # SHA-pinned to master per the action's README: when the toolchain
+        # is passed as an explicit input (instead of encoded in the @rev),
+        # the pinned rev should be master.
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       - name: Warnings are errors
@@ -54,20 +65,25 @@ jobs:
         run: cargo check --locked
 
       - name: Install cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        # Pinned to an exact commit (last crates.io release v0.2.5 is from
+        # 2023, so git install is required). --locked builds cross with its
+        # own committed Cargo.lock — the whole cross toolchain is now
+        # deterministic instead of tracking cross-rs HEAD on every release.
+        run: cargo install cross --git https://github.com/cross-rs/cross --rev 64b5bb4d3d34de062552b9a2093affe77b4ad16a --locked
 
       - name: Pin libz-sys to working version
         run: |
           cargo update -p libz-sys --precise 1.1.25
 
       - name: Pre-pull cross-rs docker image with retries
-        # `cross build` pulls ghcr.io/cross-rs/<target>:main on first
-        # invocation. GHCR's token endpoint occasionally times out and
-        # the build dies with exit 125 (docker auth failure). Pull
-        # explicitly with 5 retries + exponential-ish backoff so a
-        # transient outage doesn't fail the whole release.
+        # `cross build` pulls the build image on first invocation. GHCR's
+        # token endpoint occasionally times out and the build dies with
+        # exit 125 (docker auth failure). Pull explicitly with 5 retries +
+        # exponential-ish backoff so a transient outage doesn't fail the
+        # whole release. Pulled by digest (see matrix.image_digest) so the
+        # build container is immutable.
         run: |
-          IMAGE="ghcr.io/cross-rs/${{ matrix.target }}:main"
+          IMAGE="ghcr.io/cross-rs/${{ matrix.target }}@${{ matrix.image_digest }}"
           for attempt in 1 2 3 4 5; do
             echo "::group::Pull attempt $attempt for $IMAGE"
             if docker pull "$IMAGE"; then
@@ -84,7 +100,15 @@ jobs:
           exit 1
 
       - name: Build static binary
-        run: cross build --release --target ${{ matrix.target }}
+        # CROSS_TARGET_<TRIPLE>_IMAGE overrides cross's default mutable
+        # ":main" image with the digest-pinned one we just pulled (cross
+        # src/docker/image.rs ImageReference: a full name is used verbatim;
+        # env-var naming per cross src/config.rs build_var_name() = triple
+        # uppercased with - replaced by _).
+        run: |
+          VAR="CROSS_TARGET_$(echo '${{ matrix.target }}' | tr '[:lower:]-' '[:upper:]_')_IMAGE"
+          export "$VAR=ghcr.io/cross-rs/${{ matrix.target }}@${{ matrix.image_digest }}"
+          cross build --release --target ${{ matrix.target }}
 
       - name: Get version
         id: version
@@ -97,7 +121,7 @@ jobs:
           chmod +x dist/wolfstack-${{ matrix.arch }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: wolfstack-${{ matrix.arch }}
           path: dist/wolfstack-${{ matrix.arch }}
@@ -110,7 +134,7 @@ jobs:
       id-token: write       # cosign keyless OIDC + attest provenance
       attestations: write   # actions/attest-build-provenance
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           # Need full history so we can extract the release commit body
           # for release notes, and regenerate CHANGELOG.md.
@@ -121,7 +145,7 @@ jobs:
         run: echo "version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*\"\(.*\)\".*/\1/')" >> "$GITHUB_OUTPUT"
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           path: dist
           merge-multiple: true
@@ -135,14 +159,14 @@ jobs:
         # Run BEFORE cosign signing so subject-path matches just the
         # binaries (not the .cosign.bundle files that signing produces).
         # Provenance covers both x86_64 and aarch64 in one attestation.
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
           subject-path: |
             dist/wolfstack-x86_64
             dist/wolfstack-aarch64
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
         with:
           cosign-release: 'v2.4.1'
 
