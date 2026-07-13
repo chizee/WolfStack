@@ -2491,14 +2491,29 @@ pub async fn forgot_password(state: web::Data<AppState>, body: web::Json<serde_j
         "message": "If an account with that username exists and has an email address, a reset link has been sent."
     }));
 
-    // Look up the WolfStack user
+    // Look up the WolfStack user. Every no-email branch below returns the
+    // same generic_ok to the CLIENT (anti-enumeration) but logs WHY server-
+    // side — "reset doesn't work" is undiagnosable otherwise (Paul,
+    // 2026-07-13: reset flow showed 'sent' but no email ever arrived).
     let store = crate::auth::users::UserStore::load();
     let user = match store.find(username) {
         Some(u) => u.clone(),
-        None => return generic_ok,
+        None => {
+            tracing::warn!(
+                "password reset requested for '{}' — no such WolfStack user \
+                 (system/Linux accounts cannot reset by email; no email was sent)",
+                username
+            );
+            return generic_ok;
+        }
     };
 
     if user.email.is_empty() {
+        tracing::warn!(
+            "password reset requested for '{}' — user has no email address \
+             set (Settings → Users), no email was sent",
+            username
+        );
         return generic_ok;
     }
 
@@ -2507,6 +2522,11 @@ pub async fn forgot_password(state: web::Data<AppState>, body: web::Json<serde_j
     // still return the generic response below to avoid leaking account state.
     let config = crate::ai::AiConfig::load();
     if config.smtp_host.is_empty() {
+        tracing::warn!(
+            "password reset requested for '{}' — SMTP is not configured \
+             (Settings → AI & Email), no email was sent",
+            username
+        );
         return generic_ok;
     }
 
