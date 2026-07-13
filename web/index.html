@@ -6229,8 +6229,13 @@
                                         <button type="button" id="alerting-ntfy-clear" onclick="clearNtfyChannel()"
                                             style="display:none; background:transparent; border:none; color:var(--danger); font-size:12px; cursor:pointer; padding:0;">Disable ntfy</button>
                                     </div>
-                                    <input type="text" id="alerting-ntfy-topic" class="form-control"
-                                        placeholder="e.g. wolfstack-a8f2c91d — pick something unguessable">
+                                    <div style="display:flex; gap:8px;">
+                                        <input type="text" id="alerting-ntfy-topic" class="form-control" style="flex:1;"
+                                            placeholder="e.g. wolfstack-a8f2c91d — pick something unguessable">
+                                        <button type="button" class="btn btn-sm" onclick="generateNtfyTopic()"
+                                            title="Generate a random unguessable topic"
+                                            style="white-space:nowrap;">🎲 Generate</button>
+                                    </div>
                                     <small style="color:var(--text-muted);">Install the free
                                         <a href="https://ntfy.sh/" target="_blank" rel="noopener" style="color:var(--accent-primary);">ntfy</a>
                                         app (iOS / Android), subscribe to the same topic, done. On the public

@@ -261,6 +261,22 @@ pub fn control_plane_apply(
 // ─── Password Hashing (pure Rust, no libcrypt dependency) ───
 
 /// Hash a password using SHA-512 crypt (same as Linux /etc/shadow)
+#[cfg(test)]
+mod password_roundtrip_tests {
+    /// The password-reset flow writes hash_password() output into the
+    /// UserStore and login verifies it via verify_password() (native
+    /// libc crypt() when available, pure-Rust sha512_check otherwise).
+    /// If those two ever disagree on hash format, reset "succeeds" and
+    /// every subsequent login fails — lock the contract.
+    #[test]
+    fn hash_then_verify_roundtrip() {
+        let h = super::hash_password("test-password-123").expect("hash");
+        assert!(h.starts_with("$6$"), "expected sha512-crypt format, got {}", &h[..h.len().min(12)]);
+        assert!(super::verify_password("test-password-123", &h), "fresh hash must verify");
+        assert!(!super::verify_password("wrong-password", &h), "wrong password must fail");
+    }
+}
+
 pub fn hash_password(password: &str) -> Result<String, String> {
     let params = sha_crypt::Sha512Params::new(5000)
         .map_err(|e| format!("SHA-512 params error: {:?}", e))?;
