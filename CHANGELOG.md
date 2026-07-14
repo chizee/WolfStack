@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.2.58: file-transfer handlers off the async workers (sync-in-async sweep, phase 1a)** _(2026-07-14 — [`f5b1386e`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/f5b1386e0815fff507d79bc3f7e26cdaf548e05c))_
 - **v25.2.57: App Store loads on slow ARM boards — catalogue built once, not 534×/request (xavierasx)** _(2026-07-14 — [`afadbfef`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/afadbfefa5d7f4f37abce37e0d7f401ed68640c4))_
 - **v25.2.56: user email management — password reset actually works + user-endpoint hardening** _(2026-07-13 — [`34556e86`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/34556e86fb9d5c4dd4045df5c0dc6af8b4b0c694))_
 - **v25.2.55: Send Test Alert saves first + real failure details (klas); reset-password diagnostics** _(2026-07-13 — [`50d3eba6`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/50d3eba6e7fa2872ce5290ec81a5e5983c831172))_
