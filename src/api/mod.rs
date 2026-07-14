@@ -21401,7 +21401,10 @@ pub async fn files_upload(
         if safe_name.is_empty() || safe_name == "." { continue; }
 
         let file_path = canonical_dir.join(&safe_name);
-        let mut file = match std::fs::File::create(&file_path) {
+        // tokio::fs, not std::fs — the sync writes ran on the async
+        // worker, blocking it for the duration of every chunk flush
+        // (sync-in-async sweep, phase 1a).
+        let mut file = match tokio::fs::File::create(&file_path).await {
             Ok(f) => f,
             Err(e) => {
                 return HttpResponse::InternalServerError().json(serde_json::json!({
@@ -21410,9 +21413,9 @@ pub async fn files_upload(
             }
         };
 
-        use std::io::Write;
+        use tokio::io::AsyncWriteExt;
         while let Some(Ok(chunk)) = field.next().await {
-            if file.write_all(&chunk).is_err() {
+            if file.write_all(&chunk).await.is_err() {
                 return HttpResponse::InternalServerError().json(serde_json::json!({
                     "error": format!("Failed to write file {}", safe_name)
                 }));
@@ -21458,11 +21461,27 @@ pub async fn files_download(
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "download".into());
 
-    match std::fs::read(&canonical) {
-        Ok(data) => HttpResponse::Ok()
-            .insert_header(("Content-Disposition", format!("attachment; filename=\"{}\"", filename)))
-            .insert_header(("Content-Type", "application/octet-stream"))
-            .body(data),
+    // Stream via NamedFile (chunked reads on the blocking pool) instead
+    // of std::fs::read: the old path buffered the WHOLE file in RAM and
+    // blocked the async worker for the entire read — a multi-GB download
+    // pinned a worker and ballooned RSS (sync-in-async sweep, phase 1a).
+    // The open+stat itself also goes through web::block: open_async is
+    // NOT async without the io-uring feature, and a stat can stall for
+    // hundreds of ms on NFS/SSHFS-backed paths.
+    let canonical_c = canonical.clone();
+    let opened = match web::block(move || actix_files::NamedFile::open(&canonical_c)).await {
+        Ok(r) => r,
+        Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("blocking pool: {}", e)
+        })),
+    };
+    match opened {
+        Ok(nf) => nf
+            .set_content_disposition(actix_web::http::header::ContentDisposition {
+                disposition: actix_web::http::header::DispositionType::Attachment,
+                parameters: vec![actix_web::http::header::DispositionParam::Filename(filename)],
+            })
+            .into_response(&req),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
             "error": format!("Cannot read file: {}", e)
         })),
@@ -21847,37 +21866,91 @@ pub async fn files_docker_download(
         return HttpResponse::BadRequest().json(serde_json::json!({ "error": "Missing 'container' or 'path'" }));
     }
 
-    // Use docker cp to a temp file
-    let tmp = format!("/tmp/wolfstack-docker-dl-{}", std::process::id());
+    // docker cp to a temp file, off the async worker: cp of a large
+    // file takes as long as the file is big — running it inline
+    // blocked the event loop for the duration (sync-in-async sweep,
+    // phase 1a). Temp name carries a process-wide counter — the old
+    // pid-only name collided when two downloads ran concurrently.
+    let tmp = unique_tmp_path("wolfstack-docker-dl");
     let src = format!("{}:{}", container, path);
-    let output = std::process::Command::new("docker").args(["cp", &src, &tmp]).output();
+    let tmp_for_cp = tmp.clone();
+    let output = web::block(move || {
+        std::process::Command::new("docker").args(["cp", &src, &tmp_for_cp]).output()
+    }).await;
 
     match output {
-        Ok(out) if out.status.success() => {
+        Ok(Ok(out)) if out.status.success() => {
             let filename = std::path::Path::new(&path)
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "download".into());
 
-            match std::fs::read(&tmp) {
-                Ok(data) => {
-                    let _ = std::fs::remove_file(&tmp);
-                    HttpResponse::Ok()
-                        .insert_header(("Content-Disposition", format!("attachment; filename=\"{}\"", filename)))
-                        .insert_header(("Content-Type", "application/octet-stream"))
-                        .body(data)
+            // Open, then unlink: the open fd keeps the data readable
+            // (POSIX) while the path disappears — no leftover temp file
+            // whether the stream completes or the client disconnects.
+            // NamedFile streams in chunks on the blocking pool instead
+            // of buffering the whole file in RAM like fs::read did.
+            // Open+stat itself offloaded too (open_async is sync
+            // without io-uring).
+            let tmp_c = tmp.clone();
+            let opened = match web::block(move || actix_files::NamedFile::open(&tmp_c)).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                    return HttpResponse::InternalServerError().json(serde_json::json!({
+                        "error": format!("blocking pool: {}", e)
+                    }));
+                }
+            };
+            match opened {
+                Ok(nf) => {
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                    nf.set_content_disposition(actix_web::http::header::ContentDisposition {
+                        disposition: actix_web::http::header::DispositionType::Attachment,
+                        parameters: vec![actix_web::http::header::DispositionParam::Filename(filename)],
+                    })
+                    .into_response(&req)
                 }
                 Err(e) => {
-                    let _ = std::fs::remove_file(&tmp);
+                    let _ = tokio::fs::remove_file(&tmp).await;
                     HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("Read error: {}", e) }))
                 }
             }
         }
-        Ok(out) => HttpResponse::InternalServerError().json(serde_json::json!({
+        Ok(Ok(out)) => HttpResponse::InternalServerError().json(serde_json::json!({
             "error": String::from_utf8_lossy(&out.stderr).trim().to_string()
         })),
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("{}", e) })),
+        Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("{}", e) })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("blocking pool: {}", e) })),
     }
+}
+
+/// Collision-proof temp path: pid alone repeats across concurrent
+/// requests in the same process (two simultaneous downloads corrupted
+/// each other's temp file before this existed). Lives under a private
+/// root-owned 0700 dir, NOT world-writable /tmp — a predictable name
+/// in /tmp is the classic symlink-race target when root writes
+/// through it (review find, 2026-07-14).
+fn unique_tmp_path(prefix: &str) -> String {
+    const TMP_DIR: &str = "/var/lib/wolfstack/tmp";
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static TMP_DIR_READY: std::sync::Once = std::sync::Once::new();
+    TMP_DIR_READY.call_once(|| {
+        // One mkdir per process lifetime — µs-scale, idempotent.
+        let _ = std::fs::create_dir_all(TMP_DIR);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(TMP_DIR, std::fs::Permissions::from_mode(0o700));
+        }
+    });
+    format!(
+        "{}/{}-{}-{}",
+        TMP_DIR,
+        prefix,
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
 }
 
 /// POST /api/files/docker/upload?container=NAME&path=/some/dir — upload file(s) into a Docker container
@@ -21909,10 +21982,15 @@ pub async fn files_docker_upload(
             .to_string();
         if safe_name.is_empty() || safe_name == "." { continue; }
 
-        // Write to a temp file, then docker cp into container
-        let tmp = format!("/tmp/wolfstack-docker-ul-{}-{}", std::process::id(), safe_name);
+        // Write to a temp file (async I/O — the old sync writes blocked
+        // the worker per chunk), then docker cp into the container off
+        // the async worker: cp duration scales with file size
+        // (sync-in-async sweep, phase 1a). Unique temp name — pid+name
+        // collided when the same filename uploaded to two containers
+        // concurrently.
+        let tmp = unique_tmp_path("wolfstack-docker-ul");
         {
-            let mut file = match std::fs::File::create(&tmp) {
+            let mut file = match tokio::fs::File::create(&tmp).await {
                 Ok(f) => f,
                 Err(e) => {
                     return HttpResponse::InternalServerError().json(serde_json::json!({
@@ -21920,10 +21998,10 @@ pub async fn files_docker_upload(
                     }));
                 }
             };
-            use std::io::Write;
+            use tokio::io::AsyncWriteExt;
             while let Some(Ok(chunk)) = field.next().await {
-                if file.write_all(&chunk).is_err() {
-                    let _ = std::fs::remove_file(&tmp);
+                if file.write_all(&chunk).await.is_err() {
+                    let _ = tokio::fs::remove_file(&tmp).await;
                     return HttpResponse::InternalServerError().json(serde_json::json!({
                         "error": format!("Failed to write temp file {}", safe_name)
                     }));
@@ -21932,8 +22010,19 @@ pub async fn files_docker_upload(
         }
 
         let dest = format!("{}:{}/{}", container, dir.trim_end_matches('/'), safe_name);
-        let output = std::process::Command::new("docker").args(["cp", &tmp, &dest]).output();
-        let _ = std::fs::remove_file(&tmp);
+        let tmp_for_cp = tmp.clone();
+        let output = match web::block(move || {
+            std::process::Command::new("docker").args(["cp", &tmp_for_cp, &dest]).output()
+        }).await {
+            Ok(o) => o,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return HttpResponse::InternalServerError().json(serde_json::json!({
+                    "error": format!("blocking pool: {}", e)
+                }));
+            }
+        };
+        let _ = tokio::fs::remove_file(&tmp).await;
 
         match output {
             Ok(out) if out.status.success() => { uploaded.push(safe_name); }
@@ -22216,8 +22305,21 @@ pub async fn files_lxc_download(
         return HttpResponse::BadRequest().json(serde_json::json!({ "error": "Missing 'container' or 'path'" }));
     }
 
-    // Use lxc-attach cat to stream the file content
-    let output = lxc_exec_cmd(&container, &["cat", &path]).output();
+    // lxc-attach/pct-exec cat, off the async worker — the exec runs as
+    // long as the file is big and blocked the event loop inline
+    // (sync-in-async sweep, phase 1a). Output is still buffered in RAM
+    // (child stdout capture); acceptable for the file-browser use case,
+    // noted in SYNC_ASYNC_SWEEP.md as a potential streaming follow-up.
+    let container_c = container.clone();
+    let path_c = path.clone();
+    let output = match web::block(move || {
+        lxc_exec_cmd(&container_c, &["cat", &path_c]).output()
+    }).await {
+        Ok(o) => o,
+        Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("blocking pool: {}", e)
+        })),
+    };
 
     match output {
         Ok(out) if out.status.success() => {
@@ -22267,10 +22369,13 @@ pub async fn files_lxc_upload(
             .to_string();
         if safe_name.is_empty() || safe_name == "." { continue; }
 
-        // Write to temp file first (avoids buffering large files in memory)
-        let tmp = format!("/tmp/wolfstack-lxc-ul-{}-{}", std::process::id(), safe_name);
+        // Write to a temp file with async I/O (the old sync writes ran
+        // on the async worker), then stream it into the container on
+        // the blocking pool. Unique temp name — pid+filename collided
+        // for concurrent same-named uploads.
+        let tmp = unique_tmp_path("wolfstack-lxc-ul");
         {
-            let mut file = match std::fs::File::create(&tmp) {
+            let mut file = match tokio::fs::File::create(&tmp).await {
                 Ok(f) => f,
                 Err(e) => {
                     return HttpResponse::InternalServerError().json(serde_json::json!({
@@ -22278,10 +22383,10 @@ pub async fn files_lxc_upload(
                     }));
                 }
             };
-            use std::io::Write;
+            use tokio::io::AsyncWriteExt;
             while let Some(Ok(chunk)) = field.next().await {
-                if file.write_all(&chunk).is_err() {
-                    let _ = std::fs::remove_file(&tmp);
+                if file.write_all(&chunk).await.is_err() {
+                    let _ = tokio::fs::remove_file(&tmp).await;
                     return HttpResponse::InternalServerError().json(serde_json::json!({
                         "error": format!("Failed to write temp file {}", safe_name)
                     }));
@@ -22289,53 +22394,50 @@ pub async fn files_lxc_upload(
             }
         }
 
-        // Pipe temp file into container via tee (works with both lxc-attach and pct exec)
+        // Pipe temp file into the container via tee (works with both
+        // lxc-attach and pct exec). Everything below is blocking — the
+        // spawn, the byte pump, the wait — so the whole unit runs in
+        // web::block. io::copy streams in small chunks: the old path
+        // read the ENTIRE file into RAM (directly under a comment
+        // claiming it avoided exactly that) and pushed it down the
+        // child's stdin with a sync write on the event loop
+        // (sync-in-async sweep, phase 1a).
         let dest_path = format!("{}/{}", dir.trim_end_matches('/'), safe_name);
-        let data = match std::fs::read(&tmp) {
-            Ok(d) => d,
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                return HttpResponse::InternalServerError().json(serde_json::json!({
-                    "error": format!("Failed to read temp file: {}", e)
-                }));
-            }
-        };
-        let _ = std::fs::remove_file(&tmp);
+        let container_c = container.clone();
+        let tmp_c = tmp.clone();
+        let result: Result<Result<std::process::ExitStatus, String>, _> = web::block(move || {
+            let mut child = lxc_exec_cmd(&container_c, &["tee", &dest_path])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|e| format!("Failed to exec into container: {}", e))?;
 
-        let mut child = match lxc_exec_cmd(&container, &["tee", &dest_path])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                return HttpResponse::InternalServerError().json(serde_json::json!({
-                    "error": format!("Failed to exec into container: {}", e)
-                }));
+            let mut src = std::fs::File::open(&tmp_c)
+                .map_err(|e| format!("Failed to read temp file: {}", e))?;
+            if let Some(ref mut stdin) = child.stdin {
+                std::io::copy(&mut src, stdin)
+                    .map_err(|e| format!("Failed to write to container: {}", e))?;
             }
-        };
+            drop(child.stdin.take()); // Close stdin so tee finishes
 
-        if let Some(ref mut stdin) = child.stdin {
-            use std::io::Write;
-            if stdin.write_all(&data).is_err() {
-                return HttpResponse::InternalServerError().json(serde_json::json!({
-                    "error": format!("Failed to write to container: {}", safe_name)
-                }));
-            }
-        }
-        drop(child.stdin.take()); // Close stdin so tee finishes
+            child.wait().map_err(|e| format!("Container exec error: {}", e))
+        }).await;
+        let _ = tokio::fs::remove_file(&tmp).await;
 
-        match child.wait() {
-            Ok(status) if status.success() => { uploaded.push(safe_name); }
-            Ok(_) => {
+        match result {
+            Ok(Ok(status)) if status.success() => { uploaded.push(safe_name); }
+            Ok(Ok(_)) => {
                 return HttpResponse::InternalServerError().json(serde_json::json!({
                     "error": format!("Failed to upload {} to container", safe_name)
                 }));
             }
+            Ok(Err(e)) => {
+                return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }));
+            }
             Err(e) => {
                 return HttpResponse::InternalServerError().json(serde_json::json!({
-                    "error": format!("Container exec error: {}", e)
+                    "error": format!("blocking pool: {}", e)
                 }));
             }
         }
