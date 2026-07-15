@@ -15,6 +15,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
 
+/// Consecutive failed checks before a monitor is considered Down (vs
+/// Degraded). Drives both the status computation and the "N consecutive
+/// failed checks" wording in the down notification.
+const DOWN_THRESHOLD: usize = 3;
+
 fn config_file() -> String { crate::paths::get().statuspage_config }
 fn uptime_file() -> String { crate::paths::get().statuspage_uptime }
 
@@ -332,8 +337,8 @@ impl StatusPageState {
                 if last.success {
                     MonitorStatus::Up
                 } else {
-                    let recent_failures = deque.iter().rev().take(3).filter(|r| !r.success).count();
-                    if recent_failures >= 3 {
+                    let recent_failures = deque.iter().rev().take(DOWN_THRESHOLD).filter(|r| !r.success).count();
+                    if recent_failures >= DOWN_THRESHOLD {
                         MonitorStatus::Down
                     } else {
                         MonitorStatus::Degraded
@@ -712,7 +717,11 @@ impl MonitorStatus {
 
 /// Run all enabled monitors and record results.
 /// Called periodically by the background task in main.rs.
-pub async fn run_checks(state: &Arc<StatusPageState>) {
+pub async fn run_checks(
+    state: &Arc<StatusPageState>,
+    cluster: &crate::agent::ClusterState,
+    cluster_secret: &str,
+) {
     let monitors = {
         let config = state.config.read().unwrap();
         config.monitors.iter()
@@ -744,11 +753,8 @@ pub async fn run_checks(state: &Arc<StatusPageState>) {
             CheckType::Ping { host } => {
                 run_ping_check(host, timeout).await
             }
-            CheckType::Container { runtime, name, node_id: _ } => {
-                let rt = runtime.clone();
-                let nm = name.clone();
-                tokio::task::spawn_blocking(move || run_container_check(&rt, &nm))
-                    .await.unwrap_or((false, Some("Check task failed".to_string())))
+            CheckType::Container { runtime, name, node_id } => {
+                run_container_check_routed(runtime, name, node_id, cluster, cluster_secret).await
             }
             CheckType::Wolfrun { service_id, min_healthy, health_check, .. } => {
                 run_wolfrun_check(service_id, *min_healthy, health_check).await
@@ -772,8 +778,11 @@ pub async fn run_checks(state: &Arc<StatusPageState>) {
     // Auto-create/resolve incidents on each page
     auto_manage_incidents(state);
 
-    // WolfFunctions monitor_down / monitor_up trigger events
-    fire_monitor_transition_events(state, &monitors);
+    // WolfFunctions monitor_down / monitor_up trigger events + channel
+    // notifications. Cluster passed so the notification fires from the
+    // LEADER only — every node runs every replicated monitor, so without
+    // this the operator would get one Discord/ntfy/email per node.
+    fire_monitor_transition_events(state, &monitors, cluster);
 }
 
 /// Fire WolfFunctions trigger events on monitor state transitions.
@@ -786,7 +795,7 @@ pub async fn run_checks(state: &Arc<StatusPageState>) {
 /// `MonitorStatus::Down` (3 consecutive failures) until it computes `Up`.
 /// Degraded (1-2 failures) and Unknown never change the latch, so a flap
 /// through Degraded during recovery can't strand the latch or double-fire.
-fn fire_monitor_transition_events(state: &Arc<StatusPageState>, monitors: &[Monitor]) {
+fn fire_monitor_transition_events(state: &Arc<StatusPageState>, monitors: &[Monitor], cluster: &crate::agent::ClusterState) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -818,6 +827,38 @@ fn fire_monitor_transition_events(state: &Arc<StatusPageState>, monitors: &[Moni
         }
     }
     for (monitor, went_down, downtime_secs) in transitions {
+        // Direct channel notification (Discord/Slack/Telegram/ntfy/email)
+        // on down + recovery — klas's request. Fires independent of the
+        // WolfFunctions trigger below; skips the security-alert verbosity
+        // gate (see send_monitor_alert). Recovery pings honour the
+        // operator's recovery_notifications toggle. LEADER ONLY — every
+        // node runs every replicated monitor, so gating here prevents one
+        // notification per node (same dedup as the WolfFunctions dispatch).
+        if crate::wolfrun::is_leader(cluster) {
+            let send_recovery = crate::alerting::AlertConfig::load().recovery_notifications;
+            let mname = monitor.name.clone();
+            if went_down {
+                let title = format!("🔴 Monitor down: {}", mname);
+                let body = format!(
+                    "Status-page monitor '{}' (cluster {}) is DOWN — {} consecutive failed checks.",
+                    mname, monitor.cluster, DOWN_THRESHOLD,
+                );
+                tokio::spawn(async move {
+                    crate::alerting::send_monitor_alert(&title, &body, true).await;
+                });
+            } else if send_recovery {
+                let mins = downtime_secs / 60;
+                let title = format!("🟢 Monitor recovered: {}", mname);
+                let body = format!(
+                    "Status-page monitor '{}' (cluster {}) is back UP after ~{} min of downtime.",
+                    mname, monitor.cluster, mins,
+                );
+                tokio::spawn(async move {
+                    crate::alerting::send_monitor_alert(&title, &body, false).await;
+                });
+            }
+        }
+
         let (event, payload) = if went_down {
             (
                 crate::wolffunctions::TriggerEvent::MonitorDown,
@@ -910,6 +951,124 @@ async fn run_ping_check(host: &str, timeout: std::time::Duration) -> (bool, Opti
         }
         Err(e) => (false, Some(format!("Ping failed: {}", e))),
     }
+}
+
+/// Public wrapper so the inter-node container-check endpoint
+/// (`/api/statuspage/container-check`) can run the same local probe a
+/// direct check uses. See `run_container_check`.
+pub fn check_container_local(runtime: &str, name: &str) -> (bool, Option<String>) {
+    run_container_check(runtime, name)
+}
+
+/// Resolve a Container check that may target a remote node. Container
+/// monitors are replicated cluster-wide and every node runs every
+/// monitor (see run_checks), so a container living on node B was being
+/// probed with LOCAL `docker inspect` on node A — where it doesn't
+/// exist — and reported "major outage" while the owning node saw it
+/// healthy (klas, 2026-07-15). When `node_id` names another online
+/// node, proxy the probe to it so every node computes the correct
+/// answer regardless of where the container runs.
+async fn run_container_check_routed(
+    runtime: &str,
+    name: &str,
+    node_id: &Option<String>,
+    cluster: &crate::agent::ClusterState,
+    cluster_secret: &str,
+) -> (bool, Option<String>) {
+    // No node pinned, or it's this node → local probe (unchanged path).
+    let target = match node_id {
+        Some(id) if !id.is_empty() && *id != cluster.self_id => id.clone(),
+        _ => {
+            let rt = runtime.to_string();
+            let nm = name.to_string();
+            return tokio::task::spawn_blocking(move || run_container_check(&rt, &nm))
+                .await.unwrap_or((false, Some("Check task failed".to_string())));
+        }
+    };
+
+    let node = match cluster.get_node(&target) {
+        Some(n) if n.is_self => {
+            // node_id points at us after all (id mirror / alias) — local.
+            let rt = runtime.to_string();
+            let nm = name.to_string();
+            return tokio::task::spawn_blocking(move || run_container_check(&rt, &nm))
+                .await.unwrap_or((false, Some("Check task failed".to_string())));
+        }
+        Some(n) => n,
+        None => return (false, Some(format!("target node {} not found in cluster", target))),
+    };
+    if !node.online {
+        return (false, Some(format!("node {} is offline", node.hostname)));
+    }
+
+    let path = format!(
+        "/api/statuspage/container-check?runtime={}&name={}",
+        urlencoding::encode(runtime),
+        urlencoding::encode(name),
+    );
+    let urls = crate::api::build_node_urls(&node.address, node.port, &path);
+    let client = &*SP_RPC_CLIENT;
+    let mut last_err = String::new();
+    for url in &urls {
+        match client.get(url)
+            .header("X-WolfStack-Secret", cluster_secret)
+            .send().await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(v) => {
+                        let up = v.get("up").and_then(|b| b.as_bool()).unwrap_or(false);
+                        let err = v.get("error").and_then(|e| e.as_str())
+                            .filter(|s| !s.is_empty()).map(|s| s.to_string());
+                        return (up, err);
+                    }
+                    Err(e) => { last_err = format!("bad response from {}: {}", node.hostname, e); }
+                }
+            }
+            Ok(resp) if resp.status().as_u16() == 404 => {
+                // Node predates the container-check endpoint (rolling
+                // upgrade). Fall back to /api/containers/running — present
+                // on older builds — so a healthy container isn't false-
+                // flagged as a major outage mid-upgrade.
+                return remote_container_running_fallback(&node, runtime, name, cluster_secret).await;
+            }
+            Ok(resp) => {
+                last_err = format!("node {} returned HTTP {}", node.hostname, resp.status());
+            }
+            Err(e) => { last_err = format!("could not reach node {}: {}", node.hostname, e); }
+        }
+    }
+    (false, Some(if last_err.is_empty() { "remote container check failed".into() } else { last_err }))
+}
+
+/// Backward-compat container probe for peers that predate
+/// /api/statuspage/container-check: list the node's running containers
+/// and check membership. Only reached on a 404 from the primary path.
+async fn remote_container_running_fallback(
+    node: &crate::agent::Node,
+    runtime: &str,
+    name: &str,
+    cluster_secret: &str,
+) -> (bool, Option<String>) {
+    let urls = crate::api::build_node_urls(&node.address, node.port, "/api/containers/running");
+    let client = &*SP_RPC_CLIENT;
+    for url in &urls {
+        if let Ok(resp) = client.get(url).header("X-WolfStack-Secret", cluster_secret).send().await {
+            if !resp.status().is_success() { continue; }
+            if let Ok(list) = resp.json::<Vec<serde_json::Value>>().await {
+                let running = list.iter().any(|c| {
+                    c.get("runtime").and_then(|r| r.as_str()) == Some(runtime)
+                        && c.get("name").and_then(|n| n.as_str()) == Some(name)
+                });
+                return if running {
+                    (true, None)
+                } else {
+                    (false, Some("Container not running".to_string()))
+                };
+            }
+        }
+    }
+    (false, Some(format!("node {} unreachable (needs update for container monitoring)", node.hostname)))
 }
 
 fn run_container_check(runtime: &str, name: &str) -> (bool, Option<String>) {

@@ -909,35 +909,62 @@ pub async fn send_alert(config: &AlertConfig, category: AlertCategory, title: &s
         return;
     }
 
-    // Discord
-    if !config.discord_webhook.is_empty() {
-        if let Err(e) = send_discord(&config.discord_webhook, title, message).await {
-            warn!("Discord alert failed: {}", e);
-        }
-    }
+    let priority: u8 = if category == AlertCategory::Compromise { 5 } else { 3 };
+    dispatch_to_channels(config, title, message, priority).await;
+}
 
-    // Slack
-    if !config.slack_webhook.is_empty() {
-        if let Err(e) = send_slack(&config.slack_webhook, title, message).await {
-            warn!("Slack alert failed: {}", e);
-        }
+/// Fan a title/body out to every configured push channel (Discord,
+/// Slack, Telegram, ntfy). Pure dispatch — no enabled/verbosity/
+/// rate-limit gating; callers decide whether to send. `ntfy_priority`
+/// is the 1–5 ntfy scale.
+async fn dispatch_to_channels(config: &AlertConfig, title: &str, message: &str, ntfy_priority: u8) {
+    if !config.discord_webhook.is_empty()
+        && let Err(e) = send_discord(&config.discord_webhook, title, message).await
+    {
+        warn!("Discord alert failed: {}", e);
     }
-
-    // Telegram
-    if !config.telegram_bot_token.is_empty() && !config.telegram_chat_id.is_empty() {
-        if let Err(e) = send_telegram(&config.telegram_bot_token, &config.telegram_chat_id, title, message).await {
-            warn!("Telegram alert failed: {}", e);
-        }
+    if !config.slack_webhook.is_empty()
+        && let Err(e) = send_slack(&config.slack_webhook, title, message).await
+    {
+        warn!("Slack alert failed: {}", e);
     }
+    if !config.telegram_bot_token.is_empty() && !config.telegram_chat_id.is_empty()
+        && let Err(e) = send_telegram(&config.telegram_bot_token, &config.telegram_chat_id, title, message).await
+    {
+        warn!("Telegram alert failed: {}", e);
+    }
+    if !config.ntfy_topic.is_empty()
+        && let Err(e) = send_ntfy(&config.ntfy_server, &config.ntfy_topic, &config.ntfy_token, title, message, ntfy_priority).await
+    {
+        warn!("ntfy alert failed: {}", e);
+    }
+}
 
-    // ntfy — priority 5 (max) for Compromise so the phone breaks
-    // through Do-Not-Disturb where the user has configured that;
-    // everything else at the ntfy default of 3.
-    if !config.ntfy_topic.is_empty() {
-        let priority: u8 = if category == AlertCategory::Compromise { 5 } else { 3 };
-        if let Err(e) = send_ntfy(&config.ntfy_server, &config.ntfy_topic, &config.ntfy_token, title, message, priority).await {
-            warn!("ntfy alert failed: {}", e);
-        }
+/// Notify the configured channels that a status-page monitor changed
+/// state (down or recovered). Deliberately NOT gated by the security
+/// `alert_verbosity` (Simple/Verbose) or the security categories: an
+/// uptime monitor is a watch the operator explicitly set up, so its
+/// transitions should notify whenever alerting is enabled with a
+/// channel — not be suppressed as "security noise" the way a
+/// brute-force scan is. Still respects `enabled` + `has_channels`.
+/// `down` picks ntfy priority 5 (breaks through phone DND where
+/// configured) vs 3 for the recovery ping. klas, 2026-07-15.
+pub async fn send_monitor_alert(title: &str, message: &str, down: bool) {
+    let config = AlertConfig::load();
+    if !config.enabled || !config.has_channels() {
+        return;
+    }
+    let (t, b) = decorate_local(title, message);
+    dispatch_to_channels(&config, &t, &b, if down { 5 } else { 3 }).await;
+
+    // Email too, if configured — same fan-out as send_node_alert.
+    let email_cfg = crate::ai::AiConfig::load();
+    if email_cfg.email_enabled && !email_cfg.email_to.is_empty() {
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = crate::ai::send_alert_email(&email_cfg, &t, &b) {
+                warn!("monitor alert email failed: {}", e);
+            }
+        }).await.ok();
     }
 }
 
