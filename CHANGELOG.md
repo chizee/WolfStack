@@ -8,6 +8,8 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.2.65: VM host readiness preflight — one-click install of swtpm/OVMF/qemu (masterpier)** _(2026-07-15 — [`3fd9053a`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/3fd9053ab000cfc46fdc5dc3f95acccf1ccd84ca))_
+- **v25.2.64: fix monitor Recent Checks showing 21/01/1970 (Rutger)** _(2026-07-15 — [`7b062b4b`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/7b062b4be1be4dab27b8076be5bcbf3c5e30ff34))_
 - **v25.2.63: container monitors work on remote nodes + monitor down/up notifications (klas)** _(2026-07-15 — [`5ce9a153`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/5ce9a153ce5f321eab4d4af9f9dc59d7fbf2a997))_
 - **v25.2.62: shared confirm dialog renders above ad-hoc modals (Rutger)** _(2026-07-15 — [`5bd5aa7c`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/5bd5aa7c33fe9ce347052852bee30ea5bb8fb9d8))_
 - **v25.2.61: Docker autostart survives image update — use name, not stale id (Paul)** _(2026-07-14 — [`2ebef92e`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/2ebef92e8b086381a26c4d016e858dde8b3ad38a))_
