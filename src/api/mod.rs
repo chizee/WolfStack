@@ -31870,6 +31870,32 @@ pub async fn statuspage_config_save(req: HttpRequest, state: web::Data<AppState>
 }
 
 /// GET /api/statuspage/monitors — list all monitors with current status
+/// GET /api/statuspage/container-check?runtime=&name= — probe a
+/// container's running state on THIS node. Called node-to-node by the
+/// status-page checker when a Container monitor targets a remote node
+/// (auth via the cluster secret through require_auth). Returns
+/// {"up": bool, "error": string|null}.
+pub async fn statuspage_container_check(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    query: web::Query<std::collections::HashMap<String, String>>,
+) -> HttpResponse {
+    if let Err(resp) = require_auth(&req, &state) { return resp; }
+    let runtime = query.get("runtime").cloned().unwrap_or_default();
+    let name = query.get("name").cloned().unwrap_or_default();
+    if runtime.is_empty() || name.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({ "error": "runtime and name required" }));
+    }
+    // Off the async worker — docker inspect / lxc-info are blocking.
+    let (up, err) = match web::block(move || {
+        crate::statuspage::check_container_local(&runtime, &name)
+    }).await {
+        Ok(v) => v,
+        Err(e) => (false, Some(format!("check task failed: {}", e))),
+    };
+    HttpResponse::Ok().json(serde_json::json!({ "up": up, "error": err }))
+}
+
 pub async fn statuspage_monitors_list(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = require_auth(&req, &state) { return resp; }
     let config = state.statuspage.config.read().unwrap();
@@ -31914,7 +31940,9 @@ pub async fn statuspage_monitor_save(req: HttpRequest, state: web::Data<AppState
     }
     // Trigger immediate check cycle so status is available right away
     let sp = state.statuspage.clone();
-    tokio::spawn(async move { crate::statuspage::run_checks(&sp).await; });
+    let sp_cluster = state.cluster.clone();
+    let sp_secret = state.cluster_secret.clone();
+    tokio::spawn(async move { crate::statuspage::run_checks(&sp, &sp_cluster, &sp_secret).await; });
     sp_broadcast(&state);
     HttpResponse::Ok().json(serde_json::json!({ "saved": true, "monitor": monitor }))
 }
@@ -32015,7 +32043,9 @@ pub async fn statuspage_page_save(req: HttpRequest, state: web::Data<AppState>, 
     drop(config);
     // Trigger immediate check cycle so status is available right away
     let sp = state.statuspage.clone();
-    tokio::spawn(async move { crate::statuspage::run_checks(&sp).await; });
+    let sp_cluster = state.cluster.clone();
+    let sp_secret = state.cluster_secret.clone();
+    tokio::spawn(async move { crate::statuspage::run_checks(&sp, &sp_cluster, &sp_secret).await; });
     sp_broadcast(&state);
     HttpResponse::Ok().json(serde_json::json!({ "saved": true, "page": page }))
 }
@@ -41129,6 +41159,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         // Status Page (admin — auth required)
         .route("/api/statuspage/config", web::get().to(statuspage_config_get))
         .route("/api/statuspage/config", web::post().to(statuspage_config_save))
+        .route("/api/statuspage/container-check", web::get().to(statuspage_container_check))
         .route("/api/statuspage/monitors", web::get().to(statuspage_monitors_list))
         .route("/api/statuspage/monitors", web::post().to(statuspage_monitor_save))
         .route("/api/statuspage/monitors/{id}", web::delete().to(statuspage_monitor_delete))

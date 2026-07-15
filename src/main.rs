@@ -3851,11 +3851,13 @@ a{color:#dc2626;text-decoration:none;}a:hover{text-decoration:underline;}
 
         // Background: Status page health check runner (every 30s)
         let sp_state = statuspage_state.clone();
+        let sp_cluster = app_state.cluster.clone();
+        let sp_secret = app_state.cluster_secret.clone();
         tokio::spawn(async move {
             // Short delay after startup, then run first check immediately
             tokio::time::sleep(Duration::from_secs(5)).await;
             loop {
-                statuspage::run_checks(&sp_state).await;
+                statuspage::run_checks(&sp_state, &sp_cluster, &sp_secret).await;
                 tokio::time::sleep(Duration::from_secs(30)).await;
             }
         });
