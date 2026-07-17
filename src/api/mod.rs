@@ -148,6 +148,40 @@ pub fn build_node_urls(address: &str, port: u16, path: &str) -> Vec<String> {
     urls
 }
 
+/// Extract the bare host from a target that may be `host`, `host:port`, or
+/// `scheme://host:port/path` (bracketed IPv6 supported). Mirrors the host
+/// parsing in `build_external_urls`.
+fn extract_target_host(target: &str) -> String {
+    let trimmed = target.trim().trim_end_matches('/');
+    let after_scheme = match trimmed.find("://") {
+        Some(i) => &trimmed[i + 3..],
+        None => trimmed,
+    };
+    let host_port = after_scheme.split('/').next().unwrap_or(after_scheme);
+    if let Some(rest) = host_port.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest).to_string();
+    }
+    match host_port.rfind(':') {
+        Some(pos) if !host_port[..pos].contains(':') => host_port[..pos].to_string(),
+        _ => host_port.to_string(),
+    }
+}
+
+/// True only if `target` names a host that is a REGISTERED member of this
+/// cluster. Our `X-WolfStack-Secret` is the fleet-root credential, so it must
+/// never be attached to an outbound request whose host isn't a cluster node —
+/// otherwise an operator- or attacker-supplied URL could capture the secret.
+/// Cross-cluster targets legitimately use a different secret and never needed
+/// ours, so gating this way loses no working behaviour.
+fn target_is_cluster_node(state: &AppState, target: &str) -> bool {
+    let host = extract_target_host(target).to_ascii_lowercase();
+    if host.is_empty() { return false; }
+    state.cluster.get_all_nodes().iter().any(|n| {
+        let na = extract_target_host(&n.address).to_ascii_lowercase();
+        !na.is_empty() && na == host
+    })
+}
+
 /// Build ordered URLs to try for external (cross-cluster) communication.
 /// All destination nodes run WolfStack (HTTPS 8553, HTTP 8554), so we try those ports
 /// automatically — the user only needs to provide the hostname.
@@ -8433,14 +8467,18 @@ pub async fn remote_storage_list(
 
     let urls = build_external_urls(&target, "/api/storage/list");
     let client = &*API_HTTP_CLIENT;
+    // Only hand our cluster secret to a genuine cluster node — never to an
+    // arbitrary operator-supplied URL (which could be attacker-controlled and
+    // would capture the fleet-root credential).
+    let attach_secret = target_is_cluster_node(&state, &target);
 
     let mut last_err = String::new();
     for url in &urls {
-        match client.get(url)
-            .timeout(std::time::Duration::from_secs(10))
-            .header("X-WolfStack-Secret", state.cluster_secret.clone())
-            .send()
-            .await
+        let mut rb = client.get(url).timeout(std::time::Duration::from_secs(10));
+        if attach_secret {
+            rb = rb.header("X-WolfStack-Secret", state.cluster_secret.clone());
+        }
+        match rb.send().await
         {
             Ok(r) if r.status().is_success() => {
                 let body = r.text().await.unwrap_or_default();
@@ -12112,6 +12150,12 @@ pub async fn lxc_migrate_external(
     let target_token = body.target_token.clone();
     let storage_val = body.storage.as_deref().unwrap_or("").to_string();
     let cluster_secret = state.cluster_secret.clone();
+    // Attach our cluster secret only when the destination is a member of THIS
+    // cluster. A genuine external cluster authenticates with `target_token`
+    // (federation), never with our fleet-root secret — so gating this way
+    // stops the secret leaking to an arbitrary destination without changing
+    // any working migration path.
+    let attach_secret = target_is_cluster_node(&state, &target_url);
     let tasks = state.migration_tasks.clone();
 
     // Create task entry
@@ -12129,11 +12173,12 @@ pub async fn lxc_migrate_external(
         let mut preflight_err = String::new();
         for url in &preflight_urls {
             // Just check connectivity — any HTTP response means the destination is running
-            match preflight_client.get(url)
-                .timeout(std::time::Duration::from_secs(10))
-                .header("X-WolfStack-Secret", cluster_secret.clone())
-                .send()
-                .await
+            let mut rb = preflight_client.get(url)
+                .timeout(std::time::Duration::from_secs(10));
+            if attach_secret {
+                rb = rb.header("X-WolfStack-Secret", cluster_secret.clone());
+            }
+            match rb.send().await
             {
                 Ok(resp) => { let _ = resp.bytes().await; preflight_ok = true; break; } // any response = reachable
                 Err(e) => { preflight_err = format!("{}: {}", url, e); }
@@ -12186,11 +12231,13 @@ pub async fn lxc_migrate_external(
                 .part("archive", reqwest::multipart::Part::bytes(archive_bytes.clone())
                     .file_name(file_name.clone()));
 
-            match client.post(import_url)
+            let mut rb = client.post(import_url)
                 .timeout(std::time::Duration::from_secs(600))
-                .header("X-Transfer-Token", &target_token)
-                .header("X-WolfStack-Secret", cluster_secret.clone())
-                .multipart(form)
+                .header("X-Transfer-Token", &target_token);
+            if attach_secret {
+                rb = rb.header("X-WolfStack-Secret", cluster_secret.clone());
+            }
+            match rb.multipart(form)
                 .send()
                 .await
             {
