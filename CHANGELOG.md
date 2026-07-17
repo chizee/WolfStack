@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.2.72: WolfHost subsystem maintenance and input validation** _(2026-07-17 — [`f528ff41`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/f528ff41ef2cf4e14292bf64bc9f4903215ddbe0))_
 - **v25.2.71: scan detector catches raw-socket scanners (zmap/masscan/nmap -sS)** _(2026-07-17 — [`014b234b`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/014b234bdb6526de840a0b67d3d467e604a07031))_
 - **v25.2.70: sticky peer ban-protection — a node leaving its cluster keeps its manager unbannable (klas)** _(2026-07-16 — [`a3ea1f37`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/a3ea1f373f40ca81994ee9b7a5c51021e87f597d))_
 - **v25.2.69: agent mode caps HTTP workers + skips tenant poll (klas Unraid RSS)** _(2026-07-16 — [`67bcfcc1`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/67bcfcc165bfd888dac95aa23f5a48627e5bec7b))_
