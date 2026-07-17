@@ -602,8 +602,11 @@ async fn main() -> std::io::Result<()> {
                Only the per-install secret will authenticate inter-node calls.");
     }
     if secret_audit::is_using_default_cluster_secret() {
-        info!("Cluster secret: still using the built-in default — see \
-               Settings → Security to rotate to a per-install value.");
+        warn!("Cluster secret: this node is running on the BUILT-IN DEFAULT secret. \
+               That value is a constant in the source, so any host that can reach this \
+               node's inter-node port could authenticate as a cluster peer. Rotate to a \
+               per-install secret now — Settings → Security → Rotate cluster secret — \
+               especially if this node is network-reachable.");
     }
 
     // Fetch public IP (best effort — try multiple services)

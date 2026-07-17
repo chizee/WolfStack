@@ -661,6 +661,24 @@ if [ -d /etc/wolfstack ] && [ "$(ls -A /etc/wolfstack 2>/dev/null)" ]; then
     fi
 fi
 
+# Fresh install only: generate a unique per-install cluster secret so a new
+# node never runs on the built-in default (that default is a constant in the
+# source — a node still on it would accept inter-node calls from anyone who
+# knows the constant). Guarded on both IS_UPGRADE=false AND absence of the
+# file, so an upgrade or an already-configured node is NEVER touched — this
+# cannot change the secret on an existing cluster. A fresh node with its own
+# secret still joins a cluster normally: the join handshake rekeys it to the
+# fleet secret. Format matches auth::generate_cluster_secret() (wsk_ + 64 hex).
+if [ "$IS_UPGRADE" = false ] && [ ! -s /etc/wolfstack/custom-cluster-secret ]; then
+    mkdir -p /etc/wolfstack
+    _ws_secret="wsk_$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    if printf '%s' "$_ws_secret" > /etc/wolfstack/custom-cluster-secret 2>/dev/null; then
+        chmod 600 /etc/wolfstack/custom-cluster-secret 2>/dev/null || true
+        echo "  ✓ Generated a unique cluster secret for this install (not the built-in default)."
+    fi
+    unset _ws_secret
+fi
+
 # Detect whether this upgrade is crossing the v23.11 boundary (when
 # WolfStack started serving HTTPS by default on the main port). Only
 # matters for upgraders who were running with NO TLS configured —
