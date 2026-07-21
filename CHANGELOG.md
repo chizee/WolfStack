@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.2.87: Docker update settings always reachable + skip bind mounts in pre-update backups (wabil)** _(2026-07-21 — [`d70ca667`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/d70ca66716fca647b4ce8fd3857eeb8c260b8278))_
 - **v25.2.86: per-container image-update policy no longer reverts for containers on a remote cluster node (RutgerDiehard)** _(2026-07-21 — [`606c297c`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/606c297ce9b6aab4cc864c4afb38c419cb044604))_
 - **v25.2.85: "Push to all nodes" for Docker image-update settings + make the panel discoverable (RutgerDiehard)** _(2026-07-21 — [`9a4171a7`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/9a4171a7e14f87c953f197ab6f7fc643320d4d42))_
 - **v25.2.84: bridge networking — active ifupdown beats a stray netplan file; warn when the drop-in isn't sourced (Computerman)** _(2026-07-21 — [`c0605d45`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/c0605d4592f0c4410578c28bb20181a8f66c87f3))_
