@@ -805,11 +805,31 @@ fn persist_systemd_networkd(
     })
 }
 
+/// True when `/etc/network/interfaces` pulls in the drop-in directory via a
+/// non-comment `source`/`source-directory /etc/network/interfaces.d/*` line.
+/// Our ifupdown persistence writes to `/etc/network/interfaces.d/` and is
+/// completely inert at boot without this include. Most distros ship it, but
+/// some minimal images — and, per a 26.04 bridge report, some newer defaults —
+/// omit it, so the drop-in looks identical to a working Proxmox bridge yet is
+/// never loaded. Unreadable file → assume sourced (don't nag odd setups; the
+/// manager-detection layer already vets ifupdown before we get here).
+fn interfaces_sources_dropins() -> bool {
+    match std::fs::read_to_string("/etc/network/interfaces") {
+        Ok(main) => main.lines().any(|l| {
+            let t = l.trim();
+            !t.starts_with('#')
+                && (t.starts_with("source /etc/network/interfaces.d")
+                    || t.starts_with("source-directory /etc/network/interfaces.d"))
+        }),
+        Err(_) => true,
+    }
+}
+
 /// ifupdown persistence: write a dedicated drop-in under
 /// `/etc/network/interfaces.d/`. The operator's primary
 /// `/etc/network/interfaces` is never edited. If that primary file
-/// still configures the NIC, the bridge won't come up cleanly on
-/// reboot — we detect that and warn loudly.
+/// still configures the NIC — or doesn't source `interfaces.d/*` at all —
+/// the bridge won't come up on reboot; we detect both and warn loudly.
 fn persist_ifupdown(
     bridge: &str,
     nic: &str,
@@ -864,18 +884,32 @@ fn persist_ifupdown(
 
     std::fs::write(&path, &out).map_err(|e| format!("write {}: {}", path, e))?;
 
-    // Detect whether the operator's primary interfaces file still
-    // configures this NIC — if so the bridge fight for the NIC on boot.
-    let warning = if primary_interfaces_configures_nic(nic) {
-        Some(format!(
-            "Your /etc/network/interfaces still configures '{}'. \
-             Remove its 'iface {}' / 'auto {}' stanza (we do NOT edit that \
-             file ourselves) or the bridge will not come up on reboot.",
+    // Collect the persistence caveats. The drop-in only takes effect on the
+    // next boot if `/etc/network/interfaces` sources `interfaces.d/*` AND no
+    // longer configures the slave NIC itself.
+    let mut warns: Vec<String> = Vec::new();
+    // (1) interfaces.d must actually be sourced, or the drop-in is inert at
+    // boot — the silent 26.04 failure where the stanza looks identical to a
+    // working Proxmox bridge but is never pulled in.
+    if !interfaces_sources_dropins() {
+        warns.push(format!(
+            "/etc/network/interfaces does not source /etc/network/interfaces.d/* — \
+             the bridge is live now but the persisted config at {} will NOT be \
+             loaded on the next reboot. Add this line near the top of \
+             /etc/network/interfaces:  source /etc/network/interfaces.d/*",
+            path
+        ));
+    }
+    // (2) the primary file must not still own the slave NIC.
+    if primary_interfaces_configures_nic(nic) {
+        warns.push(format!(
+            "Your /etc/network/interfaces still configures '{}'. Remove its \
+             'iface {}' / 'auto {}' stanza (we do NOT edit that file ourselves) \
+             or the bridge will not come up on reboot.",
             nic, nic, nic
-        ))
-    } else {
-        None
-    };
+        ));
+    }
+    let warning = if warns.is_empty() { None } else { Some(warns.join("  ")) };
 
     Ok(PersistResult {
         files: vec![path.clone()],

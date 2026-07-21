@@ -1331,6 +1331,16 @@ pub fn detect_net_manager() -> NetManager {
     };
     if active("NetworkManager") { return NetManager::NetworkManager; }
     if active("wicked") { return NetManager::Wicked; }
+    // An actively-running ifupdown (`networking.service`) is authoritative:
+    // the host is managing its network through /etc/network/interfaces right
+    // now, so a leftover/default `/etc/netplan/*.yaml` — which newer
+    // Debian/Ubuntu can ship even on ifupdown hosts (e.g. Proxmox) — must NOT
+    // flip us onto the netplan backend. Writing netplan config there would
+    // never apply and the bridge would silently fail to come up, while an
+    // identical-looking Proxmox (ifupdown) bridge works. This must come
+    // BEFORE the netplan file-presence check below (Computerman, 26.04 vs
+    // 25.04 bridge networking).
+    if active("networking") { return NetManager::Ifupdown; }
     // Netplan generates output for either networkd or NM, so this
     // check fires when /etc/netplan has files AND `netplan` exists.
     if std::path::Path::new("/etc/netplan").exists() {
