@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.2.85: "Push to all nodes" for Docker image-update settings + make the panel discoverable (RutgerDiehard)** _(2026-07-21 — [`9a4171a7`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/9a4171a7e14f87c953f197ab6f7fc643320d4d42))_
 - **v25.2.84: bridge networking — active ifupdown beats a stray netplan file; warn when the drop-in isn't sourced (Computerman)** _(2026-07-21 — [`c0605d45`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/c0605d4592f0c4410578c28bb20181a8f66c87f3))_
 - **v25.2.83: Docker image-update flags now appear on every cluster node, not just the manager (RutgerDiehard)** _(2026-07-20 — [`fc78f39c`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/fc78f39c22d31c3b7bfcacfdb0c54fa95e0dd57e))_
 - **v25.2.82: LXC config writes always terminate with a newline** _(2026-07-19 — [`98e5b0c2`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/98e5b0c22fa3e262fdb1304af351fe07dedb0fad))_
