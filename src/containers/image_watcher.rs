@@ -164,6 +164,36 @@ impl ImageWatcherConfig {
             && self.max_parallel_updates == other.max_parallel_updates
     }
 
+    /// Resolve which config to persist when a save request lands.
+    ///
+    /// `is_propagation` = a CLUSTER PEER syncing global settings: take only the
+    /// cluster-wide fields and keep this host's `container_policies` + audit
+    /// `update_history`, so a fleet-wide enable/interval change never wipes
+    /// host-local state.
+    ///
+    /// Otherwise it's an OPERATOR edit — made on this node directly OR proxied
+    /// to it via `/api/nodes/{id}/proxy/...` — and the full incoming config
+    /// wins, except this host's `update_history` (the config editor never
+    /// touches history, so a stale client copy must not truncate it).
+    ///
+    /// The proxied-operator case is exactly why the caller can't key this purely
+    /// off "did the request carry the inter-node secret": a proxied per-container
+    /// edit carries the secret too, but its policy change is real operator intent
+    /// that must be APPLIED, not merged away (the bug this fixes: unticking
+    /// backup/health/rollback on a container hosted by a *remote* node silently
+    /// reverted).
+    pub fn resolve_on_save(existing: Self, incoming: Self, is_propagation: bool) -> Self {
+        if is_propagation {
+            let mut merged = existing;
+            merged.merge_cluster_settings_from(&incoming);
+            merged
+        } else {
+            let mut c = incoming;
+            c.update_history = existing.update_history;
+            c
+        }
+    }
+
     /// True when the auto-apply window is currently open. With no
     /// schedule configured, the window is always open (apply
     /// immediately on detection). With a cron set, the window opens
@@ -1564,5 +1594,59 @@ mod tests {
         // A genuine cluster-wide difference (disabled default vs enabled) reads
         // as changed.
         assert!(!ImageWatcherConfig::default().cluster_settings_eq(&incoming));
+    }
+
+    #[test]
+    fn resolve_on_save_applies_operator_edits_but_merges_propagations() {
+        // This host's on-disk state: a per-container policy + audit history.
+        let mut existing = ImageWatcherConfig::default();
+        existing.container_policies.insert(
+            "netdata".to_string(),
+            ContainerUpdatePolicy { backup_before_update: true, ..Default::default() },
+        );
+        existing.update_history.push(ImageUpdateEvent {
+            id: "evt-hist".to_string(),
+            container_name: "netdata".to_string(),
+            image: "netdata:1".to_string(),
+            old_digest: String::new(),
+            new_digest: String::new(),
+            backup_id: None,
+            status: ImageUpdateStatus::Completed,
+            timestamp: "2026-07-21T00:00:00Z".to_string(),
+            error: None,
+        });
+
+        // OPERATOR edit (local OR proxied to this node): operator unticked
+        // "backup before update" for netdata. The editor sends the changed
+        // policy and an empty history. resolve_on_save must APPLY the policy
+        // and restore this host's history. This is the RutgerDiehard bug: when
+        // netdata lived on a remote node, the proxied edit was merged away and
+        // backup=false silently reverted.
+        let mut op_incoming = existing.clone();
+        op_incoming.update_history.clear();
+        op_incoming.container_policies.get_mut("netdata").unwrap().backup_before_update = false;
+
+        let saved = ImageWatcherConfig::resolve_on_save(existing.clone(), op_incoming, false);
+        assert!(!saved.container_policies["netdata"].backup_before_update,
+            "operator edit (backup off) must persist");
+        assert_eq!(saved.update_history.len(), 1,
+            "host audit history must survive an operator edit");
+
+        // PROPAGATION from a peer: only cluster-wide fields are taken; this
+        // host's netdata policy (backup=true) and history stay untouched, and
+        // the pusher's own container policy is not adopted.
+        let mut prop_incoming = ImageWatcherConfig::default();
+        prop_incoming.enabled = true;
+        prop_incoming.container_policies.insert(
+            "peer-only".to_string(), ContainerUpdatePolicy::default());
+
+        let synced = ImageWatcherConfig::resolve_on_save(existing.clone(), prop_incoming, true);
+        assert!(synced.enabled, "propagation must adopt the cluster-wide enable");
+        assert!(synced.container_policies["netdata"].backup_before_update,
+            "propagation must not touch this host's per-container policies");
+        assert!(!synced.container_policies.contains_key("peer-only"),
+            "propagation must not adopt the pusher's container policies");
+        assert_eq!(synced.update_history.len(), 1,
+            "propagation keeps this host's history");
     }
 }

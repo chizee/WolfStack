@@ -7688,6 +7688,13 @@ pub async fn node_proxy(
         builder = builder.timeout(std::time::Duration::from_secs(timeout_secs));
         builder = builder.header("content-type", &content_type);
         builder = builder.header("X-WolfStack-Secret", state.cluster_secret.clone());
+        // Mark this as a proxied OPERATOR action (a real user request forwarded
+        // on their behalf), distinct from a node-to-node propagation. The target
+        // node authenticates both via the fleet secret, so handlers that must
+        // treat "an operator edited via /api/nodes/{id}/proxy" differently from
+        // "a peer synced state to me" (e.g. image_watcher_config_save) key off
+        // this stamp. Handlers that don't care simply ignore it.
+        builder = builder.header("X-WolfStack-Proxied", "1");
         if !body_vec.is_empty() {
             builder = builder.body(body_vec.clone());
         }
@@ -35829,42 +35836,42 @@ pub async fn image_watcher_config_save(
     // (caller "cluster-node"). Peers must apply-but-not-refan, or the cluster
     // loops. See image_watcher_propagate_config_to_peers.
     let from_peer = caller == "cluster-node";
+    // A proxied OPERATOR edit (browser -> local node -> /api/nodes/{id}/proxy ->
+    // here, for a container that lives on THIS node) also arrives with the
+    // inter-node secret, so `from_peer` alone can't tell it apart from a genuine
+    // cluster propagation. node_proxy stamps proxied user requests with
+    // `X-WolfStack-Proxied`; a secret-authed save WITHOUT that stamp is a real
+    // peer propagation. Older nodes don't stamp it, so they fall back to the
+    // pre-fix merge behaviour — no mixed-version regression; the fix activates
+    // once both the proxying node and this node are upgraded. This is the bug
+    // where unticking backup/health/rollback for a container hosted on a REMOTE
+    // node silently reverted: the proxied edit was merged away as if it were a
+    // propagation.
+    let is_propagation = from_peer
+        && req.headers().get("X-WolfStack-Proxied").is_none();
 
-    // Merge so per-node state survives a cluster-wide toggle. `update_history`
-    // is THIS host's audit trail and `container_policies` key on THIS host's
-    // container names — a propagated enable/interval change must never wipe
-    // them. A peer save takes only the cluster-wide fields; a local operator
-    // save keeps the submitted config but still restores the on-disk history
-    // (the config editor never edits history, so a stale client copy must not
-    // truncate it).
+    // Cluster-wide fields decide whether we fan out; compute before `existing`
+    // is consumed. A propagation merges cluster fields only (keeping this host's
+    // per-container policies + audit history); an operator edit — local OR
+    // proxied — applies the full incoming config, restoring only this host's
+    // history. See ImageWatcherConfig::resolve_on_save.
     let existing = crate::containers::image_watcher::ImageWatcherConfig::load();
     let incoming = body.into_inner();
-    // Whether any CLUSTER-WIDE field changed vs what's on disk. Computed before
-    // `existing` is consumed below. Both branches produce a `cfg` whose
-    // cluster-wide fields equal `incoming`'s, so comparing against `incoming`
-    // is exact. A purely host-local edit (one container's policy) leaves this
-    // false and skips the fan-out entirely.
     let cluster_changed = !existing.cluster_settings_eq(&incoming);
-    let cfg = if from_peer {
-        let mut merged = existing;
-        merged.merge_cluster_settings_from(&incoming);
-        merged
-    } else {
-        let mut c = incoming;
-        c.update_history = existing.update_history;
-        c
-    };
+    let cfg = crate::containers::image_watcher::ImageWatcherConfig::resolve_on_save(
+        existing, incoming, is_propagation,
+    );
 
     if let Err(e) = cfg.save() {
         return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e }));
     }
 
-    // Operator-driven save that changes a cluster-wide setting: fan it out so
-    // the watcher runs on every node, not just the one the operator was
-    // viewing. A peer save (cycle-breaker) or a purely host-local edit never
-    // propagates — the latter would otherwise fan out on every single-container
-    // pin/unpin and could block the request on one slow/firewalled peer.
-    let peers = if !from_peer && cluster_changed {
+    // Operator-driven save that changed a cluster-wide setting (locally or via
+    // proxy): fan it out so the config matches on every node. A propagation
+    // (cycle-breaker) or a purely host-local edit never propagates — the latter
+    // would otherwise fan out on every single-container pin/unpin and could
+    // block the request on one slow/firewalled peer.
+    let peers = if !is_propagation && cluster_changed {
         image_watcher_propagate_config_to_peers(&state, &cfg).await
     } else {
         Vec::new()
