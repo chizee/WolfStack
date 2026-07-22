@@ -8,6 +8,7 @@ _Regenerated from git history by `scripts/gen-changelog.sh`. Do not
 edit this file by hand — your changes will be overwritten on the next
 release._
 
+- **v25.2.88: switch in-app sponsor CTAs to Pricing, linking to the wolfstack.org pricing page** _(2026-07-22 — [`ff1ac941`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/ff1ac9411a7ff8efbac43af8d8358d2282db5877))_
 - **v25.2.87: Docker update settings always reachable + skip bind mounts in pre-update backups (wabil)** _(2026-07-21 — [`d70ca667`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/d70ca66716fca647b4ce8fd3857eeb8c260b8278))_
 - **v25.2.86: per-container image-update policy no longer reverts for containers on a remote cluster node (RutgerDiehard)** _(2026-07-21 — [`606c297c`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/606c297ce9b6aab4cc864c4afb38c419cb044604))_
 - **v25.2.85: "Push to all nodes" for Docker image-update settings + make the panel discoverable (RutgerDiehard)** _(2026-07-21 — [`9a4171a7`](https://github.com/wolfsoftwaresystemsltd/WolfStack/commit/9a4171a7e14f87c953f197ab6f7fc643320d4d42))_
